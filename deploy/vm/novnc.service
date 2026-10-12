@@ -1,0 +1,11 @@
+[Unit]
+Description=noVNC / websockify (6080 -> localhost:5900)
+After=x11vnc.service
+
+[Service]
+ExecStart=/usr/bin/websockify --web /usr/share/novnc 6080 localhost:5900
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

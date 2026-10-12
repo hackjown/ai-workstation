@@ -1,0 +1,26 @@
+name: ipa
+on:
+  push:
+    branches: [main]
+    paths: ["apps/ios/**", "apps/web/icon-512.png", ".github/workflows/ipa.yml"]
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install ldid && python3 -m pip install --break-system-packages pillow
+      - name: Build (fakesigned, for TrollStore)
+        run: SDK=$(xcrun --sdk iphoneos --show-sdk-path) ./apps/ios/build-ipa.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIWorkstation-ipa
+          path: apps/ios/AIWorkstation.ipa
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apps/ios/AIWorkstation.ipa

@@ -1,0 +1,16 @@
+# 在 Docker 主机上：cp .env.example .env && nano .env && docker compose up -d --build
+# 打开 http://<本机IP>:8000/?token=<AIW_API_TOKEN>
+services:
+  aiw-api:
+    image: ${AIW_IMAGE:-ghcr.io/hackjown/ai-workstation:latest}   # 预构建镜像；本地构建改用 docker compose up -d --build
+    build: .
+    container_name: aiw-api
+    env_file: .env
+    environment:
+      AIW_HOST: 0.0.0.0
+      AIW_PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/workspace      # 数据库和截图持久化
+    restart: unless-stopped

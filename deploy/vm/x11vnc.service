@@ -1,0 +1,13 @@
+[Unit]
+Description=x11vnc for :0 (localhost only; exposed via websockify)
+After=graphical-session.target
+
+[Service]
+Environment=DISPLAY=:0
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do xdpyinfo >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
+ExecStart=/usr/bin/x11vnc -display :0 -rfbauth @HOME@/.config/aiw/vncpass -localhost -forever -shared -noxdamage -repeat -rfbport 5900
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

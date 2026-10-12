@@ -9,18 +9,27 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Tools
-        run: brew install ldid && python3 -m pip install --break-system-packages pillow
+      - name: Toolchain (clang + lld + ldid + iPhoneOS SDK)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang lld libplist-dev libssl-dev python3-pil zip
+          git clone -q --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+          make -C /tmp/ldid -j"$(nproc)"
+          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          git -C /tmp/sdks sparse-checkout set iPhoneOS16.5.sdk
       - name: Build (fakesigned, for TrollStore)
-        run: SDK=$(xcrun --sdk iphoneos --show-sdk-path) ./apps/ios/build-ipa.sh
+        run: SDK=/tmp/sdks/iPhoneOS16.5.sdk LDID=/tmp/ldid/ldid ./apps/ios/build-ipa.sh
       - uses: actions/upload-artifact@v4
         with:
           name: AIWorkstation-ipa
           path: apps/ios/AIWorkstation.ipa
-      - if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish to "latest" release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ipa-latest
+          name: AIWorkstation IPA (latest)
+          prerelease: true
           files: apps/ios/AIWorkstation.ipa

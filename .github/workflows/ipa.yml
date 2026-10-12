@@ -21,7 +21,12 @@ jobs:
           git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
           git -C /tmp/sdks sparse-checkout set iPhoneOS16.5.sdk
       - name: Build (fakesigned, for TrollStore)
-        run: SDK=/tmp/sdks/iPhoneOS16.5.sdk LDID=/tmp/ldid/ldid ./apps/ios/build-ipa.sh
+        run: |
+          set -o pipefail
+          SDK=/tmp/sdks/iPhoneOS16.5.sdk LDID=/tmp/ldid/ldid bash -x apps/ios/build-ipa.sh 2>&1 | tee /tmp/build.log
+      - name: Report build error
+        if: failure()
+        run: echo "::error title=build-ipa::$(tail -n 25 /tmp/build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A",$0}')"
       - uses: actions/upload-artifact@v4
         with:
           name: AIWorkstation-ipa

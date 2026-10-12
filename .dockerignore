@@ -1,0 +1,11 @@
+references/
+.env
+.git
+**/__pycache__
+.pytest_cache
+.venv
+**/node_modules
+workspace/*.db
+workspace/artifacts/
+data/
+tests/

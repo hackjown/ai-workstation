@@ -1,0 +1,8 @@
+references/
+workspace/*.db
+workspace/artifacts/
+.env
+__pycache__/
+.pytest_cache/
+apps/ios/build/
+apps/ios/*.ipa

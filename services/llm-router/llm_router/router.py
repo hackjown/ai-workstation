@@ -39,6 +39,10 @@ class LLMProvider(abc.ABC):
     @abc.abstractmethod
     async def decide(self, req: LLMRequest) -> LLMDecision: ...
 
+    async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
+        """Plain text completion (planning, summaries). Optional per provider."""
+        raise NotImplementedError
+
 
 class ScriptedProvider(LLMProvider):
     """Replays a fixed list of decisions. For tests and offline demos."""
@@ -76,6 +80,17 @@ class LLMRouter:
         self.providers = providers
 
     @classmethod
+    def from_settings(cls, model: str | None = None, fallback: str | None = None,
+                      api_key: str | None = None, base_url: str | None = None) -> "LLMRouter":
+        """Models picked in the web console (OpenAI-compatible gateway). Falls back to env config."""
+        from .providers.openai import OpenAIProvider
+        key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not key or not (model or fallback):
+            return cls.from_env()
+        ps = [OpenAIProvider(model=m, api_key=key, base_url=base_url) for m in (model, fallback) if m]
+        return cls(ps)
+
+    @classmethod
     def from_env(cls) -> "LLMRouter":
         from .providers.anthropic import AnthropicProvider
         from .providers.google import GoogleProvider
@@ -95,3 +110,14 @@ class LLMRouter:
             except Exception as e:  # noqa: BLE001
                 last = e
         raise RuntimeError(f"all LLM providers failed: {last}")
+
+    async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
+        last = None
+        for p in self.providers:
+            try:
+                return await p.complete(system, user, max_tokens)
+            except NotImplementedError as e:
+                last = e
+            except Exception as e:  # noqa: BLE001
+                last = e
+        raise RuntimeError(f"no provider could complete: {last}")

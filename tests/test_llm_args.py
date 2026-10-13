@@ -37,3 +37,20 @@ async def test_empty_args_are_retried_with_feedback(monkeypatch):
     assert sent[0]["max_tokens"] >= 4096
     fb = sent[1]["messages"][-1]
     assert fb["role"] == "tool" and "command" in fb["content"] and "cut off" in fb["content"]
+
+
+async def test_probe_detects_empty_tool_args_and_vision(monkeypatch):
+    from aiw_api.probe import probe
+
+    async def fake_post(self, url, json=None, headers=None):
+        if json.get("tools"):
+            args = "{}" if json["tool_choice"] == "required" else __import__("json").dumps(
+                {"command": "python3 -c \"print('" + "x" * 400 + "')\""})
+            msg = {"content": "", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "run_command", "arguments": args}}]}
+        else:
+            msg = {"content": "47, red"}
+        return httpx.Response(200, json={"choices": [{"message": msg}]}, request=httpx.Request("POST", url))
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    r = await probe("http://gw/v1", "k", "glm")
+    assert r["tools"] and r["tool_choice"] == "auto" and r["vision"]
+    assert any("为空" in n for n in r["notes"])

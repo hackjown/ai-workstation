@@ -86,6 +86,18 @@ class AgentLoop:
         p.write_bytes(base64.b64decode(b64))
         return str(p)
 
+    async def _deliver_file(self, res: dict):
+        b64 = res.get("content_b64")
+        if not b64 or not self.cfg.artifacts_dir:
+            return
+        name = Path(res.get("path") or "file").name
+        d = Path(self.cfg.artifacts_dir) / self.session_id / "files"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / name
+        p.write_bytes(base64.b64decode(b64))
+        await self.emit(EventType.FILE, name=name, size=res.get("size"), artifact=str(p),
+                        truncated=bool(res.get("size") and res["size"] > p.stat().st_size))
+
     # ------------------------------------------------------------------- run
     async def run(self) -> Task:
         self.task.status = TaskStatus.RUNNING
@@ -160,6 +172,10 @@ class AgentLoop:
                 if not retryable:
                     break
                 await asyncio.sleep(0.5)
+            if decision.tool == "send_file" and outcome.success and isinstance(outcome.result, dict):
+                await self._deliver_file(outcome.result)
+                outcome.result = {k: v for k, v in outcome.result.items() if k != "content_b64"}
+                outcome.result["sent_to_user"] = True
             if outcome.success and decision.tool not in ("screenshot", "done", "fail"):
                 self._acted = True
             await self.emit(EventType.ACTION_RESULT, tool=outcome.tool, success=outcome.success,

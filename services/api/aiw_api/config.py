@@ -27,6 +27,10 @@ class Settings:
     artifacts_dir: str = os.environ.get("AIW_ARTIFACTS", str(ROOT / "workspace" / "artifacts"))
     web_dir: str = str(ROOT / "apps" / "web")
     pve_enabled: bool = bool(os.environ.get("PVE_HOST"))
+    ask_timeout_s: float = float(os.environ.get("AIW_ASK_TIMEOUT", "600"))
+    clone_snapshot: str = os.environ.get("AIW_CLONE_SNAPSHOT", "clean")
+    resume_interrupted: bool = os.environ.get("AIW_RESUME_INTERRUPTED", "true").lower() != "false"
+    scheduler_enabled: bool = os.environ.get("AIW_SCHEDULER", "true").lower() != "false"
     machines: list[MachineConfig] = field(default_factory=list)
 
     def __post_init__(self):

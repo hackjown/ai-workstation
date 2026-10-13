@@ -109,6 +109,8 @@ class AgentLoop:
     async def _run(self):
         failures = 0
         shots = 0
+        self._acted = False
+        self._done_rejects = 0
         note: Optional[str] = None
         while self.step < self.cfg.max_steps:
             if await self.control.checkpoint():
@@ -131,6 +133,16 @@ class AgentLoop:
                         "call done with the full answer in summary.")
             if shots >= 4:
                 decision.tool, decision.args = "done", {"summary": decision.thought or "已截图，但模型未给出描述。"}
+            if decision.tool == "done" and not self._acted and _needs_action(self.task.prompt) and self._done_rejects < 2:
+                self._done_rejects += 1
+                await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                await self.emit(EventType.VALIDATION, success=False, change=0.0,
+                                message="拒绝 done：任务要求操作，但还没有执行任何操作")
+                self.history.append(f"{self.step}. done REJECTED: no action has been performed yet")
+                note = ("REJECTED: you called done without performing any action. The task requires real actions "
+                        "(open/search/type/click...). Do the first action now, e.g. browser_open with the URL. "
+                        "Do not invent results.")
+                continue
             await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
 
             if await self.control.checkpoint():  # paused while the model was thinking: discard stale decision
@@ -148,6 +160,8 @@ class AgentLoop:
                 if not retryable:
                     break
                 await asyncio.sleep(0.5)
+            if outcome.success and decision.tool not in ("screenshot", "done", "fail"):
+                self._acted = True
             await self.emit(EventType.ACTION_RESULT, tool=outcome.tool, success=outcome.success,
                             error=outcome.error, result=_short(outcome.result))
 
@@ -193,3 +207,12 @@ def _hist_line(step, decision, outcome, vmsg) -> str:
         res = f" exit={outcome.result.get('exit_code')} out={outcome.result.get('stdout','')[:200]!r}"
     status = "ok" if outcome.success else f"FAILED ({outcome.error})"
     return f"{step}. {decision.tool}({args}) -> {status}{res}; {vmsg}"
+
+
+_ACTION_WORDS = ("打开", "搜索", "输入", "点击", "新建", "创建", "运行", "执行", "下载", "访问", "登录", "安装", "写入", "删除",
+                 "open", "search", "type", "click", "create", "run", "download", "visit", "install", "write", "go to")
+
+
+def _needs_action(prompt: str) -> bool:
+    p = (prompt or "").lower()
+    return any(w in p for w in _ACTION_WORDS)

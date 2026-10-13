@@ -30,6 +30,10 @@
   #log { flex:1; overflow:auto; padding:10px; font:12px/1.5 ui-monospace, Menlo, monospace; }
   .ev { padding:4px 0; border-bottom:1px dashed #22262e; white-space:pre-wrap; word-break:break-word; }
   .ev .t { color:var(--acc); } .ev.err .t { color:var(--bad); } .ev.ok .t { color:var(--ok); }
+  #status { display:none; align-items:center; gap:8px; padding:8px 10px; border-top:1px solid var(--line); color:var(--dim); font-size:13px; }
+  #status.on { display:flex; }
+  .spin { width:12px; height:12px; border:2px solid var(--line); border-top-color:var(--acc); border-radius:50%; animation:sp .8s linear infinite; flex:none; }
+  @keyframes sp { to { transform:rotate(360deg); } }
   #confirm { display:none; margin:10px; padding:10px; border:1px solid var(--warn); border-radius:8px; background:#2a2110; }
   form { display:flex; gap:6px; padding:10px; border-top:1px solid var(--line); }
   textarea { flex:1; resize:none; height:60px; background:#0f1115; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; }
@@ -72,6 +76,7 @@
     </div>
   </div>
   <div id="log"></div>
+  <div id="status"><span class="spin"></span><span id="statusText"></span><span id="statusTime" style="margin-left:auto"></span></div>
   <form onsubmit="send(event)">
     <textarea id="prompt" placeholder="给 AI 一个任务，例如：打开 Chrome，搜索 OpenAI"></textarea>
     <button class="primary">发送</button>
@@ -102,9 +107,19 @@ async function loadDesktop(viewOnly) {
 async function refresh() {
   try {
     const m = await api("GET", `/api/machines/${MID}`);
-    pill($("vm"), "VM: " + (m.vm ? m.vm.state : (m.vm_error ? "未连接 PVE" : m.status)), m.vm && m.vm.state === "running" ? "ok" : "");
+    pill($("vm"), "VM: " + (m.vm ? m.vm.state : (m.vm_error ? "未连接 PVE" : m.status)), m.vm && m.vm.state === "running" ? "ok" : (m.vm_error ? "bad" : ""));
+    $("vm").title = m.vm_error || "";
     pill($("agent"), "Agent: " + (m.agent && m.agent.ok ? "在线" : "离线"), m.agent && m.agent.ok ? "ok" : "bad");
   } catch (e) { pill($("vm"), "API 错误", "bad"); }
+}
+const TOOL_CN = { screenshot:"截图", click:"点击", double_click:"双击", right_click:"右键", move:"移动鼠标", drag:"拖动", type:"输入文字", keypress:"按键", scroll:"滚动", open_app:"打开应用", close_app:"关闭应用", shell:"执行命令", browser_open:"打开浏览器", browser_navigate:"打开网址", browser_back:"后退", browser_forward:"前进", files_list:"列文件", files_read:"读文件", files_write:"写文件", files_download:"下载", done:"完成", fail:"放弃" };
+let busyT0 = 0, busyTimer = null;
+function busy(text) {
+  if (!text) { $("status").classList.remove("on"); clearInterval(busyTimer); busyTimer = null; return; }
+  $("statusText").textContent = text; busyT0 = Date.now(); $("statusTime").textContent = "";
+  $("status").classList.add("on");
+  clearInterval(busyTimer);
+  busyTimer = setInterval(() => { $("statusTime").textContent = Math.floor((Date.now() - busyT0) / 1000) + "s"; }, 1000);
 }
 function setState(s) {
   pill($("state"), s, { running: "ok", paused: "warn", takeover: "warn", succeeded: "ok", failed: "bad", stopped: "bad" }[s]);
@@ -115,17 +130,21 @@ function setState(s) {
 function onEvent(e) {
   const d = e.data || {};
   switch (e.type) {
-    case "task.started": setState("running"); log("任务", d.prompt); break;
+    case "task.started": setState("running"); busy("Agent 启动中…"); break;
+    case "agent.observation": busy(`#${e.step} 正在截取屏幕…`); break;
+    case "agent.thinking": busy(`#${e.step} 模型思考中…`); break;
+    case "agent.action": busy(`#${e.step} 正在${TOOL_CN[d.tool] || d.tool}…`); break;
+    case "agent.error": log("错误", d.error || "", "err"); break;
     case "agent.decision": log(`#${e.step} 决策`, `${d.tool}(${JSON.stringify(d.args)})  ${d.thought ? "— " + d.thought.slice(0, 200) : ""}`); break;
     case "agent.action_result": log(`#${e.step} 结果`, d.success ? "成功" : "失败: " + d.error, d.success ? "ok" : "err"); break;
     case "agent.validation": if (!d.success) log(`#${e.step} 校验`, d.message, "err"); break;
     case "agent.recovery": log(`#${e.step} 恢复`, d.note, "err"); break;
-    case "agent.confirm_required": $("confirm").style.display = "block"; $("confirmText").textContent = `需要你确认 (L${d.level}): ${d.reason}\n${d.tool} ${JSON.stringify(d.payload)}`; setState("waiting_confirm"); break;
-    case "agent.paused": setState("paused"); log("控制", "已暂停"); break;
-    case "agent.takeover": setState("takeover"); log("控制", "你已接管桌面"); loadDesktop(false); break;
+    case "agent.confirm_required": busy(null); $("confirm").style.display = "block"; $("confirmText").textContent = `需要你确认 (L${d.level}): ${d.reason}\n${d.tool} ${JSON.stringify(d.payload)}`; setState("waiting_confirm"); break;
+    case "agent.paused": setState("paused"); log("控制", "已暂停"); busy(null); break;
+    case "agent.takeover": setState("takeover"); busy(null); log("控制", "你已接管桌面"); loadDesktop(false); break;
     case "agent.resumed": setState("running"); log("控制", "Agent 恢复"); loadDesktop(true); break;
-    case "task.finished": setState("succeeded"); log("完成", d.result || "", "ok"); break;
-    case "task.failed": setState(d.status || "failed"); log("结束", d.result || d.op || "", "err"); break;
+    case "task.finished": busy(null); setState("succeeded"); log("完成", d.result || "", "ok"); break;
+    case "task.failed": busy(null); setState(d.status || "failed"); log("结束", d.result || d.op || "", "err"); break;
   }
 }
 function connect(sid) {
@@ -137,9 +156,9 @@ function connect(sid) {
 async function send(ev) {
   ev.preventDefault();
   const p = $("prompt").value.trim(); if (!p) return;
-  $("log").innerHTML = "";
+  $("log").innerHTML = ""; log("任务", p); busy("已提交，等待 Agent 接单…");
   try { const r = await api("POST", "/api/tasks", { prompt: p, machine_id: MID }); SID = r.session_id; connect(SID); $("prompt").value = ""; }
-  catch (e) { log("错误", e.message, "err"); }
+  catch (e) { busy(null); log("错误", e.message, "err"); }
 }
 async function ctl(op) { if (SID) await api("POST", `/api/agent/${op}`, { session_id: SID }); }
 async function answer(ok) { $("confirm").style.display = "none"; await api("POST", "/api/agent/confirm", { session_id: SID, approve: ok }); }

@@ -2,182 +2,168 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="mobile-web-app-capable" content="yes" />
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
 <meta name="apple-mobile-web-app-title" content="AIW" />
-<meta name="theme-color" content="#0f1115" />
+<meta name="theme-color" content="#FCFCFC" />
 <link rel="manifest" href="manifest.json" />
 <link rel="apple-touch-icon" href="icon-180.png" />
 <title>AI Workstation</title>
-<style>
-  :root { --bg:#0f1115; --panel:#171a21; --line:#262a33; --text:#e6e6e6; --dim:#8a8f98; --acc:#4f8cff; --warn:#f0a020; --bad:#e5484d; --ok:#30a46c; }
-  * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.45 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background:var(--bg); color:var(--text); height:100vh; display:grid; grid-template-columns: 1fr 420px; grid-template-rows: 48px 1fr; }
-  header { grid-column: 1 / 3; display:flex; align-items:center; gap:12px; padding:0 16px; border-bottom:1px solid var(--line); }
-  header b { font-size:15px; }
-  .pill { padding:2px 8px; border-radius:99px; background:var(--line); color:var(--dim); font-size:12px; }
-  .pill.ok { background:#103d2a; color:#6ee7a8; } .pill.bad { background:#3d1214; color:#ff9a9d; } .pill.warn { background:#3d2e10; color:#ffd08a; }
-  main { position:relative; background:#000; }
-  main iframe { width:100%; height:100%; border:0; }
-  main .overlay { position:absolute; top:10px; left:10px; display:flex; gap:6px; }
-  aside { border-left:1px solid var(--line); display:flex; flex-direction:column; min-height:0; background:var(--panel); }
-  .bar { display:flex; gap:6px; padding:10px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
-  button { background:var(--line); color:var(--text); border:0; border-radius:6px; padding:6px 10px; cursor:pointer; font-size:13px; }
-  button.primary { background:var(--acc); } button.warn { background:var(--warn); color:#000; } button.bad { background:var(--bad); }
-  button:disabled { opacity:.4; cursor:default; }
-  #log { flex:1; overflow:auto; padding:10px; font:12px/1.5 ui-monospace, Menlo, monospace; }
-  .ev { padding:4px 0; border-bottom:1px dashed #22262e; white-space:pre-wrap; word-break:break-word; }
-  .ev .t { color:var(--acc); } .ev.err .t { color:var(--bad); } .ev.ok .t { color:var(--ok); }
-  #status { display:none; align-items:center; gap:8px; padding:8px 10px; border-top:1px solid var(--line); color:var(--dim); font-size:13px; }
-  #status.on { display:flex; }
-  .spin { width:12px; height:12px; border:2px solid var(--line); border-top-color:var(--acc); border-radius:50%; animation:sp .8s linear infinite; flex:none; }
-  @keyframes sp { to { transform:rotate(360deg); } }
-  #confirm { display:none; margin:10px; padding:10px; border:1px solid var(--warn); border-radius:8px; background:#2a2110; }
-  form { display:flex; gap:6px; padding:10px; border-top:1px solid var(--line); }
-  textarea { flex:1; resize:none; height:60px; background:#0f1115; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; }
-  /* phone: desktop on top, task panel below */
-  @media (max-width: 820px) {
-    body { height:100dvh; grid-template-columns: 1fr; grid-template-rows: auto 45dvh 1fr; padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
-    header { grid-column: 1; flex-wrap:wrap; height:auto; padding:6px 10px; gap:6px; }
-    header b { display:none; }
-    aside { border-left:0; border-top:1px solid var(--line); }
-    textarea { font-size:16px; }
-  }
-</style>
+<link rel="stylesheet" href="app.css" />
 </head>
 <body>
-<header>
-  <b>AI Workstation</b>
-  <span class="pill" id="vm">VM: …</span>
-  <span class="pill" id="agent">Agent: …</span>
-  <span class="pill" id="state">idle</span>
-  <span style="flex:1"></span>
-  <button onclick="vmOp('start')">开机</button>
-  <button onclick="vmOp('restart')">重启</button>
-  <button onclick="vmOp('stop')">关机</button>
-</header>
-<main>
-  <iframe id="desk" title="desktop"></iframe>
-  <div class="overlay"><span class="pill" id="mode">观看模式</span></div>
-</main>
-<aside>
-  <div class="bar">
-    <button id="bPause" onclick="ctl('pause')" disabled>暂停</button>
-    <button id="bTake" class="warn" onclick="ctl('takeover')" disabled>接管桌面</button>
-    <button id="bResume" class="primary" onclick="ctl('resume')" disabled>恢复 Agent</button>
-    <button id="bStop" class="bad" onclick="ctl('stop')" disabled>停止</button>
-  </div>
-  <div id="confirm">
-    <div id="confirmText"></div>
-    <div style="margin-top:8px; display:flex; gap:6px">
-      <button class="primary" onclick="answer(true)">允许</button><button onclick="answer(false)">拒绝</button>
+<div id="app">
+  <!-- sidebar (desktop) -->
+  <nav id="side">
+    <div class="brand">
+      <button class="avatar" id="sideAvatar" onclick="go('settings')" title="设置"></button>
+      <div><div class="heading" id="agentName">AI Workstation</div><div class="small" id="agentStatus">空闲</div></div>
     </div>
-  </div>
-  <div id="log"></div>
-  <div id="status"><span class="spin"></span><span id="statusText"></span><span id="statusTime" style="margin-left:auto"></span></div>
-  <form onsubmit="send(event)">
-    <textarea id="prompt" placeholder="给 AI 一个任务，例如：打开 Chrome，搜索 OpenAI"></textarea>
-    <button class="primary">发送</button>
-  </form>
-</aside>
-<script>
-const MID = new URLSearchParams(location.search).get("machine") || "ai-linux-001";
-let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("aiw_token") || "";
-// Home-screen web app on iOS starts without ?token= and has its own storage: ask once.
-if (!TOKEN) TOKEN = (prompt("输入 AIW_API_TOKEN") || "").trim();
-if (TOKEN) { localStorage.setItem("aiw_token", TOKEN); document.cookie = "aiw_token=" + TOKEN + "; path=/; SameSite=Strict"; }
-let SID = null, ws = null, agentFails = 0;
-const H = () => ({ "Content-Type": "application/json", ...(TOKEN ? { Authorization: "Bearer " + TOKEN } : {}) });
-const $ = (id) => document.getElementById(id);
-const api = async (m, p, b) => { const r = await fetch(p, { method: m, headers: H(), body: b ? JSON.stringify(b) : undefined }); if (!r.ok) throw new Error(await r.text()); return r.json(); };
+    <button class="btn primary wide" onclick="newThread()"><i data-i="plus"></i>新对话</button>
+    <div class="navs">
+      <button data-view="chat" onclick="go('chat')"><i data-i="chat"></i>对话</button>
+      <button data-view="activity" onclick="go('activity')"><i data-i="activity"></i>活动<span class="badge" id="needBadge"></span></button>
+      <button data-view="tracking" onclick="go('tracking')"><i data-i="target"></i>追踪</button>
+      <button data-view="routines" onclick="go('routines')"><i data-i="clock"></i>例程</button>
+      <button data-view="computer" onclick="go('computer')"><i data-i="monitor"></i>电脑</button>
+      <button data-view="settings" onclick="go('settings')"><i data-i="settings"></i>设置</button>
+    </div>
+    <div class="label pad">对话</div>
+    <div id="threadList" class="threads"></div>
+    <button class="link small pad" onclick="toggleArchived()" id="archToggle">查看已归档</button>
+  </nav>
 
-function pill(el, text, cls) { el.textContent = text; el.className = "pill " + (cls || ""); }
-function log(type, text, cls) {
-  const d = document.createElement("div"); d.className = "ev " + (cls || "");
-  d.innerHTML = `<span class="t">${type}</span> ${text.replace(/[<&]/g, c => c === "<" ? "&lt;" : "&amp;")}`;
-  $("log").appendChild(d); $("log").scrollTop = 1e9;
-}
-function fileLink(d) {
-  const url = `/api/artifacts?download=1&path=${encodeURIComponent(d.artifact)}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
-  const kb = d.size ? (d.size > 1048576 ? (d.size / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(d.size / 1024)) + " KB") : "";
-  const el = document.createElement("div"); el.className = "ev ok";
-  const a = document.createElement("a"); a.href = url; a.download = d.name; a.textContent = "⬇ " + d.name;
-  a.style.cssText = "color:#6ee7a8;font-weight:600";
-  const t = document.createElement("span"); t.className = "t"; t.textContent = "文件 ";
-  el.append(t, a, document.createTextNode(` ${kb}${d.truncated ? "（超过 40MB 已截断）" : ""}`));
-  $("log").appendChild(el); $("log").scrollTop = 1e9;
-}
-async function loadDesktop(viewOnly) {
-  const d = await api("GET", `/api/machines/${MID}/desktop?view_only=${viewOnly}`);
-  $("desk").src = d.novnc_url + (TOKEN ? "&token=" + encodeURIComponent(TOKEN) : "");
-  pill($("mode"), viewOnly ? "观看模式" : "你正在操作桌面", viewOnly ? "" : "warn");
-}
-async function refresh() {
-  try {
-    const m = await api("GET", `/api/machines/${MID}`);
-    pill($("vm"), "VM: " + (m.vm ? m.vm.state : (m.vm_error ? "未连接 PVE" : m.status)), m.vm && m.vm.state === "running" ? "ok" : (m.vm_error ? "bad" : ""));
-    $("vm").title = m.vm_error || "";
-    const up = !!(m.agent && m.agent.ok);
-    agentFails = up ? 0 : agentFails + 1;
-    if (up || agentFails >= 2) pill($("agent"), "Agent: " + (up ? "在线" : "离线"), up ? "ok" : "bad");
-    $("agent").title = up ? "" : ((m.agent && m.agent.error) || "");
-  } catch (e) { pill($("vm"), "API 错误", "bad"); }
-}
-const TOOL_CN = { screenshot:"截图", click:"点击", double_click:"双击", right_click:"右键", move:"移动鼠标", drag:"拖动", type:"输入文字", keypress:"按键", scroll:"滚动", open_app:"打开应用", close_app:"关闭应用", shell:"执行命令", browser_open:"打开浏览器", browser_navigate:"打开网址", browser_back:"后退", browser_forward:"前进", files_list:"列文件", files_read:"读文件", files_write:"写文件", files_download:"下载", send_file:"发送文件", done:"完成", fail:"放弃" };
-let busyT0 = 0, busyTimer = null;
-function busy(text) {
-  if (!text) { $("status").classList.remove("on"); clearInterval(busyTimer); busyTimer = null; return; }
-  $("statusText").textContent = text; busyT0 = Date.now(); $("statusTime").textContent = "";
-  $("status").classList.add("on");
-  clearInterval(busyTimer);
-  busyTimer = setInterval(() => { $("statusTime").textContent = Math.floor((Date.now() - busyT0) / 1000) + "s"; }, 1000);
-}
-function setState(s) {
-  pill($("state"), s, { running: "ok", paused: "warn", takeover: "warn", succeeded: "ok", failed: "bad", stopped: "bad" }[s]);
-  const live = ["running", "paused", "takeover", "waiting_confirm"].includes(s);
-  $("bPause").disabled = s !== "running"; $("bTake").disabled = !live || s === "takeover";
-  $("bResume").disabled = !["paused", "takeover"].includes(s); $("bStop").disabled = !live;
-}
-function onEvent(e) {
-  const d = e.data || {};
-  switch (e.type) {
-    case "task.started": setState("running"); busy("Agent 启动中…"); break;
-    case "agent.observation": busy(`#${e.step} 正在截取屏幕…`); break;
-    case "agent.thinking": busy(`#${e.step} 模型思考中…`); break;
-    case "agent.action": busy(`#${e.step} 正在${TOOL_CN[d.tool] || d.tool}…`); break;
-    case "agent.error": log("错误", d.error || "", "err"); break;
-    case "agent.file": fileLink(d); break;
-    case "agent.decision": log(`#${e.step} 决策`, `${d.tool}(${JSON.stringify(d.args)})  ${d.thought ? "— " + d.thought.slice(0, 200) : ""}`); break;
-    case "agent.action_result": log(`#${e.step} 结果`, d.success ? "成功" : "失败: " + d.error, d.success ? "ok" : "err"); break;
-    case "agent.validation": if (!d.success) log(`#${e.step} 校验`, d.message, "err"); break;
-    case "agent.recovery": log(`#${e.step} 恢复`, d.note, "err"); break;
-    case "agent.confirm_required": busy(null); $("confirm").style.display = "block"; $("confirmText").textContent = `需要你确认 (L${d.level}): ${d.reason}\n${d.tool} ${JSON.stringify(d.payload)}`; setState("waiting_confirm"); break;
-    case "agent.paused": setState("paused"); log("控制", "已暂停"); busy(null); break;
-    case "agent.takeover": setState("takeover"); busy(null); log("控制", "你已接管桌面"); loadDesktop(false); break;
-    case "agent.resumed": setState("running"); log("控制", "Agent 恢复"); loadDesktop(true); break;
-    case "task.finished": busy(null); setState("succeeded"); log("完成", d.result || "", "ok"); break;
-    case "task.failed": busy(null); setState(d.status || "failed"); log("结束", d.result || d.op || "", "err"); break;
-  }
-}
-function connect(sid) {
-  if (ws) ws.close();
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws/session/${sid}${TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""}`);
-  ws.onmessage = (m) => { const e = JSON.parse(m.data); if (e.kind === "event") onEvent(e); };
-}
-async function send(ev) {
-  ev.preventDefault();
-  const p = $("prompt").value.trim(); if (!p) return;
-  $("log").innerHTML = ""; log("任务", p); busy("已提交，等待 Agent 接单…");
-  try { const r = await api("POST", "/api/tasks", { prompt: p, machine_id: MID }); SID = r.session_id; connect(SID); $("prompt").value = ""; }
-  catch (e) { busy(null); log("错误", e.message, "err"); }
-}
-async function ctl(op) { if (SID) await api("POST", `/api/agent/${op}`, { session_id: SID }); }
-async function answer(ok) { $("confirm").style.display = "none"; await api("POST", "/api/agent/confirm", { session_id: SID, approve: ok }); }
-async function vmOp(op) { try { await api("POST", `/api/machines/${MID}/${op}`); refresh(); } catch (e) { log("VM", e.message, "err"); } }
-loadDesktop(true).catch(e => log("桌面", e.message, "err")); refresh(); setInterval(refresh, 10000); setState("idle");
-</script>
+  <!-- main column -->
+  <section id="main">
+    <header id="top">
+      <button class="icon only-mobile" onclick="openDrawer()" aria-label="对话列表"><i data-i="menu"></i></button>
+      <div class="ttl"><div class="heading" id="viewTitle">对话</div><div class="small" id="viewSub"></div></div>
+      <span class="chip" id="pillAgent">Agent …</span>
+      <button class="icon" id="bell" onclick="toggleNotes()" aria-label="通知"><i data-i="bell"></i><span class="dot" id="bellDot"></span></button>
+      <button class="icon only-wide" id="deskToggle" onclick="toggleDeskPane()" aria-label="桌面" title="显示/隐藏桌面"><i data-i="monitor"></i></button>
+    </header>
+    <div id="notes" class="pop"></div>
+
+    <!-- CHAT -->
+    <div class="view" id="v-chat">
+      <div id="msgs" class="scroll"></div>
+      <button id="toLatest" class="fab" onclick="scrollLatest(true)">↓ 最新</button>
+      <div id="queueBar"></div>
+      <div class="composer-wrap">
+        <div id="attach" class="attachments"></div>
+        <form class="composer" onsubmit="submitPrompt(event)">
+          <button type="button" class="icon soft" onclick="$('file').click()" aria-label="附件"><i data-i="clip"></i></button>
+          <input type="file" id="file" hidden multiple onchange="uploadFiles(this.files)" />
+          <textarea id="prompt" rows="1" placeholder="让 Agent 去做点什么…" oninput="autoGrow(this); saveDraft()" onkeydown="promptKey(event)"></textarea>
+          <button type="button" class="icon soft" id="micBtn" onclick="toggleMic()" aria-label="语音输入"><i data-i="mic"></i></button>
+          <button class="send" id="sendBtn" aria-label="发送"><i data-i="up"></i></button>
+        </form>
+        <div class="small center hint" id="composerHint"></div>
+      </div>
+    </div>
+
+    <!-- ACTIVITY -->
+    <div class="view scroll" id="v-activity">
+      <div class="page">
+        <div class="seg" id="actFilter">
+          <button data-f="all" class="on">全部</button><button data-f="live">进行中</button>
+          <button data-f="need">需要你</button><button data-f="failed">失败</button><button data-f="queued">排队</button>
+        </div>
+        <div id="actList" class="list"></div>
+      </div>
+    </div>
+
+    <!-- TRACKING -->
+    <div class="view scroll" id="v-tracking">
+      <div class="page">
+        <div class="card sky">
+          <div class="heading">追踪网页</div>
+          <div class="muted">定时检查页面：内容变化、出现某段文字、价格低于阈值时提醒你，同一变化只提醒一次。</div>
+          <form class="grid2" onsubmit="addWatch(event)">
+            <input name="name" placeholder="名称，例如 耳机降价" required />
+            <input name="url" placeholder="https://…" required />
+            <select name="mode" onchange="this.form.value.placeholder={change:'（可空）',contains:'要出现的文字，例如 有货',price_below:'价格阈值，例如 149'}[this.value]">
+              <option value="change">页面有变化</option><option value="contains">出现文字</option><option value="price_below">价格低于</option>
+            </select>
+            <input name="value" placeholder="（可空）" />
+            <select name="interval_min"><option value="15">每 15 分钟</option><option value="60" selected>每小时</option><option value="360">每 6 小时</option><option value="1440">每天</option></select>
+            <button class="btn primary"><i data-i="plus"></i>添加追踪</button>
+          </form>
+        </div>
+        <div id="watchList" class="list"></div>
+      </div>
+    </div>
+
+    <!-- ROUTINES -->
+    <div class="view scroll" id="v-routines">
+      <div class="page">
+        <div class="card lavender">
+          <div class="heading">例程</div>
+          <div class="muted">按时间自动交给 Agent 的任务，结果会出现在对话里并推送通知。</div>
+          <form class="grid2" onsubmit="addRoutine(event)">
+            <input name="name" placeholder="名称，例如 每日巡检" required />
+            <select name="preset" onchange="if(this.value) this.form.schedule.value=this.value">
+              <option value="">常用时间…</option><option value="daily 09:00">每天 09:00</option><option value="0 9 * * 1-5">工作日 09:00</option>
+              <option value="every 2h">每 2 小时</option><option value="0 18 * * 5">每周五 18:00</option>
+            </select>
+            <textarea name="prompt" rows="2" class="span2" placeholder="要做什么，例如：打开 Hacker News，挑 5 条有意思的新闻写成 news.docx 发给我" required></textarea>
+            <input name="schedule" placeholder="daily 09:00 / every 30m / cron: 0 9 * * 1-5" required />
+            <button class="btn primary"><i data-i="plus"></i>添加例程</button>
+          </form>
+        </div>
+        <div id="routineList" class="list"></div>
+      </div>
+    </div>
+
+    <!-- COMPUTER -->
+    <div class="view scroll" id="v-computer">
+      <div class="page">
+        <div class="card sky row gap">
+          <div class="iconbox"><i data-i="monitor"></i></div>
+          <div class="grow"><div class="heading" id="pcTitle">电脑</div><div class="muted" id="pcSub">…</div></div>
+        </div>
+        <div class="row gap wrap">
+          <button class="btn primary" id="takeBtn" onclick="toggleTakeover()"><i data-i="hand"></i>接管桌面</button>
+          <button class="btn" onclick="vmOp('start')">开机</button>
+          <button class="btn" onclick="vmOp('restart')">重启</button>
+          <button class="btn" onclick="vmOp('stop')">关机</button>
+          <button class="btn" onclick="snapshot()">快照</button>
+          <label class="toggle"><input type="checkbox" id="isoToggle" onchange="localStorage.setItem('aiw_iso', this.checked?'1':'')" /> 下个任务用一次性隔离电脑</label>
+        </div>
+        <div class="deskframe big"><iframe id="deskBig" title="desktop"></iframe></div>
+      </div>
+    </div>
+
+    <!-- SETTINGS -->
+    <div class="view scroll" id="v-settings">
+      <div class="page" id="settingsPage"></div>
+    </div>
+  </section>
+
+  <!-- desktop pane (wide screens, chat view) -->
+  <aside id="deskPane">
+    <div class="card flat deskhead">
+      <div class="iconbox sm"><i data-i="monitor"></i></div>
+      <div class="grow"><div class="heading">Agent 电脑</div><div class="small" id="deskMode">观看模式</div></div>
+      <button class="btn sm" onclick="toggleTakeover()" id="takeBtn2">接管</button>
+    </div>
+    <div class="deskframe"><iframe id="desk" title="desktop"></iframe></div>
+  </aside>
+
+  <!-- mobile tab bar -->
+  <nav id="tabs">
+    <button data-view="chat" onclick="go('chat')"><i data-i="chat"></i><span>对话</span></button>
+    <button data-view="activity" onclick="go('activity')"><i data-i="activity"></i><span>活动</span></button>
+    <button data-view="tracking" onclick="go('tracking')"><i data-i="target"></i><span>追踪</span></button>
+    <button data-view="computer" onclick="go('computer')"><i data-i="monitor"></i><span>电脑</span></button>
+    <button data-view="settings" onclick="go('settings')"><i data-i="settings"></i><span>更多</span></button>
+  </nav>
+</div>
+<div id="shade" onclick="closeOverlays()"></div>
+<div id="modal" class="sheet"></div>
+<div id="toast"></div>
+<script src="app.js"></script>
 </body>
 </html>

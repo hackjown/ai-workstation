@@ -96,9 +96,13 @@ async def test_one_session_per_machine_and_stop(stack):
     client, backend, scripts, _ = stack
     scripts.append([("screenshot", {})] * 200)
     r = (await client.post("/api/tasks", json={"prompt": "loop", "max_steps": 200})).json()
-    r2 = await client.post("/api/tasks", json={"prompt": "second"})
-    assert r2.status_code == 409
+    r2 = (await client.post("/api/tasks", json={"prompt": "second", "thread_id": r["thread_id"]})).json()
+    assert r2["queued"] and r2["session_id"] is None          # busy machine -> follow-up waits in the queue
     await client.post("/api/agent/pause", json={"session_id": r["session_id"]})
     await client.post("/api/agent/stop", json={"session_id": r["session_id"]})
     s = await wait_done(client, r["session_id"])
     assert s["status"] == "stopped"
+    await asyncio.sleep(0.2)
+    th = (await client.get(f"/api/threads/{r['thread_id']}")).json()
+    assert th["queue_held"] and th["tasks"][-1]["status"] == "queued"   # stop pauses the queue
+    assert (await client.delete(f"/api/tasks/{r2['task']['id']}")).json()["cancelled"]

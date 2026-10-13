@@ -228,6 +228,15 @@ class AgentLoop:
             await self.emit(EventType.VALIDATION, success=v.success, change=v.changed, message=v.message)
             self.history.append(_hist_line(self.step, decision, outcome, v.message))
 
+            if not outcome.success and (outcome.error or "").startswith("missing args"):
+                failures += 1
+                if failures >= self.cfg.max_consecutive_failures:
+                    self._finish(TaskStatus.FAILED, f"模型连续 {failures} 次调用 {decision.tool} 时没有给出参数（{outcome.error}）。"
+                                                    "多半是模型输出被截断或网关不支持工具参数，可换模型或调大 AIW_LLM_MAX_TOKENS。")
+                    return
+                note = (f"Your last {decision.tool} call had no arguments ({outcome.error}). Call it again WITH the "
+                        "required arguments. If the content is long, use files_write to save a script first, then run it.")
+                continue
             if outcome.decision.forbidden or (outcome.decision.needs_confirm and not outcome.success):
                 failures += 1
                 note = f"Action blocked: {outcome.error}. Choose a different approach or call fail."

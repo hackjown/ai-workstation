@@ -108,6 +108,7 @@ class AgentLoop:
 
     async def _run(self):
         failures = 0
+        shots = 0
         note: Optional[str] = None
         while self.step < self.cfg.max_steps:
             if await self.control.checkpoint():
@@ -123,6 +124,13 @@ class AgentLoop:
                 system=SYSTEM_PROMPT, task=self.task.prompt, history=self.history,
                 screenshot_b64=before, tools=tool_schemas(), screen=shown, note=note))
             note = None
+            shots = shots + 1 if decision.tool == "screenshot" else 0
+            if shots >= 2:
+                note = ("You keep calling screenshot, but the current screenshot is already attached every turn. "
+                        "Do NOT call screenshot again. Take the next real action, or if the task is only to look/report, "
+                        "call done with the full answer in summary.")
+            if shots >= 4:
+                decision.tool, decision.args = "done", {"summary": decision.thought or "已截图，但模型未给出描述。"}
             await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
 
             if await self.control.checkpoint():  # paused while the model was thinking: discard stale decision

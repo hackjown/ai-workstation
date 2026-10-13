@@ -50,3 +50,11 @@ class OpenAIProvider(LLMProvider):
         fn = calls[0]["function"]
         return LLMDecision(msg.get("content") or "", fn["name"], json.loads(fn.get("arguments") or "{}"),
                            raw=data, usage=data.get("usage", {}))
+
+    async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
+        body = {"model": self.model, "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"].get("content") or ""

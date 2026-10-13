@@ -166,3 +166,37 @@ async def test_send_file_delivers_artifact(env):
     assert f and f[0].data["name"] == "report.docx"
     from pathlib import Path
     assert Path(f[0].data["artifact"]).read_bytes() == b"PK\x03\x04fake-docx"
+
+
+class FakeEyes(ScriptedProvider):
+    def __init__(self):
+        super().__init__([])
+        self.looks = 0
+
+    async def describe(self, system, user, image_b64, max_tokens=900):
+        self.looks += 1
+        return "Terminal window in front. Search box -> (640, 40)"
+
+
+async def test_separate_vision_model_reads_screen_for_tool_model(env):
+    backend, comp, tmp = env
+    eyes = FakeEyes()
+    llm = ScriptedProvider([("open_app", {"name": "chrome"}), ("done", {"summary": "ok"})])
+    loop = AgentLoop(Task(prompt="打开 Chrome"), "s2", comp, LLMRouter([llm]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=5, timeout_s=20, make_plan=False), vision_llm=LLMRouter([eyes]))
+    task = await loop.run()
+    assert task.status == TaskStatus.SUCCEEDED
+    assert eyes.looks >= 1
+    req = llm.requests[0]
+    assert req.screen_desc and "(640, 40)" in req.screen_desc
+    from llm_router.router import user_text
+    assert "SCREEN DESCRIPTION" in user_text(req) and "No image is attached" in user_text(req)
+
+
+async def test_delegate_without_goal_is_bounced(env):
+    backend, comp, tmp = env
+    llm = ScriptedProvider([("delegate", {}), ("done", {"summary": "ok"})])
+    loop = AgentLoop(Task(prompt="看一下"), "s3", comp, LLMRouter([llm]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=5, timeout_s=20, make_plan=False))
+    await loop.run()
+    assert any("delegate needs a non-empty" in h for h in loop.history)

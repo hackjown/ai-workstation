@@ -27,7 +27,7 @@ class LinuxComputerProvider(ComputerProvider):
         self.retries = retries
         self._ws = None
         self._reader: Optional[asyncio.Task] = None
-        self._pending: dict[str, asyncio.Future] = {}
+        self._pending: dict[str, tuple] = {}  # id -> (ws, future)
         self._lock = asyncio.Lock()
 
     async def _ensure(self):
@@ -45,17 +45,20 @@ class LinuxComputerProvider(ComputerProvider):
         try:
             async for raw in ws:
                 data = json.loads(raw)
-                fut = self._pending.pop(data.get("id"), None)
-                if fut and not fut.done():
-                    fut.set_result(CommandResult.model_validate(data))
+                entry = self._pending.pop(data.get("id"), None)
+                if entry and not entry[1].done():
+                    entry[1].set_result(CommandResult.model_validate(data))
         except ConnectionClosed:
             pass
         finally:
-            self._ws = None
-            for fut in self._pending.values():
-                if not fut.done():
-                    fut.set_exception(ConnectionError("vm-agent connection lost"))
-            self._pending.clear()
+            # Only tear down state that belongs to THIS connection: a newer connection may already be live.
+            if self._ws is ws:
+                self._ws = None
+            for cid, (conn, fut) in list(self._pending.items()):
+                if conn is ws:
+                    self._pending.pop(cid, None)
+                    if not fut.done():
+                        fut.set_exception(ConnectionError("vm-agent connection lost"))
 
     async def execute(self, action: str, payload: dict | None = None, observe: bool = False,
                       timeout: float = 30.0) -> ActionResult:
@@ -64,9 +67,10 @@ class LinuxComputerProvider(ComputerProvider):
         for attempt in range(self.retries + 1):
             try:
                 await self._ensure()
+                ws = self._ws
                 fut = asyncio.get_running_loop().create_future()
-                self._pending[cmd.id] = fut
-                await self._ws.send(cmd.model_dump_json())
+                self._pending[cmd.id] = (ws, fut)
+                await ws.send(cmd.model_dump_json())
                 res: CommandResult = await asyncio.wait_for(fut, timeout + 5)
                 obs = res.observation
                 return ActionResult(
@@ -78,10 +82,11 @@ class LinuxComputerProvider(ComputerProvider):
                 self._pending.pop(cmd.id, None)
                 last_err = f"{type(e).__name__}: {e}"
                 log.warning("vm-agent call %s failed (attempt %s): %s", action, attempt + 1, last_err)
-                await self.close()
+                # A slow command is not a dead link: keep the shared connection (other calls ride on it).
                 # Input actions are NOT idempotent: only retry on connection failure, not timeout.
                 if isinstance(e, asyncio.TimeoutError):
                     break
+                await self.close()
                 await asyncio.sleep(0.5 * (attempt + 1))
         return ActionResult(success=False, error=last_err, action=action)
 

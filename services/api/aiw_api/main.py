@@ -465,9 +465,32 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.put("/api/settings/models", dependencies=[Depends(auth)])
     async def put_models(body: dict):
-        m = {k: (str(body.get(k) or "").strip() or None) for k in ("model", "fallback", "subagent_model", "base_url")}
+        m = {k: (str(body.get(k) or "").strip() or None)
+             for k in ("model", "vision_model", "fallback", "subagent_model", "base_url")}
         store.kv_set("models", m)
         return m
+
+    @app.post("/api/models/probe", dependencies=[Depends(auth)])
+    async def probe_model(body: dict):
+        """Check what a model can really do through this gateway: tool calls with arguments, and vision."""
+        from .probe import probe
+        m = store.kv_get("models", {}) or {}
+        model = (body.get("model") or "").strip()
+        if not model:
+            raise HTTPException(400, "model required")
+        base = (body.get("base_url") or m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+        key = secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        if not key:
+            return {"model": model, "error": "no API key"}
+        res = await probe(base, key, model)
+        probes = store.kv_get("model_probes", {}) or {}
+        probes[model] = res
+        store.kv_set("model_probes", probes)
+        return res
+
+    @app.get("/api/models/probes", dependencies=[Depends(auth)])
+    async def model_probes():
+        return store.kv_get("model_probes", {}) or {}
 
     @app.get("/api/models", dependencies=[Depends(auth)])
     async def list_models():

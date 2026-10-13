@@ -41,6 +41,11 @@ class ToolExecutor:
         spec = BY_NAME.get(name)
         if spec is None:
             return ToolOutcome(name, None, False, Decision(RiskLevel.L4, "unknown tool"), error=f"unknown tool {name}")
+        if spec.action is None:  # done/fail: never bounce the finish on a missing text arg
+            args = dict(args)
+            for k in spec.required:
+                if not args.get(k):
+                    args[k] = intent or ("done" if name == "done" else "gave up")
         missing = [k for k in spec.required if k not in args]
         if missing:
             return ToolOutcome(name, spec.action, False, Decision(RiskLevel.L0, "schema"), error=f"missing args {missing}")

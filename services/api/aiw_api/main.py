@@ -24,6 +24,7 @@ import base64
 import hmac
 import logging
 import os
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -224,8 +225,10 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if not store.machine(mid):
             raise HTTPException(404)
         path = f"ws/desktop/{mid}"
+        vnc_pw = os.environ.get("AIW_VNC_PASSWORD", "")
+        pw_q = f"&password={quote(vnc_pw, safe='')}" if vnc_pw else ""
         return {"novnc_url": f"/desktop/{mid}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
-                              f"&view_only={'1' if view_only else '0'}&path={path}",
+                              f"&view_only={'1' if view_only else '0'}&path={path}{pw_q}",
                 "ws_path": f"/{path}"}
 
     # noVNC static files are served by the VM's websockify (--web); proxy them

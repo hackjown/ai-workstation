@@ -47,7 +47,8 @@ class AgentLoop:
                  control: Optional[AgentControl] = None, emit: Optional[EventSink] = None,
                  config: Optional[LoopConfig] = None, ask: Optional[AskFn] = None,
                  remember: Optional[RememberFn] = None, extra_tools: Optional[dict[str, ExtTool]] = None,
-                 subagent_llm: Optional[LLMRouter] = None, system_extra: str = ""):
+                 subagent_llm: Optional[LLMRouter] = None, system_extra: str = "",
+                 vision_llm: Optional[LLMRouter] = None):
         self.task, self.session_id = task, session_id
         self.computer, self.llm, self.tools = computer, llm, tools
         self.control = control or AgentControl()
@@ -60,6 +61,9 @@ class AgentLoop:
         self.ask, self.remember = ask, remember
         self.extra_tools = extra_tools or {}
         self.subagent_llm = subagent_llm
+        self.vision_llm = vision_llm  # optional "eyes": reads the screen for a tool model without vision
+        self._seen_hash: Optional[str] = None
+        self._seen_desc: Optional[str] = None
         self.system = SYSTEM_PROMPT + (("\n" + system_extra) if system_extra else "")
         self.plan_steps: list[str] = []
         self.plan_done: set[int] = set()
@@ -161,11 +165,20 @@ class AgentLoop:
             self.step += 1
             before, shown = await self.observe()
 
+            desc = await self._look(before, shown) if self.vision_llm and before else None
             await self.emit(EventType.THINKING)
             decision = await self.llm.decide(LLMRequest(
                 system=self.system, task=self._task_with_plan(), history=self.history,
                 screenshot_b64=before, tools=tool_schemas([t[0] for t in self.extra_tools.values()]),
-                screen=shown, note=note))
+                screen=shown, note=note, screen_desc=desc))
+            if decision.tool and not decision.args and decision.tool not in ("screenshot", "done", "fail"):
+                raw = decision.raw or {}
+                try:
+                    m = raw["choices"][0]["message"]
+                    detail = str({"content": (m.get("content") or "")[:300], "tool_calls": m.get("tool_calls")})[:600]
+                except Exception:  # noqa: BLE001
+                    detail = str(raw)[:600]
+                await self.emit(EventType.ERROR, error=f"模型调用 {decision.tool} 时参数为空", raw=detail)
             note = None
             shots = shots + 1 if decision.tool == "screenshot" else 0
             if shots >= 2:
@@ -253,6 +266,31 @@ class AgentLoop:
         self._finish(TaskStatus.FAILED, f"max steps ({self.cfg.max_steps}) reached")
 
 
+    async def _look(self, shot: str, shown: tuple[int, int]) -> Optional[str]:
+        """Ask the vision model what is on screen. Re-read only when the picture changed."""
+        import hashlib
+        h = hashlib.sha1(shot.encode()).hexdigest()
+        if h == self._seen_hash and self._seen_desc:
+            return self._seen_desc + "\n(screen unchanged since the last description)"
+        last = self.history[-1] if self.history else "(first step)"
+        prompt = (f"TASK OF THE AGENT: {self.task.prompt}\nLAST STEP: {last}\n"
+                  f"The screenshot is {shown[0]}x{shown[1]} pixels. Describe it for an agent that cannot see:\n"
+                  "1. which app/window is in front, page title or URL, any dialog, error or popup;\n"
+                  "2. the visible text that matters for the task, quoted exactly;\n"
+                  "3. every button, link, field or menu the agent may need next, each as: name -> (x, y) center pixel.\n"
+                  "Be factual and concise (max ~250 words). Do not suggest actions.")
+        try:
+            await self.emit(EventType.THINKING, phase="vision")
+            desc = (await self.vision_llm.describe("You are the eyes of a computer-use agent.", prompt, shot)).strip()
+        except Exception as e:  # noqa: BLE001
+            await self.emit(EventType.ERROR, error=f"视觉模型失败，改为直接发截图：{e}"[:300])
+            return None
+        if not desc:
+            return None
+        self._seen_hash, self._seen_desc = h, desc
+        await self.emit(EventType.OBSERVATION, vision=desc[:1500])
+        return desc
+
     def _task_with_plan(self) -> str:
         if not self.plan_steps:
             return self.task_text
@@ -288,6 +326,10 @@ class AgentLoop:
             await self.emit(EventType.ACTION_RESULT, tool=t, success=bool(text), error=None, result={})
             return "saved to memory"
         if t == "delegate":
+            if not (a.get("goal") or "").strip():
+                await self.emit(EventType.ACTION_RESULT, tool=t, success=False, error="missing args ['goal']", result={})
+                return ("FAILED: delegate needs a non-empty `goal` describing the whole sub-task. "
+                        "Call it again with goal filled in, or do the work yourself with shell/files_write.")
             summary = await self._delegate(a.get("goal") or "")
             self._acted = True
             return f"helper finished: {summary[:400]}"

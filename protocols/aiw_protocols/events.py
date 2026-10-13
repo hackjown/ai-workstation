@@ -15,6 +15,7 @@ class EventType(str, Enum):
     TASK_FAILED = "task.failed"
     PLAN = "agent.plan"
     OBSERVATION = "agent.observation"
+    THINKING = "agent.thinking"
     DECISION = "agent.decision"
     POLICY = "agent.policy"
     ACTION = "agent.action"

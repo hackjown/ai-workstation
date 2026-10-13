@@ -53,6 +53,8 @@ class ToolExecutor:
             return ToolOutcome(name, None, True, Decision(RiskLevel.L0, "control"), result=args, control=name)
 
         payload = dict(args)
+        if name == "send_file":
+            payload["binary"] = True
         if self.scale != 1.0:
             for k in COORD_KEYS:
                 if k in payload and payload[k] is not None:

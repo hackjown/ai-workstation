@@ -118,6 +118,7 @@ class AgentLoop:
             self.step += 1
             before, shown = await self.observe()
 
+            await self.emit(EventType.THINKING)
             decision = await self.llm.decide(LLMRequest(
                 system=SYSTEM_PROMPT, task=self.task.prompt, history=self.history,
                 screenshot_b64=before, tools=tool_schemas(), screen=shown, note=note))
@@ -130,6 +131,7 @@ class AgentLoop:
                 continue
 
             outcome = None
+            await self.emit(EventType.ACTION, tool=decision.tool, args=decision.args)
             for attempt in range(self.cfg.action_retries + 1):
                 outcome = await self.tools.run(decision.tool, decision.args, intent=decision.thought)
                 await self.emit(EventType.POLICY, level=int(outcome.decision.level), reason=outcome.decision.reason)

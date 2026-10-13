@@ -29,6 +29,12 @@ class EventType(str, Enum):
     MESSAGE = "agent.message"
     FILE = "agent.file"
     ERROR = "agent.error"
+    PLAN_UPDATE = "agent.plan_update"
+    INPUT_REQUIRED = "agent.input_required"
+    INPUT_ANSWERED = "agent.input_answered"
+    SUBAGENT = "agent.subagent"
+    MEMORY = "agent.memory"
+    TOOL_CALL = "agent.tool_call"
 
 
 class AgentEvent(BaseModel):

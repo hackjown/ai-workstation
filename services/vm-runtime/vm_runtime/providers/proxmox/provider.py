@@ -117,3 +117,26 @@ class ProxmoxProvider(VMProvider):
 
     async def list_snapshots(self, vm_id: str) -> list[dict]:
         return await self._req("GET", f"{self._vm(vm_id)}/snapshot")
+
+    # ---------------------------------------------------------- throw-away clones
+    # Needs extra token privileges on the clone pool/storage: VM.Clone, VM.Allocate,
+    # Datastore.AllocateSpace, VM.Config.* (see README "隔离电脑").
+    async def clone(self, vm_id: str, name: str, snapshot: Optional[str] = None, full: bool = True) -> dict:
+        newid = str(await self._req("GET", "/cluster/nextid"))
+        data = {"newid": newid, "name": re.sub(r"[^A-Za-z0-9\-]", "-", name)[:60], "full": 1 if full else 0}
+        if snapshot:
+            if not SNAP_RE.match(snapshot):
+                raise ValueError("invalid snapshot name")
+            data["snapname"] = snapshot
+        await self._wait(await self._req("POST", f"{self._vm(vm_id)}/clone", data))
+        return {"vmid": newid}
+
+    async def destroy(self, vm_id: str) -> dict:
+        try:
+            await self.stop(vm_id, force=True)
+        except ProxmoxError:
+            pass
+        r = await self.client.request("DELETE", f"{self._vm(vm_id)}", params={"purge": 1, "destroy-unreferenced-disks": 1})
+        if r.status_code >= 400:
+            raise ProxmoxError(f"PVE destroy {vm_id} -> {r.status_code}: {r.text[:300]}")
+        return await self._wait(r.json().get("data"))

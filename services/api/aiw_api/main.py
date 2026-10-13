@@ -181,11 +181,15 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                 out["vm"] = st.model_dump()
             except Exception as e:  # noqa: BLE001
                 out["vm_error"] = str(e)
-        try:
-            h = await asyncio.wait_for(sessions.computer(mid).health(), 5)
-            out["agent"] = h.result if h.success else {"ok": False, "error": h.error}
-        except Exception as e:  # noqa: BLE001
-            out["agent"] = {"ok": False, "error": str(e)}
+        out["agent"] = {"ok": False, "error": "no response"}
+        for attempt in range(2):  # one retry: a single slow/reconnecting probe is not "offline"
+            try:
+                h = await asyncio.wait_for(sessions.computer(mid).health(), 8)
+                out["agent"] = h.result if h.success else {"ok": False, "error": h.error}
+            except Exception as e:  # noqa: BLE001
+                out["agent"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            if out["agent"].get("ok"):
+                break
         return out
 
     def _need_vm():

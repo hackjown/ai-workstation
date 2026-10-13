@@ -106,3 +106,19 @@ async def test_one_session_per_machine_and_stop(stack):
     th = (await client.get(f"/api/threads/{r['thread_id']}")).json()
     assert th["queue_held"] and th["tasks"][-1]["status"] == "queued"   # stop pauses the queue
     assert (await client.delete(f"/api/tasks/{r2['task']['id']}")).json()["cancelled"]
+
+
+async def test_model_roles_and_probe_endpoint(stack, monkeypatch):
+    client, *_ = stack
+    r = await client.put("/api/settings/models", json={"model": "glm-4.6", "vision_model": "glm-4.5v", "base_url": "http://gw/v1"})
+    assert r.json()["vision_model"] == "glm-4.5v"
+    assert (await client.get("/api/settings/models")).json()["vision_model"] == "glm-4.5v"
+    import aiw_api.probe as pr
+
+    async def fake_probe(base, key, model):
+        return {"model": model, "tools": True, "tool_choice": "auto", "vision": False, "notes": []}
+    monkeypatch.setattr(pr, "probe", fake_probe)
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    r = await client.post("/api/models/probe", json={"model": "glm-4.6"})
+    assert r.json()["tools"] is True
+    assert (await client.get("/api/models/probes")).json()["glm-4.6"]["tool_choice"] == "auto"

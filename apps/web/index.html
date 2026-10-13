@@ -88,7 +88,7 @@ let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.ge
 // Home-screen web app on iOS starts without ?token= and has its own storage: ask once.
 if (!TOKEN) TOKEN = (prompt("输入 AIW_API_TOKEN") || "").trim();
 if (TOKEN) { localStorage.setItem("aiw_token", TOKEN); document.cookie = "aiw_token=" + TOKEN + "; path=/; SameSite=Strict"; }
-let SID = null, ws = null;
+let SID = null, ws = null, agentFails = 0;
 const H = () => ({ "Content-Type": "application/json", ...(TOKEN ? { Authorization: "Bearer " + TOKEN } : {}) });
 const $ = (id) => document.getElementById(id);
 const api = async (m, p, b) => { const r = await fetch(p, { method: m, headers: H(), body: b ? JSON.stringify(b) : undefined }); if (!r.ok) throw new Error(await r.text()); return r.json(); };
@@ -109,7 +109,10 @@ async function refresh() {
     const m = await api("GET", `/api/machines/${MID}`);
     pill($("vm"), "VM: " + (m.vm ? m.vm.state : (m.vm_error ? "未连接 PVE" : m.status)), m.vm && m.vm.state === "running" ? "ok" : (m.vm_error ? "bad" : ""));
     $("vm").title = m.vm_error || "";
-    pill($("agent"), "Agent: " + (m.agent && m.agent.ok ? "在线" : "离线"), m.agent && m.agent.ok ? "ok" : "bad");
+    const up = !!(m.agent && m.agent.ok);
+    agentFails = up ? 0 : agentFails + 1;
+    if (up || agentFails >= 2) pill($("agent"), "Agent: " + (up ? "在线" : "离线"), up ? "ok" : "bad");
+    $("agent").title = up ? "" : ((m.agent && m.agent.error) || "");
   } catch (e) { pill($("vm"), "API 错误", "bad"); }
 }
 const TOOL_CN = { screenshot:"截图", click:"点击", double_click:"双击", right_click:"右键", move:"移动鼠标", drag:"拖动", type:"输入文字", keypress:"按键", scroll:"滚动", open_app:"打开应用", close_app:"关闭应用", shell:"执行命令", browser_open:"打开浏览器", browser_navigate:"打开网址", browser_back:"后退", browser_forward:"前进", files_list:"列文件", files_read:"读文件", files_write:"写文件", files_download:"下载", done:"完成", fail:"放弃" };

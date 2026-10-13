@@ -77,7 +77,7 @@ class SessionManager:
             return self._custom_llm()
         m = self.model_settings()
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m.get("model"), m.get("fallback"), key, m.get("base_url") or None)
+        return LLMRouter.from_settings(m.get("model"), m.get("fallback"), key, m.get("base_url") or None, self._tool_choices())
 
     def _subagent_llm(self) -> Optional[LLMRouter]:
         if self._custom_llm:
@@ -86,7 +86,21 @@ class SessionManager:
         if not m.get("subagent_model"):
             return None
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m["subagent_model"], None, key, m.get("base_url") or None)
+        return LLMRouter.from_settings(m["subagent_model"], None, key, m.get("base_url") or None, self._tool_choices())
+
+    def _tool_choices(self) -> dict:
+        """tool_choice that the probe found working for each model ('auto' for gateways that break on 'required')."""
+        probes = self.store.kv_get("model_probes", {}) or {}
+        return {k: v.get("tool_choice") for k, v in probes.items() if v.get("tool_choice")}
+
+    def _vision_llm(self) -> Optional[LLMRouter]:
+        if self._custom_llm:
+            return None
+        m = self.model_settings()
+        if not m.get("vision_model") or m.get("vision_model") == m.get("model"):
+            return None
+        key = self.secrets.get("openai_api_key") if self.secrets else None
+        return LLMRouter.from_settings(m["vision_model"], None, key, m.get("base_url") or None)
 
     # ------------------------------------------------------------------ context
     def build_context(self, thread_id: Optional[str], exclude_task: Optional[str] = None) -> Optional[str]:
@@ -281,7 +295,7 @@ class SessionManager:
 
         loop = AgentLoop(task, sid, computer, self._llm(), ToolExecutor(computer, confirm=confirm, audit=audit),
                          control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
-                         subagent_llm=self._subagent_llm(), system_extra=system_extra.strip(),
+                         subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(), system_extra=system_extra.strip(),
                          config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                            artifacts_dir=self.settings.artifacts_dir))
 

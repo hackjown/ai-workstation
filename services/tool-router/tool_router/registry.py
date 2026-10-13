@@ -47,6 +47,10 @@ TOOLS: list[ToolSpec] = [
              {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
     ToolSpec("files_download", "files.download", "Download a URL into the VM workspace (downloads/).",
              {"url": {"type": "string"}, "path": {"type": "string"}}, ["url"]),
+    ToolSpec("send_file", "files.read",
+             "Send a finished file (docx/xlsx/pdf/png/zip...) to the user's chat window as a download. "
+             "Path is relative to ~/workspace; copy or save the file there first.",
+             {"path": {"type": "string"}}, ["path"]),
     ToolSpec("done", None, "Finish: the task is complete. Give a short summary.", {"summary": {"type": "string"}}, ["summary"]),
     ToolSpec("fail", None, "Give up: the task cannot be completed. Explain why.", {"reason": {"type": "string"}}, ["reason"]),
 ]

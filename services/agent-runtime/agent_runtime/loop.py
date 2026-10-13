@@ -17,13 +17,17 @@ from aiw_protocols import AgentEvent, EventType, Task, TaskStatus
 from llm_router import LLMRequest, LLMRouter
 from PIL import Image
 from tool_router import ToolExecutor, tool_schemas
+from tool_router.registry import SUBAGENT_TOOLS
 
 from .control import AgentControl, StopRequested
-from .planner import SYSTEM_PROMPT, plan
+from .planner import SYSTEM_PROMPT, make_plan
 from .recovery import Recovery
 from .validator import Validator
 
 EventSink = Callable[[AgentEvent], Awaitable[None]]
+AskFn = Callable[[str, list], Awaitable[Optional[str]]]
+RememberFn = Callable[[str], Awaitable[None]]
+ExtTool = tuple[dict, Callable[[dict], Awaitable[dict]]]  # (schema, call)
 
 
 @dataclass
@@ -34,12 +38,16 @@ class LoopConfig:
     llm_image_width: int = 1280  # downscale screenshots sent to the LLM
     max_consecutive_failures: int = 5
     artifacts_dir: Optional[str] = None
+    subagent_steps: int = 8
+    make_plan: bool = True
 
 
 class AgentLoop:
     def __init__(self, task: Task, session_id: str, computer, llm: LLMRouter, tools: ToolExecutor,
                  control: Optional[AgentControl] = None, emit: Optional[EventSink] = None,
-                 config: Optional[LoopConfig] = None):
+                 config: Optional[LoopConfig] = None, ask: Optional[AskFn] = None,
+                 remember: Optional[RememberFn] = None, extra_tools: Optional[dict[str, ExtTool]] = None,
+                 subagent_llm: Optional[LLMRouter] = None, system_extra: str = ""):
         self.task, self.session_id = task, session_id
         self.computer, self.llm, self.tools = computer, llm, tools
         self.control = control or AgentControl()
@@ -49,6 +57,18 @@ class AgentLoop:
         self._emit_fn = emit
         self.history: list[str] = []
         self.step = 0
+        self.ask, self.remember = ask, remember
+        self.extra_tools = extra_tools or {}
+        self.subagent_llm = subagent_llm
+        self.system = SYSTEM_PROMPT + (("\n" + system_extra) if system_extra else "")
+        self.plan_steps: list[str] = []
+        self.plan_done: set[int] = set()
+
+    @property
+    def task_text(self) -> str:
+        if self.task.context:
+            return f"{self.task.context}\n\nCURRENT REQUEST: {self.task.prompt}"
+        return self.task.prompt
 
     async def emit(self, type_: EventType, **data):
         if self._emit_fn:
@@ -102,7 +122,12 @@ class AgentLoop:
     async def run(self) -> Task:
         self.task.status = TaskStatus.RUNNING
         await self.emit(EventType.TASK_STARTED, prompt=self.task.prompt)
-        await self.emit(EventType.PLAN, plan=plan(self.task.prompt))
+        try:
+            if self.cfg.make_plan:
+                self.plan_steps = await make_plan(self.llm, self.task.prompt, self.task.context)
+                await self.emit(EventType.PLAN, plan=self.plan_steps, done=[])
+        except Exception:  # noqa: BLE001
+            self.plan_steps = []
         try:
             await asyncio.wait_for(self._run(), self.cfg.timeout_s)
         except asyncio.TimeoutError:
@@ -111,6 +136,9 @@ class AgentLoop:
             self._finish(TaskStatus.STOPPED, "stopped by user")
         except Exception as e:  # noqa: BLE001
             self._finish(TaskStatus.FAILED, f"{type(e).__name__}: {e}")
+        if self.task.status == TaskStatus.SUCCEEDED and self.plan_steps and len(self.plan_done) < len(self.plan_steps):
+            self.plan_done = set(range(len(self.plan_steps)))
+            await self.emit(EventType.PLAN_UPDATE, done=sorted(self.plan_done), note=None)
         ev = {TaskStatus.SUCCEEDED: EventType.TASK_FINISHED}.get(self.task.status, EventType.TASK_FAILED)
         await self.emit(ev, status=self.task.status.value, result=self.task.result, steps=self.step)
         return self.task
@@ -135,8 +163,9 @@ class AgentLoop:
 
             await self.emit(EventType.THINKING)
             decision = await self.llm.decide(LLMRequest(
-                system=SYSTEM_PROMPT, task=self.task.prompt, history=self.history,
-                screenshot_b64=before, tools=tool_schemas(), screen=shown, note=note))
+                system=self.system, task=self._task_with_plan(), history=self.history,
+                screenshot_b64=before, tools=tool_schemas([t[0] for t in self.extra_tools.values()]),
+                screen=shown, note=note))
             note = None
             shots = shots + 1 if decision.tool == "screenshot" else 0
             if shots >= 2:
@@ -162,8 +191,14 @@ class AgentLoop:
                 note = "Paused before acting; previous decision discarded. Re-assess."
                 continue
 
-            outcome = None
             await self.emit(EventType.ACTION, tool=decision.tool, args=decision.args)
+            handled = await self._loop_tool(decision)
+            if handled is not None:
+                self.history.append(f"{self.step}. {decision.tool}({_args_short(decision.args)}) -> {handled}")
+                note = None
+                continue
+
+            outcome = None
             for attempt in range(self.cfg.action_retries + 1):
                 outcome = await self.tools.run(decision.tool, decision.args, intent=decision.thought)
                 await self.emit(EventType.POLICY, level=int(outcome.decision.level), reason=outcome.decision.reason)
@@ -207,6 +242,102 @@ class AgentLoop:
                 note = await self.recovery.recover(failures, outcome.action)
                 await self.emit(EventType.RECOVERY, attempt=failures, note=note)
         self._finish(TaskStatus.FAILED, f"max steps ({self.cfg.max_steps}) reached")
+
+
+    def _task_with_plan(self) -> str:
+        if not self.plan_steps:
+            return self.task_text
+        lines = [f"  [{'x' if i in self.plan_done else ' '}] {i}. {st}" for i, st in enumerate(self.plan_steps)]
+        return self.task_text + "\n\nPLAN:\n" + "\n".join(lines)
+
+    # ------------------------------------------------- tools handled by the loop
+    async def _loop_tool(self, decision) -> Optional[str]:
+        """update_plan / ask_user / remember / delegate / external tools. Returns a history
+        note when handled here, None when the Tool Router should run it."""
+        t, a = decision.tool, decision.args or {}
+        if t == "update_plan":
+            for i in a.get("done") or []:
+                if isinstance(i, int) and 0 <= i < len(self.plan_steps):
+                    self.plan_done.add(i)
+            await self.emit(EventType.PLAN_UPDATE, done=sorted(self.plan_done), note=a.get("note"))
+            await self.emit(EventType.ACTION_RESULT, tool=t, success=True, error=None, result={})
+            return f"plan updated, done={sorted(self.plan_done)}"
+        if t == "ask_user":
+            q = a.get("question") or decision.thought or "?"
+            opts = [str(o) for o in (a.get("options") or [])][:6]
+            await self.emit(EventType.INPUT_REQUIRED, question=q, options=opts)
+            reply = await self.ask(q, opts) if self.ask else None
+            await self.emit(EventType.INPUT_ANSWERED, answer=reply)
+            await self.emit(EventType.ACTION_RESULT, tool=t, success=reply is not None, error=None if reply else "no answer",
+                            result={"answer": reply})
+            return f"user answered: {reply!r}" if reply else "user did not answer within the time limit; decide yourself or fail"
+        if t == "remember":
+            text = (a.get("text") or "").strip()
+            if text and self.remember:
+                await self.remember(text)
+            await self.emit(EventType.MEMORY, text=text)
+            await self.emit(EventType.ACTION_RESULT, tool=t, success=bool(text), error=None, result={})
+            return "saved to memory"
+        if t == "delegate":
+            summary = await self._delegate(a.get("goal") or "")
+            self._acted = True
+            return f"helper finished: {summary[:400]}"
+        if t in self.extra_tools:
+            _schema, fn = self.extra_tools[t]
+            await self.emit(EventType.TOOL_CALL, tool=t, args=a)
+            if _RISKY_EXT.search(t) and self.tools.confirm:
+                from tool_router import Decision, RiskLevel
+                ok = await self.tools.confirm(t, a, Decision(RiskLevel.L3, "external tool can act outside the VM"))
+                if not ok:
+                    await self.emit(EventType.ACTION_RESULT, tool=t, success=False, error="user declined", result={})
+                    return "user declined this external action; choose another approach or ask_user"
+            try:
+                res = await fn(a)
+                ok, err = True, None
+            except Exception as e:  # noqa: BLE001
+                res, ok, err = {}, False, f"{type(e).__name__}: {e}"
+            self._acted = self._acted or ok
+            await self.emit(EventType.ACTION_RESULT, tool=t, success=ok, error=err, result=_short(res if isinstance(res, dict) else {"result": res}))
+            text = str(res)[:600] if ok else f"FAILED ({err})"
+            return text
+        return None
+
+    async def _delegate(self, goal: str) -> str:
+        """Text-only helper: shell/file tools, no screenshots, its own short history."""
+        llm = self.subagent_llm or self.llm
+        await self.emit(EventType.SUBAGENT, phase="start", goal=goal)
+        hist: list[str] = []
+        summary = "helper hit its step limit"
+        schemas = tool_schemas(only=SUBAGENT_TOOLS)
+        for i in range(self.cfg.subagent_steps):
+            await self.control.checkpoint()
+            d = await llm.decide(LLMRequest(
+                system="You are a helper agent with a Linux shell and the ~/workspace folder. No screen. "
+                       "One tool call per turn. Finish with done and a factual summary of what you did and produced.",
+                task=goal, history=hist, screenshot_b64=None, tools=schemas))
+            if d.tool not in SUBAGENT_TOOLS:
+                hist.append(f"{i+1}. {d.tool} is not available to the helper")
+                continue
+            await self.emit(EventType.SUBAGENT, phase="step", tool=d.tool, args=_args_short(d.args))
+            if d.tool in ("done", "fail"):
+                summary = d.args.get("summary") or d.args.get("reason") or d.thought or d.tool
+                break
+            o = await self.tools.run(d.tool, d.args, intent=d.thought)
+            out = ""
+            if o.action == "shell.exec" and o.result:
+                out = f" exit={o.result.get('exit_code')} out={str(o.result.get('stdout',''))[:300]!r} err={str(o.result.get('stderr',''))[:200]!r}"
+            hist.append(f"{i+1}. {d.tool}({_args_short(d.args)}) -> {'ok' if o.success else 'FAILED ' + str(o.error)}{out}")
+        await self.emit(EventType.SUBAGENT, phase="done", summary=summary)
+        await self.emit(EventType.ACTION_RESULT, tool="delegate", success=True, error=None, result={"summary": summary[:500]})
+        return summary
+
+
+import re as _re
+_RISKY_EXT = _re.compile(r"(send|delete|remove|pay|purchase|order|post|publish|transfer|create|update|write|cancel)", _re.I)
+
+
+def _args_short(a: dict) -> dict:
+    return {k: (v[:80] if isinstance(v, str) else v) for k, v in (a or {}).items()}
 
 
 def _short(d: dict) -> dict:

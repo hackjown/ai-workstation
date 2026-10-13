@@ -308,11 +308,11 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     # ------------------------------------------------------------- artifacts + web console
     @app.get("/api/artifacts", dependencies=[Depends(auth)])
-    async def artifact(path: str):
+    async def artifact(path: str, download: bool = False):
         real = os.path.realpath(path)
         if not real.startswith(os.path.realpath(settings.artifacts_dir) + os.sep) or not os.path.exists(real):
             raise HTTPException(404)
-        return FileResponse(real)
+        return FileResponse(real, filename=os.path.basename(real) if download else None)
 
     @app.get("/api/health")
     async def health():

@@ -22,6 +22,7 @@ class LLMRequest:
     tools: list[dict]
     screen: tuple[int, int] = (0, 0)
     note: Optional[str] = None  # e.g. "user took over and returned control"
+    screen_desc: Optional[str] = None  # set when a separate vision model read the screenshot
 
 
 @dataclass
@@ -41,6 +42,10 @@ class LLMProvider(abc.ABC):
 
     async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
         """Plain text completion (planning, summaries). Optional per provider."""
+        raise NotImplementedError
+
+    async def describe(self, system: str, user: str, image_b64: str, max_tokens: int = 900) -> str:
+        """Look at an image and answer in text (the 'eyes' role). Optional per provider."""
         raise NotImplementedError
 
 
@@ -63,8 +68,15 @@ class ScriptedProvider(LLMProvider):
 
 def user_text(req: LLMRequest) -> str:
     hist = "\n".join(req.history[-25:]) or "(none yet)"
-    parts = [f"TASK: {req.task}", f"SCREEN: {req.screen[0]}x{req.screen[1]} (screenshot attached, coordinates in its pixels)",
-             f"PREVIOUS STEPS:\n{hist}"]
+    if req.screen_desc:
+        screen = (f"SCREEN: {req.screen[0]}x{req.screen[1]}. No image is attached: a vision model looked at the current "
+                  f"screenshot for you. Coordinates below are pixels of that screenshot; use them for click/type.\n"
+                  f"SCREEN DESCRIPTION:\n{req.screen_desc}")
+    elif req.screenshot_b64:
+        screen = f"SCREEN: {req.screen[0]}x{req.screen[1]} (screenshot attached, coordinates in its pixels)"
+    else:
+        screen = "SCREEN: not available this step"
+    parts = [f"TASK: {req.task}", screen, f"PREVIOUS STEPS:\n{hist}"]
     if req.note:
         parts.append(f"NOTE: {req.note}")
     parts.append("Decide the single next tool call. Briefly state your reasoning first.")
@@ -81,13 +93,15 @@ class LLMRouter:
 
     @classmethod
     def from_settings(cls, model: str | None = None, fallback: str | None = None,
-                      api_key: str | None = None, base_url: str | None = None) -> "LLMRouter":
+                      api_key: str | None = None, base_url: str | None = None,
+                      tool_choice: dict | None = None) -> "LLMRouter":
         """Models picked in the web console (OpenAI-compatible gateway). Falls back to env config."""
         from .providers.openai import OpenAIProvider
         key = api_key or os.environ.get("OPENAI_API_KEY")
         if not key or not (model or fallback):
             return cls.from_env()
-        ps = [OpenAIProvider(model=m, api_key=key, base_url=base_url) for m in (model, fallback) if m]
+        tc = tool_choice or {}
+        ps = [OpenAIProvider(model=m, api_key=key, base_url=base_url, tool_choice=tc.get(m)) for m in (model, fallback) if m]
         return cls(ps)
 
     @classmethod
@@ -110,6 +124,15 @@ class LLMRouter:
             except Exception as e:  # noqa: BLE001
                 last = e
         raise RuntimeError(f"all LLM providers failed: {last}")
+
+    async def describe(self, system: str, user: str, image_b64: str, max_tokens: int = 900) -> str:
+        last = None
+        for p in self.providers:
+            try:
+                return await p.describe(system, user, image_b64, max_tokens)
+            except Exception as e:  # noqa: BLE001
+                last = e
+        raise RuntimeError(f"no provider could describe the image: {last}")
 
     async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
         last = None

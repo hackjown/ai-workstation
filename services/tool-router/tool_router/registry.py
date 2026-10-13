@@ -51,6 +51,17 @@ TOOLS: list[ToolSpec] = [
              "Send a finished file (docx/xlsx/pdf/png/zip...) to the user's chat window as a download. "
              "Path is relative to ~/workspace; copy or save the file there first.",
              {"path": {"type": "string"}}, ["path"]),
+    ToolSpec("update_plan", None, "Mark plan steps finished (0-based indexes) and optionally add a short progress note.",
+             {"done": {"type": "array", "items": {"type": "integer"}}, "note": {"type": "string"}}, ["done"]),
+    ToolSpec("ask_user", None, "Ask the user a question when required information is missing (login choice, which file, "
+             "a value). Waits for the reply. Do not use it for confirmations of risky actions.",
+             {"question": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}}}, ["question"]),
+    ToolSpec("remember", None, "Save a durable fact or preference about the user for future tasks "
+             "(e.g. 'weekly report goes to ~/workspace/reports'). Only facts the user stated or confirmed.",
+             {"text": {"type": "string"}}, ["text"]),
+    ToolSpec("delegate", None, "Hand a self-contained terminal/file sub-task to a text-only helper agent (no screen). "
+             "Faster and cheaper for shell work: scripts, file conversion, data processing. Returns its summary.",
+             {"goal": {"type": "string"}}, ["goal"]),
     ToolSpec("done", None, "Finish: the task is complete. Give a short summary.", {"summary": {"type": "string"}}, ["summary"]),
     ToolSpec("fail", None, "Give up: the task cannot be completed. Explain why.", {"reason": {"type": "string"}}, ["reason"]),
 ]
@@ -58,8 +69,14 @@ TOOLS: list[ToolSpec] = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-def tool_schemas() -> list[dict]:
-    """Neutral schema list; llm-router adapts to OpenAI/Anthropic/Gemini formats."""
-    return [{"name": t.name, "description": t.description,
-             "parameters": {"type": "object", "properties": t.params, "required": t.required}}
-            for t in TOOLS]
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate"}
+SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
+
+
+def tool_schemas(extra: list[dict] | None = None, only: tuple[str, ...] | None = None) -> list[dict]:
+    """Neutral schema list; llm-router adapts to OpenAI/Anthropic/Gemini formats.
+    `extra` adds external (HTTP/OpenAPI/MCP) tools; `only` restricts to a subset."""
+    out = [{"name": t.name, "description": t.description,
+            "parameters": {"type": "object", "properties": t.params, "required": t.required}}
+           for t in TOOLS if only is None or t.name in only]
+    return out + list(extra or [])

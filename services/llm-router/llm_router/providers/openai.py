@@ -29,12 +29,22 @@ class OpenAIProvider(LLMProvider):
             "tools": [{"type": "function", "function": t} for t in req.tools],
             "tool_choice": "required",
         }
+        data, msg, calls = {}, {}, []
         async with httpx.AsyncClient(timeout=120) as c:
-            r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
-            r.raise_for_status()
-            data = r.json()
-        msg = data["choices"][0]["message"]
-        calls = msg.get("tool_calls") or []
+            # Some compatible gateways ignore tool_choice=required and answer in prose.
+            # Retry with a nudge before giving up.
+            for _ in range(3):
+                r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
+                r.raise_for_status()
+                data = r.json()
+                msg = data["choices"][0]["message"]
+                calls = msg.get("tool_calls") or []
+                if calls:
+                    break
+                body["messages"] = body["messages"][:2] + [
+                    {"role": "assistant", "content": msg.get("content") or ""},
+                    {"role": "user", "content": "Do not reply in text. Call exactly one of the provided tools now "
+                                                "(use done/fail to finish)."}]
         if not calls:
             return LLMDecision(msg.get("content") or "", "fail", {"reason": "model returned no tool call"}, raw=data)
         fn = calls[0]["function"]

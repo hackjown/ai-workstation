@@ -152,3 +152,17 @@ async def test_done_without_action_is_rejected(env):
     loop.task.prompt = "打开浏览器搜索深圳天气"
     t = await loop.run()
     assert t.status == TaskStatus.SUCCEEDED and t.result == "real"
+
+
+async def test_send_file_delivers_artifact(env):
+    backend, comp, tmp = env
+    (tmp / "report.docx").write_bytes(b"PK\x03\x04fake-docx")
+    events = []
+    loop, _ = make_loop(comp, [("send_file", {"path": "report.docx"}), ("done", {"summary": "sent"})], tmp, events=events)
+    loop.cfg.artifacts_dir = str(tmp / "artifacts")
+    t = await loop.run()
+    assert t.status == TaskStatus.SUCCEEDED
+    f = [e for e in events if e.type.value == "agent.file"]
+    assert f and f[0].data["name"] == "report.docx"
+    from pathlib import Path
+    assert Path(f[0].data["artifact"]).read_bytes() == b"PK\x03\x04fake-docx"

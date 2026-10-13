@@ -99,6 +99,16 @@ function log(type, text, cls) {
   d.innerHTML = `<span class="t">${type}</span> ${text.replace(/[<&]/g, c => c === "<" ? "&lt;" : "&amp;")}`;
   $("log").appendChild(d); $("log").scrollTop = 1e9;
 }
+function fileLink(d) {
+  const url = `/api/artifacts?download=1&path=${encodeURIComponent(d.artifact)}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
+  const kb = d.size ? (d.size > 1048576 ? (d.size / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(d.size / 1024)) + " KB") : "";
+  const el = document.createElement("div"); el.className = "ev ok";
+  const a = document.createElement("a"); a.href = url; a.download = d.name; a.textContent = "⬇ " + d.name;
+  a.style.cssText = "color:#6ee7a8;font-weight:600";
+  const t = document.createElement("span"); t.className = "t"; t.textContent = "文件 ";
+  el.append(t, a, document.createTextNode(` ${kb}${d.truncated ? "（超过 40MB 已截断）" : ""}`));
+  $("log").appendChild(el); $("log").scrollTop = 1e9;
+}
 async function loadDesktop(viewOnly) {
   const d = await api("GET", `/api/machines/${MID}/desktop?view_only=${viewOnly}`);
   $("desk").src = d.novnc_url + (TOKEN ? "&token=" + encodeURIComponent(TOKEN) : "");
@@ -115,7 +125,7 @@ async function refresh() {
     $("agent").title = up ? "" : ((m.agent && m.agent.error) || "");
   } catch (e) { pill($("vm"), "API 错误", "bad"); }
 }
-const TOOL_CN = { screenshot:"截图", click:"点击", double_click:"双击", right_click:"右键", move:"移动鼠标", drag:"拖动", type:"输入文字", keypress:"按键", scroll:"滚动", open_app:"打开应用", close_app:"关闭应用", shell:"执行命令", browser_open:"打开浏览器", browser_navigate:"打开网址", browser_back:"后退", browser_forward:"前进", files_list:"列文件", files_read:"读文件", files_write:"写文件", files_download:"下载", done:"完成", fail:"放弃" };
+const TOOL_CN = { screenshot:"截图", click:"点击", double_click:"双击", right_click:"右键", move:"移动鼠标", drag:"拖动", type:"输入文字", keypress:"按键", scroll:"滚动", open_app:"打开应用", close_app:"关闭应用", shell:"执行命令", browser_open:"打开浏览器", browser_navigate:"打开网址", browser_back:"后退", browser_forward:"前进", files_list:"列文件", files_read:"读文件", files_write:"写文件", files_download:"下载", send_file:"发送文件", done:"完成", fail:"放弃" };
 let busyT0 = 0, busyTimer = null;
 function busy(text) {
   if (!text) { $("status").classList.remove("on"); clearInterval(busyTimer); busyTimer = null; return; }
@@ -138,6 +148,7 @@ function onEvent(e) {
     case "agent.thinking": busy(`#${e.step} 模型思考中…`); break;
     case "agent.action": busy(`#${e.step} 正在${TOOL_CN[d.tool] || d.tool}…`); break;
     case "agent.error": log("错误", d.error || "", "err"); break;
+    case "agent.file": fileLink(d); break;
     case "agent.decision": log(`#${e.step} 决策`, `${d.tool}(${JSON.stringify(d.args)})  ${d.thought ? "— " + d.thought.slice(0, 200) : ""}`); break;
     case "agent.action_result": log(`#${e.step} 结果`, d.success ? "成功" : "失败: " + d.error, d.success ? "ok" : "err"); break;
     case "agent.validation": if (!d.success) log(`#${e.step} 校验`, d.message, "err"); break;

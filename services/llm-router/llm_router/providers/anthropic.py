@@ -36,3 +36,11 @@ class AnthropicProvider(LLMProvider):
         if not call:
             return LLMDecision(thought, "fail", {"reason": "model returned no tool call"}, raw=data)
         return LLMDecision(thought, call["name"], call.get("input") or {}, raw=data, usage=data.get("usage", {}))
+
+    async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
+        body = {"model": self.model, "max_tokens": max_tokens, "system": system,
+                "messages": [{"role": "user", "content": user}]}
+        async with httpx.AsyncClient(timeout=60) as c:
+            r = await c.post(self.url, json=body, headers={"x-api-key": self.key, "anthropic-version": "2023-06-01"})
+            r.raise_for_status()
+            return " ".join(b.get("text", "") for b in r.json()["content"] if b["type"] == "text").strip()

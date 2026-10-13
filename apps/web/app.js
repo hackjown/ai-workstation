@@ -181,6 +181,8 @@ function renderTask(t) {
     if (e.type === "agent.subagent" && d.phase === "step") steps.push({ tool: d.tool, args: d.args, sub: true, ok: true });
     if (e.type === "agent.file") files.push(d);
     if (e.type === "agent.message") steps.push({ tool: "message", thought: d.text, ok: true });
+    if (e.type === "agent.observation" && d.vision) steps.push({ tool: "vision", thought: d.vision, ok: true });
+    if (e.type === "agent.error" && d.raw) steps.push({ tool: "message", thought: d.error + "：" + d.raw, ok: false });
     if (["agent.observation", "agent.thinking", "agent.action"].includes(e.type)) last = e;
     if (e.type === "task.finished" || e.type === "task.failed") endTs = e.ts;
   }
@@ -188,7 +190,7 @@ function renderTask(t) {
   let status = "";
   if (liveNow && last) {
     const d = last.data || {};
-    status = last.type === "agent.observation" ? "正在看屏幕…" : last.type === "agent.thinking" ? "正在思考…" : `正在${toolName(d.tool)}…`;
+    status = last.type === "agent.observation" ? "正在看屏幕…" : last.type === "agent.thinking" ? ((last.data || {}).phase === "vision" ? "视觉模型在看屏幕…" : "正在思考…") : `正在${toolName(d.tool)}…`;
   } else if (liveNow) status = "启动中…";
   const dur = startTs ? Math.round(((endTs || Date.now() / 1000) - startTs)) : null;
   let html = `<div class="a"><div class="work">
@@ -201,7 +203,7 @@ function renderTask(t) {
   }
   if (steps.length) {
     html += `<details class="steps" ${liveNow ? "open" : ""}><summary>${icon("chev", "chev")}${steps.length} 个操作</summary><div class="steplist">${steps.slice(-40).map((s) =>
-      `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : toolName(s.tool))}</b><span>${esc(stepText(s))}</span></div>`).join("")}</div></details>`;
+      `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}</span></div>`).join("")}</div></details>`;
   }
   if (t.pending_question && liveNow) {
     const q = t.pending_question;
@@ -228,7 +230,7 @@ function renderTask(t) {
   return user + html;
 }
 function stepText(s) {
-  if (s.tool === "message") return s.thought || "";
+  if (s.tool === "message" || s.tool === "vision") return s.thought || "";
   const a = s.args || {};
   let t = a.command || a.url || a.text || a.key || a.name || a.path || a.goal || a.question || (a.x != null ? `(${a.x}, ${a.y})` : "");
   if (!t && s.args) t = JSON.stringify(s.args);
@@ -508,14 +510,15 @@ async function loadSettings() {
       <div class="acts"><button class="btn sm" onclick="editMem(${esc(JSON.stringify(m))})">编辑</button><button class="btn sm danger" onclick="delRow('memories','${m.id}',loadSettings)">删除</button></div></div>`).join("") || `<div class="small">还没有记忆</div>`}</div></div>
 
   <form class="card sec" id="sModel" onsubmit="saveModels(event)"><h3>${icon("bolt")} 模型</h3>
-    <div class="muted">OpenAI 兼容网关。留空则用 .env（当前 ${esc(models.env_model || "未设置")}）。桌面任务需要视觉 + 工具调用模型。</div>
-    <div class="kv"><span class="muted">主模型</span><input name="model" list="modelIds" value="${esc(models.model || "")}" placeholder="${esc(models.env_model || "glm-5v-turbo")}" />
-    <span class="muted">备用模型</span><input name="fallback" list="modelIds" value="${esc(models.fallback || "")}" placeholder="主模型失败时使用" />
-    <span class="muted">子 Agent 模型</span><input name="subagent_model" list="modelIds" value="${esc(models.subagent_model || "")}" placeholder="纯文本即可，用于 delegate" />
-    <span class="muted">网关地址</span><input name="base_url" value="${esc(models.base_url || "")}" placeholder="${esc(models.env_base_url || "https://api.openai.com/v1")}" />
-    <span class="muted">API Key</span><input name="key" type="password" placeholder="${models.has_key ? "已设置（加密保存），留空不修改" : "sk-…"}" autocomplete="off" /></div>
-    <datalist id="modelIds"></datalist>
-    <div class="row gap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="fetchModels()">读取模型列表</button></div></form>
+    <div class="muted">从网关读取模型列表后用下拉选择，点"探测"会实测这个模型能不能稳定调用工具、能不能看图。主模型负责决定下一步操作，需要能调用工具；如果它看不了图，再选一个视觉模型，由它把屏幕描述给主模型。留空则用 .env（当前 ${esc(models.env_model || "未设置")}）。</div>
+    <div class="kv">
+      <span class="muted">网关地址</span><input name="base_url" value="${esc(models.base_url || "")}" placeholder="${esc(models.env_base_url || "https://api.openai.com/v1")}" />
+      <span class="muted">API Key</span><input name="key" type="password" placeholder="${models.has_key ? "已设置（加密保存），留空不修改" : "sk-…"}" autocomplete="off" />
+      ${MODEL_ROLES.map((r) => `<span class="muted">${r.label}<div class="small">${r.hint}</div></span>
+        <div class="mrow"><select name="${r.key}" data-cur="${esc(models[r.key] || "")}" onchange="paintProbe(this)"></select>
+        <button type="button" class="btn sm" onclick="probeModel(this)">探测</button><div class="probe small"></div></div>`).join("")}
+    </div>
+    <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="fetchModels(true)">刷新模型列表</button><span id="modelListNote" class="small"></span></div></form>
 
   <form class="card sec" id="sNotify" onsubmit="saveNotify(event)"><h3>${icon("bell")} 手机推送</h3>
     <div class="muted">任务完成、失败、需要确认或回答、追踪触发时推送。iPhone 推荐 Bark。</div>
@@ -547,6 +550,7 @@ async function loadSettings() {
     <div class="row gap wrap"><button class="btn" onclick="localStorage.removeItem('aiw_token');location.href=location.pathname">更换 Token</button><a class="btn" href="/docs" target="_blank">API 文档</a></div></div>`;
   paintIcons($("settingsPage"));
   applyProfile();
+  fetchModels(false);
 }
 function applyProfile() {
   $("agentName").textContent = S.profile.agent_name || "AI Workstation";
@@ -555,13 +559,65 @@ function applyProfile() {
 async function saveProfile(e) { e.preventDefault(); const f = e.target; S.profile = await api("PUT", "/api/profile", { name: f.name.value, agent_name: f.agent_name.value, tone: f.tone.value, about: f.about.value, avatar: f.avatar.value }); applyProfile(); toast("已保存"); }
 async function addMem(e) { e.preventDefault(); const v = e.target.t.value.trim(); if (!v) return; await api("POST", "/api/memories", { text: v }); loadSettings(); }
 async function editMem(m) { const v = prompt("编辑记忆", m.text); if (v === null) return; await api("PUT", `/api/memories/${m.id}`, { text: v }); loadSettings(); }
+const MODEL_ROLES = [
+  { key: "model", label: "主模型", hint: "决定操作，需能调用工具", need: "tools" },
+  { key: "vision_model", label: "视觉模型", hint: "可选，主模型不会看图时设置", need: "vision" },
+  { key: "fallback", label: "备用模型", hint: "主模型出错时用", need: "tools" },
+  { key: "subagent_model", label: "子 Agent 模型", hint: "纯文本命令行任务", need: "tools" },
+];
+S.modelIds = []; S.probes = {};
+async function fetchModels(manual) {
+  const note = $("modelListNote"); if (note) note.textContent = "正在读取…";
+  const [r, probes] = await Promise.all([api("GET", "/api/models").catch((e) => ({ models: [], error: e.message })), api("GET", "/api/models/probes").catch(() => ({}))]);
+  S.modelIds = r.models || []; S.probes = probes || {};
+  if (note) note.textContent = r.error ? "读取失败：" + r.error.slice(0, 80) : `网关有 ${S.modelIds.length} 个模型`;
+  document.querySelectorAll("#sModel select").forEach((sel) => {
+    const cur = sel.value || sel.dataset.cur || "";
+    const ids = [...new Set([...(cur ? [cur] : []), ...S.modelIds])];
+    const role = MODEL_ROLES.find((x) => x.key === sel.name);
+    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" ? "不用" : "同主模型"}</option>`
+      + ids.map((m) => `<option value="${esc(m)}" ${m === cur ? "selected" : ""}>${esc(m)}${probeTag(m)}</option>`).join("")
+      + `<option value="__custom">手动输入…</option>`;
+    paintProbe(sel);
+  });
+  if (manual && !r.error) toast(`找到 ${S.modelIds.length} 个模型`);
+}
+function probeTag(m) { const p = S.probes[m]; if (!p) return ""; return "  " + (p.tools ? "🛠" : "") + (p.vision ? "👁" : "") + (!p.tools && !p.vision ? "✕" : ""); }
+function paintProbe(sel) {
+  if (sel.value === "__custom") {
+    const v = prompt("模型名称"); const val = (v || "").trim();
+    if (val) { const o = document.createElement("option"); o.value = val; o.textContent = val; sel.insertBefore(o, sel.lastChild); sel.value = val; } else sel.value = sel.dataset.cur || "";
+  }
+  const box = sel.parentNode.querySelector(".probe"); const p = S.probes[sel.value];
+  const role = MODEL_ROLES.find((x) => x.key === sel.name);
+  if (!sel.value) { box.innerHTML = ""; return; }
+  if (!p) { box.innerHTML = `<span class="muted">未探测</span>`; return; }
+  const ok = (b, t) => `<span class="chip ${b ? "ok" : "bad"}">${b ? "✓" : "✕"} ${t}</span>`;
+  let warn = "";
+  if (role.need === "tools" && !p.tools) warn = "这个模型调用工具时参数不完整，不适合做主模型";
+  if (role.need === "vision" && !p.vision) warn = "这个模型看不懂图片";
+  box.innerHTML = `${ok(p.tools, "工具调用" + (p.tool_choice === "auto" ? "(auto)" : ""))} ${ok(p.vision, "看图")}`
+    + (warn ? `<div style="color:var(--danger)">${esc(warn)}</div>` : "")
+    + (p.notes && p.notes.length && (!p.tools || !p.vision) ? `<div class="muted">${esc(p.notes.join("；").slice(0, 200))}</div>` : "");
+}
+async function probeModel(btn) {
+  const sel = btn.parentNode.querySelector("select"); if (!sel.value) return toast("先选一个模型");
+  const box = btn.parentNode.querySelector(".probe"); box.innerHTML = `<span class="spin"></span> 正在实测…`; btn.disabled = true;
+  try {
+    const base = document.querySelector("#sModel [name=base_url]").value.trim();
+    const r = await api("POST", "/api/models/probe", { model: sel.value, base_url: base || undefined });
+    if (r.error) { box.textContent = r.error; return; }
+    S.probes[sel.value] = r;
+    document.querySelectorAll("#sModel select").forEach((s2) => { [...s2.options].forEach((o) => { if (o.value && o.value !== "__custom") o.textContent = o.value + probeTag(o.value); }); paintProbe(s2); });
+  } catch (e) { box.textContent = "探测失败：" + e.message; } finally { btn.disabled = false; }
+}
 async function saveModels(e) {
   e.preventDefault(); const f = e.target;
   if (f.key.value) await api("PUT", "/api/secrets/openai_api_key", { value: f.key.value });
-  await api("PUT", "/api/settings/models", { model: f.model.value, fallback: f.fallback.value, subagent_model: f.subagent_model.value, base_url: f.base_url.value });
+  const v = (n) => (f[n].value === "__custom" ? "" : f[n].value);
+  await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), fallback: v("fallback"), subagent_model: v("subagent_model"), base_url: f.base_url.value });
   toast("已保存，下个任务生效"); loadSettings();
 }
-async function fetchModels() { const r = await api("GET", "/api/models"); if (r.error) toast("读取失败：" + r.error); $("modelIds").innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join(""); if (r.models.length) toast(`找到 ${r.models.length} 个模型，点输入框选择`); }
 async function saveNotify(e) { e.preventDefault(); const f = e.target; await api("PUT", "/api/settings/notify", { bark_url: f.bark_url.value, ntfy_url: f.ntfy_url.value, webhook_url: f.webhook_url.value }); toast("已保存"); }
 async function addMcp(e) {
   e.preventDefault(); const f = e.target; const cur = (await api("GET", "/api/integrations")).mcp_servers || [];

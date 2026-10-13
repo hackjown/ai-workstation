@@ -49,6 +49,7 @@ Name=noblank
 Exec=sh -c "xset s off; xset -dpms; xset s noblank"
 CONF
 xfconf-query -c xfce4-screensaver -p /saver/enabled -n -t bool -s false 2>/dev/null || true
+xfconf-query -c xfwm4 -p /general/use_compositing -n -t bool -s false 2>/dev/null || true  # x11vnc shows black frames with compositing
 
 # Python env for vm-agent
 python3 -m venv ~/.aiw-venv

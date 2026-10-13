@@ -115,7 +115,7 @@ async def test_pause_takeover_resume(env):
 async def test_stop(env):
     backend, comp, tmp = env
     control = AgentControl()
-    loop, llm = make_loop(comp, [("screenshot", {})] * 50, tmp, control=control)
+    loop, llm = make_loop(comp, [("move", {"x": 5, "y": 5})] * 50, tmp, control=control)
     run = asyncio.create_task(loop.run())
     await asyncio.sleep(0.2)
     control.stop()
@@ -124,7 +124,7 @@ async def test_stop(env):
 
 async def test_max_steps(env):
     backend, comp, tmp = env
-    loop, _ = make_loop(comp, [("screenshot", {})] * 50, tmp)
+    loop, _ = make_loop(comp, [("move", {"x": 5, "y": 5})] * 50, tmp)
     loop.cfg.max_steps = 3
     t = await loop.run()
     assert t.status == TaskStatus.FAILED and "max steps" in t.result

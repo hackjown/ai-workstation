@@ -41,7 +41,7 @@ class ToolExecutor:
         spec = BY_NAME.get(name)
         if spec is None:
             return ToolOutcome(name, None, False, Decision(RiskLevel.L4, "unknown tool"), error=f"unknown tool {name}")
-        if spec.action is None:  # done/fail: never bounce the finish on a missing text arg
+        if name in ("done", "fail"):  # never bounce the finish on a missing text arg
             args = dict(args)
             for k in spec.required:
                 if not args.get(k):

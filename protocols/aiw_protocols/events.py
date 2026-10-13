@@ -27,6 +27,7 @@ class EventType(str, Enum):
     TAKEOVER = "agent.takeover"
     CONFIRM_REQUIRED = "agent.confirm_required"
     MESSAGE = "agent.message"
+    FILE = "agent.file"
     ERROR = "agent.error"
 
 

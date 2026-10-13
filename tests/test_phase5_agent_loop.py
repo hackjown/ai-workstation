@@ -142,3 +142,13 @@ def test_policy_levels():
     assert L("shell.exec", {"command": "sudo -i"}) == RiskLevel.L4
     assert L("browser.navigate", {"url": "http://192.168.1.1"}) == RiskLevel.L3
     assert PolicyEngine(allow_domains=["openai.com"]).check("browser.navigate", {"url": "https://evil.com"}).level == RiskLevel.L3
+
+
+async def test_done_without_action_is_rejected(env):
+    backend, comp, tmp = env
+    loop, _ = make_loop(comp, [("done", {"summary": "fake weather"}),
+                               ("open_app", {"name": "chrome"}),
+                               ("done", {"summary": "real"})], tmp)
+    loop.task.prompt = "打开浏览器搜索深圳天气"
+    t = await loop.run()
+    assert t.status == TaskStatus.SUCCEEDED and t.result == "real"

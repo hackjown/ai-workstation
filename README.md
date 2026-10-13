@@ -1,4 +1,4 @@
-# AI Workstation V1
+# AI Workstation V1.1
 
 一台跑在自有 Proxmox VE 上、可被 AI 自主操作的 Linux 电脑。依据《AI Workstation V1 开发实施说明书》实现。
 
@@ -60,6 +60,38 @@ cp .env.example .env    # 填 AIW_VM_IP、两个 token、PVE token、至少一�
 VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 screenshot shot.png
 VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 ```
+
+## V1.1 新功能
+
+界面改为浅色、圆角、天蓝/灰气泡的对话式设计（参考 OpenMuse 的视觉语言），网页、iPhone 主屏 Web App 和 IPA 共用一套。
+
+**对话体验**
+- 多轮对话：同一对话里可以追问（"再把标题改大"），Agent 会带上前几轮的请求和结果。
+- 排队：Agent 工作时继续发消息会排队，按顺序执行；停止会暂停队列，点"发送排队消息"继续，单条可移除。
+- 发送/停止合一：工作中发送键变成停止方块，草稿按对话保存在本机。
+- 先出计划：每个任务开始时生成 2–5 步清单，Agent 用 `update_plan` 打勾。
+- 历史与回放：左侧对话列表（可重命名、归档），每个任务可逐步回放截图，查看操作收据（每条命令、风险等级、耗时、交付文件）。
+
+**可靠性**
+- 失败、停止或中断的任务一键重试；API 重启时，30 分钟内被中断的任务自动重新排队。
+- `ask_user`：缺信息时 Agent 在对话里提问（可带选项），你回答后继续。
+- 通知：任务完成/失败/需要确认/需要回答、追踪触发都会进通知中心，并可推送到 Bark（iOS）、ntfy 或 Webhook。
+
+**自动化与记忆**
+- 例程：`daily 09:00`、`every 2h` 或 cron（`0 9 * * 1-5`），到点自动执行，结果进对应对话。
+- 追踪：网页变化 / 出现文字 / 价格低于阈值，只在状态变化时提醒一次，读取失败自动指数退避。
+- 记忆与个人资料：称呼、Agent 名字、语气、长期事实；Agent 听到长期偏好会用 `remember` 记下，可在设置里编辑删除。
+- 附件：网页上传文件（≤40MB）直接放到虚拟机 `~/workspace/uploads/`，配合 `send_file` 做"传入 → 处理 → 交回"。
+
+**平台**
+- 子 Agent：`delegate` 把纯命令行子任务交给不看截图的文本模型（设置 > 模型 > 子 Agent 模型）。
+- 网页里切换主模型 / 备用模型 / 网关地址 / API Key（加密保存），可读取网关的模型列表。
+- 一次性隔离电脑：勾选后下个任务在 PVE 完整克隆（来自快照 `AIW_CLONE_SNAPSHOT`）里运行，结束即删除。需要 qemu-guest-agent 和额外的 PVE 权限：`VM.Clone`、`VM.Allocate`、`VM.Config.*`、`Datastore.AllocateSpace`。
+- 集成：MCP 服务器（Streamable HTTP）、OpenAPI 导入、自定义 HTTP 工具，在 API 主机上执行，请求头可用 `{{secret:名字}}` 引用加密密钥。
+- 语音：浏览器听写 + 朗读结果；IPA 内用系统语音识别（SFSpeechRecognizer）和本地通知。
+- 一键安装/升级：`curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/scripts/install.sh | bash`（保留现有 `.env`，只补新配置）。
+
+**升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
 ## 安全设计（§19、§30）
 - Agent 不持有 PVE 凭据；PVE Token 只在 VM Runtime，且仅限 VM 100 的电源/快照权限。

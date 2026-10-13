@@ -9,7 +9,7 @@ OUT=build; APP=$OUT/Payload/AIW.app
 [ "$(uname)" = Linux ] && LDFLAG=-fuse-ld=lld
 rm -rf $OUT && mkdir -p $APP
 clang -target arm64-apple-ios14.0 -isysroot "$SDK" -fobjc-arc -O2 ${LDFLAG:-} \
-  main.m -framework UIKit -framework WebKit -framework Foundation -o $APP/AIW
+  main.m -framework UIKit -framework WebKit -framework Foundation -framework Speech -framework AVFoundation -framework UserNotifications -o $APP/AIW
 cp Info.plist $APP/
 python3 - "$APP" <<'PY'
 import sys; from PIL import Image

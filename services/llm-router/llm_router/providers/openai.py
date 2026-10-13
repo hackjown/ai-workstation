@@ -54,27 +54,31 @@ class OpenAIProvider(LLMProvider):
 
     name = "openai"
 
-    def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None):
+    def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None,
+                 tool_choice: str | None = None):
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-4.1")
         self.key = api_key or os.environ["OPENAI_API_KEY"]
+        self.tool_choice = tool_choice or os.environ.get("AIW_TOOL_CHOICE", "required")
         self.url = (base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")) + "/chat/completions"
 
     async def decide(self, req: LLMRequest) -> LLMDecision:
         content = [{"type": "text", "text": user_text(req)}]
-        if req.screenshot_b64:
+        if req.screenshot_b64 and not req.screen_desc:
             content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{req.screenshot_b64}"}})
         body = {
             "model": self.model,
             "messages": [{"role": "system", "content": req.system}, {"role": "user", "content": content}],
             "tools": [{"type": "function", "function": t} for t in req.tools],
-            "tool_choice": "required",
+            "tool_choice": self.tool_choice,
             # a long script inside `command` gets cut (and arrives as {}) on gateways with a small default
             "max_tokens": int(os.environ.get("AIW_LLM_MAX_TOKENS", "4096")),
         }
         required = {t["name"]: (t.get("parameters") or {}).get("required") or [] for t in req.tools}
         data, msg, calls, name, args = {}, {}, [], "", {}
         async with httpx.AsyncClient(timeout=180) as c:
-            for _ in range(3):
+            for attempt in range(3):
+                if attempt == 2:  # some gateways (e.g. GLM) only behave with tool_choice=auto
+                    body["tool_choice"] = "auto"
                 r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
                 r.raise_for_status()
                 data = r.json()
@@ -109,6 +113,16 @@ class OpenAIProvider(LLMProvider):
         if not calls:
             return LLMDecision(msg.get("content") or "", "fail", {"reason": "model returned no tool call"}, raw=data)
         return LLMDecision(msg.get("content") or "", name, args, raw=data, usage=data.get("usage", {}))
+
+    async def describe(self, system: str, user: str, image_b64: str, max_tokens: int = 900) -> str:
+        body = {"model": self.model, "max_tokens": max_tokens, "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": [{"type": "text", "text": user},
+                                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}]}]}
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"].get("content") or ""
 
     async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
         body = {"model": self.model, "max_tokens": max_tokens,

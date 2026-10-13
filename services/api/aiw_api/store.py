@@ -22,6 +22,17 @@ CREATE TABLE IF NOT EXISTS machine_actions (id TEXT PRIMARY KEY, session_id TEXT
 CREATE TABLE IF NOT EXISTS agent_events (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, step INTEGER, data TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, session_id TEXT, kind TEXT, path TEXT, created_at REAL);
 CREATE TABLE IF NOT EXISTS workspace_files (id TEXT PRIMARY KEY, session_id TEXT, path TEXT, size INTEGER, created_at REAL);
+CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, title TEXT, archived INTEGER DEFAULT 0, created_at REAL, updated_at REAL);
+CREATE TABLE IF NOT EXISTS routines (id TEXT PRIMARY KEY, name TEXT, prompt TEXT, schedule TEXT, machine_id TEXT,
+  thread_id TEXT, enabled INTEGER DEFAULT 1, last_run REAL, next_run REAL, last_task_id TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS watches (id TEXT PRIMARY KEY, name TEXT, url TEXT, mode TEXT, value TEXT, interval_min INTEGER,
+  enabled INTEGER DEFAULT 1, last_value TEXT, last_hash TEXT, last_checked REAL, next_check REAL, fail_count INTEGER DEFAULT 0,
+  last_error TEXT, triggered_at REAL, created_at REAL);
+CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, kind TEXT, title TEXT, body TEXT, task_id TEXT,
+  thread_id TEXT, link TEXT, read INTEGER DEFAULT 0, created_at REAL);
+CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, text TEXT, source TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS secrets (name TEXT PRIMARY KEY, value TEXT, updated_at REAL);
 CREATE INDEX IF NOT EXISTS ix_events_session ON agent_events(session_id, ts);
 CREATE INDEX IF NOT EXISTS ix_actions_session ON machine_actions(session_id, created_at);
 """
@@ -34,6 +45,13 @@ class Store:
         self.lock = threading.Lock()
         with self.lock:
             self.db.executescript(SCHEMA)
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
+            for col, typ in (("thread_id", "TEXT"), ("source", "TEXT"), ("plan", "TEXT"), ("session_id", "TEXT"),
+                             ("max_steps", "INTEGER"), ("timeout_s", "REAL")):
+                if col not in cols:
+                    self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typ}")
+            self.db.execute("CREATE INDEX IF NOT EXISTS ix_tasks_thread ON tasks(thread_id, created_at)")
+            self.db.commit()
 
     def _x(self, sql: str, args: tuple = ()) -> list[dict]:
         with self.lock:
@@ -62,8 +80,120 @@ class Store:
 
     def create_task(self, t: dict):
         now = time.time()
-        self._x("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?)",
-                (t["id"], t.get("user_id"), t["prompt"], t["machine_id"], t["status"], None, now, now))
+        self._x("""INSERT INTO tasks (id, user_id, prompt, machine_id, status, result, created_at, updated_at,
+                   thread_id, source, max_steps, timeout_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (t["id"], t.get("user_id"), t["prompt"], t["machine_id"], t["status"], None, now, now,
+                 t.get("thread_id"), t.get("source", "chat"), t.get("max_steps", 40), t.get("timeout_s", 600)))
+        if t.get("thread_id"):
+            self.touch_thread(t["thread_id"])
+
+    def set_task_session(self, tid: str, sid: str):
+        self._x("UPDATE tasks SET session_id=? WHERE id=?", (sid, tid))
+
+    def set_task_plan(self, tid: str, plan: dict):
+        self._x("UPDATE tasks SET plan=? WHERE id=?", (json.dumps(plan, ensure_ascii=False), tid))
+
+    def tasks_by_status(self, statuses: tuple[str, ...]) -> list[dict]:
+        q = ",".join("?" * len(statuses))
+        return self._x(f"SELECT * FROM tasks WHERE status IN ({q}) ORDER BY created_at", statuses)
+
+    def thread_tasks(self, thread_id: str, limit: int = 200) -> list[dict]:
+        rows = self._x("SELECT * FROM tasks WHERE thread_id=? ORDER BY created_at LIMIT ?", (thread_id, limit))
+        for r in rows:
+            r["plan"] = json.loads(r["plan"]) if r.get("plan") else None
+        return rows
+
+    def recent_tasks(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
+        if status:
+            return self._x("SELECT * FROM tasks WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, limit))
+        return self._x("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,))
+
+    # ---------------------------------------------------------------- threads
+    def create_thread(self, title: str = "") -> dict:
+        tid, now = f"thr-{uuid.uuid4().hex[:10]}", time.time()
+        self._x("INSERT INTO threads VALUES (?,?,?,?,?)", (tid, title or "新对话", 0, now, now))
+        return self.thread(tid)
+
+    def thread(self, tid: str) -> Optional[dict]:
+        r = self._x("SELECT * FROM threads WHERE id=?", (tid,))
+        return r[0] if r else None
+
+    def threads(self, archived: bool = False, limit: int = 100) -> list[dict]:
+        return self._x("""SELECT t.*, (SELECT prompt FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_prompt,
+                          (SELECT status FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_status,
+                          (SELECT COUNT(*) FROM tasks WHERE thread_id=t.id) AS task_count
+                          FROM threads t WHERE archived=? ORDER BY updated_at DESC LIMIT ?""", (1 if archived else 0, limit))
+
+    def update_thread(self, tid: str, title: Optional[str] = None, archived: Optional[bool] = None):
+        if title is not None:
+            self._x("UPDATE threads SET title=? WHERE id=?", (title, tid))
+        if archived is not None:
+            self._x("UPDATE threads SET archived=? WHERE id=?", (1 if archived else 0, tid))
+
+    def touch_thread(self, tid: str):
+        self._x("UPDATE threads SET updated_at=? WHERE id=?", (time.time(), tid))
+
+    def delete_thread(self, tid: str):
+        self._x("DELETE FROM threads WHERE id=?", (tid,))
+        self._x("UPDATE tasks SET thread_id=NULL WHERE thread_id=?", (tid,))
+
+    # ---------------------------------------------------------------- generic rows
+    def insert(self, table: str, row: dict) -> dict:
+        row = {"id": row.get("id") or f"{table[:3]}-{uuid.uuid4().hex[:10]}", "created_at": time.time(), **row}
+        cols = ",".join(row)
+        self._x(f"INSERT INTO {table} ({cols}) VALUES ({','.join('?' * len(row))})", tuple(row.values()))
+        return self.get(table, row["id"])
+
+    def get(self, table: str, rid: str) -> Optional[dict]:
+        r = self._x(f"SELECT * FROM {table} WHERE id=?", (rid,))
+        return r[0] if r else None
+
+    def update(self, table: str, rid: str, **fields):
+        if fields:
+            sets = ",".join(f"{k}=?" for k in fields)
+            self._x(f"UPDATE {table} SET {sets} WHERE id=?", (*fields.values(), rid))
+
+    def delete(self, table: str, rid: str):
+        self._x(f"DELETE FROM {table} WHERE id=?", (rid,))
+
+    def all(self, table: str, where: str = "1=1", args: tuple = (), order: str = "created_at DESC", limit: int = 200) -> list[dict]:
+        return self._x(f"SELECT * FROM {table} WHERE {where} ORDER BY {order} LIMIT ?", (*args, limit))
+
+    # ---------------------------------------------------------------- kv settings
+    def kv_get(self, key: str, default: Any = None) -> Any:
+        r = self._x("SELECT value FROM kv WHERE key=?", (key,))
+        return json.loads(r[0]["value"]) if r else default
+
+    def kv_set(self, key: str, value: Any):
+        self._x("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value, ensure_ascii=False)))
+
+    def secret_put(self, name: str, enc: str):
+        self._x("INSERT INTO secrets VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                (name, enc, time.time()))
+
+    def secret_get(self, name: str) -> Optional[str]:
+        r = self._x("SELECT value FROM secrets WHERE name=?", (name,))
+        return r[0]["value"] if r else None
+
+    def secret_names(self) -> list[dict]:
+        return self._x("SELECT name, updated_at FROM secrets ORDER BY name")
+
+    def secret_delete(self, name: str):
+        self._x("DELETE FROM secrets WHERE name=?", (name,))
+
+    def actions(self, sid: str) -> list[dict]:
+        rows = self._x("SELECT * FROM machine_actions WHERE session_id=? ORDER BY created_at", (sid,))
+        for r in rows:
+            for k in ("payload", "result"):
+                try:
+                    r[k] = json.loads(r[k]) if r.get(k) else None
+                except ValueError:
+                    pass
+        return rows
+
+    def delete_machine(self, mid: str):
+        self._x("DELETE FROM machines WHERE id=?", (mid,))
 
     def update_task(self, tid: str, status: str, result: Optional[str] = None):
         self._x("UPDATE tasks SET status=?, result=COALESCE(?, result), updated_at=? WHERE id=?",

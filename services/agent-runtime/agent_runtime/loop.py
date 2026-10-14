@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,12 +127,9 @@ class AgentLoop:
     async def run(self) -> Task:
         self.task.status = TaskStatus.RUNNING
         await self.emit(EventType.TASK_STARTED, prompt=self.task.prompt)
-        try:
-            if self.cfg.make_plan:
-                self.plan_steps = await make_plan(self.llm, self.task.prompt, self.task.context)
-                await self.emit(EventType.PLAN, plan=self.plan_steps, done=[])
-        except Exception:  # noqa: BLE001
-            self.plan_steps = []
+        plan_job = None
+        if self.cfg.make_plan and _needs_action(self.task.prompt):
+            plan_job = asyncio.create_task(self._plan())  # plan in parallel with the first step, not before it
         try:
             await asyncio.wait_for(self._run(), self.cfg.timeout_s)
         except asyncio.TimeoutError:
@@ -140,12 +138,23 @@ class AgentLoop:
             self._finish(TaskStatus.STOPPED, "stopped by user")
         except Exception as e:  # noqa: BLE001
             self._finish(TaskStatus.FAILED, f"{type(e).__name__}: {e}")
+        if plan_job and not plan_job.done():
+            plan_job.cancel()
         if self.task.status == TaskStatus.SUCCEEDED and self.plan_steps and len(self.plan_done) < len(self.plan_steps):
             self.plan_done = set(range(len(self.plan_steps)))
             await self.emit(EventType.PLAN_UPDATE, done=sorted(self.plan_done), note=None)
         ev = {TaskStatus.SUCCEEDED: EventType.TASK_FINISHED}.get(self.task.status, EventType.TASK_FAILED)
         await self.emit(ev, status=self.task.status.value, result=self.task.result, steps=self.step)
         return self.task
+
+    async def _plan(self):
+        try:
+            steps = await make_plan(self.llm, self.task.prompt, self.task.context)
+        except Exception:  # noqa: BLE001
+            return
+        if self.task.status == TaskStatus.RUNNING and steps:
+            self.plan_steps = steps
+            await self.emit(EventType.PLAN, plan=self.plan_steps, done=sorted(self.plan_done))
 
     def _finish(self, status: TaskStatus, result: str):
         self.task.status, self.task.result = status, result
@@ -155,6 +164,7 @@ class AgentLoop:
         shots = 0
         self._acted = False
         self._done_rejects = 0
+        self._sent_file, self._after_send = None, 0
         note: Optional[str] = None
         while self.step < self.cfg.max_steps:
             if await self.control.checkpoint():
@@ -167,6 +177,7 @@ class AgentLoop:
 
             desc = await self._look(before, shown) if self.vision_llm and before else None
             await self.emit(EventType.THINKING)
+            t_llm = time.time()
             decision = await self.llm.decide(LLMRequest(
                 system=self.system, task=self._task_with_plan(), history=self.history,
                 screenshot_b64=before, tools=tool_schemas([t[0] for t in self.extra_tools.values()]),
@@ -197,7 +208,12 @@ class AgentLoop:
                         "(open/search/type/click...). Do the first action now, e.g. browser_open with the URL. "
                         "Do not invent results.")
                 continue
-            await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+            llm_ms = int((time.time() - t_llm) * 1000)
+            if self._sent_file and decision.tool not in ("done", "fail", "send_file"):
+                self._after_send += 1
+                if self._after_send >= 2:  # the file is already with the user; stop wandering
+                    decision.tool, decision.args = "done", {"summary": f"已生成并发送 {self._sent_file}。"}
+            await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args, llm_ms=llm_ms)
 
             if await self.control.checkpoint():  # paused while the model was thinking: discard stale decision
                 self.step -= 1
@@ -224,6 +240,9 @@ class AgentLoop:
                 await self._deliver_file(outcome.result)
                 outcome.result = {k: v for k, v in outcome.result.items() if k != "content_b64"}
                 outcome.result["sent_to_user"] = True
+                self._sent_file = Path(outcome.result.get("path") or "file").name
+                note = ("The file was delivered to the user's chat. If nothing else was asked, call done NOW "
+                        "with a short Chinese summary.")
             if outcome.success and decision.tool not in ("screenshot", "done", "fail"):
                 self._acted = True
             await self.emit(EventType.ACTION_RESULT, tool=outcome.tool, success=outcome.success,
@@ -411,6 +430,16 @@ _ACTION_WORDS = ("打开", "搜索", "输入", "点击", "新建", "创建", "�
                  "open", "search", "type", "click", "create", "run", "download", "visit", "install", "write", "go to")
 
 
+_QUESTION = re.compile(r"^(为什么|为啥|怎么回事|怎么没|是什么|什么原因|why|what|how come)|[?？吗呢]\s*$", re.I)
+
+
+def _is_question(prompt: str) -> bool:
+    p = (prompt or "").strip()
+    return bool(_QUESTION.search(p)) and len(p) < 60 and not re.search(r"帮我|请你|给我|发给|please", p, re.I)
+
+
 def _needs_action(prompt: str) -> bool:
     p = (prompt or "").lower()
+    if _is_question(p):
+        return False
     return any(w in p for w in _ACTION_WORDS)

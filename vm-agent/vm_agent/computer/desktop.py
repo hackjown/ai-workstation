@@ -52,7 +52,7 @@ def png_b64(img: Image.Image, max_width: Optional[int] = None) -> str:
         ratio = max_width / img.width
         img = img.resize((max_width, int(img.height * ratio)))
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    img.save(buf, format="PNG", compress_level=1)  # optimize=True costs seconds per 1600x900 frame
     return base64.b64encode(buf.getvalue()).decode()
 
 

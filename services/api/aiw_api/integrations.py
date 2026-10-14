@@ -11,6 +11,7 @@ ext_ (HTTP/OpenAPI) and mcp_ (MCP) so the policy and the UI can tell them apart.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -146,8 +147,23 @@ class MCPClient:
         return {"text": "\n".join(texts)[:6000], "is_error": bool((res or {}).get("isError"))}
 
 
+_MCP_CACHE: dict[str, tuple[float, list]] = {}
+_MCP_TTL = 300.0
+
+
+async def _mcp_tools(client: "MCPClient", key: str) -> list[dict]:
+    import time
+    hit = _MCP_CACHE.get(key)
+    if hit and time.time() - hit[0] < _MCP_TTL:
+        return hit[1]
+    tools = await asyncio.wait_for(client.list_tools(), 8)
+    _MCP_CACHE[key] = (time.time(), tools)
+    return tools
+
+
 async def load_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
-    """name -> (schema, async call(args)). Broken integrations are skipped, not fatal."""
+    """name -> (schema, async call(args)). Broken integrations are skipped, not fatal.
+    MCP tool lists are cached for 5 minutes and each server gets 8 s, so a slow server never stalls a task start."""
     tools: dict[str, tuple[dict, Any]] = {}
     for spec in store.kv_get("http_tools", []) or []:
         if spec.get("enabled", True):
@@ -161,7 +177,7 @@ async def load_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
             continue
         try:
             client = MCPClient(secrets.expand(srv["url"]), {k: secrets.expand(v) for k, v in (srv.get("headers") or {}).items()})
-            for t in await client.list_tools():
+            for t in await _mcp_tools(client, srv["url"] + json.dumps(srv.get("headers") or {}, sort_keys=True)):
                 name = safe_name("mcp_", srv["name"], t["name"])
                 schema = {"name": name, "description": (t.get("description") or t["name"])[:900],
                           "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}

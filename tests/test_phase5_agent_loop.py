@@ -224,3 +224,15 @@ async def test_stops_after_file_is_sent(env):
                      config=LoopConfig(max_steps=8, timeout_s=20, make_plan=False, artifacts_dir=str(tmp / "art")))
     task = await loop.run()
     assert task.status == TaskStatus.SUCCEEDED and "a.txt" in task.result
+
+
+async def test_identical_write_is_skipped_and_unchanged_screen_not_resent(env):
+    backend, comp, tmp = env
+    w = ("files_write", {"path": "m.py", "content": "print(1)"})
+    llm = ScriptedProvider([w, w, ("done", {"summary": "ok"})])
+    loop = AgentLoop(Task(prompt="写 m.py"), "s5", comp, LLMRouter([llm]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=6, timeout_s=20, make_plan=False))
+    await loop.run()
+    assert any("SKIPPED" in h for h in loop.history)
+    assert llm.requests[0].screenshot_b64 and llm.requests[0].screenshot_b64.startswith("/9j/")  # JPEG
+    assert llm.requests[1].screenshot_b64 is None and "unchanged" in (llm.requests[1].note or "")

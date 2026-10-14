@@ -35,6 +35,8 @@ class ActionType(str, Enum):
     BROWSER_NAVIGATE = "browser.navigate"
     BROWSER_BACK = "browser.back"
     BROWSER_FORWARD = "browser.forward"
+    BROWSER_CLICK = "browser.click"  # click a page element found by its text (DOM), with the real mouse
+    BROWSER_FILL = "browser.fill"  # type into a form field found by its label/placeholder
     # files.*
     FILES_LIST = "files.list"
     FILES_READ = "files.read"
@@ -63,6 +65,8 @@ PAYLOAD_SCHEMA: dict[str, list[str]] = {
     ActionType.SHELL_EXEC.value: ["command"],
     ActionType.BROWSER_OPEN.value: [],
     ActionType.BROWSER_NAVIGATE.value: ["url"],
+    ActionType.BROWSER_CLICK.value: ["text"],
+    ActionType.BROWSER_FILL.value: ["field", "text"],
     ActionType.FILES_LIST.value: ["path"],
     ActionType.FILES_READ.value: ["path"],
     ActionType.FILES_WRITE.value: ["path", "content"],

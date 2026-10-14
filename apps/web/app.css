@@ -206,3 +206,4 @@ pre.code { background:#fff; border:1px solid var(--line); border-radius:16px; pa
 .mrow select { width:100%; min-width:0; }
 .mrow .probe { grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
 .mrow .probe > div { flex-basis:100%; }
+.steplist .ms { font-style:normal; color:var(--muted); font-size:12px; margin-left:8px; white-space:nowrap; }

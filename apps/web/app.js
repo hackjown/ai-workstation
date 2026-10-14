@@ -609,7 +609,7 @@ async function fetchModels(manual) {
   });
   if (manual && !r.error) toast(`找到 ${S.modelIds.length} 个模型`);
 }
-function probeTag(m) { const p = S.probes[m]; if (!p) return ""; return "  " + (p.tools ? "🛠" : "") + (p.vision ? "👁" : "") + (!p.tools && !p.vision ? "✕" : ""); }
+function probeTag(m) { const p = S.probes[m]; if (!p) return ""; return "  " + (p.tools ? "🛠" : "") + (p.vision ? "👁" : "") + (!p.tools && !p.vision ? "✕" : "") + ({ fast: " ⚡快", medium: " 中速", slow: " 🐢慢" }[p.speed] || ""); }
 function paintProbe(sel) {
   if (sel.value === "__custom") {
     const v = prompt("模型名称"); const val = (v || "").trim();
@@ -623,9 +623,11 @@ function paintProbe(sel) {
   let warn = "";
   if (role.need === "tools" && !p.tools) warn = "这个模型调用工具时参数不完整，不适合做主模型";
   if (role.need === "vision" && !p.vision) warn = "这个模型看不懂图片";
-  box.innerHTML = `${ok(p.tools, "工具调用" + (p.tool_choice === "auto" ? "(auto)" : ""))} ${ok(p.vision, "看图")}`
+  if (role.need === "tools" && p.tools && p.speed === "slow") warn = "能用但很慢，每步可能要几十秒到几分钟，建议换更快的主模型";
+  const spd = p.speed ? `<span class="chip ${p.speed === "slow" ? "bad" : "ok"}">${{ fast: "⚡ 快", medium: "中速", slow: "🐢 慢" }[p.speed]} · ${(p.speed_ms / 1000).toFixed(1)}s${p.tok_s ? " · " + p.tok_s + " tok/s" : ""}${p.tools_ms ? " · 工具 " + (p.tools_ms / 1000).toFixed(1) + "s" : ""}</span>` : "";
+  box.innerHTML = `${ok(p.tools, "工具调用" + (p.tool_choice === "auto" ? "(auto)" : ""))} ${ok(p.vision, "看图")} ${spd}`
     + (warn ? `<div style="color:var(--danger)">${esc(warn)}</div>` : "")
-    + (p.notes && p.notes.length && (!p.tools || !p.vision) ? `<div class="muted">${esc(p.notes.join("；").slice(0, 200))}</div>` : "");
+    + (p.notes && p.notes.length && (!p.tools || !p.vision || p.reasoning_tokens) ? `<div class="muted">${esc(p.notes.join("；").slice(0, 200))}</div>` : "");
 }
 async function probeModel(btn) {
   const sel = btn.parentNode.querySelector("select"); if (!sel.value) return toast("先选一个模型");

@@ -38,6 +38,7 @@ class LoopConfig:
     action_retries: int = 1
     llm_image_width: int = 1280  # downscale screenshots sent to the LLM
     skip_unchanged_screens: bool = True  # don't resend an identical screenshot (terminal/file work)
+    vision_timeout_s: float = 25.0  # a slow "eyes" model must not stall every step
     max_consecutive_failures: int = 5
     artifacts_dir: Optional[str] = None
     subagent_steps: int = 8
@@ -169,6 +170,8 @@ class AgentLoop:
         self._last_ok: Optional[tuple] = None
         self._prev_sig: Optional[tuple] = None
         self._rep = 0
+        self._last_tool: Optional[str] = None
+        self._last_shown: tuple[int, int] = (0, 0)
         note: Optional[str] = None
         while self.step < self.cfg.max_steps:
             if await self.control.checkpoint():
@@ -177,7 +180,15 @@ class AgentLoop:
                         if self.control.resumed_after_takeover else "Agent was paused and resumed.")
                 await self.emit(EventType.RESUMED, takeover=self.control.resumed_after_takeover)
             self.step += 1
-            before, shown = await self.observe()
+            blind = self._last_tool in _NO_SCREEN_TOOLS and self.step > 1
+            if blind:  # a shell/file step does not change the screen: skip the screenshot and the vision call
+                before, shown = None, self._last_shown
+                note = ((note + "\n") if note else "") + (
+                    "Screen not re-read: your last step was a shell/file action. Keep working in the shell; "
+                    "call screenshot only if you need to see the desktop.")
+            else:
+                before, shown = await self.observe()
+                self._last_shown = shown
 
             desc = await self._look(before, shown) if self.vision_llm and before else None
             send_shot = before
@@ -255,6 +266,7 @@ class AgentLoop:
                 note = "Paused before acting; previous decision discarded. Re-assess."
                 continue
 
+            self._last_tool = decision.tool
             await self.emit(EventType.ACTION, tool=decision.tool, args=decision.args)
             handled = await self._loop_tool(decision)
             if handled is not None:
@@ -336,7 +348,12 @@ class AgentLoop:
                   "Be factual and concise (max ~250 words). Do not suggest actions.")
         try:
             await self.emit(EventType.THINKING, phase="vision")
-            desc = (await self.vision_llm.describe("You are the eyes of a computer-use agent.", prompt, shot)).strip()
+            desc = (await asyncio.wait_for(
+                self.vision_llm.describe("You are the eyes of a computer-use agent.", prompt, shot),
+                self.cfg.vision_timeout_s)).strip()
+        except asyncio.TimeoutError:
+            await self.emit(EventType.ERROR, error=f"视觉模型超过 {self.cfg.vision_timeout_s:.0f} 秒没回应，本步跳过（建议换更快的视觉模型）")
+            return None
         except Exception as e:  # noqa: BLE001
             await self.emit(EventType.ERROR, error=f"视觉模型失败，改为直接发截图：{e}"[:300])
             return None
@@ -503,6 +520,7 @@ def _needs_action(prompt: str) -> bool:
     return any(w in p for w in _ACTION_WORDS)
 
 
+_NO_SCREEN_TOOLS = {"shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "open_app"}
 
 

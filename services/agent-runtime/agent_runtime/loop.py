@@ -83,7 +83,9 @@ class AgentLoop:
 
     # ---------------------------------------------------------------- observe
     async def observe(self) -> tuple[Optional[str], tuple[int, int]]:
+        t_shot = time.time()
         r = await self.computer.execute("computer.screenshot")
+        shot_ms = int((time.time() - t_shot) * 1000)
         if not r.success or not r.screenshot:
             await self.emit(EventType.ERROR, error=f"screenshot failed: {r.error}")
             return None, (0, 0)
@@ -100,7 +102,10 @@ class AgentLoop:
         buf = io.BytesIO(); img.save(buf, "JPEG", quality=75)
         shot = base64.b64encode(buf.getvalue()).decode()
         artifact = self._save_artifact(r.screenshot)
-        await self.emit(EventType.OBSERVATION, width=full[0], height=full[1], artifact=artifact)
+        meta = r.result if isinstance(getattr(r, "result", None), dict) else {}
+        await self.emit(EventType.OBSERVATION, width=full[0], height=full[1], artifact=artifact, shot_ms=shot_ms,
+                        vm_ms=getattr(r, "duration_ms", None), grabber=meta.get("grabber"),
+                        grab_ms=meta.get("grab_ms"), encode_ms=meta.get("encode_ms"))
         return shot, shown
 
     def _save_artifact(self, b64: str) -> Optional[str]:

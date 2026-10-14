@@ -4,6 +4,8 @@ call can be plugged in later without changing the loop."""
 from __future__ import annotations
 
 SYSTEM_PROMPT = """You operate a remote Ubuntu 24.04 XFCE desktop through tools.
+LANGUAGE: the user speaks Chinese unless the request is clearly in another language. Write every user-visible text
+(your reasoning before the tool call, summary, reason, question, plan notes) in Simplified Chinese (简体中文).
 Each turn you see the latest screenshot and the previous steps. Call exactly ONE tool per turn.
 Rules:
 - Coordinates are pixels in the attached screenshot.
@@ -26,13 +28,17 @@ Rules:
 - If information only the user has is missing, call `ask_user` instead of guessing.
 - When the user states a lasting preference, call `remember`.
 - For pure terminal/file sub-work (scripts, conversions) you may call `delegate` with a clear goal.
+- If the request is only a question you can answer from the context (e.g. why an earlier task failed, what a file
+  contains), do not operate the computer: call `done` right away with the answer in `summary`.
+- After `send_file` succeeds and nothing else was asked, call `done` immediately. Do not keep checking.
+- Be fast: one decisive action per turn, no exploratory `files_list` when you already know the path.
 - External tools (names starting with ext_ or mcp_) call APIs directly; prefer them over clicking through a website.
 """
 
 
-PLAN_PROMPT = """You plan tasks for an agent that controls a Linux desktop (browser, terminal, files).
-Write 2-5 short, concrete steps to accomplish the request, one per line, no numbering, no extra text.
-Write the steps in the same language as the request."""
+PLAN_PROMPT = """你为一个操作 Linux 桌面（浏览器、终端、文件）的 Agent 拆解任务。
+只输出一个 JSON 数组，包含 2-5 个简短具体的步骤（每步不超过 25 个字），不要任何解释、不要思考过程。
+步骤用请求的语言书写（中文请求就用简体中文）。例：["用 python-docx 生成 ~/workspace/周报.docx", "把文件发给用户"]"""
 
 
 def plan(task: str) -> list[str]:
@@ -46,11 +52,36 @@ def plan(task: str) -> list[str]:
 async def make_plan(llm, task: str, context: str | None = None) -> list[str]:
     """Ask the model for a short checklist; fall back to the offline split."""
     try:
-        text = await llm.complete(PLAN_PROMPT, (f"Context:\n{context}\n\n" if context else "") + f"Request: {task}", 300)
-        steps = [l.strip(" -*•\t").lstrip("0123456789.)、 ").strip() for l in (text or "").splitlines()]
-        steps = [x for x in steps if x][:5]
+        text = await llm.complete(PLAN_PROMPT, (f"背景：\n{context[-1500:]}\n\n" if context else "") + f"请求：{task}", 1200)
+        steps = parse_plan(text, task)
         if len(steps) >= 2:
             return steps
     except Exception:  # noqa: BLE001
         pass
     return plan(task)
+
+
+def parse_plan(text: str, task: str) -> list[str]:
+    """Steps from the model's answer. Prefer a JSON array; otherwise keep only short step-like lines,
+    never a model's stream of reasoning ("The user wants...")."""
+    import json
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    for m in reversed(list(re.finditer(r"\[[^\[\]]*\]", text, re.S))):
+        try:
+            arr = json.loads(m.group(0))
+        except ValueError:
+            continue
+        steps = [str(x).strip() for x in arr if isinstance(x, (str, int)) and str(x).strip()]
+        if steps:
+            return steps[:5]
+    zh = bool(re.search(r"[\u4e00-\u9fff]", task or ""))
+    out = []
+    for line in text.splitlines():
+        line = line.strip(" -*•\t").lstrip("0123456789.)、 ").strip()
+        if not line or len(line) > 60 or line.endswith((":", "：")):
+            continue
+        if zh and not re.search(r"[\u4e00-\u9fff]", line):
+            continue
+        out.append(line)
+    return out[:5]

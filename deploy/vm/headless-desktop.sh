@@ -14,7 +14,8 @@ set -euo pipefail
 U=$(id -un); H=$HOME; GEOMETRY=${GEOMETRY:-1600x900}
 
 sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tigervnc-standalone-server tigervnc-tools dbus-x11 x11-utils
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tigervnc-standalone-server tigervnc-tools dbus-x11 x11-utils \
+  python3-pip python3-openpyxl python3-docx python3-pptx
 
 mkdir -p "$H/.config/aiw"
 printf '%s\n' "$VNC_PASSWORD" | vncpasswd -f > "$H/.config/aiw/tigervnc.pass"
@@ -49,6 +50,9 @@ Requires=aiw-xvnc.service
 User=$U
 Environment=DISPLAY=:1
 Environment=HOME=$H
+Environment=XDG_RUNTIME_DIR=/run/user/$(id -u)
+Environment=XDG_SESSION_TYPE=x11
+Environment=XDG_CURRENT_DESKTOP=XFCE
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 30); do xdpyinfo -display :1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/startxfce4
 ExecStartPost=-/bin/sh -c 'sleep 3; xset -display :1 s off -dpms s noblank'

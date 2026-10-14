@@ -5,7 +5,7 @@ set -uo pipefail
 U=$(id -un); H=$HOME; UID_=$(id -u)
 
 echo "== 1/4 Python packages (Debian blocks plain pip; use apt + allow pip --user)"
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-pip python3-openpyxl python3-bs4 python3-docx python3-matplotlib fonts-noto-cjk imagemagick x11-apps scrot \
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-pip python3-openpyxl python3-bs4 wmctrl python3-docx python3-matplotlib fonts-noto-cjk imagemagick x11-apps scrot \
   dbus-x11 x11-utils xfce4 xfce4-session >/dev/null
 python3 -m pip install -q --user --break-system-packages python-pptx || true
 grep -q '^PIP_BREAK_SYSTEM_PACKAGES=' "$H/.config/aiw/vm-agent.env" || echo 'PIP_BREAK_SYSTEM_PACKAGES=1' >> "$H/.config/aiw/vm-agent.env"
@@ -52,3 +52,7 @@ python3 -c "import openpyxl, docx; print('openpyxl', openpyxl.__version__, '+ py
 echo "== 4/4 Last log lines (send these if the screen is still black)"
 sudo journalctl -u aiw-xfce -n 15 --no-pager
 sudo journalctl -u aiw-xvnc -n 5 --no-pager
+
+# Chrome policy: no translate bubble on foreign pages, no password-save prompts
+sudo mkdir -p /etc/opt/chrome/policies/managed /etc/chromium/policies/managed
+echo '{"TranslateEnabled": false, "PasswordManagerEnabled": false}' | sudo tee /etc/opt/chrome/policies/managed/aiw.json /etc/chromium/policies/managed/aiw.json >/dev/null

@@ -207,3 +207,12 @@ pre.code { background:#fff; border:1px solid var(--line); border-radius:16px; pa
 .mrow .probe { grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
 .mrow .probe > div { flex-basis:100%; }
 .steplist .ms { font-style:normal; color:var(--muted); font-size:12px; margin-left:8px; white-space:nowrap; }
+
+.deskframe { position:relative; }
+.deskframe.taking { outline:3px solid #f59e0b; outline-offset:-3px; }
+.deskhead.taking { background:#fff1db; }
+.takebanner { position:absolute; left:50%; top:10px; transform:translateX(-50%); display:flex; align-items:center; gap:10px;
+  background:rgba(17,24,39,.88); color:#fff; padding:6px 6px 6px 12px; border-radius:999px; font-size:13px; z-index:5; white-space:nowrap; }
+.takebanner .dot { width:8px; height:8px; border-radius:50%; background:#f59e0b; animation:pulse 1.2s infinite; }
+.takebanner button { border:0; background:#fff; color:#111; border-radius:999px; padding:5px 12px; font-size:13px; cursor:pointer; }
+@keyframes pulse { 50% { opacity:.3; } }

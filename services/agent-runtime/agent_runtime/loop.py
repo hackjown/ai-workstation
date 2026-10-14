@@ -20,6 +20,7 @@ from PIL import Image
 from tool_router import ToolExecutor, tool_schemas
 from tool_router.registry import SUBAGENT_TOOLS
 
+from . import cad as _cad
 from .control import AgentControl, StopRequested
 from .grounding import convert_desc, coord_instruction, coord_mode, locate, model_name
 from .planner import SYSTEM_PROMPT, make_plan
@@ -413,6 +414,10 @@ class AgentLoop:
             return f"user answered: {reply!r}" if reply else "user did not answer within the time limit; decide yourself or fail"
         if t == "click_element":
             return await self._click_element(a, decision.thought)
+        if t == "cad_draw":
+            return await self._cad_draw(a, decision.thought)
+        if t == "read_image":
+            return await self._read_image(a)
         if t == "remember":
             text = (a.get("text") or "").strip()
             if text and self.remember:
@@ -485,6 +490,95 @@ class AgentLoop:
             self._acted = True
             self._fresh = outcome.screenshot
         return f"{tool} at ({x}, {y}) for '{target}' -> {'ok' if outcome.success else 'FAILED ' + str(outcome.error)}; {v.message}"
+
+    async def _cad_draw(self, a: dict, intent: str) -> str:
+        """Write the drawing body into a script with the CAD prelude, run it on the VM (ezdxf), open the DXF in
+        LibreCAD on the desktop and deliver PDF + DXF to the chat."""
+        code = a.get("code") or ""
+        if not code.strip():
+            await self.emit(EventType.ACTION_RESULT, tool="cad_draw", success=False, error="missing args ['code']", result={})
+            return "FAILED: cad_draw needs `code`, the Python drawing body that uses the helpers (rect, wall, dim, text...)"
+        name = _cad.safe_name(a.get("name") or "drawing")
+        script = _cad.build_script(name, code, a.get("scale") or 50)
+        rel = f"{_cad.CAD_DIR}/{name}_build.py"
+        w = await self.tools.run("files_write", {"path": rel, "content": script}, intent=intent)
+        if not w.success:
+            await self.emit(EventType.ACTION_RESULT, tool="cad_draw", success=False, error=w.error, result={})
+            return f"FAILED: could not write the script ({w.error})"
+        r = await self.tools.run("shell", {"command": f"cd \"${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}/{_cad.CAD_DIR}\" && python3 {name}_build.py",
+                                           "timeout": 180}, intent=intent)
+        res = r.result if isinstance(r.result, dict) else {}
+        info = _cad.parse_result(res.get("stdout") or "")
+        if not info:
+            err = (res.get("stderr") or r.error or "no output")[-1500:]
+            if "No module named 'ezdxf'" in err or "No module named ezdxf" in err:
+                err += "\n(ezdxf missing: run shell `sudo apt install -y python3-ezdxf python3-matplotlib fonts-wqy-microhei`)"
+            await self.emit(EventType.ACTION_RESULT, tool="cad_draw", success=False, error=err[-300:], result={})
+            return f"FAILED: the drawing script raised an error. Fix the body and call cad_draw again.\n{err}"
+        self._acted = True
+        if a.get("open", True):
+            view = info.get("view_dxf") or info["dxf"]
+            await self.tools.run("shell", {"command": f"cd \"${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}/{_cad.CAD_DIR}\" && pkill -x librecad; "
+                                           f"(DISPLAY=:0 nohup librecad '{view}' >/dev/null 2>&1 &) ; sleep 2; echo ok",
+                                           "timeout": 20}, intent=intent)
+        sent = []
+        if a.get("deliver", True):
+            for key in ("pdf", "dxf"):
+                if info.get(key):
+                    f = await self.tools.run("send_file", {"path": f"{_cad.CAD_DIR}/{info[key]}"}, intent=intent)
+                    if f.success and isinstance(f.result, dict):
+                        await self._deliver_file(f.result)
+                        sent.append(info[key])
+        short = {k: info[k] for k in ("dxf", "pdf", "png", "extents_mm", "entities_by_layer", "render_error", "warning") if k in info}
+        await self.emit(EventType.ACTION_RESULT, tool="cad_draw", success=True, error=None, result={**short, "sent": sent})
+        tip = (f" Check it: read_image path={_cad.CAD_DIR}/{info['png']} with a question about missing or overlapping items."
+               if info.get("png") else "")
+        return (f"drawing saved: {json_short(short)}; sent to user: {sent or 'nothing'}; "
+                f"opened in LibreCAD: {bool(a.get('open', True))}.{tip}")
+
+    async def _read_image(self, a: dict) -> str:
+        """Read an image (or one PDF page) from ~/workspace and have the vision model describe it for drafting."""
+        path = (a.get("path") or "").strip().lstrip("/")
+        for pre in ("home/aiw/workspace/", "workspace/", "~/workspace/"):
+            if path.startswith(pre):
+                path = path[len(pre):]
+        if not path:
+            await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error="missing args ['path']", result={})
+            return "FAILED: read_image needs `path` (relative to ~/workspace)"
+        if path.lower().endswith(".pdf"):
+            page = int(a.get("page") or 1)
+            stem = f".preview/{_cad.safe_name(Path(path).stem)}-p{page}"
+            r = await self.tools.run("shell", {"command": f"cd \"${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}\" && mkdir -p .preview && pdftoppm -r 130 -png "
+                                               f"-f {page} -l {page} -singlefile '{path}' '{stem}'", "timeout": 60})
+            if not r.success:
+                err = (r.result or {}).get("stderr") if isinstance(r.result, dict) else r.error
+                return f"FAILED: could not render PDF page ({err}); is poppler-utils installed?"
+            path = stem + ".png"
+        f = await self.tools.run("send_file", {"path": path})   # binary read; not delivered to the chat
+        if not f.success or not isinstance(f.result, dict) or not f.result.get("content_b64"):
+            await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=f.error, result={})
+            return f"FAILED: cannot read {path} ({f.error}). Use files_list to find the uploaded file."
+        try:
+            img = Image.open(io.BytesIO(base64.b64decode(f.result["content_b64"]))).convert("RGB")
+            if max(img.size) > 2000:
+                k = 2000 / max(img.size)
+                img = img.resize((int(img.width * k), int(img.height * k)))
+            buf = io.BytesIO(); img.save(buf, "JPEG", quality=88)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+        except Exception as e:  # noqa: BLE001
+            return f"FAILED: {path} is not an image ({e})"
+        eyes = self.vision_llm or self.llm
+        q = (a.get("question") or "").strip()
+        try:
+            text = await asyncio.wait_for(eyes.describe(_cad.READ_IMAGE_PROMPT, q or "请按结构描述这张图。", b64, 1800),
+                                          self.cfg.vision_timeout_s * 3)
+        except Exception as e:  # noqa: BLE001
+            await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=str(e)[:200], result={})
+            return f"FAILED: the vision model could not read the image ({type(e).__name__})"
+        self._acted = True
+        await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
+                        result={"path": path, "chars": len(text or "")})
+        return f"image {path} reads:\n{(text or '').strip()[:3500]}"
 
     async def _delegate(self, goal: str) -> str:
         """Text-only helper: shell/file tools, no screenshots, its own short history."""
@@ -581,7 +675,7 @@ def _needs_action(prompt: str) -> bool:
     return any(w in p for w in _ACTION_WORDS)
 
 
-_NO_SCREEN_TOOLS = {"shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
+_NO_SCREEN_TOOLS = {"read_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "open_app"}
 
 
@@ -590,3 +684,8 @@ def _thumb(b64: str):
         return Image.open(io.BytesIO(base64.b64decode(b64))).convert("L").resize((64, 40)).tobytes()
     except Exception:  # noqa: BLE001
         return None
+
+
+def json_short(d: dict) -> str:
+    import json
+    return json.dumps(d, ensure_ascii=False)[:600]

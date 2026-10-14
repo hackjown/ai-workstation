@@ -59,7 +59,7 @@ class TaskIn(BaseModel):
     machine_id: str = "ai-linux-001"
     thread_id: Optional[str] = None
     max_steps: int = 40
-    timeout_s: float = 600
+    timeout_s: float = float(os.environ.get("AIW_TASK_TIMEOUT", "900"))
     isolated: bool = False
 
 class Answer(BaseModel):
@@ -466,7 +466,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.put("/api/settings/models", dependencies=[Depends(auth)])
     async def put_models(body: dict):
         m = {k: (str(body.get(k) or "").strip() or None)
-             for k in ("model", "vision_model", "fallback", "subagent_model", "base_url")}
+             for k in ("model", "vision_model", "fallback", "subagent_model", "base_url", "thinking")}
         store.kv_set("models", m)
         return m
 

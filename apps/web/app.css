@@ -216,3 +216,5 @@ pre.code { background:#fff; border:1px solid var(--line); border-radius:16px; pa
 .takebanner .dot { width:8px; height:8px; border-radius:50%; background:#f59e0b; animation:pulse 1.2s infinite; }
 .takebanner button { border:0; background:#fff; color:#111; border-radius:999px; padding:5px 12px; font-size:13px; cursor:pointer; }
 @keyframes pulse { 50% { opacity:.3; } }
+
+#sendBtn.busy{opacity:.55;pointer-events:none}

@@ -117,10 +117,18 @@ class LLMRouter:
         return cls(ps)
 
     async def decide(self, req: LLMRequest) -> LLMDecision:
+        """Try providers in order. A provider that takes longer than AIW_DECIDE_TIMEOUT (default 90s) is
+        abandoned for the next one (the fallback model); the last provider gets no limit."""
+        import asyncio
+        limit = float(os.environ.get("AIW_DECIDE_TIMEOUT", "90"))
         last = None
-        for p in self.providers:
+        for i, p in enumerate(self.providers):
             try:
+                if i < len(self.providers) - 1 and limit > 0:
+                    return await asyncio.wait_for(p.decide(req), limit)
                 return await p.decide(req)
+            except asyncio.TimeoutError:
+                last = TimeoutError(f"{getattr(p, 'model', p)} took over {limit:.0f}s")
             except Exception as e:  # noqa: BLE001
                 last = e
         raise RuntimeError(f"all LLM providers failed: {last}")

@@ -68,7 +68,7 @@ class OpenAIProvider(LLMProvider):
     async def decide(self, req: LLMRequest) -> LLMDecision:
         content = [{"type": "text", "text": user_text(req)}]
         if req.screenshot_b64 and not req.screen_desc:
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{req.screenshot_b64}"}})
+            content.append({"type": "image_url", "image_url": {"url": f"data:{_mime(req.screenshot_b64)};base64,{req.screenshot_b64}"}})
         body = {
             "model": self.model,
             "messages": [{"role": "system", "content": req.system}, {"role": "user", "content": content}],
@@ -79,11 +79,14 @@ class OpenAIProvider(LLMProvider):
         }
         required = {t["name"]: (t.get("parameters") or {}).get("required") or [] for t in req.tools}
         data, msg, calls, name, args = {}, {}, [], "", {}
+        attempts, out_tokens = 0, 0
         async with httpx.AsyncClient(timeout=180) as c:
             for attempt in range(3):
                 if attempt == 2:  # some gateways (e.g. GLM) only behave with tool_choice=auto
                     body["tool_choice"] = "auto"
                 data = await self._post(c, body)
+                attempts += 1
+                out_tokens += int((data.get("usage") or {}).get("completion_tokens") or 0)
                 choice = data["choices"][0]
                 msg = choice["message"]
                 calls = msg.get("tool_calls") or []
@@ -114,7 +117,8 @@ class OpenAIProvider(LLMProvider):
                                   "For long scripts first write the file with files_write, then run it with a short shell command."}]
         if not calls:
             return LLMDecision(msg.get("content") or "", "fail", {"reason": "model returned no tool call"}, raw=data)
-        return LLMDecision(msg.get("content") or "", name, args, raw=data, usage=data.get("usage", {}))
+        usage = {**(data.get("usage") or {}), "attempts": attempts, "out_tokens": out_tokens}
+        return LLMDecision(strip_think(msg.get("content") or ""), name, args, raw=data, usage=usage)
 
     def _extras(self) -> dict:
         if self.thinking != "off" or not self._extras_ok:
@@ -133,7 +137,7 @@ class OpenAIProvider(LLMProvider):
         body = {"model": self.model, "max_tokens": max_tokens, "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": [{"type": "text", "text": user},
-                                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}]}]}
+                                         {"type": "image_url", "image_url": {"url": f"data:{_mime(image_b64)};base64,{image_b64}"}}]}]}
         async with httpx.AsyncClient(timeout=120) as c:
             return strip_think((await self._post(c, body))["choices"][0]["message"].get("content") or "")
 
@@ -150,3 +154,7 @@ def strip_think(text: str) -> str:
     if "</think>" in text:
         text = text.split("</think>")[-1]
     return text.strip()
+
+
+def _mime(b64: str) -> str:
+    return "image/jpeg" if (b64 or "").startswith("/9j/") else "image/png"

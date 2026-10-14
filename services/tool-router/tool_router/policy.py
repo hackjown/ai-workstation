@@ -72,7 +72,7 @@ class PolicyEngine:
     def __init__(self, allow_domains: Optional[list[str]] = None, extra_rules: Optional[list[Rule]] = None):
         env = os.environ.get("AIW_ALLOW_DOMAINS", "")
         self.allow_domains = allow_domains if allow_domains is not None else [d.strip() for d in env.split(",") if d.strip()]
-        self.rules: list[Rule] = [self._shell, self._files, self._net, self._typing] + (extra_rules or [])
+        self.rules: list[Rule] = [self._shell, self._files, self._net, self._typing, self._dom] + (extra_rules or [])
 
     def check(self, action: str, payload: dict) -> Decision:
         best = Decision(RiskLevel.L0, "default allow")
@@ -120,6 +120,13 @@ class PolicyEngine:
 
     def _typing(self, action, p):
         if action == "computer.type" and SENSITIVE_PATH.search(p.get("text", "")):
+            return Decision(RiskLevel.L2, "typing sensitive-looking text")
+        return None
+
+    def _dom(self, action, p):
+        if action == "browser.click" and PAY_WORDS.search(p.get("text", "")):
+            return Decision(RiskLevel.L3, "clicking a payment button")
+        if action == "browser.fill" and SENSITIVE_PATH.search(p.get("text", "")):
             return Decision(RiskLevel.L2, "typing sensitive-looking text")
         return None
 

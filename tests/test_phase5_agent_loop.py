@@ -235,4 +235,4 @@ async def test_identical_write_is_skipped_and_unchanged_screen_not_resent(env):
     await loop.run()
     assert any("SKIPPED" in h for h in loop.history)
     assert llm.requests[0].screenshot_b64 and llm.requests[0].screenshot_b64.startswith("/9j/")  # JPEG
-    assert llm.requests[1].screenshot_b64 is None and "unchanged" in (llm.requests[1].note or "")
+    assert llm.requests[1].screenshot_b64 is None and "not re-read" in (llm.requests[1].note or "")  # file step: no screenshot

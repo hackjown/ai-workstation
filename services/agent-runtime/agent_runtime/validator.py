@@ -10,7 +10,9 @@ from PIL import Image, ImageChops
 VISUAL_ACTIONS = {"computer.click", "computer.double_click", "computer.right_click", "computer.type",
                   "computer.keypress", "computer.hotkey", "computer.scroll", "computer.drag",
                   "computer.open_app", "computer.close_app", "browser.open", "browser.navigate",
-                  "browser.back", "browser.forward"}
+                  "browser.back", "browser.forward", "browser.click"}
+# a page load can outlast the settle delay; "no change yet" is not a failure for these
+SLOW_ACTIONS = {"browser.open", "browser.navigate", "browser.back", "browser.forward"}
 
 
 def change_ratio(a_b64: str, b_b64: str) -> float:
@@ -36,6 +38,8 @@ class Validator:
             return Validation(False, None, f"action failed: {error}")
         if action in VISUAL_ACTIONS and before and after:
             r = change_ratio(before, after)
+            if r < self.min_change and action in SLOW_ACTIONS:
+                return Validation(True, r, f"no visible change yet after {action}; the page may still be loading")
             if r < self.min_change and action not in ("computer.scroll", "computer.keypress", "computer.hotkey"):
                 return Validation(False, r, f"no visible change after {action} ({r:.3%})")
             return Validation(True, r, f"screen changed {r:.1%}")

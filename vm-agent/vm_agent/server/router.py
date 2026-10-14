@@ -46,6 +46,8 @@ class Router:
             A.BROWSER_NAVIGATE: lambda p: self.browser.navigate(p["url"]),
             A.BROWSER_BACK: lambda p: self.browser.back(),
             A.BROWSER_FORWARD: lambda p: self.browser.forward(),
+            A.BROWSER_CLICK: lambda p: self.browser.click(p["text"]),
+            A.BROWSER_FILL: lambda p: self.browser.fill(p["field"], p["text"], bool(p.get("submit"))),
             A.FILES_LIST: lambda p: _sync(fread.list_dir, p["path"]),
             A.FILES_READ: lambda p: _sync(fread.read, p["path"], p.get("binary", False)),
             A.FILES_WRITE: lambda p: _sync(fwrite.write, p["path"], p["content"], p.get("append", False)),

@@ -97,6 +97,7 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 - Agent 不持有 PVE 凭据；PVE Token 只在 VM Runtime，且仅限 VM 100 的电源/快照权限。
 - 所有工具调用必经 Tool Router → Policy Engine：L4（root、碰 PVE、关机、改防火墙、写裸盘）直接拒绝；L3（`rm -rf`、批量删除、`curl|sh`、ssh/scp、内网地址、敏感文件、付款意图、白名单外域名）弹窗等你确认；L2 执行并审计。
 - VM Agent 以普通用户运行，文件操作限制在 `~/workspace`，Shell 有超时和输出上限。
+- 推荐运行 `deploy/vm/headless-desktop.sh`：用 TigerVNC 在开机时创建独立虚拟桌面 :1，不依赖 PVE 控制台登录，也不会因为控制台黑屏而黑屏。
 - vm-agent 需 Token，x11vnc 只监听 localhost 且必须有密码，6080/8765 端口建议只放行 API 主机。
 - 每个动作写入 `machine_actions`，每一步事件写入 `agent_events`，截图存为 Artifact。
 

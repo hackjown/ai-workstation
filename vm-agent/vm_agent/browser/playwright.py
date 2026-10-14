@@ -61,7 +61,8 @@ class Browser:
             if wid:
                 await asyncio.sleep(1.0)  # let the page start painting
                 p2 = await asyncio.create_subprocess_shell(
-                    f"xdotool windowactivate {wid}", stdout=asyncio.subprocess.DEVNULL,
+                    f"xdotool windowactivate {wid}; command -v wmctrl >/dev/null && "
+                    f"wmctrl -i -r {wid} -b add,maximized_vert,maximized_horz", stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL, env=self.b.env)
                 await p2.wait()
                 return True

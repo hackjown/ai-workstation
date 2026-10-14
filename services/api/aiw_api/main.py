@@ -237,6 +237,20 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         files = [a for a in store.artifacts(sid) if a["kind"] == "file"] if sid else []
         return {"task": t, "actions": out, "files": files}
 
+    @app.get("/api/tasks/{task_id}/export", dependencies=[Depends(auth)])
+    async def export_task(task_id: str):
+        """Everything needed to debug a run, no screenshots or secrets: task, model steps with timing, tool results."""
+        base = await receipts(task_id)
+        sid = base["task"].get("session_id")
+        steps = []
+        for e in (store.events(sid, limit=2000) if sid else []):
+            d = e.get("data") if isinstance(e.get("data"), dict) else {}
+            d = {k: v for k, v in d.items() if k not in ("screenshot", "screenshot_b64", "image", "content_b64")}
+            steps.append({"type": e.get("type"), "step": e.get("step"), "at": e.get("ts"), **d})
+        settings = store.kv_get("models", {}) or {}
+        return {"exported_at": time.time(), "task": base["task"], "models": {k: v for k, v in settings.items() if "key" not in k.lower()},
+                "events": steps, "receipts": base["actions"], "files": [f.get("path") for f in base["files"]]}
+
     # ------------------------------------------------------------- threads
     def _thread_full(tid: str) -> dict:
         th = store.thread(tid)

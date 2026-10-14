@@ -200,3 +200,27 @@ async def test_delegate_without_goal_is_bounced(env):
                      config=LoopConfig(max_steps=5, timeout_s=20, make_plan=False))
     await loop.run()
     assert any("delegate needs a non-empty" in h for h in loop.history)
+
+
+def test_plan_parser_drops_reasoning():
+    from agent_runtime.planner import parse_plan
+    junk = "The user wants a plan for an agent.\nI need to write 2-5 short steps.\nSteps:\nOpen terminal"
+    assert parse_plan(junk, "用 Python 新建 周报.docx") == []
+    assert parse_plan('思考…\n["生成 周报.docx", "发给用户"]', "新建周报") == ["生成 周报.docx", "发给用户"]
+
+
+def test_question_is_not_a_task():
+    from agent_runtime.loop import _needs_action
+    assert not _needs_action("为什么没执行")
+    assert _needs_action("帮我执行 ls")
+
+
+async def test_stops_after_file_is_sent(env):
+    backend, comp, tmp = env
+    (tmp / "a.txt").write_text("hi")
+    llm = ScriptedProvider([("send_file", {"path": "a.txt"}), ("files_list", {"path": "."}),
+                            ("files_list", {"path": "."}), ("files_list", {"path": "."})])
+    loop = AgentLoop(Task(prompt="把 a.txt 发给我"), "s4", comp, LLMRouter([llm]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=8, timeout_s=20, make_plan=False, artifacts_dir=str(tmp / "art")))
+    task = await loop.run()
+    assert task.status == TaskStatus.SUCCEEDED and "a.txt" in task.result

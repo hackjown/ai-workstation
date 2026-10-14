@@ -15,7 +15,7 @@ U=$(id -un); H=$HOME; GEOMETRY=${GEOMETRY:-1600x900}
 
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tigervnc-standalone-server tigervnc-tools dbus-x11 x11-utils \
-  python3-pip python3-openpyxl python3-docx python3-matplotlib fonts-noto-cjk imagemagick x11-apps scrot
+  python3-pip python3-openpyxl python3-bs4 python3-docx python3-matplotlib fonts-noto-cjk imagemagick x11-apps scrot
 python3 -m pip install -q --user --break-system-packages python-pptx || true
 
 mkdir -p "$H/.config/aiw"

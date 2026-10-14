@@ -224,7 +224,7 @@ function renderTask(t) {
   if (t.result && !liveNow) html += `<div class="bubble result" style="max-width:100%;background:${t.status === "succeeded" ? "var(--sky)" : "var(--dangerBg)"}">${esc(t.result)}</div>`;
   html += `<div class="foot">`;
   if (liveNow) html += `<button class="btn sm" onclick="go('computer')">${icon("monitor")}看桌面</button><button class="btn sm danger" onclick="ctl('${t.session_id}','stop')">${icon("stop")}停止</button>`;
-  if (t.session_id) html += `<button class="btn sm" onclick="replay('${t.session_id}')">${icon("play")}回放</button><button class="btn sm" onclick="receipts('${t.id}')">${icon("receipt")}收据</button>`;
+  if (t.session_id) html += `<button class="btn sm" onclick="replay('${t.session_id}')">${icon("play")}回放</button><button class="btn sm" onclick="receipts('${t.id}')">${icon("receipt")}收据</button><button class="btn sm" onclick="exportTask('${t.id}')">导出</button>`;
   if (["failed", "stopped", "interrupted"].includes(t.status)) html += `<button class="btn sm primary" onclick="retry('${t.id}')">${icon("retry")}重试</button>`;
   if (!liveNow && t.result && ("speechSynthesis" in window || NATIVE)) html += `<button class="btn sm" onclick="speak(${esc(JSON.stringify(t.result))})">${icon("speaker")}朗读</button>`;
   html += `</div></div></div>`;

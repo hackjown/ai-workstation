@@ -27,7 +27,7 @@ Environment=XDG_SESSION_TYPE=x11
 Environment=XDG_CURRENT_DESKTOP=XFCE
 ExecStartPre=/bin/sh -c 'for i in \$(seq 1 30); do xdpyinfo -display :1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/xfce4-session
-ExecStartPost=-/bin/sh -c 'sleep 4; xset -display :1 s off -dpms s noblank'
+ExecStartPost=-/bin/sh -c 'sleep 4; xset -display :1 s off; xset -display :1 s noblank; pkill -u \$USER xfce4-screensaver; exit 0'
 Restart=always
 RestartSec=3
 

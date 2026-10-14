@@ -353,9 +353,24 @@ async function receipts(tid) {
   const r = await api("GET", `/api/tasks/${tid}/receipts`);
   const rows = r.actions.map((a) => `<tr><td>${when(a.at)}</td><td><b>${esc(a.action)}</b><div class="small">${esc(JSON.stringify(a.payload || {}).slice(0, 220))}</div></td>
     <td>L${a.level ?? "?"}<div class="small">${esc(a.reason || "")}</div></td><td>${a.ok === true ? "✅" : a.ok === false ? "❌ " + esc(a.error || "") : "⛔ 未执行"}</td><td>${a.duration_ms ? Math.round(a.duration_ms) + "ms" : ""}</td></tr>`).join("");
-  modal(`<div class="row gap"><div class="grow"><div class="heading">操作收据</div><div class="small">${esc(r.task.prompt).slice(0, 80)}</div></div><button class="icon" onclick="closeOverlays()">${icon("x")}</button></div>
+  modal(`<div class="row gap"><div class="grow"><div class="heading">操作收据</div><div class="small">${esc(r.task.prompt).slice(0, 80)}</div></div><button class="btn sm" onclick="exportTask('${tid}')">导出</button><button class="btn sm" onclick="exportTask('${tid}', true)">复制</button><button class="icon" onclick="closeOverlays()">${icon("x")}</button></div>
     <div style="margin-top:12px">${rows ? `<table>${rows}</table>` : `<div class="empty">没有记录</div>`}</div>
     ${r.files.length ? `<div class="label" style="margin:14px 0 6px">交付的文件</div>` + r.files.map((f) => `<a class="filecard" href="${artUrl(f.path, true)}">${icon("file")}${esc(f.path.split("/").pop())}</a>`).join("") : ""}`);
+}
+
+async function exportTask(tid, copy) {
+  try {
+    const r = await api("GET", `/api/tasks/${tid}/export`);
+    const text = JSON.stringify(r, null, 1);
+    if (copy) {
+      try { await navigator.clipboard.writeText(text); toast("已复制，可以直接粘贴给我看"); return; } catch (e) { /* insecure origin: fall back to download */ }
+    }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+    a.download = `aiw-task-${tid.slice(0, 8)}.json`; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    toast(copy ? "浏览器不允许复制，已改为下载文件" : "已导出");
+  } catch (e) { toast("导出失败：" + e.message); }
 }
 
 /* ---------------------------------------------------------------- activity */

@@ -67,6 +67,29 @@ TOOLS: list[ToolSpec] = [
              "Send a finished file (docx/xlsx/pdf/png/zip...) to the user's chat window as a download. "
              "Path is relative to ~/workspace; copy or save the file there first.",
              {"path": {"type": "string"}}, ["path"]),
+    ToolSpec("read_image", None,
+             "Read an image or a PDF page in ~/workspace (an uploaded design drawing, rendering, sketch, quote-sheet "
+             "photo, or a cad_draw preview) with the vision model. Returns a structured Chinese description: drawing "
+             "type, every readable dimension, components left-to-right, materials, and unclear points. Ask a specific "
+             "question to focus it, e.g. '电视墙从左到右每段宽度是多少'.",
+             {"path": {"type": "string", "description": "relative to ~/workspace, e.g. uploads/设计图.jpg"},
+              "page": {"type": "integer", "description": "PDF page, 1-based"},
+              "question": {"type": "string"}}, ["path"]),
+    ToolSpec("cad_draw", None,
+             "Make a construction drawing (施工图: plan/elevation/section/detail) as DXF + PDF with exact dimensions. "
+             "`code` is the Python BODY only (ezdxf, millimetres, 1:scale); a prelude already defines doc, msp, SCALE "
+             "and helpers: frame(x0,y0,size='A3',title,project,sheet,date)->(ix0,iy0,ix1,iy1) inner box; "
+             "rect(x,y,w,h,layer); line(p1,p2,layer); pline(pts,close,layer); circle(c,r); arc(c,r,a1,a2); "
+             "wall(x1,y1,x2,y2,t=240); door(x,y,w,angle,swing); window(x1,y1,x2,y2,t); hatch(pts,pattern,scale); "
+             "text(x,y,s,h_mm=3.5,layer,align); note(x,y,lines,h,title); leader(pts,s); dim(p1,p2,offset); "
+             "dim_chain(points,offset) (segments + overall); elev_level(x,y,value_m); view_title(x,y,s,scale). "
+             "Layers: 墙体 门窗 柜体 家具 完成面 轴线 隐藏线 填充 尺寸 文字 图框 索引. Text heights are printed mm. "
+             "Put several views on one sheet by offsetting origins inside the frame. The DXF opens in LibreCAD on "
+             "the desktop and PDF+DXF are sent to the user. On a script error, fix the code and call again.",
+             {"name": {"type": "string", "description": "file name without extension, e.g. 客厅背景墙立面"},
+              "code": {"type": "string"},
+              "scale": {"type": "integer", "description": "1:scale, default 50 (details 1:10 or 1:20)"},
+              "open": {"type": "boolean"}, "deliver": {"type": "boolean"}}, ["name", "code"]),
     ToolSpec("update_plan", None, "Mark plan steps finished (0-based indexes) and optionally add a short progress note.",
              {"done": {"type": "array", "items": {"type": "integer"}}, "note": {"type": "string"}}, ["done"]),
     ToolSpec("ask_user", None, "Ask the user a question when required information is missing (login choice, which file, "
@@ -85,7 +108,7 @@ TOOLS: list[ToolSpec] = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element", "cad_draw", "read_image"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

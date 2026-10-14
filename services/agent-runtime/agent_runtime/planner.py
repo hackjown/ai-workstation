@@ -20,8 +20,10 @@ Rules:
   for a success or error message before you report the result.
 - CAD / 施工图 (construction drawings from a design image + 报价清单): never draw with the mouse. Workflow:
   1. `files_list` uploads/ to find the files. Read each design image with `read_image` (ask focused questions for
-     widths/heights you need); read the quote list with `shell` (xlsx: python3 + openpyxl printing every row; pdf:
-     `pdftotext -layout`; images: `read_image`). Collect for each item: 位置, 名称, 尺寸 (长×宽×高 mm), 材料, 做法.
+     widths/heights you need); read the quote list with `shell` (.xlsx: openpyxl; old .xls: `import xlrd` (apt
+     python3-xlrd is installed; openpyxl cannot open .xls). Print EVERY row of every sheet in one script. If xlrd
+     fails, convert with `soffice --headless -env:UserInstallation=file:///tmp/lo_conv --convert-to xlsx FILE`
+     (the separate profile avoids hanging on an open LibreOffice window). pdf: `pdftotext -layout`; images: `read_image`). Collect for each item: 位置, 名称, 尺寸 (长×宽×高 mm), 材料, 做法.
   2. If a size that the drawing needs is in neither file, `ask_user` once with ALL missing values; never invent.
   3. `cad_draw` one sheet per wall/room (平面图, 各立面图, 必要的剖面/节点), dimensions from the quote list, layout
      from the design image, 做法说明 from the quote list via note(); frame() with title, project, sheet numbers.

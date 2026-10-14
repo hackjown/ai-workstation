@@ -30,9 +30,9 @@ KEY_ALIASES = {
 
 # App names the agent may use -> launch commands
 APP_COMMANDS = {
-    "chrome": "google-chrome --no-first-run --no-default-browser-check || chromium --no-first-run || chromium-browser --no-first-run",
+    "chrome": "google-chrome --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic || chromium --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic || chromium-browser --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic",
     "chromium": "chromium --no-first-run || chromium-browser --no-first-run",
-    "browser": "google-chrome --no-first-run || chromium --no-first-run || chromium-browser --no-first-run",
+    "browser": "google-chrome --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic || chromium --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic || chromium-browser --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic",
     "terminal": "xfce4-terminal || x-terminal-emulator",
     "files": "thunar",
     "editor": "mousepad",
@@ -107,7 +107,7 @@ class X11Backend(DesktopBackend):
 
     def _grab_any(self) -> Image.Image:
         """mss fails on some Xvnc servers ("drawable's visual not found"), so fall back through other grabbers."""
-        order = ["mss", "pil", "import", "xwd", "scrot"]
+        order = ["mss", "xwdraw", "pil", "scrot", "import", "xwd"]
         if self._grabber in order:
             order.remove(self._grabber)
             order.insert(0, self._grabber)
@@ -126,6 +126,28 @@ class X11Backend(DesktopBackend):
         with mss.mss(display=self.display) as sct:
             shot = sct.grab(sct.monitors[0])
             return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+    def _grab_xwdraw(self) -> Image.Image:
+        """xwd + a tiny parser: ~0.3s, versus ~5s for ImageMagick `import`."""
+        if not shutil.which("xwd"):
+            raise RuntimeError("xwd not installed (apt install x11-apps)")
+        import struct
+        import subprocess
+        env = dict(os.environ, DISPLAY=self.display or os.environ.get("DISPLAY", ":1"))
+        raw = subprocess.run(["xwd", "-root", "-silent"], env=env, capture_output=True, timeout=15, check=True).stdout
+        f = struct.unpack(">25I", raw[:100])
+        header, depth, w, h, byte_order, bpp, bpl, ncolors = f[0], f[3], f[4], f[5], f[7], f[11], f[12], f[19]
+        red_mask = f[14]
+        data = raw[header + ncolors * 12:]
+        if bpp == 32:
+            mode = ("BGRX" if red_mask == 0xFF0000 else "RGBX") if byte_order == 0 else ("XRGB" if red_mask == 0xFF0000 else "XBGR")
+            return Image.frombuffer("RGBX", (w, h), data, "raw", mode, bpl, 1).convert("RGB")
+        if bpp == 24:
+            mode = "BGR" if (byte_order == 0) == (red_mask == 0xFF0000) else "RGB"
+            return Image.frombuffer("RGB", (w, h), data, "raw", mode, bpl, 1)
+        if bpp == 16 and depth == 16 and byte_order == 0:
+            return Image.frombuffer("RGB", (w, h), data, "raw", "BGR;16", bpl, 1)
+        raise RuntimeError(f"unsupported xwd format bpp={bpp} depth={depth}")
 
     def _grab_pil(self) -> Image.Image:
         from PIL import ImageGrab

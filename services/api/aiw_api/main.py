@@ -791,6 +791,14 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         return {"ok": True}
 
     if os.path.isdir(settings.web_dir):
+        @app.middleware("http")
+        async def no_stale_web(request: Request, call_next):
+            resp = await call_next(request)
+            p = request.url.path
+            if not p.startswith("/api") and (p == "/" or p.endswith((".js", ".css", ".html"))):
+                resp.headers["Cache-Control"] = "no-cache"  # always revalidate so updates show up at once
+            return resp
+
         app.mount("/", StaticFiles(directory=settings.web_dir, html=True), name="web")
     return app
 

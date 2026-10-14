@@ -167,6 +167,8 @@ class AgentLoop:
         self._sent_file, self._after_send = None, 0
         self._last_sent_thumb = None
         self._last_ok: Optional[tuple] = None
+        self._prev_sig: Optional[tuple] = None
+        self._rep = 0
         note: Optional[str] = None
         while self.step < self.cfg.max_steps:
             if await self.control.checkpoint():
@@ -228,6 +230,19 @@ class AgentLoop:
             await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args, llm_ms=llm_ms,
                             out_tokens=u.get("out_tokens") or u.get("completion_tokens"), attempts=u.get("attempts"))
             sig = (decision.tool, repr(sorted(decision.args.items())))
+            if decision.tool not in ("screenshot", "wait", "done", "fail"):
+                self._rep = self._rep + 1 if sig == self._prev_sig else 0
+                self._prev_sig = sig
+                if self._rep >= 4:
+                    await self.emit(EventType.VALIDATION, success=False, change=0.0, message="同一操作连续重复，已停止")
+                    self._finish(TaskStatus.FAILED, f"模型连续 {self._rep + 1} 次重复同一操作（{decision.tool}），已停止以免空转。请换更稳定的主模型或把任务拆小。")
+                    return
+                if self._rep >= 2:
+                    self.history.append(f"{self.step}. {decision.tool} SKIPPED: same call as the previous {self._rep} steps; its result is already above")
+                    note = (f"You have issued the identical {decision.tool} call {self._rep + 1} times in a row. Its result is already in "
+                            "PREVIOUS STEPS. Do something different now: fix the problem shown there, run the script, or finish with done/fail.")
+                    await self.emit(EventType.VALIDATION, success=False, change=0.0, message="重复操作已跳过")
+                    continue
             if self._last_ok and sig == self._last_ok[0] and decision.tool in _NO_REPEAT:
                 self.history.append(f"{self.step}. {decision.tool} SKIPPED: identical to step {self._last_ok[1]}, which already succeeded")
                 note = (f"You just repeated step {self._last_ok[1]} exactly ({decision.tool}); it already succeeded, so it was skipped. "
@@ -417,6 +432,8 @@ class AgentLoop:
             out = ""
             if o.action == "shell.exec" and o.result:
                 out = f" exit={o.result.get('exit_code')} out={str(o.result.get('stdout',''))[:300]!r} err={str(o.result.get('stderr',''))[:200]!r}"
+            elif o.action == "files.read" and d.tool == "files_read" and isinstance(o.result, dict):
+                out = " content:\n" + _read_excerpt(o.result.get("content") or "", 4000)
             hist.append(f"{i+1}. {d.tool}({_args_short(d.args)}) -> {'ok' if o.success else 'FAILED ' + str(o.error)}{out}")
         await self.emit(EventType.SUBAGENT, phase="done", summary=summary)
         await self.emit(EventType.ACTION_RESULT, tool="delegate", success=True, error=None, result={"summary": summary[:500]})
@@ -438,6 +455,13 @@ def _short(d: dict) -> dict:
     return out
 
 
+def _read_excerpt(text: str, limit: int = 6000) -> str:
+    """File content the model sees: whole file when short, head and tail when long."""
+    if len(text) <= limit:
+        return text
+    return text[: limit * 2 // 3] + f"\n... [{len(text) - limit} chars omitted] ...\n" + text[-limit // 3:]
+
+
 def _hist_line(step, decision, outcome, vmsg) -> str:
     args = {k: (v[:80] if isinstance(v, str) else v) for k, v in decision.args.items()}
     res = ""
@@ -446,6 +470,11 @@ def _hist_line(step, decision, outcome, vmsg) -> str:
                + (f" err={outcome.result.get('stderr','')[-300:]!r}" if outcome.result.get("stderr") else ""))
     elif outcome.action == "files.write" and outcome.success and isinstance(outcome.result, dict):
         res = f" saved {outcome.result.get('path')} ({outcome.result.get('size')} bytes); next: run or use it"
+    elif outcome.action == "files.read" and outcome.success and isinstance(outcome.result, dict) and decision.tool == "files_read":
+        res = " content:\n" + _read_excerpt(outcome.result.get("content") or "") + "\n(end of file content; do not read it again)"
+    elif outcome.action == "files.list" and outcome.success and isinstance(outcome.result, dict):
+        ents = outcome.result.get("entries") or []
+        res = " entries=" + ", ".join((e.get("name", "") + ("/" if e.get("dir") else "")) for e in ents[:60])
     status = "ok" if outcome.success else f"FAILED ({outcome.error})"
     return f"{step}. {decision.tool}({args}) -> {status}{res}; {vmsg}"
 

@@ -94,14 +94,14 @@ class LLMRouter:
     @classmethod
     def from_settings(cls, model: str | None = None, fallback: str | None = None,
                       api_key: str | None = None, base_url: str | None = None,
-                      tool_choice: dict | None = None) -> "LLMRouter":
+                      tool_choice: dict | None = None, thinking: str | None = None) -> "LLMRouter":
         """Models picked in the web console (OpenAI-compatible gateway). Falls back to env config."""
         from .providers.openai import OpenAIProvider
         key = api_key or os.environ.get("OPENAI_API_KEY")
         if not key or not (model or fallback):
             return cls.from_env()
         tc = tool_choice or {}
-        ps = [OpenAIProvider(model=m, api_key=key, base_url=base_url, tool_choice=tc.get(m)) for m in (model, fallback) if m]
+        ps = [OpenAIProvider(model=m, api_key=key, base_url=base_url, tool_choice=tc.get(m), thinking=thinking) for m in (model, fallback) if m]
         return cls(ps)
 
     @classmethod

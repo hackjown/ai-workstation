@@ -75,7 +75,7 @@ class ToolExecutor:
 
         observe = spec.action not in ("computer.screenshot", "shell.exec") and not spec.action.startswith("files.")
         r = await self.computer.execute(spec.action, payload, observe=observe,
-                                        timeout=float(args.get("timeout", 60 if spec.action == "shell.exec" else 30)))
+                                        timeout=float(args.get("timeout", _default_timeout(spec.action, args))))
         await self._audit({"phase": "result", "tool": name, "action": spec.action, "success": r.success,
                            "error": r.error, "duration_ms": r.duration_ms})
         return ToolOutcome(name, spec.action, r.success, decision, r.result, r.error, r.screenshot)
@@ -92,3 +92,14 @@ def _redact(p: dict) -> dict:
     if "content" in out and isinstance(out["content"], str) and len(out["content"]) > 200:
         out["content"] = out["content"][:200] + "..."
     return out
+
+
+import re as _re
+_INSTALL = _re.compile(r"\b(pip3?|apt(-get)?|npm|pnpm|yarn|conda|uv)\b.*\b(install|add|update|upgrade)\b|playwright install|git clone|curl|wget", _re.I)
+
+
+def _default_timeout(action: str, args: dict) -> float:
+    """Shell commands get 60s, package installs and downloads 300s (a mirror can be slow)."""
+    if action != "shell.exec":
+        return 30
+    return 300 if _INSTALL.search(str(args.get("command", ""))) else 60

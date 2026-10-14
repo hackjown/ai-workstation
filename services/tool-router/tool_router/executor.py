@@ -14,6 +14,11 @@ ConfirmFn = Callable[[str, dict, Decision], Awaitable[bool]]
 AuditFn = Callable[[dict], Awaitable[None]]
 
 COORD_KEYS = ("x", "y", "x1", "y1", "x2", "y2")
+# seconds to wait after an action before the follow-up screenshot: long enough for a page to react,
+# because that screenshot is also what the model sees on its next step
+SETTLE = {"computer.click": 0.8, "computer.double_click": 0.8, "computer.right_click": 0.6, "computer.keypress": 0.6,
+          "computer.type": 0.3, "browser.click": 1.2, "browser.fill": 0.4, "browser.navigate": 1.5,
+          "browser.open": 1.0, "browser.back": 1.2, "browser.forward": 1.2}
 
 
 @dataclass
@@ -73,6 +78,9 @@ class ToolExecutor:
             if not ok:
                 return ToolOutcome(name, spec.action, False, decision, error=f"user declined: {decision.reason}")
 
+        if spec.action in SETTLE:
+            import os
+            payload.setdefault("settle", SETTLE[spec.action] * float(os.environ.get("AIW_SETTLE_SCALE", "1")))
         observe = spec.action not in ("computer.screenshot", "shell.exec") and not spec.action.startswith("files.")
         r = await self.computer.execute(spec.action, payload, observe=observe,
                                         timeout=float(args.get("timeout", _default_timeout(spec.action, args))))

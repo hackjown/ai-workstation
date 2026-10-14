@@ -31,10 +31,42 @@ class Browser:
         return self._page
 
     async def open(self, url: str | None = None) -> dict:
-        await self.b.open_app("chrome")
-        if url:
-            return await self.navigate(url)
-        return {"opened": True}
+        if self.mode == "playwright" or not url or not hasattr(self.b, "env"):
+            await self.b.open_app("chrome")
+            if url:
+                return await self.navigate(url)
+            return {"opened": True}
+        # Pass the URL on Chrome's command line: no keystrokes race a window that is still starting
+        # (typing ctrl+l into the desktop is what made browser_open hang), and a running Chrome
+        # simply opens it in a new tab.
+        import shlex
+        from ..computer.desktop import APP_COMMANDS
+        cmd = " || ".join(f"{alt.strip()} {shlex.quote(url)}" for alt in APP_COMMANDS["chrome"].split("||"))
+        proc = await asyncio.create_subprocess_shell(
+            f"nohup sh -c {shlex.quote(cmd)} >/dev/null 2>&1 &", env=self.b.env)
+        await proc.wait()
+        window = await self._wait_window()
+        return {"url": url, "window": window}
+
+    async def _wait_window(self, timeout: float = 12.0) -> bool:
+        """Wait until a Chrome window is visible and raise it, so the user sees it in the desktop view."""
+        loop = asyncio.get_running_loop()
+        end = loop.time() + timeout
+        while loop.time() < end:
+            proc = await asyncio.create_subprocess_shell(
+                "xdotool search --onlyvisible --class 'chrom' | tail -1",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=self.b.env)
+            out, _ = await proc.communicate()
+            wid = out.decode().strip()
+            if wid:
+                await asyncio.sleep(1.0)  # let the page start painting
+                p2 = await asyncio.create_subprocess_shell(
+                    f"xdotool windowactivate {wid}", stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL, env=self.b.env)
+                await p2.wait()
+                return True
+            await asyncio.sleep(0.5)
+        return False
 
     async def navigate(self, url: str) -> dict:
         if self.mode == "playwright":

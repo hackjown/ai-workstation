@@ -270,13 +270,6 @@ class SessionManager:
         async def remember(text: str):
             self.store.insert("memories", {"text": text[:500], "source": task.id})
 
-        from .integrations import load_tools
-        try:
-            extra = await load_tools(self.store, self.secrets) if self.secrets else {}
-        except Exception as e:  # noqa: BLE001
-            log.warning("integrations unavailable: %s", e)
-            extra = {}
-
         prof = self.store.kv_get("profile", {}) or {}
         system_extra = f"Agent name: {prof['agent_name']}." if prof.get("agent_name") else ""
         if prof.get("tone"):
@@ -295,15 +288,21 @@ class SessionManager:
         computer = computer or self.computer(task.machine_id)
         live.cleanup = cleanup
 
-        loop = AgentLoop(task, sid, computer, self._llm(), ToolExecutor(computer, confirm=confirm, audit=audit),
-                         control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
-                         subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(), system_extra=system_extra.strip(),
-                         config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
-                                           artifacts_dir=self.settings.artifacts_dir))
-
         async def runner():
             self.store.update_task(task.id, TaskStatus.RUNNING.value)
             try:
+                # integrations (MCP servers) are loaded here, off the request path: POST /api/tasks returns at once
+                from .integrations import load_tools
+                try:
+                    extra = await load_tools(self.store, self.secrets) if self.secrets else {}
+                except Exception as e:  # noqa: BLE001
+                    log.warning("integrations unavailable: %s", e)
+                    extra = {}
+                loop = AgentLoop(task, sid, computer, self._llm(), ToolExecutor(computer, confirm=confirm, audit=audit),
+                                 control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
+                                 subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(), system_extra=system_extra.strip(),
+                                 config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
+                                                   artifacts_dir=self.settings.artifacts_dir))
                 t = await loop.run()
                 status, result = t.status.value, t.result
             except Exception as e:  # noqa: BLE001

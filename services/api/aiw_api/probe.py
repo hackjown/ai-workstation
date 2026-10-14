@@ -81,5 +81,26 @@ async def probe(base: str, key: str, model: str) -> dict:
         except Exception as e:  # noqa: BLE001
             notes.append(f"看图：{e}"[:200])
         out["vision_ms"] = int((time.time() - t0) * 1000)
+        # speed: plain text generation of a known length -> tokens/s, time to answer, hidden reasoning
+        t0 = time.time()
+        try:
+            data = await _post(c, url, key, {
+                "model": model, "max_tokens": 400, "messages": [{"role": "user", "content":
+                    "Count from 1 to 60 separated by commas. Output only the numbers."}]})
+            sec = max(time.time() - t0, 0.01)
+            usage = data.get("usage") or {}
+            toks = int(usage.get("completion_tokens") or 0)
+            msg = data["choices"][0]["message"]
+            reasoning = int(((usage.get("completion_tokens_details") or {}).get("reasoning_tokens")) or 0)
+            if not reasoning and (msg.get("reasoning_content") or msg.get("reasoning")):
+                reasoning = len(str(msg.get("reasoning_content") or msg.get("reasoning"))) // 3
+            out["speed_ms"] = int(sec * 1000)
+            out["tok_s"] = round(toks / sec, 1) if toks else None
+            out["reasoning_tokens"] = reasoning
+            out["speed"] = "fast" if sec < 6 and not reasoning else ("slow" if sec > 20 or reasoning > 300 else "medium")
+            if reasoning:
+                notes.append(f"带隐藏推理约 {reasoning} token，会明显变慢")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"速度：{e}"[:200])
     out["notes"] = notes
     return out

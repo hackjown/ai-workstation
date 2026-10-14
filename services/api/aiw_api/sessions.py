@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import asyncio
 import logging
 import time
@@ -77,7 +79,7 @@ class SessionManager:
             return self._custom_llm()
         m = self.model_settings()
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m.get("model"), m.get("fallback"), key, m.get("base_url") or None, self._tool_choices())
+        return LLMRouter.from_settings(m.get("model"), m.get("fallback"), key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"))
 
     def _subagent_llm(self) -> Optional[LLMRouter]:
         if self._custom_llm:
@@ -86,7 +88,7 @@ class SessionManager:
         if not m.get("subagent_model"):
             return None
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m["subagent_model"], None, key, m.get("base_url") or None, self._tool_choices())
+        return LLMRouter.from_settings(m["subagent_model"], None, key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"))
 
     def _tool_choices(self) -> dict:
         """tool_choice that the probe found working for each model ('auto' for gateways that break on 'required')."""
@@ -100,7 +102,7 @@ class SessionManager:
         if not m.get("vision_model") or m.get("vision_model") == m.get("model"):
             return None
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m["vision_model"], None, key, m.get("base_url") or None)
+        return LLMRouter.from_settings(m["vision_model"], None, key, m.get("base_url") or None, None, m.get("thinking"))
 
     # ------------------------------------------------------------------ context
     def build_context(self, thread_id: Optional[str], exclude_task: Optional[str] = None) -> Optional[str]:
@@ -127,7 +129,7 @@ class SessionManager:
         return None
 
     async def submit(self, prompt: str, machine_id: Optional[str] = None, thread_id: Optional[str] = None,
-                     source: str = "chat", max_steps: int = 40, timeout_s: float = 600, title: Optional[str] = None,
+                     source: str = "chat", max_steps: int = 40, timeout_s: float = float(os.environ.get("AIW_TASK_TIMEOUT", "900")), title: Optional[str] = None,
                      isolated: bool = False) -> dict:
         machine_id = machine_id or (self.settings.machines[0].id if self.settings.machines else "ai-linux-001")
         if not self.store.machine(machine_id):
@@ -152,7 +154,7 @@ class SessionManager:
     async def _start_task_row(self, row: dict) -> LiveSession:
         task = Task(id=row["id"], prompt=row["prompt"], machine_id=row["machine_id"], thread_id=row.get("thread_id"),
                     source=row.get("source") or "chat", max_steps=row.get("max_steps") or 40,
-                    timeout_s=row.get("timeout_s") or 600)
+                    timeout_s=row.get("timeout_s") or float(os.environ.get("AIW_TASK_TIMEOUT", "900")))
         task.context = self.build_context(task.thread_id, exclude_task=task.id)
         return await self.start(task)
 

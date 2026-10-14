@@ -176,7 +176,7 @@ function renderTask(t) {
     if (e.type === "task.started") startTs = e.ts;
     if (e.type === "agent.plan") plan = { steps: d.plan || [], done: d.done || [] };
     if (e.type === "agent.plan_update" && plan) plan = { ...plan, done: d.done || [] };
-    if (e.type === "agent.decision") cur = { tool: d.tool, args: d.args, thought: d.thought, ok: null, ms: d.llm_ms };
+    if (e.type === "agent.decision") cur = { tool: d.tool, args: d.args, thought: d.thought, ok: null, ms: d.llm_ms, tok: d.out_tokens, tries: d.attempts };
     if (e.type === "agent.action_result" && cur && cur.tool === d.tool) { cur.ok = d.success; cur.err = d.error; if (cur.tool !== "screenshot") steps.push(cur); cur = null; }
     if (e.type === "agent.subagent" && d.phase === "step") steps.push({ tool: d.tool, args: d.args, sub: true, ok: true });
     if (e.type === "agent.file") files.push(d);
@@ -203,7 +203,7 @@ function renderTask(t) {
   }
   if (steps.length) {
     html += `<details class="steps" ${liveNow ? "open" : ""}><summary>${icon("chev", "chev")}${steps.length} 个操作</summary><div class="steplist">${steps.slice(-40).map((s) =>
-      `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${s.ms ? `<em class="ms">${(s.ms / 1000).toFixed(1)}s</em>` : ""}</span></div>`).join("")}</div></details>`;
+      `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${s.ms ? `<em class="ms">${(s.ms / 1000).toFixed(1)}s${s.tok ? ` · ${s.tok} tok` : ""}${s.tries > 1 ? ` · 重试${s.tries - 1}` : ""}</em>` : ""}</span></div>`).join("")}</div></details>`;
   }
   if (t.pending_question && liveNow) {
     const q = t.pending_question;

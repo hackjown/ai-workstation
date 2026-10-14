@@ -94,7 +94,7 @@ async def test_confirm_flow(stack):
 
 async def test_one_session_per_machine_and_stop(stack):
     client, backend, scripts, _ = stack
-    scripts.append([("screenshot", {})] * 200)
+    scripts.append([("keypress", {"key": f"F{i % 12 + 1}"}) for i in range(200)])  # busy, never finishing
     r = (await client.post("/api/tasks", json={"prompt": "loop", "max_steps": 200})).json()
     r2 = (await client.post("/api/tasks", json={"prompt": "second", "thread_id": r["thread_id"]})).json()
     assert r2["queued"] and r2["session_id"] is None          # busy machine -> follow-up waits in the queue

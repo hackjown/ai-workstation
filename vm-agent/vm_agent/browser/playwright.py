@@ -19,6 +19,7 @@ class Browser:
         self.mode = os.environ.get("VM_AGENT_BROWSER", "desktop")
         self._pw = None
         self._page = None
+        self._last_url: str | None = None
 
     async def _playwright_page(self):
         if self._page is None:
@@ -31,11 +32,14 @@ class Browser:
         return self._page
 
     async def open(self, url: str | None = None) -> dict:
+        if url:
+            self._last_url = url
         if self.mode == "playwright" or not url or not hasattr(self.b, "env"):
             await self.b.open_app("chrome")
             if url:
                 return await self.navigate(url)
             return {"opened": True}
+        await self._ensure_debuggable()
         # Pass the URL on Chrome's command line: no keystrokes race a window that is still starting
         # (typing ctrl+l into the desktop is what made browser_open hang), and a running Chrome
         # simply opens it in a new tab.
@@ -47,6 +51,39 @@ class Browser:
         await proc.wait()
         window = await self._wait_window()
         return {"url": url, "window": window}
+
+    async def _ensure_debuggable(self):
+        """browser_click / browser_fill need Chrome's DevTools port. A Chrome started earlier without it
+        (by hand, or by an older vm-agent) is closed once so the next launch carries the flag."""
+        from .cdp import CDP
+        if await CDP().available():
+            return
+        proc = await asyncio.create_subprocess_shell(
+            "pgrep -f 'chrom(e|ium)' >/dev/null && pkill -f 'chrom(e|ium)' && sleep 1.5", env=self.b.env)
+        await proc.wait()
+
+    async def click(self, text: str) -> dict:
+        from . import cdp
+        await self._need_cdp()
+        return await cdp.click(self.b, text)
+
+    async def fill(self, field: str, text: str, submit: bool = False) -> dict:
+        from . import cdp
+        await self._need_cdp()
+        return await cdp.fill(self.b, field, text, submit)
+
+    async def _need_cdp(self):
+        from .cdp import CDP
+        if await CDP().available():
+            return
+        if self._last_url and hasattr(self.b, "env"):  # Chrome was started without the port: reopen the same page
+            await self.open(self._last_url)
+            for _ in range(20):
+                if await CDP().available():
+                    await asyncio.sleep(1.0)
+                    return
+                await asyncio.sleep(0.5)
+        raise RuntimeError("Chrome 没有开调试端口（或没打开）。先调用 browser_open 打开网址，再用 browser_click / browser_fill。")
 
     async def _wait_window(self, timeout: float = 12.0) -> bool:
         """Wait until a Chrome window is visible and raise it, so the user sees it in the desktop view."""
@@ -70,6 +107,7 @@ class Browser:
         return False
 
     async def navigate(self, url: str) -> dict:
+        self._last_url = url
         if self.mode == "playwright":
             page = await self._playwright_page()
             await page.goto(url)

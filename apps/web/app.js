@@ -132,8 +132,8 @@ function onLiveEvent(t, e) {
   if (e.type === "agent.input_required") t.pending_question = d;
   if (e.type === "agent.input_answered") t.pending_question = null;
   if (e.type === "agent.action_result" && t.pending_confirm) t.pending_confirm = null;
-  if (e.type === "agent.takeover") { t.status = "takeover"; setTake(true); }
-  if (e.type === "agent.resumed") { t.status = "running"; setTake(false); }
+  if (e.type === "agent.takeover") { t.status = "takeover"; setTake(true, true); }
+  if (e.type === "agent.resumed") { t.status = "running"; setTake(false, true); }
   if (e.type === "agent.paused") t.status = "paused";
   if (e.type === "task.finished" || e.type === "task.failed") {
     t.status = d.status || (e.type === "task.finished" ? "succeeded" : "failed"); t.result = d.result; t.live = false;
@@ -162,6 +162,7 @@ function renderChat(scroll) {
   renderQueue();
   const live = S.thread.tasks.find((t) => LIVE.includes(t.status) || t.live);
   setComposerBusy(live || null);
+  if (live && live.status === "takeover" && !S.take) setTake(true, true);
   if (scroll || nearBottom) scrollLatest();
 }
 function renderTask(t) {
@@ -430,13 +431,37 @@ async function loadDesktop() {
     if (deskLoaded[target] !== url) { el.src = url; deskLoaded[target] = url; }
     if (target === "big") { $("desk").src = "about:blank"; deskLoaded.small = null; } else if (S.view !== "computer") { $("deskBig").src = "about:blank"; deskLoaded.big = null; }
   } catch (e) { toast("桌面：" + e.message); }
-  $("deskMode").textContent = S.take ? "你正在操作桌面" : "观看模式";
+  $("deskMode").textContent = S.take ? "你正在操作桌面 · 鼠标键盘已接通" : "观看模式 · 只看不操作";
 }
-function setTake(on) { S.take = on; $("takeBtn").innerHTML = icon("hand") + (on ? "交还给 Agent" : "接管桌面"); $("takeBtn2").textContent = on ? "交还" : "接管"; deskLoaded = { small: null, big: null }; loadDesktop(); }
+function liveTask() { return busyTask || (S.thread && S.thread.tasks.find((t) => LIVE.includes(t.status))); }
+function setTake(on, quiet) {
+  const was = !!S.take; S.take = on;
+  const live = liveTask();
+  const back = live ? "交还给 Agent" : "结束操作";
+  $("takeBtn").innerHTML = icon("hand") + (on ? back : "接管桌面");
+  $("takeBtn").classList.toggle("danger", on);
+  $("takeBtn2").textContent = on ? (live ? "交还" : "结束操作") : "接管";
+  $("takeBtn2").classList.toggle("primary", on);
+  document.querySelectorAll(".deskhead, .deskframe").forEach((el) => el.classList.toggle("taking", on));
+  document.querySelectorAll(".takebanner").forEach((el) => el.remove());
+  if (on) document.querySelectorAll(".deskframe").forEach((el) => {
+    const b = document.createElement("div"); b.className = "takebanner";
+    b.innerHTML = `<span class="dot"></span>你正在操作桌面${live ? "，Agent 已暂停" : ""}<button type="button" onclick="toggleTakeover()">${back}</button>`;
+    el.appendChild(b);
+  });
+  if (was !== on) { deskLoaded = { small: null, big: null }; loadDesktop(); }
+  if (!quiet && was !== on) toast(on ? (live ? "已接管：Agent 已暂停，你可以直接操作桌面" : "已接管：你可以直接操作桌面") : (live ? "已交还给 Agent，回到观看模式" : "已回到观看模式"));
+}
 async function toggleTakeover() {
-  const live = busyTask || (S.thread && S.thread.tasks.find((t) => LIVE.includes(t.status)));
-  if (live && live.session_id) await ctl(live.session_id, S.take ? "resume" : "takeover");
-  setTake(!S.take);
+  const live = liveTask(); const want = !S.take;
+  const btns = [$("takeBtn"), $("takeBtn2")]; btns.forEach((b) => (b.disabled = true));
+  $("deskMode").textContent = want ? "正在接管…" : "正在交还…";
+  try {
+    if (live && live.session_id) await api("POST", `/api/agent/${want ? "takeover" : "resume"}`, { session_id: live.session_id });
+    setTake(want);
+    if (live) setTimeout(() => refreshThread(), 300);
+  } catch (e) { toast((want ? "接管失败：" : "交还失败：") + e.message); $("deskMode").textContent = S.take ? "你正在操作桌面" : "观看模式"; }
+  finally { btns.forEach((b) => (b.disabled = false)); }
 }
 async function vmOp(op) { if (op !== "start" && !confirm("确定" + { stop: "关机", restart: "重启" }[op] + "？")) return; try { await api("POST", `/api/machines/${MID}/${op}`); toast("已发送"); refreshMachine(); } catch (e) { toast(e.message); } }
 async function snapshot() { const n = prompt("快照名称（字母开头，字母数字-_）", "snap" + new Date().toISOString().slice(0, 10).replace(/-/g, "")); if (!n) return; try { await api("POST", `/api/machines/${MID}/snapshot`, { name: n }); toast("快照已创建"); } catch (e) { toast(e.message); } }

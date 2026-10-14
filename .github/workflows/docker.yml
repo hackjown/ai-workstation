@@ -4,6 +4,10 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+# one build at a time: an older commit finishing last must not overwrite :latest
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
   packages: write

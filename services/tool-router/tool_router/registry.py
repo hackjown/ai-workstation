@@ -39,6 +39,22 @@ TOOLS: list[ToolSpec] = [
              {"command": {"type": "string"}, "cwd": {"type": "string"}}, ["command"]),
     ToolSpec("browser_open", "browser.open", "Open Chrome, optionally at a URL.", {"url": {"type": "string"}}),
     ToolSpec("browser_navigate", "browser.navigate", "Navigate the visible Chrome tab to a URL.", {"url": {"type": "string"}}, ["url"]),
+    ToolSpec("browser_click", "browser.click",
+             "BEST way to click on a web page in Chrome: give the visible text (or aria-label/title) of the button, "
+             "link, tab or checkbox, e.g. 注册 / Sign in / 下一步. The element is found in the page DOM and clicked with "
+             "the real mouse, so it is exact. If it is not found, the error lists the clickable texts that exist.",
+             {"text": {"type": "string", "description": "visible text of the element"}}, ["text"]),
+    ToolSpec("browser_fill", "browser.fill",
+             "BEST way to type into a web form field in Chrome: give the field's label or placeholder (e.g. 用户名, "
+             "密码, Email) and the text. Clears the field first. submit=true presses Enter afterwards. Also selects "
+             "an option in a <select>.",
+             {"field": {"type": "string"}, "text": {"type": "string"}, "submit": {"type": "boolean"}}, ["field", "text"]),
+    ToolSpec("click_element", None,
+             "Click a UI element described in words when browser_click cannot be used (desktop apps, canvas, images, "
+             "icons). A vision model locates it in two zoom passes, which is far more precise than guessing x/y. "
+             "Describe it with position and look, e.g. '右上角红色的注册按钮'.",
+             {"target": {"type": "string"}, "double": {"type": "boolean"},
+              "button": {"type": "string", "enum": ["left", "right"]}}, ["target"]),
     ToolSpec("browser_back", "browser.back", "Browser back."),
     ToolSpec("browser_forward", "browser.forward", "Browser forward."),
     ToolSpec("files_list", "files.list", "List files under the VM workspace.", {"path": {"type": "string"}}, ["path"]),
@@ -69,7 +85,7 @@ TOOLS: list[ToolSpec] = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

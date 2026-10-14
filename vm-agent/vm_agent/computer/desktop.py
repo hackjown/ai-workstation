@@ -100,13 +100,68 @@ class X11Backend(DesktopBackend):
             raise RuntimeError(f"xdotool {args} failed: {err.strip()}")
         return out
 
+    _grabber: Optional[str] = None  # the first method that worked on this display, tried first next time
+
     async def screenshot(self) -> Image.Image:
-        def grab() -> Image.Image:
-            import mss  # local import: only needed on a real desktop
-            with mss.mss(display=self.display) as sct:
-                shot = sct.grab(sct.monitors[0])
-                return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-        return await asyncio.to_thread(grab)
+        return await asyncio.to_thread(self._grab_any)
+
+    def _grab_any(self) -> Image.Image:
+        """mss fails on some Xvnc servers ("drawable's visual not found"), so fall back through other grabbers."""
+        order = ["mss", "pil", "import", "xwd", "scrot"]
+        if self._grabber in order:
+            order.remove(self._grabber)
+            order.insert(0, self._grabber)
+        errors = []
+        for name in order:
+            try:
+                img = getattr(self, "_grab_" + name)()
+                self._grabber = name
+                return img.convert("RGB")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{name}: {e}")
+        raise RuntimeError("all screenshot methods failed: " + " | ".join(errors))
+
+    def _grab_mss(self) -> Image.Image:
+        import mss  # local import: only needed on a real desktop
+        with mss.mss(display=self.display) as sct:
+            shot = sct.grab(sct.monitors[0])
+            return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+
+    def _grab_pil(self) -> Image.Image:
+        from PIL import ImageGrab
+        return ImageGrab.grab(xdisplay=self.display)
+
+    def _run_png(self, cmd: list[str]) -> Image.Image:
+        import subprocess
+        env = dict(os.environ, DISPLAY=self.display or os.environ.get("DISPLAY", ":1"))
+        out = subprocess.run(cmd, env=env, capture_output=True, timeout=15, check=True).stdout
+        return Image.open(io.BytesIO(out))
+
+    def _grab_import(self) -> Image.Image:
+        if not shutil.which("import"):
+            raise RuntimeError("imagemagick not installed")
+        return self._run_png(["import", "-silent", "-window", "root", "png:-"])
+
+    def _grab_xwd(self) -> Image.Image:
+        if not (shutil.which("xwd") and shutil.which("convert")):
+            raise RuntimeError("xwd/convert not installed")
+        import subprocess
+        env = dict(os.environ, DISPLAY=self.display or os.environ.get("DISPLAY", ":1"))
+        raw = subprocess.run(["xwd", "-root", "-silent"], env=env, capture_output=True, timeout=15, check=True).stdout
+        png = subprocess.run(["convert", "xwd:-", "png:-"], input=raw, capture_output=True, timeout=15, check=True).stdout
+        return Image.open(io.BytesIO(png))
+
+    def _grab_scrot(self) -> Image.Image:
+        if not shutil.which("scrot"):
+            raise RuntimeError("scrot not installed")
+        import tempfile
+        import subprocess
+        f = os.path.join(tempfile.gettempdir(), "aiw-shot.png")
+        env = dict(os.environ, DISPLAY=self.display or os.environ.get("DISPLAY", ":1"))
+        subprocess.run(["scrot", "-o", f], env=env, capture_output=True, timeout=15, check=True)
+        img = Image.open(f)
+        img.load()
+        return img
 
     async def screen_size(self) -> tuple[int, int]:
         out = await self._xdo("getdisplaygeometry")

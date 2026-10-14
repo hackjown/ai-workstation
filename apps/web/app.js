@@ -168,6 +168,7 @@ function renderChat(scroll) {
 function renderTask(t) {
   const evs = S.evs[t.id] || [];
   const user = `<div class="u"><div><div class="bubble">${esc(t.prompt)}</div><div class="meta">${when(t.created_at)}${t.source && t.source !== "chat" ? " · " + ({ routine: "例程", retry: "重试", resume: "自动恢复" }[t.source] || t.source) : ""}</div></div></div>`;
+  if (t.status === "sending") return user + `<div class="a"><div class="small" style="margin-left:8px">正在发送…</div></div>`;
   if (t.status === "queued") return user + `<div class="a"><div class="small" style="margin-left:8px">排队中，前面的任务完成后自动开始</div></div>`;
   let plan = t.plan && t.plan.steps && t.plan.steps.length ? t.plan : null;
   const steps = [], files = [];
@@ -264,22 +265,36 @@ function draftKey() { return "aiw_draft_" + (S.threadId || "new"); }
 function saveDraft() { localStorage.setItem(draftKey(), $("prompt").value); }
 function loadDraft() { $("prompt").value = localStorage.getItem(draftKey()) || ""; autoGrow($("prompt")); }
 function usePrompt(t) { $("prompt").value = t; autoGrow($("prompt")); $("prompt").focus(); }
+let sending = false;
 async function submitPrompt(e) {
   if (e) e.preventDefault();
-  let p = $("prompt").value.trim();
+  if (sending) return;
+  const raw = $("prompt").value;
+  let p = raw.trim();
   if (!p && busyTask) { ctl(busyTask.session_id, "stop"); return; }   // the button is a stop square while working
   if (!p) return;
   if (S.attach.length) p += "\n\n附件（已放到电脑上）：\n" + S.attach.map((a) => "- " + a.vm_path).join("\n");
   const iso = localStorage.getItem("aiw_iso") === "1";
+  // optimistic: clear the box and show the message right away, the server round trip happens behind it
+  sending = true;
+  const attach = S.attach;
+  $("prompt").value = ""; autoGrow($("prompt")); S.attach = []; renderAttach();
+  const tmp = { id: "tmp-" + Date.now(), prompt: p, status: "sending", created_at: Date.now() / 1000 };
+  if (!S.thread) S.thread = { id: null, title: "新对话", tasks: [] };
+  S.thread.tasks.push(tmp); renderChat(true);
+  $("sendBtn").classList.add("busy");
   try {
     const r = await api("POST", "/api/tasks", { prompt: p, machine_id: MID, thread_id: S.threadId, isolated: iso });
     localStorage.removeItem(draftKey());
-    $("prompt").value = ""; autoGrow($("prompt")); S.attach = []; renderAttach();
     if (iso) { localStorage.removeItem("aiw_iso"); $("isoToggle").checked = false; }
     S.threadId = r.thread_id; localStorage.setItem("aiw_thread", r.thread_id);
     if (r.queued) toast("已加入队列");
-    await refreshThread(true); loadThreads();
-  } catch (err) { toast("发送失败：" + err.message); }
+    refreshThread(true); loadThreads();
+  } catch (err) {
+    S.thread.tasks = S.thread.tasks.filter((t) => t !== tmp); renderChat();
+    $("prompt").value = raw; autoGrow($("prompt")); S.attach = attach; renderAttach();
+    toast("发送失败：" + err.message);
+  } finally { sending = false; $("sendBtn").classList.remove("busy"); }
 }
 async function uploadFiles(list) {
   for (const f of list) {

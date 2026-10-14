@@ -21,6 +21,7 @@ from tool_router import ToolExecutor, tool_schemas
 from tool_router.registry import SUBAGENT_TOOLS
 
 from .control import AgentControl, StopRequested
+from .grounding import convert_desc, coord_instruction, coord_mode, locate, model_name
 from .planner import SYSTEM_PROMPT, make_plan
 from .recovery import Recovery
 from .validator import Validator
@@ -70,6 +71,9 @@ class AgentLoop:
         self.system = SYSTEM_PROMPT + (("\n" + system_extra) if system_extra else "")
         self.plan_steps: list[str] = []
         self.plan_done: set[int] = set()
+        self._fresh: Optional[str] = None  # post-action screenshot, reused as the next observation
+        self._full: Optional[Image.Image] = None  # latest full-resolution screen, for click_element zooming
+        self._eyes_mode = coord_mode(model_name(vision_llm)) if vision_llm else "pixel"
 
     @property
     def task_text(self) -> str:
@@ -83,14 +87,26 @@ class AgentLoop:
 
     # ---------------------------------------------------------------- observe
     async def observe(self) -> tuple[Optional[str], tuple[int, int]]:
+        fresh, self._fresh = self._fresh, None
+        if fresh:  # the screenshot taken right after the last action is still current: no second grab
+            img = Image.open(io.BytesIO(base64.b64decode(fresh))).convert("RGB")
+            self._full = img
+            return await self._shrink(img, fresh, {"reused": True})
         t_shot = time.time()
         r = await self.computer.execute("computer.screenshot")
         shot_ms = int((time.time() - t_shot) * 1000)
         if not r.success or not r.screenshot:
             await self.emit(EventType.ERROR, error=f"screenshot failed: {r.error}")
             return None, (0, 0)
-        full = (r.width or 0, r.height or 0)
         img = Image.open(io.BytesIO(base64.b64decode(r.screenshot))).convert("RGB")
+        self._full = img
+        meta = r.result if isinstance(getattr(r, "result", None), dict) else {}
+        return await self._shrink(img, r.screenshot, dict(
+            shot_ms=shot_ms, vm_ms=getattr(r, "duration_ms", None), grabber=meta.get("grabber"),
+            grab_ms=meta.get("grab_ms"), encode_ms=meta.get("encode_ms")))
+
+    async def _shrink(self, img, raw_b64, info) -> tuple[Optional[str], tuple[int, int]]:
+        full = img.size
         if full[0] > self.cfg.llm_image_width:
             ratio = self.cfg.llm_image_width / img.width
             img = img.resize((self.cfg.llm_image_width, int(img.height * ratio)))
@@ -101,11 +117,8 @@ class AgentLoop:
         # JPEG is ~5-10x smaller than PNG: faster upload and fewer image tokens on most gateways
         buf = io.BytesIO(); img.save(buf, "JPEG", quality=75)
         shot = base64.b64encode(buf.getvalue()).decode()
-        artifact = self._save_artifact(r.screenshot)
-        meta = r.result if isinstance(getattr(r, "result", None), dict) else {}
-        await self.emit(EventType.OBSERVATION, width=full[0], height=full[1], artifact=artifact, shot_ms=shot_ms,
-                        vm_ms=getattr(r, "duration_ms", None), grabber=meta.get("grabber"),
-                        grab_ms=meta.get("grab_ms"), encode_ms=meta.get("encode_ms"))
+        artifact = self._save_artifact(raw_b64)
+        await self.emit(EventType.OBSERVATION, width=full[0], height=full[1], artifact=artifact, **info)
         return shot, shown
 
     def _save_artifact(self, b64: str) -> Optional[str]:
@@ -180,6 +193,7 @@ class AgentLoop:
         note: Optional[str] = None
         while self.step < self.cfg.max_steps:
             if await self.control.checkpoint():
+                self._fresh = None
                 note = ("The user took over the desktop and has now returned control. "
                         "Re-assess from the current screenshot; do not assume earlier state."
                         if self.control.resumed_after_takeover else "Agent was paused and resumed.")
@@ -312,6 +326,7 @@ class AgentLoop:
             await self.emit(EventType.VALIDATION, success=v.success, change=v.changed, message=v.message)
             self.history.append(_hist_line(self.step, decision, outcome, v.message))
             self._last_ok = ((decision.tool, repr(sorted(decision.args.items()))), self.step) if outcome.success else None
+            self._fresh = after if (after and outcome.success) else None
 
             if not outcome.success and (outcome.error or "").startswith("missing args"):
                 failures += 1
@@ -346,7 +361,7 @@ class AgentLoop:
             return self._seen_desc + "\n(screen unchanged since the last description)"
         last = self.history[-1] if self.history else "(first step)"
         prompt = (f"TASK OF THE AGENT: {self.task.prompt}\nLAST STEP: {last}\n"
-                  f"The screenshot is {shown[0]}x{shown[1]} pixels. Describe it for an agent that cannot see:\n"
+                  f"{coord_instruction(self._eyes_mode, shown)} Describe the screen for an agent that cannot see:\n"
                   "1. which app/window is in front, page title or URL, any dialog, error or popup;\n"
                   "2. the visible text that matters for the task, quoted exactly;\n"
                   "3. every button, link, field or menu the agent may need next, each as: name -> (x, y) center pixel.\n"
@@ -364,6 +379,7 @@ class AgentLoop:
             return None
         if not desc:
             return None
+        desc = convert_desc(desc, shown, self._eyes_mode)  # 0-1000 answers -> pixels of the screenshot
         self._seen_hash, self._seen_desc = h, desc
         await self.emit(EventType.OBSERVATION, vision=desc[:1500])
         return desc
@@ -395,6 +411,8 @@ class AgentLoop:
             await self.emit(EventType.ACTION_RESULT, tool=t, success=reply is not None, error=None if reply else "no answer",
                             result={"answer": reply})
             return f"user answered: {reply!r}" if reply else "user did not answer within the time limit; decide yourself or fail"
+        if t == "click_element":
+            return await self._click_element(a, decision.thought)
         if t == "remember":
             text = (a.get("text") or "").strip()
             if text and self.remember:
@@ -429,6 +447,44 @@ class AgentLoop:
             text = str(res)[:600] if ok else f"FAILED ({err})"
             return text
         return None
+
+    async def _click_element(self, a: dict, intent: str) -> str:
+        """Locate a described element with the vision model (whole screen, then a zoomed crop) and click it."""
+        target = (a.get("target") or "").strip()
+        eyes = self.vision_llm or self.llm
+        if not target:
+            await self.emit(EventType.ACTION_RESULT, tool="click_element", success=False, error="missing args ['target']", result={})
+            return "FAILED: click_element needs `target`, a description of the element"
+        if self._full is None:
+            await self.observe()
+        full = self._full
+        mode = self._eyes_mode if self.vision_llm else coord_mode(model_name(self.llm))
+        try:
+            pt = await asyncio.wait_for(locate(eyes, full, target, mode, max_width=self.cfg.llm_image_width),
+                                        self.cfg.vision_timeout_s * 2)
+        except Exception as e:  # noqa: BLE001
+            await self.emit(EventType.ACTION_RESULT, tool="click_element", success=False, error=str(e)[:200], result={})
+            return f"FAILED: could not locate '{target}' ({type(e).__name__}). Try browser_click with its text, or click with x/y."
+        if pt is None:
+            await self.emit(EventType.ACTION_RESULT, tool="click_element", success=False, error="not found", result={})
+            return f"FAILED: '{target}' is not visible on the screen. Scroll, open the right window, or describe it differently."
+        # locate() answers in full-screen pixels; the click tool expects screenshot pixels (it rescales)
+        sx, sy = pt
+        x, y = int(round(sx / self.tools.scale)), int(round(sy / self.tools.scale))
+        tool = "double_click" if a.get("double") else ("right_click" if a.get("button") == "right" else "click")
+        before = None
+        if full is not None:
+            buf = io.BytesIO(); full.save(buf, "PNG"); before = base64.b64encode(buf.getvalue()).decode()
+        outcome = await self.tools.run(tool, {"x": x, "y": y}, intent=intent)
+        await self.emit(EventType.POLICY, level=int(outcome.decision.level), reason=outcome.decision.reason)
+        v = self.validator.check(outcome.action, outcome.success, outcome.error, before, outcome.screenshot)
+        await self.emit(EventType.ACTION_RESULT, tool="click_element", success=outcome.success, error=outcome.error,
+                        result={"target": target, "screen_x": sx, "screen_y": sy, "x": x, "y": y})
+        await self.emit(EventType.VALIDATION, success=v.success, change=v.changed, message=v.message)
+        if outcome.success:
+            self._acted = True
+            self._fresh = outcome.screenshot
+        return f"{tool} at ({x}, {y}) for '{target}' -> {'ok' if outcome.success else 'FAILED ' + str(outcome.error)}; {v.message}"
 
     async def _delegate(self, goal: str) -> str:
         """Text-only helper: shell/file tools, no screenshots, its own short history."""

@@ -5,6 +5,8 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY . .
+ARG AIW_VERSION=dev
+ENV AIW_VERSION=$AIW_VERSION
 RUN chmod +x run-api.sh && mkdir -p workspace/artifacts
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

@@ -248,7 +248,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             d = {k: v for k, v in d.items() if k not in ("screenshot", "screenshot_b64", "image", "content_b64")}
             steps.append({"type": e.get("type"), "step": e.get("step"), "at": e.get("ts"), **d})
         settings = store.kv_get("models", {}) or {}
-        return {"exported_at": time.time(), "task": base["task"], "models": {k: v for k, v in settings.items() if "key" not in k.lower()},
+        return {"exported_at": time.time(), "server_version": os.environ.get("AIW_VERSION", "dev")[:7], "task": base["task"], "models": {k: v for k, v in settings.items() if "key" not in k.lower()},
                 "events": steps, "receipts": base["actions"], "files": [f.get("path") for f in base["files"]]}
 
     # ------------------------------------------------------------- threads

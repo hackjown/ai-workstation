@@ -55,10 +55,14 @@ class OpenAIProvider(LLMProvider):
     name = "openai"
 
     def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None,
-                 tool_choice: str | None = None):
+                 tool_choice: str | None = None, thinking: str | None = None):
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-4.1")
         self.key = api_key or os.environ["OPENAI_API_KEY"]
         self.tool_choice = tool_choice or os.environ.get("AIW_TOOL_CHOICE", "required")
+        # "off": ask reasoning models (GLM, Qwen3, DeepSeek...) to skip long hidden thinking. Each agent step is
+        # one small decision, so thinking mostly costs time (tens of seconds per step on GLM-V).
+        self.thinking = (thinking or os.environ.get("AIW_LLM_THINKING", "off")).lower()
+        self._extras_ok = True
         self.url = (base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")) + "/chat/completions"
 
     async def decide(self, req: LLMRequest) -> LLMDecision:
@@ -79,9 +83,7 @@ class OpenAIProvider(LLMProvider):
             for attempt in range(3):
                 if attempt == 2:  # some gateways (e.g. GLM) only behave with tool_choice=auto
                     body["tool_choice"] = "auto"
-                r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
-                r.raise_for_status()
-                data = r.json()
+                data = await self._post(c, body)
                 choice = data["choices"][0]
                 msg = choice["message"]
                 calls = msg.get("tool_calls") or []
@@ -114,20 +116,37 @@ class OpenAIProvider(LLMProvider):
             return LLMDecision(msg.get("content") or "", "fail", {"reason": "model returned no tool call"}, raw=data)
         return LLMDecision(msg.get("content") or "", name, args, raw=data, usage=data.get("usage", {}))
 
+    def _extras(self) -> dict:
+        if self.thinking != "off" or not self._extras_ok:
+            return {}
+        return {"thinking": {"type": "disabled"}, "enable_thinking": False}
+
+    async def _post(self, c: httpx.AsyncClient, body: dict) -> dict:
+        r = await c.post(self.url, json={**body, **self._extras()}, headers={"Authorization": f"Bearer {self.key}"})
+        if r.status_code == 400 and self._extras():  # gateway rejects the thinking switches: drop them for good
+            self._extras_ok = False
+            r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
+        r.raise_for_status()
+        return r.json()
+
     async def describe(self, system: str, user: str, image_b64: str, max_tokens: int = 900) -> str:
         body = {"model": self.model, "max_tokens": max_tokens, "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": [{"type": "text", "text": user},
                                          {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}}]}]}
         async with httpx.AsyncClient(timeout=120) as c:
-            r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"].get("content") or ""
+            return strip_think((await self._post(c, body))["choices"][0]["message"].get("content") or "")
 
     async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
         body = {"model": self.model, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-        async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"].get("content") or ""
+        async with httpx.AsyncClient(timeout=90) as c:
+            return strip_think((await self._post(c, body))["choices"][0]["message"].get("content") or "")
+
+
+def strip_think(text: str) -> str:
+    """Drop <think>...</think> blocks that some gateways leave inside content."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+    return text.strip()

@@ -37,6 +37,7 @@ class LoopConfig:
     timeout_s: float = 600.0
     action_retries: int = 1
     llm_image_width: int = 1280  # downscale screenshots sent to the LLM
+    skip_unchanged_screens: bool = True  # don't resend an identical screenshot (terminal/file work)
     max_consecutive_failures: int = 5
     artifacts_dir: Optional[str] = None
     subagent_steps: int = 8
@@ -86,18 +87,17 @@ class AgentLoop:
             await self.emit(EventType.ERROR, error=f"screenshot failed: {r.error}")
             return None, (0, 0)
         full = (r.width or 0, r.height or 0)
-        shot = r.screenshot
+        img = Image.open(io.BytesIO(base64.b64decode(r.screenshot))).convert("RGB")
         if full[0] > self.cfg.llm_image_width:
-            img = Image.open(io.BytesIO(base64.b64decode(shot)))
             ratio = self.cfg.llm_image_width / img.width
             img = img.resize((self.cfg.llm_image_width, int(img.height * ratio)))
-            buf = io.BytesIO(); img.save(buf, "PNG")
-            shot = base64.b64encode(buf.getvalue()).decode()
             self.tools.scale = 1 / ratio
-            shown = img.size
         else:
             self.tools.scale = 1.0
-            shown = full
+        shown = img.size
+        # JPEG is ~5-10x smaller than PNG: faster upload and fewer image tokens on most gateways
+        buf = io.BytesIO(); img.save(buf, "JPEG", quality=75)
+        shot = base64.b64encode(buf.getvalue()).decode()
         artifact = self._save_artifact(r.screenshot)
         await self.emit(EventType.OBSERVATION, width=full[0], height=full[1], artifact=artifact)
         return shot, shown
@@ -165,6 +165,8 @@ class AgentLoop:
         self._acted = False
         self._done_rejects = 0
         self._sent_file, self._after_send = None, 0
+        self._last_sent_thumb = None
+        self._last_ok: Optional[tuple] = None
         note: Optional[str] = None
         while self.step < self.cfg.max_steps:
             if await self.control.checkpoint():
@@ -176,11 +178,20 @@ class AgentLoop:
             before, shown = await self.observe()
 
             desc = await self._look(before, shown) if self.vision_llm and before else None
+            send_shot = before
+            if before and self.cfg.skip_unchanged_screens and not desc:
+                tiny = _thumb(before)
+                if tiny is not None and tiny == self._last_sent_thumb:
+                    send_shot = None
+                    note = ((note + "\n") if note else "") + (
+                        "Screen unchanged since your last screenshot (image omitted to save time); rely on that one.")
+                else:
+                    self._last_sent_thumb = tiny
             await self.emit(EventType.THINKING)
             t_llm = time.time()
             decision = await self.llm.decide(LLMRequest(
                 system=self.system, task=self._task_with_plan(), history=self.history,
-                screenshot_b64=before, tools=tool_schemas([t[0] for t in self.extra_tools.values()]),
+                screenshot_b64=send_shot, tools=tool_schemas([t[0] for t in self.extra_tools.values()]),
                 screen=shown, note=note, screen_desc=desc))
             if decision.tool and not decision.args and decision.tool not in ("screenshot", "done", "fail"):
                 raw = decision.raw or {}
@@ -213,7 +224,16 @@ class AgentLoop:
                 self._after_send += 1
                 if self._after_send >= 2:  # the file is already with the user; stop wandering
                     decision.tool, decision.args = "done", {"summary": f"已生成并发送 {self._sent_file}。"}
-            await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args, llm_ms=llm_ms)
+            u = decision.usage or {}
+            await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args, llm_ms=llm_ms,
+                            out_tokens=u.get("out_tokens") or u.get("completion_tokens"), attempts=u.get("attempts"))
+            sig = (decision.tool, repr(sorted(decision.args.items())))
+            if self._last_ok and sig == self._last_ok[0] and decision.tool in _NO_REPEAT:
+                self.history.append(f"{self.step}. {decision.tool} SKIPPED: identical to step {self._last_ok[1]}, which already succeeded")
+                note = (f"You just repeated step {self._last_ok[1]} exactly ({decision.tool}); it already succeeded, so it was skipped. "
+                        "Move on to the NEXT step (e.g. run the script you wrote with a short shell command).")
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="重复操作已跳过")
+                continue
 
             if await self.control.checkpoint():  # paused while the model was thinking: discard stale decision
                 self.step -= 1
@@ -259,6 +279,7 @@ class AgentLoop:
             v = self.validator.check(outcome.action, outcome.success, outcome.error, before, after)
             await self.emit(EventType.VALIDATION, success=v.success, change=v.changed, message=v.message)
             self.history.append(_hist_line(self.step, decision, outcome, v.message))
+            self._last_ok = ((decision.tool, repr(sorted(decision.args.items()))), self.step) if outcome.success else None
 
             if not outcome.success and (outcome.error or "").startswith("missing args"):
                 failures += 1
@@ -421,7 +442,10 @@ def _hist_line(step, decision, outcome, vmsg) -> str:
     args = {k: (v[:80] if isinstance(v, str) else v) for k, v in decision.args.items()}
     res = ""
     if outcome.action == "shell.exec" and outcome.result:
-        res = f" exit={outcome.result.get('exit_code')} out={outcome.result.get('stdout','')[:200]!r}"
+        res = (f" exit={outcome.result.get('exit_code')} out={outcome.result.get('stdout','')[:300]!r}"
+               + (f" err={outcome.result.get('stderr','')[-300:]!r}" if outcome.result.get("stderr") else ""))
+    elif outcome.action == "files.write" and outcome.success and isinstance(outcome.result, dict):
+        res = f" saved {outcome.result.get('path')} ({outcome.result.get('size')} bytes); next: run or use it"
     status = "ok" if outcome.success else f"FAILED ({outcome.error})"
     return f"{step}. {decision.tool}({args}) -> {status}{res}; {vmsg}"
 
@@ -443,3 +467,13 @@ def _needs_action(prompt: str) -> bool:
     if _is_question(p):
         return False
     return any(w in p for w in _ACTION_WORDS)
+
+
+_NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "open_app"}
+
+
+def _thumb(b64: str):
+    try:
+        return Image.open(io.BytesIO(base64.b64decode(b64))).convert("L").resize((64, 40)).tobytes()
+    except Exception:  # noqa: BLE001
+        return None

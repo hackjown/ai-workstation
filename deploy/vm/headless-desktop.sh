@@ -15,7 +15,7 @@ U=$(id -un); H=$HOME; GEOMETRY=${GEOMETRY:-1600x900}
 
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tigervnc-standalone-server tigervnc-tools dbus-x11 x11-utils \
-  python3-pip python3-openpyxl python3-bs4 python3-docx python3-matplotlib fonts-noto-cjk imagemagick x11-apps scrot
+  python3-pip python3-openpyxl python3-bs4 wmctrl python3-docx python3-matplotlib fonts-noto-cjk imagemagick x11-apps scrot
 python3 -m pip install -q --user --break-system-packages python-pptx || true
 
 mkdir -p "$H/.config/aiw"
@@ -101,3 +101,7 @@ echo "Done. Virtual desktop :1 ($GEOMETRY) runs at boot without any login."
 echo "Check:  systemctl status aiw-xvnc aiw-xfce --no-pager;  systemctl --user status vm-agent novnc --no-pager"
 echo "Reboot once to confirm, and do NOT open the PVE console: the web 'Computer' view should show XFCE."
 echo "Undo:   sudo systemctl disable --now aiw-xvnc aiw-xfce && sudo systemctl enable lightdm && sudo systemctl set-default graphical.target"
+
+# Chrome policy: no translate bubble on foreign pages, no password-save prompts
+sudo mkdir -p /etc/opt/chrome/policies/managed /etc/chromium/policies/managed
+echo '{"TranslateEnabled": false, "PasswordManagerEnabled": false}' | sudo tee /etc/opt/chrome/policies/managed/aiw.json /etc/chromium/policies/managed/aiw.json >/dev/null

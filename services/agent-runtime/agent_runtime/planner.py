@@ -20,6 +20,9 @@ Rules:
   so it appears in their chat window, then `done`. Files outside ~/workspace must be copied there first (shell `cp`).
 - Every tool call must carry all required arguments (shell needs `command`). For scripts longer than a few lines,
   write them with `files_write` (e.g. path "make_doc.py") and then run `shell` with `python3 ~/workspace/make_doc.py`.
+- The VM is Debian: openpyxl, python-docx and python-pptx are preinstalled for python3. If a package is missing use
+  `pip install --user --break-system-packages <pkg>` (plain pip is blocked). The desktop folder is ~/Desktop or ~/桌面.
+- If a shell command fails, read its stderr in PREVIOUS STEPS and fix the cause; never resend the same command.
 - For Word/Excel/PPT prefer python (python-docx / openpyxl / python-pptx) or `libreoffice --headless` via `shell`.
 - Verify with the screenshot before calling `done`. Never claim success you cannot see.
 - Never try to gain root, touch Proxmox, or change the network. Payments and bulk deletes require user confirmation.

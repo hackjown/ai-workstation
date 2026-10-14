@@ -431,7 +431,7 @@ class AgentLoop:
             o = await self.tools.run(d.tool, d.args, intent=d.thought)
             out = ""
             if o.action == "shell.exec" and o.result:
-                out = f" exit={o.result.get('exit_code')} out={str(o.result.get('stdout',''))[:300]!r} err={str(o.result.get('stderr',''))[:200]!r}"
+                out = f" exit={o.result.get('exit_code')} out={_clip(str(o.result.get('stdout') or ''), 2000)!r} err={str(o.result.get('stderr',''))[:200]!r}"
             elif o.action == "files.read" and d.tool == "files_read" and isinstance(o.result, dict):
                 out = " content:\n" + _read_excerpt(o.result.get("content") or "", 4000)
             hist.append(f"{i+1}. {d.tool}({_args_short(d.args)}) -> {'ok' if o.success else 'FAILED ' + str(o.error)}{out}")
@@ -455,6 +455,11 @@ def _short(d: dict) -> dict:
     return out
 
 
+def _clip(text: str, limit: int) -> str:
+    """Head and tail of long command output, so the model sees both what started and how it ended."""
+    return text if len(text) <= limit else text[: limit * 3 // 4] + f" ...[{len(text) - limit} chars cut]... " + text[-limit // 4:]
+
+
 def _read_excerpt(text: str, limit: int = 6000) -> str:
     """File content the model sees: whole file when short, head and tail when long."""
     if len(text) <= limit:
@@ -466,7 +471,7 @@ def _hist_line(step, decision, outcome, vmsg) -> str:
     args = {k: (v[:80] if isinstance(v, str) else v) for k, v in decision.args.items()}
     res = ""
     if outcome.action == "shell.exec" and outcome.result:
-        res = (f" exit={outcome.result.get('exit_code')} out={outcome.result.get('stdout','')[:300]!r}"
+        res = (f" exit={outcome.result.get('exit_code')} out={_clip(outcome.result.get('stdout') or '', 2500)!r}"
                + (f" err={outcome.result.get('stderr','')[-300:]!r}" if outcome.result.get("stderr") else ""))
     elif outcome.action == "files.write" and outcome.success and isinstance(outcome.result, dict):
         res = f" saved {outcome.result.get('path')} ({outcome.result.get('size')} bytes); next: run or use it"

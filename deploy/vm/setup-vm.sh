@@ -13,7 +13,7 @@ sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   xfce4 xfce4-goodies lightdm lightdm-gtk-greeter \
   python3 python3-venv python3-pip git curl ffmpeg xdotool x11-utils wmctrl scrot \
-  x11vnc novnc websockify qemu-guest-agent fonts-noto-cjk
+  x11vnc novnc websockify qemu-guest-agent fonts-noto-cjk librecad xclip
 sudo systemctl enable --now qemu-guest-agent
 
 # Google Chrome (falls back to apt/snap chromium if download fails)
@@ -56,6 +56,9 @@ python3 -m venv ~/.aiw-venv
 ~/.aiw-venv/bin/pip install -U pip
 ~/.aiw-venv/bin/pip install -r "$REPO/vm-agent/requirements.txt"
 ~/.aiw-venv/bin/python -m playwright install chromium || true
+# Chinese font for LibreCAD (its own fonts have no hanzi); cad_command also does this on first use
+~/.aiw-venv/bin/pip install fonttools
+bash "$REPO/deploy/vm/librecad-setup.sh" || true
 mkdir -p ~/workspace/downloads
 
 # VNC password file (x11vnc refuses unauthenticated clients)

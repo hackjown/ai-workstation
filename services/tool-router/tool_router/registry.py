@@ -75,13 +75,24 @@ TOOLS: list[ToolSpec] = [
              {"path": {"type": "string", "description": "relative to ~/workspace, e.g. uploads/设计图.jpg"},
               "page": {"type": "integer", "description": "PDF page, 1-based"},
               "question": {"type": "string"}}, ["path"]),
+    ToolSpec("cad_command", None,
+             "Draw in the LibreCAD window on the desktop, like a draftsman typing at its command line. Each item of "
+             "`commands` is typed into LibreCAD's command line and followed by Enter, in order; the user watches it. "
+             "Units are mm at 1:1. Examples: ['line','0,0','6000,0','6000,10000','0,10000','0,0','ESC'], "
+             "['rectangle','0,0','@1500,150'], ['circle','3000,750','350'], ['polyline','0,0','@1000,0','@0,500','ESC'], "
+             "['dimhorizontal','0,0','6000,0','3000,-800'], ['zoomauto']. Use 'ESC' to cancel/finish a command. "
+             "`open` launches LibreCAD on a .dxf in ~/workspace first. Text, layers, hatches and saving are done in "
+             "the GUI dialogs (keypress/type/click_element) after checking the screenshot.",
+             {"commands": {"type": "array", "items": {"type": "string"}},
+              "open": {"type": "string", "description": "optional .dxf path relative to ~/workspace to open first"}},
+             ["commands"]),
     ToolSpec("cad_draw", None,
-             "Make a construction drawing (施工图: plan/elevation/section/detail) as DXF + PDF with exact dimensions. "
+             "ONLY when the user explicitly asked for a script/代码: make a construction drawing (施工图: plan/elevation/section/detail) as DXF + PDF with exact dimensions. "
              "`code` is the Python BODY only (ezdxf, millimetres, 1:scale); a prelude already defines doc, msp, SCALE "
              "and helpers: frame(x0,y0,size='A3',title,project,sheet,date)->(ix0,iy0,ix1,iy1) inner box; "
              "rect(x,y,w,h,layer); line(p1,p2,layer); pline(pts,close,layer); circle(c,r); arc(c,r,a1,a2); "
              "wall(x1,y1,x2,y2,t=240); door(x,y,w,angle,swing); window(x1,y1,x2,y2,t); hatch(pts,pattern,scale); "
-             "text(x,y,s,h_mm=3.5,layer,align); note(x,y,lines,h,title); leader(pts,s); dim(p1,p2,offset); "
+             "text(x,y,s,h=3.5,layer,align); note(x,y,lines,h,title); leader(pts,s); dim(p1,p2,offset); "
              "dim_chain(points,offset) (segments + overall); elev_level(x,y,value_m); view_title(x,y,s,scale). "
              "Layers: 墙体 门窗 柜体 家具 完成面 轴线 隐藏线 填充 尺寸 文字 图框 索引. Text heights are printed mm. "
              "Put several views on one sheet by offsetting origins inside the frame. The DXF opens in LibreCAD on "
@@ -108,14 +119,15 @@ TOOLS: list[ToolSpec] = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element", "cad_draw", "read_image"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element", "cad_draw", "cad_command", "read_image"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 
-def tool_schemas(extra: list[dict] | None = None, only: tuple[str, ...] | None = None) -> list[dict]:
+def tool_schemas(extra: list[dict] | None = None, only: tuple[str, ...] | None = None,
+                 hide: tuple[str, ...] | set[str] = ()) -> list[dict]:
     """Neutral schema list; llm-router adapts to OpenAI/Anthropic/Gemini formats.
     `extra` adds external (HTTP/OpenAPI/MCP) tools; `only` restricts to a subset."""
     out = [{"name": t.name, "description": t.description,
             "parameters": {"type": "object", "properties": t.params, "required": t.required}}
-           for t in TOOLS if only is None or t.name in only]
+           for t in TOOLS if (only is None or t.name in only) and t.name not in hide]
     return out + list(extra or [])

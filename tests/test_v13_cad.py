@@ -59,8 +59,39 @@ def test_script_runs_and_writes_dxf(tmp_path):
 def test_registry_exposes_cad_tools():
     sys.path.insert(0, str(ROOT / "services/tool-router"))
     from tool_router.registry import BY_NAME, LOOP_TOOLS
-    assert "cad_draw" in BY_NAME and "read_image" in BY_NAME
-    assert {"cad_draw", "read_image"} <= LOOP_TOOLS
+    assert "cad_draw" in BY_NAME and "read_image" in BY_NAME and "cad_command" in BY_NAME
+    assert {"cad_draw", "cad_command", "read_image"} <= LOOP_TOOLS
+    from tool_router import tool_schemas
+    assert "cad_draw" not in [t["name"] for t in tool_schemas(hide=("cad_draw",))]
+
+
+def test_script_drawing_is_opt_in():
+    assert not cad.script_drawing_allowed("根据设计图和报价表画装修施工图，cad那种的")
+    assert cad.script_drawing_allowed("用python脚本画施工图")
+
+
+def test_librecad_command_line():
+    s = cad.librecad_type_command(["line", "0,0", "@6000,0", "ESC"], "cad/a.dxf")
+    assert "xdotool type --delay 25 -- line" in s and "-- @6000,0" in s and "key Escape" in s
+    assert 'librecad "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/cad/a.dxf"' in s
+
+
+async def test_cad_draw_refused_without_script_request(env):  # noqa: F811
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    events = []
+
+    async def sink(e):
+        events.append(e)
+    llm = ScriptedProvider([("cad_draw", {"name": "x", "code": "pass"}), ("done", {"summary": "ok"})])
+    loop = AgentLoop(Task(prompt="画施工图，cad那种的"), "s-cad2", comp, LLMRouter([llm]), ToolExecutor(comp), emit=sink,
+                     config=LoopConfig(max_steps=4, timeout_s=60, make_plan=False, artifacts_dir=str(tmp / "art")))
+    await loop.run()
+    assert not (tmp / "cad" / "x_build.py").exists()
+    assert any("REFUSED" in h for h in loop.history)
 
 
 async def test_cad_draw_tool_in_the_loop(env):  # noqa: F811
@@ -77,7 +108,7 @@ async def test_cad_draw_tool_in_the_loop(env):  # noqa: F811
         events.append(e)
     llm = ScriptedProvider([("cad_draw", {"name": "立面", "code": BODY, "scale": 50, "open": False}),
                             ("done", {"summary": "画好了"})])
-    loop = AgentLoop(Task(prompt="画客厅背景墙施工图"), "s-cad", comp, LLMRouter([llm]), ToolExecutor(comp), emit=sink,
+    loop = AgentLoop(Task(prompt="用脚本画客厅背景墙施工图"), "s-cad", comp, LLMRouter([llm]), ToolExecutor(comp), emit=sink,
                      config=LoopConfig(max_steps=5, timeout_s=120, make_plan=False, artifacts_dir=str(tmp / "art")))
     t = await loop.run()
     assert t.status == TaskStatus.SUCCEEDED

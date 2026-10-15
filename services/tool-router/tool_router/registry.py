@@ -81,10 +81,8 @@ TOOLS: list[ToolSpec] = [
              "Units are mm at 1:1. Examples: ['line','0,0','6000,0','6000,10000','0,10000','0,0','ESC'], "
              "['rectangle','0,0','@1500,150'], ['circle','3000,750','350'], ['polyline','0,0','@1000,0','@0,500','ESC'], "
              "['dimhorizontal','0,0','6000,0','3000,-800']. Use 'ESC' to finish a command. After each call the view zooms "
-             "to fit the whole drawing automatically. Put 'text' (or 'hatch') LAST in a call: it opens a dialog that "
-             "you fill in the GUI; afterwards ['text','字','x,y'] places more text without the dialog. "
-             "`open` launches LibreCAD on a .dxf in ~/workspace first. Text, layers, hatches and saving are done in "
-             "the GUI dialogs (keypress/type/click_element) after checking the screenshot.",
+             "to fit the whole drawing automatically. Text: 'TEXT|x,y|height|内容' (one item, Chinese ok, no dialog clicking). "
+             "Save: 'SAVE|cad/name.dxf'. Never type a bare 'text'.",
              {"commands": {"type": "array", "items": {"type": "string"}},
               "open": {"type": "string", "description": "optional .dxf path relative to ~/workspace to open first"}},
              ["commands"]),

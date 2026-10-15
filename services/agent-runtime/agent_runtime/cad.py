@@ -302,35 +302,113 @@ def script_drawing_allowed(prompt: str) -> bool:
     return bool(_SCRIPT_DRAW.search(p))
 
 
+LIBRECAD_FONT = "notosc"   # outline CJK font made by deploy/vm/ttf2lff.py; LibreCAD's own fonts have no hanzi
+
+
+def _librecad_font_setup() -> str:
+    """Shell: once per VM, give LibreCAD a Chinese font (its own fonts have no hanzi) and a 1:50 template.
+    See deploy/vm/librecad-setup.sh; a quick no-op once the marker exists."""
+    return ('([ -f "$HOME/.config/aiw/librecad-ready-v1" ] || { S=$(ls "$HOME"/ai-workstation/deploy/vm/librecad-setup.sh '
+            '/opt/ai-workstation/deploy/vm/librecad-setup.sh 2>/dev/null | head -1); [ -n "$S" ] && bash "$S" >/dev/null 2>&1; }; true)')
+
+
+def _parse_text(c: str):
+    """'TEXT|x,y|height|content' (also 'text|x,y|content', height 350) -> (point, height, content) or None."""
+    if not re.match(r"(?i)^\s*(text|txt)\s*\|", c):
+        return None
+    bits = [b.strip() for b in c.split("|", 3)]
+    if len(bits) == 3:
+        return bits[1], "350", bits[2]
+    if len(bits) == 4:
+        h = bits[2] if re.fullmatch(r"\d+(\.\d+)?", bits[2]) else "350"
+        body = bits[3] if h == bits[2] else bits[2] + "|" + bits[3]
+        return bits[1], h, body
+    return None
+
+
 def librecad_type_command(commands: list[str], open_path: str | None = None) -> str:
-    """Shell line that brings LibreCAD to the front (launching it, optionally on a file) and types each command
-    into its command line followed by Enter, the way a person would. Runs on the VM desktop (DISPLAY=:0)."""
+    """Shell line that brings LibreCAD to the front (launching it, optionally on a file), maximises it, and types
+    each command into its command line followed by Enter, the way a person would. Runs on the VM desktop.
+    'TEXT|x,y|height|内容' draws a whole text: opens the Text dialog, pastes the string (Chinese works through the
+    clipboard, not xdotool type), sets the height, OK, then places it at x,y."""
     import shlex
-    parts = ["export DISPLAY=${DISPLAY:-:0}"]
+    parts = ["export DISPLAY=${DISPLAY:-:0}", _librecad_font_setup()]
     if open_path:
         safe = str(open_path).replace('"', "").replace("`", "").replace("$(", "")
         parts.append(f'(pkill -x librecad; sleep 1; nohup librecad "${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}/{safe}" >/dev/null 2>&1 &)')
         parts.append("sleep 4")
     else:
         parts.append("(pgrep -x librecad >/dev/null || (nohup librecad >/dev/null 2>&1 &); true)")
-        parts.append("for i in 1 2 3 4 5 6 7 8; do xdotool search --onlyvisible --class librecad >/dev/null 2>&1 && break; sleep 1; done")
-    parts.append("W=$(xdotool search --onlyvisible --class librecad | tail -1)")
+    # first start shows a Welcome (language/units) dialog; accept its defaults
+    parts.append("for i in $(seq 1 25); do xdotool search --onlyvisible --name '^LibreCAD' >/dev/null 2>&1 && break; "
+                 "WL=$(xdotool search --onlyvisible --name '^Welcome$' 2>/dev/null | head -1); "
+                 '[ -n "$WL" ] && { xdotool windowfocus "$WL" 2>/dev/null; xdotool key --window "$WL" Return; }; sleep 1; done')
+    parts.append("W=$(xdotool search --onlyvisible --name '^LibreCAD' | tail -1)")
     parts.append('[ -n "$W" ] || { echo "LibreCAD window not found"; exit 3; }')
-    parts.append('xdotool windowactivate --sync "$W"; sleep 0.3')
+    parts.append('(xdotool windowactivate --sync "$W" 2>/dev/null || xdotool windowfocus "$W"; true); sleep 0.3')
     # maximised, so the user watching sees the whole canvas
     parts.append('(wmctrl -i -r "$(printf 0x%08x "$W")" -b add,maximized_vert,maximized_horz 2>/dev/null'
                  ' || xdotool windowmove "$W" 0 0 windowsize "$W" 100% 100% 2>/dev/null; true)')
+    # LibreCAD only takes a typed point for some tools after the mouse has moved over the canvas
+    parts.append('hover(){ eval "$(xdotool getwindowgeometry --shell "$W")"; '
+                 'xdotool mousemove $((X+WIDTH*2/5)) $((Y+HEIGHT/2)); sleep 0.15; '
+                 'xdotool mousemove $((X+WIDTH*2/5+9)) $((Y+HEIGHT/2+7)); sleep 0.15; }')
+    parts.append("hover")
+    # a dialog left open by an earlier step (e.g. an unfinished Text dialog) swallows every keystroke: close it
+    parts.append("(for N in '^Text$' '^Hatch' '^Save Drawing As'; do for D in $(xdotool search --onlyvisible --name \"$N\" 2>/dev/null); do "
+                 'xdotool windowfocus "$D" 2>/dev/null; xdotool key --window "$D" Escape; sleep 0.3; done; done; true)')
+    texts, dialog = 0, False
     for c in commands:
         c = str(c)
-        if c.upper() in ("ESC", "ESCAPE"):
-            parts.append("xdotool key Escape; sleep 0.2")
+        t = _parse_text(c)
+        if t:
+            pt, h, body = t
+            texts += 1
+            parts.append(
+                "xdotool key Escape; sleep 0.15; xdotool key Escape; sleep 0.2; "
+                "xdotool key ctrl+m; xdotool type --delay 25 -- text; xdotool key Return; "
+                "D=; for i in $(seq 1 20); do D=$(xdotool search --onlyvisible --name '^Text$' 2>/dev/null | tail -1); "
+                '[ -n "$D" ] && break; sleep 0.2; done; '
+                '[ -n "$D" ] || { echo "Text dialog did not open"; exit 4; }; sleep 0.3; '
+                f"printf %s {shlex.quote(body)} | xclip -selection clipboard 2>/dev/null; "
+                "xdotool key ctrl+a; "
+                f"if command -v xclip >/dev/null; then xdotool key ctrl+v; else xdotool type --delay 30 -- {shlex.quote(body)}; fi; "
+                f"sleep 0.2; xdotool key Tab ctrl+a; xdotool type -- {shlex.quote(h)}; xdotool key Return; "
+                "for i in $(seq 1 20); do xdotool search --onlyvisible --name '^Text$' >/dev/null 2>&1 || break; sleep 0.2; done; "
+                f"hover; xdotool key ctrl+m; xdotool type --delay 25 -- {shlex.quote(pt)}; xdotool key Return; sleep 0.5; "
+                "xdotool key Escape; sleep 0.2")
             continue
-        parts.append(f"xdotool type --delay 25 -- {shlex.quote(c)}; xdotool key Return; sleep 0.35")
+        m = re.match(r"(?i)^\s*save\s*\|\s*(.+?)\s*$", c)
+        if m:  # File > Save as... (ctrl+shift+s is Save ALL in LibreCAD, and shortcuts are dead while the command line has focus)
+            path = m.group(1).replace('"', "").replace("`", "").replace("$(", "")
+            if not path.startswith("/"):
+                path = "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/" + path.lstrip("~/").removeprefix("workspace/")
+            parts.append(
+                f'mkdir -p "$(dirname "{path}")"; xdotool key Escape; sleep 0.15; xdotool key Escape; sleep 0.2; '
+                "xdotool key alt+f; sleep 0.6; xdotool key a; "
+                "SD=; for i in $(seq 1 20); do SD=$(xdotool search --onlyvisible --name 'Save Drawing As' 2>/dev/null | tail -1); "
+                '[ -n "$SD" ] && break; sleep 0.2; done; [ -n "$SD" ] || { echo "Save As dialog did not open"; exit 5; }; '
+                f'sleep 0.3; xdotool key ctrl+a; xdotool type --delay 15 -- "{path}"; xdotool key Return; sleep 1.5; '
+                # overwrite confirmation, if any
+                "xdotool search --onlyvisible --name 'Save Drawing As' >/dev/null 2>&1 && { xdotool key alt+y; sleep 0.3; xdotool key Return; sleep 1; }; "
+                f'[ -s "{path}" ] && echo "saved {path}" || {{ echo "save failed: {path} not written"; exit 5; }}')
+            continue
+        if c.upper() in ("ESC", "ESCAPE"):
+            # one Escape only steps back to the tool's first prompt ("Specify first point"); two leave the tool
+            parts.append("xdotool key Escape; sleep 0.15; xdotool key Escape; sleep 0.2")
+            continue
+        # ctrl+m = "Focus on Command Line": Escape inside the command line drops keyboard focus, after which
+        # typed commands went nowhere
+        parts.append(f"xdotool key ctrl+m; xdotool type --delay 25 -- {shlex.quote(c)}; xdotool key Return; sleep 0.35")
     last = str(commands[-1]).strip().lower() if commands else ""
+    if last.startswith("save"):
+        last = "za"  # no zoom after a save
     dialog = last in ("text", "txt", "mtext", "mtxt", "hatch", "ha")  # a dialog is now open; leave it to the agent
     if not dialog and not (last.startswith("zoom") or last in ("za", "zw", "zp", "zv")):
         # fit the whole drawing so the screenshot shows what was drawn (a fresh view only shows ~0..1000 mm)
-        parts.append("xdotool type --delay 25 -- za; xdotool key Return; sleep 0.5")  # zoom resumes the running tool
+        parts.append("xdotool key ctrl+m; xdotool type --delay 25 -- za; xdotool key Return; sleep 0.5")  # zoom resumes the running tool
     tail = "; the dialog is open now, fill it in" if dialog else ", then zoomauto"
+    if texts:
+        tail += f" ({texts} texts placed)"
     parts.append("echo " + shlex.quote(f"typed {len(commands)} commands{tail}"))
     return " && ".join(parts)

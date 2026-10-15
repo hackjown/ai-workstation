@@ -6,6 +6,7 @@ Task -> Planner -> [checkpoint] Observe -> LLM Decision -> Policy -> Execute
 from __future__ import annotations
 
 import asyncio
+import os
 import base64
 import io
 import re
@@ -58,6 +59,10 @@ class AgentLoop:
         self.computer, self.llm, self.tools = computer, llm, tools
         self.control = control or AgentControl()
         self.cfg = config or LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s)
+        self._cad_task = _cad.is_cad_task(task.prompt)
+        if self._cad_task and config is None:  # drawing a set in the GUI takes hundreds of steps
+            self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400")))
+            self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800")))
         self.validator = Validator()
         self.recovery = Recovery(computer)
         self._emit_fn = emit
@@ -241,8 +246,25 @@ class AgentLoop:
                 note = ("You keep calling screenshot, but the current screenshot is already attached every turn. "
                         "Do NOT call screenshot again. Take the next real action, or if the task is only to look/report, "
                         "call done with the full answer in summary.")
+            if shots >= 2 and self._cad_task and decision.tool == "screenshot":
+                self.history.append(f"{self.step}. screenshot SKIPPED: the screenshot is attached every turn")
+                note = ("Do NOT call screenshot. The view zooms to the whole drawing after every cad_command, so lines "
+                        "far apart look small; trust the command history. Continue with the next cad_command batch "
+                        "from your plan (cad/plan.md).")
+                continue
             if shots >= 4:
                 decision.tool, decision.args = "done", {"summary": decision.thought or "已截图，但模型未给出描述。"}
+            if (decision.tool == "done" and self._cad_task and not self._sent_file and self._done_rejects < 6
+                    and self.step < self.cfg.max_steps - 3):
+                self._done_rejects += 1
+                await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                await self.emit(EventType.VALIDATION, success=False, change=0.0,
+                                message="拒绝 done：图纸还没画完/没保存发送")
+                self.history.append(f"{self.step}. done REJECTED: the drawing set is not finished, saved and sent")
+                note = ("REJECTED: the drawings are not finished. Every sheet the user listed must be drawn in LibreCAD, "
+                        "saved as DXF via File > Save As, and sent with send_file before done. Continue with the next "
+                        "unfinished sheet in cad/plan.md now (cad_command). If you have no plan yet, write it first.")
+                continue
             if decision.tool == "done" and not self._acted and _needs_action(self.task.prompt) and self._done_rejects < 2:
                 self._done_rejects += 1
                 await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
@@ -670,7 +692,7 @@ def _hist_line(step, decision, outcome, vmsg) -> str:
     args = {k: (v[:80] if isinstance(v, str) else v) for k, v in decision.args.items()}
     res = ""
     if outcome.action == "shell.exec" and outcome.result:
-        res = (f" exit={outcome.result.get('exit_code')} out={_clip(outcome.result.get('stdout') or '', 2500)!r}"
+        res = (f" exit={outcome.result.get('exit_code')} out={_clip(outcome.result.get('stdout') or '', 6000)!r}"
                + (f" err={outcome.result.get('stderr','')[-300:]!r}" if outcome.result.get("stderr") else ""))
     elif outcome.action == "files.write" and outcome.success and isinstance(outcome.result, dict):
         res = f" saved {outcome.result.get('path')} ({outcome.result.get('size')} bytes); next: run or use it"

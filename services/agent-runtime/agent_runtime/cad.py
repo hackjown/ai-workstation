@@ -97,8 +97,10 @@ def hatch(points, pattern="ANSI31", scale=None, layer="填充", angle=0):
     h.paths.add_polyline_path(points, is_closed=True)
     return h
 
-def text(x, y, s, h=3.5, layer="文字", align="LEFT", rot=0):
-    """single-line text; h is the printed height in mm. align: LEFT/CENTER/RIGHT/MIDDLE_CENTER/..."""
+def text(x, y, s, h=3.5, layer="文字", align="LEFT", rot=0, h_mm=None, **_ignored):
+    """single-line text; h (alias h_mm) is the printed height in mm. align: LEFT/CENTER/RIGHT/MIDDLE_CENTER/..."""
+    if h_mm is not None:
+        h = h_mm
     t = msp.add_text(str(s), height=TH(h), rotation=rot, dxfattribs={"style": "CN", "layer": layer})
     t.set_placement((x, y), align=getattr(TextEntityAlignment, align.upper(), TextEntityAlignment.LEFT))
     return t
@@ -278,3 +280,37 @@ READ_IMAGE_PROMPT = (
     "4. 材料、颜色、做法文字\n"
     "5. 看不清或缺失、画施工图前需要向用户确认的地方\n"
 )
+
+
+# --- script drawing is opt-in -------------------------------------------------------------------------------
+_SCRIPT_WORDS = re.compile(r"脚本|代码|ezdxf|python|script", re.I)
+
+
+def script_drawing_allowed(prompt: str) -> bool:
+    """cad_draw (ezdxf script) only when the user asked for a script themselves; otherwise draw in LibreCAD."""
+    return bool(_SCRIPT_WORDS.search(prompt or ""))
+
+
+def librecad_type_command(commands: list[str], open_path: str | None = None) -> str:
+    """Shell line that brings LibreCAD to the front (launching it, optionally on a file) and types each command
+    into its command line followed by Enter, the way a person would. Runs on the VM desktop (DISPLAY=:0)."""
+    import shlex
+    parts = ["export DISPLAY=${DISPLAY:-:0}"]
+    if open_path:
+        safe = str(open_path).replace('"', "").replace("`", "").replace("$(", "")
+        parts.append(f'(pkill -x librecad; sleep 1; nohup librecad "${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}/{safe}" >/dev/null 2>&1 &)')
+        parts.append("sleep 4")
+    else:
+        parts.append("(pgrep -x librecad >/dev/null || (nohup librecad >/dev/null 2>&1 &); true)")
+        parts.append("for i in 1 2 3 4 5 6 7 8; do xdotool search --onlyvisible --class librecad >/dev/null 2>&1 && break; sleep 1; done")
+    parts.append("W=$(xdotool search --onlyvisible --class librecad | tail -1)")
+    parts.append('[ -n "$W" ] || { echo "LibreCAD window not found"; exit 3; }')
+    parts.append('xdotool windowactivate --sync "$W"; sleep 0.3')
+    for c in commands:
+        c = str(c)
+        if c.upper() in ("ESC", "ESCAPE"):
+            parts.append("xdotool key Escape; sleep 0.2")
+            continue
+        parts.append(f"xdotool type --delay 25 -- {shlex.quote(c)}; xdotool key Return; sleep 0.35")
+    parts.append(f"echo typed {len(commands)} commands")
+    return " && ".join(parts)

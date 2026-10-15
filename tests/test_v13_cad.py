@@ -68,6 +68,8 @@ def test_registry_exposes_cad_tools():
 def test_script_drawing_is_opt_in():
     assert not cad.script_drawing_allowed("根据设计图和报价表画装修施工图，cad那种的")
     assert cad.script_drawing_allowed("用python脚本画施工图")
+    assert cad.script_drawing_allowed("用脚本画客厅背景墙施工图")
+    assert not cad.script_drawing_allowed("禁止用 python / ezdxf 脚本生成图纸，也不要用 cad_draw；读报价表可以用脚本，画图只能用 cad_command")
 
 
 def test_librecad_command_line():

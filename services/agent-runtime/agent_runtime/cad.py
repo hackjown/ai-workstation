@@ -317,6 +317,9 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
     parts.append("W=$(xdotool search --onlyvisible --class librecad | tail -1)")
     parts.append('[ -n "$W" ] || { echo "LibreCAD window not found"; exit 3; }')
     parts.append('xdotool windowactivate --sync "$W"; sleep 0.3')
+    # maximised, so the user watching sees the whole canvas
+    parts.append('(wmctrl -i -r "$(printf 0x%08x "$W")" -b add,maximized_vert,maximized_horz 2>/dev/null'
+                 ' || xdotool windowmove "$W" 0 0 windowsize "$W" 100% 100% 2>/dev/null; true)')
     for c in commands:
         c = str(c)
         if c.upper() in ("ESC", "ESCAPE"):
@@ -328,5 +331,6 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
     if not dialog and not (last.startswith("zoom") or last in ("za", "zw", "zp", "zv")):
         # fit the whole drawing so the screenshot shows what was drawn (a fresh view only shows ~0..1000 mm)
         parts.append("xdotool type --delay 25 -- za; xdotool key Return; sleep 0.5")  # zoom resumes the running tool
-    parts.append(f"echo typed {len(commands)} commands" + ("; a dialog should be open now" if dialog else ", then zoomauto"))
+    tail = "; the dialog is open now, fill it in" if dialog else ", then zoomauto"
+    parts.append("echo " + shlex.quote(f"typed {len(commands)} commands{tail}"))
     return " && ".join(parts)

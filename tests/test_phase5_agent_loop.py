@@ -236,3 +236,38 @@ async def test_identical_write_is_skipped_and_unchanged_screen_not_resent(env):
     assert any("SKIPPED" in h for h in loop.history)
     assert llm.requests[0].screenshot_b64 and llm.requests[0].screenshot_b64.startswith("/9j/")  # JPEG
     assert llm.requests[1].screenshot_b64 is None and "not re-read" in (llm.requests[1].note or "")  # file step: no screenshot
+
+
+class FlakyProvider(ScriptedProvider):
+    """Fails the first two calls like a gateway timeout (empty message), then follows its script."""
+    def __init__(self, script):
+        super().__init__(script)
+        self.fails = 2
+
+    async def decide(self, req):
+        if self.fails:
+            self.fails -= 1
+            raise TimeoutError()
+        return await super().decide(req)
+
+
+async def test_llm_failure_is_retried_not_fatal(env, monkeypatch):
+    backend, comp, tmp = env
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+    events = []
+
+    async def sink(e):
+        events.append(e)
+    llm = FlakyProvider([("open_app", {"name": "chrome"}), ("done", {"summary": "ok"})])
+    loop = AgentLoop(Task(prompt="打开 Chrome"), "s1", comp, LLMRouter([llm]), ToolExecutor(comp), emit=sink,
+                     config=LoopConfig(max_steps=15, timeout_s=20, artifacts_dir=str(tmp / "artifacts")))
+    task = await loop.run()
+    assert task.status == TaskStatus.SUCCEEDED
+    assert sum(1 for e in events if e.type == EventType.ERROR and "模型调用失败" in str(e.data)) == 2
+
+
+_real_sleep = asyncio.sleep
+
+
+async def _fast_sleep(t, *a, **k):
+    return await _real_sleep(min(t, 0.01), *a, **k)

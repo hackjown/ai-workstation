@@ -288,6 +288,13 @@ _SCRIPT_DRAW = re.compile(r"cad_draw|用[^，。；,;\n]{0,15}(脚本|代码|scr
                           r"|(script|python|ezdxf)[^，。；,;.\n]{0,10}(draw|generate)", re.I)
 
 
+_CAD_TASK = re.compile(r"施工图|装修图|平面图|立面图|librecad|(?<![a-z])cad(?![a-z])|dxf", re.I)
+
+
+def is_cad_task(prompt: str) -> bool:
+    return bool(_CAD_TASK.search(prompt or ""))
+
+
 def script_drawing_allowed(prompt: str) -> bool:
     """cad_draw (ezdxf script) only when the user asked to DRAW with a script; a negated mention
     ("禁止用脚本出图") or reading files with a script does not count. Otherwise draw in LibreCAD."""
@@ -316,5 +323,10 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
             parts.append("xdotool key Escape; sleep 0.2")
             continue
         parts.append(f"xdotool type --delay 25 -- {shlex.quote(c)}; xdotool key Return; sleep 0.35")
-    parts.append(f"echo typed {len(commands)} commands")
+    last = str(commands[-1]).strip().lower() if commands else ""
+    dialog = last in ("text", "txt", "mtext", "mtxt", "hatch", "ha")  # a dialog is now open; leave it to the agent
+    if not dialog and not (last.startswith("zoom") or last in ("za", "zw", "zp", "zv")):
+        # fit the whole drawing so the screenshot shows what was drawn (a fresh view only shows ~0..1000 mm)
+        parts.append("xdotool type --delay 25 -- za; xdotool key Return; sleep 0.5")  # zoom resumes the running tool
+    parts.append(f"echo typed {len(commands)} commands" + ("; a dialog should be open now" if dialog else ", then zoomauto"))
     return " && ".join(parts)

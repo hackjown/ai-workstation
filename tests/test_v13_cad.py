@@ -76,6 +76,14 @@ def test_librecad_command_line():
     s = cad.librecad_type_command(["line", "0,0", "@6000,0", "ESC"], "cad/a.dxf")
     assert "xdotool type --delay 25 -- line" in s and "-- @6000,0" in s and "key Escape" in s
     assert 'librecad "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/cad/a.dxf"' in s
+    assert s.rstrip().endswith("then zoomauto") and "-- za;" in s
+    assert "-- za;" not in cad.librecad_type_command(["text"])
+
+
+def test_cad_task_detection():
+    assert cad.is_cad_task("根据设计图和报价表画装修施工图，cad那种的")
+    assert cad.is_cad_task("打开 LibreCAD 画平面图")
+    assert not cad.is_cad_task("打开浏览器搜索 decade")
 
 
 async def test_cad_draw_refused_without_script_request(env):  # noqa: F811
@@ -121,3 +129,20 @@ async def test_cad_draw_tool_in_the_loop(env):  # noqa: F811
 
 
 from test_phase5_agent_loop import env  # noqa: E402,F401
+
+
+async def test_cad_done_rejected_until_file_sent(env):  # noqa: F811
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    llm = ScriptedProvider([("files_write", {"path": "cad/plan.md", "content": "LM-01"}), ("done", {"summary": "画完了"}),
+                            ("files_write", {"path": "cad/plan.md", "content": "LM-01 LM-02"}), ("done", {"summary": "画完了"})])
+
+    async def sink(e):
+        pass
+    loop = AgentLoop(Task(prompt="在 LibreCAD 里画施工图"), "s-cad3", comp, LLMRouter([llm]), ToolExecutor(comp), emit=sink,
+                     config=LoopConfig(max_steps=10, timeout_s=60, make_plan=False, artifacts_dir=str(tmp / "art")))
+    await loop.run()
+    assert any("done REJECTED: the drawing set" in h for h in loop.history)

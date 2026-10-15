@@ -67,6 +67,7 @@ class AgentLoop:
         self.recovery = Recovery(computer)
         self._emit_fn = emit
         self.history: list[str] = []
+        self._images_read: dict[str, tuple[int, str]] = {}  # path -> (step, description): history keeps only ~25 steps
         self.step = 0
         self.ask, self.remember = ask, remember
         self.extra_tools = extra_tools or {}
@@ -227,11 +228,25 @@ class AgentLoop:
                     self._last_sent_thumb = tiny
             await self.emit(EventType.THINKING)
             t_llm = time.time()
-            decision = await self.llm.decide(LLMRequest(
+            req = LLMRequest(
                 system=self.system, task=self._task_with_plan(), history=self.history,
                 screenshot_b64=send_shot, tools=tool_schemas([t[0] for t in self.extra_tools.values()],
                                    hide=() if _cad.script_drawing_allowed(self.task.prompt) else ("cad_draw",)),
-                screen=shown, note=note, screen_desc=desc))
+                screen=shown, note=note, screen_desc=desc)
+            decision = None
+            tries = int(os.environ.get("AIW_DECIDE_RETRIES", "4"))
+            for attempt in range(tries):
+                try:
+                    decision = await self.llm.decide(req)
+                    break
+                except (StopRequested, asyncio.CancelledError):
+                    raise
+                except Exception as e:  # noqa: BLE001  one bad/slow gateway reply must not kill a long task
+                    await self.emit(EventType.ERROR, error=f"模型调用失败（第 {attempt + 1}/{tries} 次）：{type(e).__name__}: {str(e)[:200]}")
+                    if attempt == tries - 1:
+                        raise
+                    req.screenshot_b64 = None  # a smaller request is more likely to get through
+                    await asyncio.sleep(min(60, 5 * 3 ** attempt))
             if decision.tool and not decision.args and decision.tool not in ("screenshot", "done", "fail"):
                 raw = decision.raw or {}
                 try:
@@ -409,10 +424,14 @@ class AgentLoop:
         return desc
 
     def _task_with_plan(self) -> str:
+        base = self.task_text
+        if self._images_read:
+            base += ("\n\nIMAGES ALREADY READ (do not read again; their content is in cad/plan.md or above): "
+                     + ", ".join(self._images_read))
         if not self.plan_steps:
-            return self.task_text
+            return base
         lines = [f"  [{'x' if i in self.plan_done else ' '}] {i}. {st}" for i, st in enumerate(self.plan_steps)]
-        return self.task_text + "\n\nPLAN:\n" + "\n".join(lines)
+        return base + "\n\nPLAN:\n" + "\n".join(lines)
 
     # ------------------------------------------------- tools handled by the loop
     async def _loop_tool(self, decision) -> Optional[str]:
@@ -603,6 +622,11 @@ class AgentLoop:
                 err = (r.result or {}).get("stderr") if isinstance(r.result, dict) else r.error
                 return f"FAILED: could not render PDF page ({err}); is poppler-utils installed?"
             path = stem + ".png"
+        q0 = (a.get("question") or "").strip()
+        if path in self._images_read and not a.get("again"):
+            st, txt = self._images_read[path]
+            return (f"ALREADY READ at step {st} (not read again, it takes ~50 s). What it showed:\n{txt[:3500]}\n"
+                    "Use this; pass again=true only if you need a different question answered.")
         f = await self.tools.run("send_file", {"path": path})   # binary read; not delivered to the chat
         if not f.success or not isinstance(f.result, dict) or not f.result.get("content_b64"):
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=f.error, result={})
@@ -627,6 +651,7 @@ class AgentLoop:
         self._acted = True
         await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
                         result={"path": path, "chars": len(text or "")})
+        self._images_read[path] = (self.step, (text or "").strip())
         return f"image {path} reads:\n{(text or '').strip()[:3500]}"
 
     async def _delegate(self, goal: str) -> str:

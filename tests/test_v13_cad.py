@@ -162,3 +162,26 @@ def test_cad_task_budget():
     from aiw_api.sessions import _budget
     assert _budget("在 LibreCAD 里画施工图", 40, 900) == (400, 10800.0)
     assert _budget("打开浏览器", 40, 900) == (40, 900)
+
+
+def test_text_and_save_items():
+    import subprocess
+    s = cad.librecad_type_command(["rectangle", "0,0", "100,100", "ESC", "TEXT|1000,800|500|兴丹路 吊顶平面图 1:50",
+                                   "SAVE|cad/荣誉室.dxf"])
+    assert subprocess.run(["sh", "-n", "-c", s], capture_output=True).returncode == 0
+    assert "xclip" in s and "兴丹路 吊顶平面图 1:50" in s and "1000,800" in s
+    assert "alt+f" in s and "荣誉室.dxf" in s and "ctrl+shift+s" not in s
+    assert s.count("ctrl+m") >= 3          # command line refocused before typed commands
+    assert "librecad-setup.sh" in s        # Chinese font + 1:50 template on first use
+    assert cad._parse_text("TEXT|1,2|3|a|b") == ("1,2", "3", "a|b")
+    assert cad._parse_text("text|1,2|标题") == ("1,2", "350", "标题")
+    assert cad._parse_text("text") is None
+
+
+def test_ttf2lff_header():
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1] / "deploy/vm/ttf2lff.py"
+    assert "LibreCAD Font 1" in src.read_text()
+    tpl = Path(__file__).resolve().parents[1] / "deploy/vm/librecad-template-1to50.dxf"
+    t = tpl.read_text()
+    assert "$DIMSCALE\n 40\n50" in t and "ENTITIES\n  0\nENDSEC" in t

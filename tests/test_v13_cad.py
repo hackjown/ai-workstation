@@ -76,7 +76,7 @@ def test_librecad_command_line():
     s = cad.librecad_type_command(["line", "0,0", "@6000,0", "ESC"], "cad/a.dxf")
     assert "xdotool type --delay 25 -- line" in s and "-- @6000,0" in s and "key Escape" in s
     assert 'librecad "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/cad/a.dxf"' in s
-    assert s.rstrip().endswith("then zoomauto") and "-- za;" in s
+    assert s.rstrip().endswith("then zoomauto'") and "-- za;" in s
     assert "-- za;" not in cad.librecad_type_command(["text"])
 
 
@@ -146,3 +146,19 @@ async def test_cad_done_rejected_until_file_sent(env):  # noqa: F811
                      config=LoopConfig(max_steps=10, timeout_s=60, make_plan=False, artifacts_dir=str(tmp / "art")))
     await loop.run()
     assert any("done REJECTED: the drawing set" in h for h in loop.history)
+
+
+def test_librecad_command_line_is_valid_shell():
+    import subprocess
+    for cmds in (["text"], ["line", "0,0", "100,0", "ESC"]):
+        s = cad.librecad_type_command(cmds)
+        r = subprocess.run(["sh", "-n", "-c", s], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        assert "a dialog" not in s.split("echo ")[-1].split("'")[0]
+    assert "maximized_vert" in cad.librecad_type_command(["za"])
+
+
+def test_cad_task_budget():
+    from aiw_api.sessions import _budget
+    assert _budget("在 LibreCAD 里画施工图", 40, 900) == (400, 10800.0)
+    assert _budget("打开浏览器", 40, 900) == (40, 900)

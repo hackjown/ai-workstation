@@ -131,7 +131,7 @@ class LLMRouter:
                 last = TimeoutError(f"{getattr(p, 'model', p)} took over {limit:.0f}s")
             except Exception as e:  # noqa: BLE001
                 last = e
-        raise RuntimeError(f"all LLM providers failed: {last}")
+        raise RuntimeError(f"all LLM providers failed: {type(last).__name__}: {last}")
 
     async def describe(self, system: str, user: str, image_b64: str, max_tokens: int = 900) -> str:
         last = None

@@ -136,6 +136,7 @@ class SessionManager:
             raise KeyError(machine_id)
         if not thread_id or not self.store.thread(thread_id):
             thread_id = self.store.create_thread(title or _title(prompt))["id"]
+        max_steps, timeout_s = _budget(prompt, max_steps, timeout_s)
         task = Task(prompt=prompt, machine_id=machine_id, max_steps=max_steps, timeout_s=timeout_s,
                     thread_id=thread_id, source=source)
         row = task.model_dump()
@@ -152,9 +153,10 @@ class SessionManager:
         return {"task": t, "session_id": t.get("session_id"), "queued": queued, "thread_id": thread_id}
 
     async def _start_task_row(self, row: dict) -> LiveSession:
+        steps, secs = _budget(row["prompt"], row.get("max_steps") or 40,
+                              row.get("timeout_s") or float(os.environ.get("AIW_TASK_TIMEOUT", "900")))
         task = Task(id=row["id"], prompt=row["prompt"], machine_id=row["machine_id"], thread_id=row.get("thread_id"),
-                    source=row.get("source") or "chat", max_steps=row.get("max_steps") or 40,
-                    timeout_s=row.get("timeout_s") or float(os.environ.get("AIW_TASK_TIMEOUT", "900")))
+                    source=row.get("source") or "chat", max_steps=steps, timeout_s=secs)
         task.context = self.build_context(task.thread_id, exclude_task=task.id)
         return await self.start(task)
 
@@ -434,3 +436,12 @@ class SessionManager:
 def _title(prompt: str) -> str:
     p = " ".join((prompt or "").split())
     return p[:24] + ("…" if len(p) > 24 else "")
+
+
+def _budget(prompt: str, max_steps: int, timeout_s: float) -> tuple[int, float]:
+    """Drawing a construction set in the CAD GUI takes hundreds of steps and hours, not 40 steps / 15 min."""
+    from agent_runtime.cad import is_cad_task
+    if is_cad_task(prompt):
+        return (max(max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400"))),
+                max(timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800"))))
+    return max_steps, timeout_s

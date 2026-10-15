@@ -224,7 +224,8 @@ class AgentLoop:
             t_llm = time.time()
             decision = await self.llm.decide(LLMRequest(
                 system=self.system, task=self._task_with_plan(), history=self.history,
-                screenshot_b64=send_shot, tools=tool_schemas([t[0] for t in self.extra_tools.values()]),
+                screenshot_b64=send_shot, tools=tool_schemas([t[0] for t in self.extra_tools.values()],
+                                   hide=() if _cad.script_drawing_allowed(self.task.prompt) else ("cad_draw",)),
                 screen=shown, note=note, screen_desc=desc))
             if decision.tool and not decision.args and decision.tool not in ("screenshot", "done", "fail"):
                 raw = decision.raw or {}
@@ -415,7 +416,13 @@ class AgentLoop:
         if t == "click_element":
             return await self._click_element(a, decision.thought)
         if t == "cad_draw":
+            if not _cad.script_drawing_allowed(self.task.prompt):
+                await self.emit(EventType.ACTION_RESULT, tool=t, success=False, error="script drawing not allowed", result={})
+                return ("REFUSED: the user did not ask for a script. Draw in the LibreCAD window instead: cad_command "
+                        "with LibreCAD commands (line, rectangle, circle, dimhorizontal...), text/layers/save via its dialogs.")
             return await self._cad_draw(a, decision.thought)
+        if t == "cad_command":
+            return await self._cad_command(a, decision.thought)
         if t == "read_image":
             return await self._read_image(a)
         if t == "remember":
@@ -490,6 +497,26 @@ class AgentLoop:
             self._acted = True
             self._fresh = outcome.screenshot
         return f"{tool} at ({x}, {y}) for '{target}' -> {'ok' if outcome.success else 'FAILED ' + str(outcome.error)}; {v.message}"
+
+    async def _cad_command(self, a: dict, intent: str) -> str:
+        """Type LibreCAD command-line commands into the visible LibreCAD window (xdotool), like a person drafting."""
+        cmds = [str(c) for c in (a.get("commands") or []) if str(c).strip()]
+        if not cmds:
+            await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="missing args ['commands']", result={})
+            return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
+        cmd = _cad.librecad_type_command(cmds[:80], a.get("open") or None)
+        r = await self.tools.run("shell", {"command": cmd, "timeout": 120}, intent=intent)
+        res = r.result if isinstance(r.result, dict) else {}
+        ok = r.success and (res.get("exit_code", 0) == 0)
+        out = ((res.get("stdout") or "") + (res.get("stderr") or "") or (r.error or ""))[-400:]
+        await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=ok, error=None if ok else out[-200:],
+                        result={"commands": cmds[:80], "count": len(cmds)})
+        if ok:
+            self._acted = True
+            self._fresh = None
+        more = " (only the first 80 were typed)" if len(cmds) > 80 else ""
+        return (f"typed {min(len(cmds), 80)} commands into LibreCAD{more}: {out.strip()}. Check the screenshot and the "
+                f"command history at the bottom of LibreCAD for errors before continuing." if ok else f"FAILED: {out}")
 
     async def _cad_draw(self, a: dict, intent: str) -> str:
         """Write the drawing body into a script with the CAD prelude, run it on the VM (ezdxf), open the DXF in

@@ -35,7 +35,8 @@ Rules:
      (rectangle 0,0 -> @21000,14850 relative to its origin, title block bottom-right); put sheet n at origin
      (n*25000, 0). Sizes missing from both files: `ask_user` once with ALL of them; never invent.
      Then `update_plan` / continue sheet by sheet; plan.md is your checklist.
-  3. DRAW with `cad_command` (types into LibreCAD's command line; the view zooms to fit after each call, so a big
+  3. Never start or kill LibreCAD from shell (pkill kills your own shell): the first `cad_command` starts it,
+     brings it to the front and maximises it. DRAW with `cad_command` (types into LibreCAD's command line; the view zooms to fit after each call, so a big
      drawing looks small: trust the command history at the bottom right, do not call screenshot to "check").
      Absolute points "x,y" (add the sheet origin yourself), relative "@dx,dy". Commands: line/li, polyline/pl,
      rectangle/rec (two corners), circle/ci (centre, radius), arc, offset, move, mirror, hatch,

@@ -31,7 +31,7 @@ Rules:
      and the exact entities to draw with coordinates in mm, all derived from the quote and images, e.g.
      "LM-01 左侧墙立面, origin (50000,0): rectangle 0,0 -> @10000,3000 (墙面); rectangle 0,2550 -> @10000,400 (标题底板);
      版面 历史沿革 rectangle 0,500 -> @4000,2000; ...; dh 0,0 4000,0 2000,-600; text '历史沿革' at 2000,2700 h=250;
-     做法 text '轻钢龙骨9厘夹板打底面封石膏板' ...". Model space is 1:1 mm. Each sheet is an A3 frame at 1:50
+     做法 text '轻钢龙骨9厘夹板打底面封石膏板' ...". Model space is 1:1 mm (new drawings start from a 1:50 template, so dimensions read at 1:50). Each sheet is an A3 frame at 1:50
      (rectangle 0,0 -> @21000,14850 relative to its origin, title block bottom-right); put sheet n at origin
      (n*25000, 0). Sizes missing from both files: `ask_user` once with ALL of them; never invent.
      Then `update_plan` / continue sheet by sheet; plan.md is your checklist.
@@ -42,12 +42,12 @@ Rules:
      rectangle/rec (two corners), circle/ci (centre, radius), arc, offset, move, mirror, hatch,
      dimhorizontal/dh, dimvertical/dv, dimaligned/da, dimlinear/dl (point1, point2, dimension-line position),
      dimleader/ld, undo/u, kill/k, 'ESC' ends the current command. One sheet = several batches of 20-60 commands.
-  4. TEXT: first `cad_command` ['text'] alone (it opens the Text dialog): type the string, set Height (≈175 for
-     3.5 mm at 1:50, 250-400 for titles), press OK, then `cad_command` ['x,y'] to place it. While the text tool is
-     still active, more texts need no dialog: ['text','下一段文字','x,y','text','再一段','x,y',...]. Layers: use the
-     Layer List panel (+ button) for 墙体/尺寸/文字/填充 when useful; hatches via the hatch dialog.
-  5. FINISH: File > Save As (ctrl+shift+s) to ~/workspace/cad/<name>.dxf (type the full path, Enter; confirm
-     overwrite). PDF: File > Print Preview / Export if possible. `send_file` the DXF (and PDF), then done with the
+  4. TEXT: one item 'TEXT|x,y|height|内容' per text, e.g. ['TEXT|1000,800|500|一层吊顶平面图 1:50',
+     'TEXT|2000,2700|250|历史沿革']. It opens the Text dialog, pastes the string (Chinese is fine), sets the height
+     (≈175 for 3.5 mm at 1:50, 250-500 for titles), presses OK and places it; no clicking in the dialog. Never send a bare
+     'text' and never click inside the Text dialog. Layers: Layer List panel (+ button) when useful.
+  5. SAVE often: `cad_command` ['SAVE|cad/<name>.dxf'] does File > Save as (ctrl+shift+s is Save ALL in LibreCAD,
+     not Save As); save after every finished sheet so nothing is lost. FINISH: save once more. PDF: File > Print Preview / Export if possible. `send_file` the DXF (and PDF), then done with the
      list of sheets and any assumptions. done before the DXF is sent is rejected.
 - Prefer keyboard shortcuts and URLs over hunting for small targets (ctrl+l focuses Chrome's address bar).
 - Use `shell` for file/terminal work when it's faster than GUI, unless the task says to use the GUI.

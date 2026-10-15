@@ -283,12 +283,16 @@ READ_IMAGE_PROMPT = (
 
 
 # --- script drawing is opt-in -------------------------------------------------------------------------------
-_SCRIPT_WORDS = re.compile(r"脚本|代码|ezdxf|python|script", re.I)
+_NEGATED = re.compile(r"(禁止|不要|不能|不准|不许|不用|别|勿|严禁|\bnever\b|\bdon't\b|\bdo not\b|\bno\b)[^，。；,;.\n]{0,40}", re.I)
+_SCRIPT_DRAW = re.compile(r"cad_draw|用[^，。；,;\n]{0,15}(脚本|代码|script|ezdxf)[^，。；,;\n]{0,6}(画|出图|生成|绘|做)"
+                          r"|(script|python|ezdxf)[^，。；,;.\n]{0,10}(draw|generate)", re.I)
 
 
 def script_drawing_allowed(prompt: str) -> bool:
-    """cad_draw (ezdxf script) only when the user asked for a script themselves; otherwise draw in LibreCAD."""
-    return bool(_SCRIPT_WORDS.search(prompt or ""))
+    """cad_draw (ezdxf script) only when the user asked to DRAW with a script; a negated mention
+    ("禁止用脚本出图") or reading files with a script does not count. Otherwise draw in LibreCAD."""
+    p = _NEGATED.sub("", prompt or "")
+    return bool(_SCRIPT_DRAW.search(p))
 
 
 def librecad_type_command(commands: list[str], open_path: str | None = None) -> str:

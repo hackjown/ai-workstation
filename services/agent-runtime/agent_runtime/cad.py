@@ -5,6 +5,7 @@ saves the DXF and renders a PDF + PNG preview."""
 from __future__ import annotations
 
 import json
+import os
 import re
 
 CAD_DIR = "cad"  # under ~/workspace on the VM
@@ -302,6 +303,11 @@ def script_drawing_allowed(prompt: str) -> bool:
     return bool(_SCRIPT_DRAW.search(p))
 
 
+# typing speed: LibreCAD keeps up with 8 ms/char and an 80 ms pause per command (tested with 150-command batches);
+# the old 25 ms / 350 ms made a 60-command batch take ~45 s
+TYPE_DELAY_MS = int(os.environ.get("AIW_CAD_TYPE_DELAY_MS", "8"))
+STEP_PAUSE_S = float(os.environ.get("AIW_CAD_STEP_PAUSE_S", "0.08"))
+
 LIBRECAD_FONT = "notosc"   # outline CJK font made by deploy/vm/ttf2lff.py; LibreCAD's own fonts have no hanzi
 
 
@@ -370,7 +376,7 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
                 "D=; for i in $(seq 1 20); do D=$(xdotool search --onlyvisible --name '^Text$' 2>/dev/null | tail -1); "
                 '[ -n "$D" ] && break; sleep 0.2; done; '
                 '[ -n "$D" ] || { echo "Text dialog did not open"; exit 4; }; sleep 0.3; '
-                f"printf %s {shlex.quote(body)} | xclip -selection clipboard 2>/dev/null; "
+                f"printf %s {shlex.quote(body)} | xclip -selection clipboard -i >/dev/null 2>&1; "
                 "xdotool key ctrl+a; "
                 f"if command -v xclip >/dev/null; then xdotool key ctrl+v; else xdotool type --delay 30 -- {shlex.quote(body)}; fi; "
                 f"sleep 0.2; xdotool key Tab ctrl+a; xdotool type -- {shlex.quote(h)}; xdotool key Return; "
@@ -399,7 +405,7 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
             continue
         # ctrl+m = "Focus on Command Line": Escape inside the command line drops keyboard focus, after which
         # typed commands went nowhere
-        parts.append(f"xdotool key ctrl+m; xdotool type --delay 25 -- {shlex.quote(c)}; xdotool key Return; sleep 0.35")
+        parts.append(f"xdotool key ctrl+m; xdotool type --delay {TYPE_DELAY_MS} -- {shlex.quote(c)}; xdotool key Return; sleep {STEP_PAUSE_S}")
     last = str(commands[-1]).strip().lower() if commands else ""
     if last.startswith("save"):
         last = "za"  # no zoom after a save

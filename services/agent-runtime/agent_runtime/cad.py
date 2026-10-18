@@ -429,6 +429,51 @@ def expand(commands: list[str]) -> list[str]:
     return out
 
 
+_ABS_POINT = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
+_SHEET = re.compile(r"(?i)^\s*(frame|sheet)\s*\|\s*(-?\d+(?:\.\d+)?)")
+
+
+def place(commands: list[str], sheet: int = 0) -> tuple[list[str], int, int]:
+    """Expand macros and put every point on its sheet. 'FRAME|n|...' (or 'SHEET|n') makes sheet n current, and from
+    then on a point given sheet-locally (x left of the sheet's origin n*25000) is moved onto it, so both
+    'line 2000,3000' after FRAME|4 and the absolute 'line 102000,3000' land on sheet 4. Without this the model drew
+    sheets 1-11 at local coordinates and every sheet piled up on top of sheet 0 (2026-10-19 run).
+    Returns (expanded commands, current sheet afterwards, points moved)."""
+    out: list[str] = []
+    moved = 0
+
+    def shift(p: str) -> str:
+        nonlocal moved
+        m = _ABS_POINT.match(p)
+        ox = sheet * SHEET_PITCH
+        if not m or ox <= 0:
+            return p
+        x, y = float(m.group(1)), float(m.group(2))
+        if x < ox - 2000:  # a sheet-local x (0..21000): absolute points on this sheet are >= its origin
+            moved += 1
+            return _pt(x + ox, y)
+        return p
+
+    for c in commands:
+        c = str(c)
+        ms = _SHEET.match(c)
+        if ms:
+            sheet = max(0, int(float(ms.group(2))))
+            if ms.group(1).upper() == "SHEET":
+                continue  # only sets the origin
+            out.extend(expand([c]))  # FRAME is already absolute
+            continue
+        for e in expand([c]):
+            t = _parse_text(e)
+            if t:
+                pt, h, body = t
+                e = f"TEXT|{shift(pt)}|{h}|{body}"
+            elif _ABS_POINT.match(e):
+                e = shift(e)
+            out.append(e)
+    return out, sheet, moved
+
+
 def resume_index(commands: list[str], done: int) -> int:
     """After a batch was cut off with `done` items typed, where to restart so no tool is left half-fed:
     back up to the item that started the tool (a point never starts one)."""
@@ -529,7 +574,11 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
     parts.append("for i in $(seq 1 25); do xdotool search --onlyvisible --name '^LibreCAD' >/dev/null 2>&1 && break; "
                  "WL=$(xdotool search --onlyvisible --name '^Welcome$' 2>/dev/null | head -1); "
                  '[ -n "$WL" ] && { xdotool windowfocus "$WL" 2>/dev/null; xdotool key --window "$WL" Return; }; sleep 1; done')
-    parts.append("W=$(xdotool search --onlyvisible --name '^LibreCAD' | tail -1)")
+    # one LibreCAD only: a second instance (started by hand from shell) took the keystrokes and every Text
+    # dialog timed out (2026-10-19 run); keep the newest, whose window is the one in front
+    parts.append("(for i in 1 2 3; do N=$(pgrep -xc librecad 2>/dev/null); [ \"${N:-0}\" -gt 1 ] 2>/dev/null || break; pkill -o -x librecad; sleep 1; done; true)")
+    parts.append("W=; for i in $(seq 1 20); do W=$(xdotool search --onlyvisible --name '^LibreCAD' 2>/dev/null | tail -1); "
+                 '[ -n "$W" ] && break; sleep 0.5; done')
     parts.append('[ -n "$W" ] || { echo "LibreCAD window not found"; exit 3; }')
     parts.append('(xdotool windowactivate --sync "$W" 2>/dev/null || xdotool windowfocus "$W"; true); sleep 0.3')
     # maximised, so the user watching sees the whole canvas

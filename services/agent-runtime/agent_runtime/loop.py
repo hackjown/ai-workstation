@@ -23,6 +23,8 @@ from tool_router import ToolExecutor, tool_schemas
 from tool_router.registry import SUBAGENT_TOOLS
 
 from . import cad as _cad
+
+_LIBRECAD_PROC = re.compile(r"(?i)(nohup\s+librecad|(^|[;&|(]\s*)librecad\s*($|[&>;)])|p?kill(all)?\b[^;&|]*librecad)")
 from .control import AgentControl, StopRequested
 from .grounding import convert_desc, coord_instruction, coord_mode, locate, model_name
 from .planner import SYSTEM_PROMPT, make_plan
@@ -198,6 +200,7 @@ class AgentLoop:
         self._last_ok_cad = False  # did the last cad_command go through
         self._sheet_audit: dict = {}  # entities per sheet from the last PDF export
         self._cad_pdf_ok = False      # PDF made by LibreCAD (PDF|...), not by soffice
+        self._cad_sheet = 0           # sheet the next cad_command points belong to (set by FRAME|n / SHEET|n)
         self._prev_sig: Optional[tuple] = None
         self._rep = 0
         self._last_tool: Optional[str] = None
@@ -496,6 +499,14 @@ class AgentLoop:
             return await self._cad_draw(a, decision.thought)
         if t == "cad_command":
             return await self._cad_command(a, decision.thought)
+        if t == "shell" and self._cad_task and _LIBRECAD_PROC.search(str(a.get("command") or "")):
+            # starting/killing LibreCAD by hand left two instances (keystrokes went to the wrong one) and
+            # `pkill -f librecad` killed the tool's own shell (exit -15) in the 2026-10-19 run
+            await self.emit(EventType.ACTION_RESULT, tool=t, success=False, error="LibreCAD is managed by cad_command",
+                            result={})
+            return ("REFUSED: do not start or kill LibreCAD from shell. cad_command starts it, keeps a single instance, "
+                    "closes leftover dialogs and resumes a cut-off batch by itself: just send the next cad_command. "
+                    "To reopen a file use cad_command with open='cad/<name>.dxf'.")
         if t == "read_image":
             return await self._read_image(a)
         if t == "remember":
@@ -577,7 +588,9 @@ class AgentLoop:
         if not raw:
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="missing args ['commands']", result={})
             return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
-        cmds = _cad.expand(raw[:CAD_MAX_BATCH])[:CAD_MAX_EXPANDED]
+        # points go onto the current sheet (FRAME|n / SHEET|n), whether given sheet-locally or absolutely
+        cmds, self._cad_sheet, moved = _cad.place(raw[:CAD_MAX_BATCH], self._cad_sheet)
+        cmds = cmds[:CAD_MAX_EXPANDED]
         r, res, ok, out = await self._type_cad(cmds, a.get("open") or None, intent)
         resumed = ""
         if not ok and res.get("timed_out"):
@@ -608,6 +621,9 @@ class AgentLoop:
         if m and self._sheet_audit.get("thin"):
             audit = (f" THIN SHEETS {self._sheet_audit['thin']} (entities per sheet {self._sheet_audit.get('counts')}): "
                      f"those sheets are not finished; draw their missing content, save and export again.")
+        if moved:
+            more += (f" (sheet {self._cad_sheet}: {moved} sheet-local points were placed at origin x="
+                     f"{self._cad_sheet * _cad.SHEET_PITCH}; keep using local or absolute coordinates, both land right)")
         if ok:
             return (f"typed {len(cmds)} commands into LibreCAD{resumed}{more}: {out.strip()[-600:]}.{audit} Continue straight on "
                     f"with the next batch from cad/plan.md; no screenshot or Escape needed.")

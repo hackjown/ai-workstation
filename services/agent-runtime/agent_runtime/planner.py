@@ -27,28 +27,38 @@ Rules:
      if both fail: `soffice --headless -env:UserInstallation=file:///tmp/lo_conv --convert-to xlsx FILE`.
      Read each design image with `read_image` and a focused question (板块从左到右的名称和宽度, 门的位置...).
      Never re-read a file whose content is already in PREVIOUS STEPS.
-  2. WRITE THE PLAN (text, not drawing): `files_write` cad/plan.md. For each sheet: its number and name, its origin,
-     and the exact entities to draw with coordinates in mm, all derived from the quote and images, e.g.
-     "LM-01 左侧墙立面, origin (50000,0): rectangle 0,0 -> @10000,3000 (墙面); rectangle 0,2550 -> @10000,400 (标题底板);
-     版面 历史沿革 rectangle 0,500 -> @4000,2000; ...; dh 0,0 4000,0 2000,-600; text '历史沿革' at 2000,2700 h=250;
-     做法 text '轻钢龙骨9厘夹板打底面封石膏板' ...". Model space is 1:1 mm (new drawings start from a 1:50 template, so dimensions read at 1:50). Each sheet is an A3 frame at 1:50
-     (rectangle 0,0 -> @21000,14850 relative to its origin, title block bottom-right); put sheet n at origin
-     (n*25000, 0). Sizes missing from both files: `ask_user` once with ALL of them; never invent.
-     Then `update_plan` / continue sheet by sheet; plan.md is your checklist.
+  2. WRITE THE PLAN (text, not drawing): `files_write` cad/plan.md, written directly as cad_command items per sheet
+     (absolute mm, sheet n at origin x = n*25000; model space 1:1 mm, A3 at 1:50 = 21000 x 14850). Every sheet is
+     COMPLETE, not a sketch. Minimum content:
+     - every sheet: FRAME (frame + title block), the view title (TEXT h 400) with scale, notes where needed.
+     - 平面/拆除/天花: walls with thickness (two lines or rectangles), door opening + swing arc, every wall-mounted
+       board/形象墙 in plan, furniture outlines, axis or overall + segment dimension chains on two sides, material and
+       demolition notes with LEADERs, legend.
+     - 立面: wall outline and floor/ceiling lines, every panel and its 标题底板/边框/灯带/踢脚 drawn with its real size,
+       DIMH chain of all panel widths + overall, DIMV chain of heights (踢脚, 版面, 标题, 顶), LEADER for every material
+       (做法 from the quote), panel names as text.
+     - 节点: a layered section per node (each layer a rectangle/hatch with its thickness), LEADER per layer naming it.
+     A finished elevation is usually 80-200 items; a sheet under ~40 entities is rejected at the end.
+     Sizes missing from both files: `ask_user` once with ALL of them; never invent. plan.md is your checklist.
   3. Never start or kill LibreCAD from shell (pkill kills your own shell): the first `cad_command` starts it,
-     brings it to the front and maximises it. DRAW with `cad_command` (types into LibreCAD's command line; the view zooms to fit after each call, so a big
-     drawing looks small: trust the command history at the bottom right, do not call screenshot to "check").
-     Absolute points "x,y" (add the sheet origin yourself), relative "@dx,dy". Commands: line/li, polyline/pl,
-     rectangle/rec (two corners), circle/ci (centre, radius), arc, offset, move, mirror, hatch,
-     dimhorizontal/dh, dimvertical/dv, dimaligned/da, dimlinear/dl (point1, point2, dimension-line position),
-     dimleader/ld, undo/u, kill/k, 'ESC' ends the current command. SPEED: each cad_command call costs a model turn (~30 s), so send a whole sheet (or a big part of it) per call: 100-200 commands, lines, dimensions and its TEXT items together. Do not split a sheet into small batches, do not screenshot or press Escape between batches; if a batch FAILED, just resend what did not land.
-  4. TEXT: one item 'TEXT|x,y|height|内容' per text, e.g. ['TEXT|1000,800|500|一层吊顶平面图 1:50',
-     'TEXT|2000,2700|250|历史沿革']. It opens the Text dialog, pastes the string (Chinese is fine), sets the height
-     (≈175 for 3.5 mm at 1:50, 250-500 for titles), presses OK and places it; no clicking in the dialog. Never send a bare
-     'text' and never click inside the Text dialog. Layers: Layer List panel (+ button) when useful.
-  5. SAVE often: `cad_command` ['SAVE|cad/<name>.dxf'] does File > Save as (ctrl+shift+s is Save ALL in LibreCAD,
-     not Save As); save after every finished sheet so nothing is lost. FINISH: save once more. PDF: File > Print Preview / Export if possible. `send_file` the DXF (and PDF), then done with the
-     list of sheets and any assumptions. done before the DXF is sent is rejected.
+     brings it to the front and maximises it. DRAW with `cad_command` (types into LibreCAD's command line; the view
+     zooms to fit after each call: trust the command history, do not screenshot to "check").
+     Commands: line/li, polyline/pl, rectangle/rec (two corners), circle/ci (centre, radius), arc, offset, move,
+     mirror, hatch, dimhorizontal/dh, dimvertical/dv, dimaligned/da (point1, point2, dimension-line position),
+     undo/u, 'ESC' ends the current command. Shorthand items (typed out as those same commands):
+       'FRAME|n|图名|图号|1:50|工程名称'  A3 frame + title block for sheet n
+       'TEXT|x,y|height|内容'            one text (≈175 body, 250 labels, 400 titles; Chinese is fine)
+       'NOTE|x,y|175|第一行;第二行;...'   a block of note lines downwards from x,y
+       'DIMH|y_measured|y_dimline|x1,x2,x3,...'   chain of horizontal dims + overall; 'DIMV|x_measured|x_dimline|y1,y2,...'
+       'LEADER|x1,y1|x2,y2|175|材料做法'   leader from the object (x1,y1) to a labelled shelf at x2,y2
+       'SAVE|cad/name.dxf'   'PDF|cad/name.dxf|cad/name.pdf'
+     SPEED: every call costs a model turn, so send ONE WHOLE SHEET per call (100-200 items incl. its texts). Do not
+     split a sheet into small batches; no screenshot or Escape between batches. A cut-off batch resumes by itself.
+  4. Never send a bare 'text' and never click inside the Text dialog. Layers: Layer List panel when useful.
+  5. SAVE after every sheet (['SAVE|cad/<name>.dxf']; Chinese file names are fine). FINISH: SAVE, then
+     ['PDF|cad/<name>.dxf|cad/<name>.pdf'] (LibreCAD's own dxf2pdf, one A3 page per sheet, and it reports entities per
+     sheet: draw more on any THIN sheet and export again). Never make the PDF with soffice/LibreOffice (it mangles
+     DXF). `send_file` the DXF and the PDF, then done with the sheet list and assumptions.
 - Prefer keyboard shortcuts and URLs over hunting for small targets (ctrl+l focuses Chrome's address bar).
 - Use `shell` for file/terminal work when it's faster than GUI, unless the task says to use the GUI.
 - The user watches the desktop. If the request names an app or says 打开浏览器/打开某网页/open the browser, your FIRST

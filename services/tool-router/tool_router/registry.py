@@ -81,8 +81,11 @@ TOOLS: list[ToolSpec] = [
              "Units are mm at 1:1. Examples: ['line','0,0','6000,0','6000,10000','0,10000','0,0','ESC'], "
              "['rectangle','0,0','@1500,150'], ['circle','3000,750','350'], ['polyline','0,0','@1000,0','@0,500','ESC'], "
              "['dimhorizontal','0,0','6000,0','3000,-800']. Use 'ESC' to finish a command. After each call the view zooms "
-             "to fit the whole drawing automatically. Text: 'TEXT|x,y|height|内容' (one item, Chinese ok, no dialog clicking). "
-             "Save: 'SAVE|cad/name.dxf'. Never type a bare 'text'.",
+             "to fit the whole drawing automatically. Shorthand items: 'TEXT|x,y|height|内容' (Chinese ok), "
+             "'FRAME|n|图名|图号|1:50|工程名称' (A3 frame + title block of sheet n at x=n*25000), 'NOTE|x,y|175|行1;行2', "
+             "'DIMH|y_measured|y_dimline|x1,x2,...' / 'DIMV|x_measured|x_dimline|y1,y2,...' (dimension chains), "
+             "'LEADER|x1,y1|x2,y2|175|材料', 'SAVE|cad/name.dxf', 'PDF|cad/name.dxf|cad/name.pdf' (LibreCAD dxf2pdf, a page "
+             "per sheet). Send a whole sheet (100-200 items) per call. Never type a bare 'text'.",
              {"commands": {"type": "array", "items": {"type": "string"}},
               "open": {"type": "string", "description": "optional .dxf path relative to ~/workspace to open first"}},
              ["commands"]),

@@ -74,7 +74,7 @@ def test_script_drawing_is_opt_in():
 
 def test_librecad_command_line():
     s = cad.librecad_type_command(["line", "0,0", "@6000,0", "ESC"], "cad/a.dxf")
-    assert "xdotool type --delay 25 -- line" in s and "-- @6000,0" in s and "key Escape" in s
+    assert f"xdotool type --delay {cad.TYPE_DELAY_MS} -- line" in s and "-- @6000,0" in s and "key Escape" in s
     assert 'librecad "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/cad/a.dxf"' in s
     assert s.rstrip().endswith("then zoomauto'") and "-- za;" in s
     assert "-- za;" not in cad.librecad_type_command(["text"])
@@ -185,3 +185,18 @@ def test_ttf2lff_header():
     tpl = Path(__file__).resolve().parents[1] / "deploy/vm/librecad-template-1to50.dxf"
     t = tpl.read_text()
     assert "$DIMSCALE\n 40\n50" in t and "ENTITIES\n  0\nENDSEC" in t
+
+
+def test_text_clipboard_does_not_hold_the_output_pipe():
+    """xclip forks and keeps serving the clipboard; with the shell's stdout attached it held the pipe open and
+    every TEXT batch hung until the 120 s timeout (run of 2026-10-18)."""
+    s = cad.librecad_type_command(["TEXT|0,0|300|荣誉室"])
+    assert "xclip -selection clipboard -i >/dev/null 2>&1;" in s
+    assert "</dev/null; " not in s.split("xclip", 1)[1][:60]  # stdin must stay the piped text
+
+
+def test_cad_command_timeout_scales_with_batch():
+    import inspect
+    from agent_runtime import loop as L
+    src = inspect.getsource(L.AgentLoop._cad_command)
+    assert '"timeout": budget' in src and L.CAD_MAX_BATCH >= 150

@@ -242,3 +242,38 @@ async def test_cad_done_rejected_without_librecad_pdf(env):  # noqa: F811
                      config=LoopConfig(max_steps=10, timeout_s=60, make_plan=False, artifacts_dir=str(tmp / "art")))
     await loop.run()
     assert any("done REJECTED: no LibreCAD PDF" in h for h in loop.history)
+
+
+# ---- V1.3.7: sheet-local coordinates land on their sheet; LibreCAD not started/killed from shell ----
+def test_place_moves_local_points_onto_current_sheet():
+    from agent_runtime import cad
+    cmds, sheet, moved = cad.place(["FRAME|4|左侧墙立面图|4|1:50|X", "line", "2000,3000", "12000,3000", "ESC",
+                                    "TEXT|5000,8000|250|历史沿革", "line", "102000,3500", "112000,3500", "ESC"], 0)
+    assert sheet == 4 and moved == 3
+    assert "102000,3000" in cmds and "112000,3000" in cmds and "TEXT|105000,8000|250|历史沿革" in cmds
+    assert "102000,3500" in cmds  # absolute points stay as they are
+    assert cmds[1] == "100000,0"  # the FRAME itself is absolute
+
+
+def test_place_keeps_sheet_across_batches_and_sheet_marker():
+    from agent_runtime import cad
+    cmds, sheet, _ = cad.place(["DIMH|2000|1500|1000,5000,11000", "LEADER|3000,4000|6000,6000|175|乳胶漆"], 2)
+    assert sheet == 2 and all(not c[0].isdigit() or float(c.split(",")[0]) >= 50000 for c in cmds if "," in c and "|" not in c)
+    cmds, sheet, _ = cad.place(["SHEET|7", "circle", "3000,750", "350"], 2)
+    assert sheet == 7 and cmds == ["circle", "178000,750", "350"]
+    cmds, sheet, moved = cad.place(["line", "0,0", "@1000,0", "ESC"], 0)
+    assert moved == 0 and cmds == ["line", "0,0", "@1000,0", "ESC"]
+
+
+def test_shell_cannot_start_or_kill_librecad():
+    from agent_runtime.loop import _LIBRECAD_PROC as P
+    for c in ["nohup librecad >/tmp/l 2>&1 &", "pkill -f librecad; sleep 2", "(librecad &)", "killall librecad"]:
+        assert P.search(c), c
+    for c in ["pgrep -a librecad", "which librecad", "xdotool search --name LibreCAD", "cat ~/.config/LibreCAD/LibreCAD.conf"]:
+        assert not P.search(c), c
+
+
+def test_type_command_keeps_one_librecad():
+    from agent_runtime import cad
+    s = cad.librecad_type_command(["line", "0,0", "100,0", "ESC"])
+    assert "pgrep -xc librecad" in s and "pkill -o -x librecad" in s

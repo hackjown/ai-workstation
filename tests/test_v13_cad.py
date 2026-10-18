@@ -198,5 +198,47 @@ def test_text_clipboard_does_not_hold_the_output_pipe():
 def test_cad_command_timeout_scales_with_batch():
     import inspect
     from agent_runtime import loop as L
-    src = inspect.getsource(L.AgentLoop._cad_command)
+    src = inspect.getsource(L.AgentLoop._type_cad)
     assert '"timeout": budget' in src and L.CAD_MAX_BATCH >= 150
+    assert "_cad_progress" in inspect.getsource(L.AgentLoop._cad_command)  # a cut-off batch resumes itself
+
+
+def test_sheet_macros_expand_to_librecad_commands():
+    import subprocess
+    out = cad.expand(["FRAME|2|平面布置图|JZ-03|1:50|兴丹路消防救援站荣誉室", "DIMH|0|-800|0,4000,6000,10000",
+                      "NOTE|1000,2000|175|一、工程概况;二、设计依据", "LEADER|100,100|900,900|175|9厘夹板", "line", "0,0", "1,1", "ESC"])
+    assert out[:3] == ["rectangle", "50000,0", "71000,14850"]
+    assert "TEXT|61650,800|350|平面布置图" in out and "TEXT|1000,1685|175|二、设计依据" in out
+    assert out.count("dimhorizontal") == 4 and "5000,-1400" in out       # 3 segments + overall further out
+    assert any(c.endswith("|9厘夹板") for c in out) and out[-4:] == ["line", "0,0", "1,1", "ESC"]
+    assert cad.expand(["DIMH|oops"])[0].startswith("#BAD")
+    s = cad.librecad_type_command(out + ["SAVE|cad/兴丹路消防救援站荣誉室施工图.dxf", "PDF|cad/a.dxf|cad/a.pdf"])
+    assert subprocess.run(["sh", "-n", "-c", s], capture_output=True).returncode == 0
+    assert "aiw_splitpdf.py" in s and "aiw-cad-progress" in s
+    assert 'xdotool type --delay 15 -- "${VM' not in s.split("Save Drawing As")[1][:400].split("else")[0]  # path pasted
+
+
+def test_resume_index_backs_up_to_the_tool():
+    c = ["line", "0,0", "1,1", "ESC", "rectangle", "2,2", "3,3", "TEXT|1,1|175|a"]
+    assert cad.resume_index(c, 6) == 4 and cad.resume_index(c, 7) == 7 and cad.resume_index(c, 0) == 0
+
+
+def test_split_pdf_script_compiles():
+    compile(cad.SPLIT_PDF_SCRIPT, "aiw_splitpdf.py", "exec")
+
+
+async def test_cad_done_rejected_without_librecad_pdf(env):  # noqa: F811
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    llm = ScriptedProvider([("files_write", {"path": "cad/a.pdf", "content": "x"}), ("send_file", {"path": "cad/a.pdf"}),
+                            ("done", {"summary": "画完了"}), ("done", {"summary": "画完了"})])
+
+    async def sink(e):
+        pass
+    loop = AgentLoop(Task(prompt="在 LibreCAD 里画施工图"), "s-cad4", comp, LLMRouter([llm]), ToolExecutor(comp), emit=sink,
+                     config=LoopConfig(max_steps=10, timeout_s=60, make_plan=False, artifacts_dir=str(tmp / "art")))
+    await loop.run()
+    assert any("done REJECTED: no LibreCAD PDF" in h for h in loop.history)

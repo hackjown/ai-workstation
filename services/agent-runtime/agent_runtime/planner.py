@@ -41,7 +41,7 @@ Rules:
      Absolute points "x,y" (add the sheet origin yourself), relative "@dx,dy". Commands: line/li, polyline/pl,
      rectangle/rec (two corners), circle/ci (centre, radius), arc, offset, move, mirror, hatch,
      dimhorizontal/dh, dimvertical/dv, dimaligned/da, dimlinear/dl (point1, point2, dimension-line position),
-     dimleader/ld, undo/u, kill/k, 'ESC' ends the current command. One sheet = several batches of 20-60 commands.
+     dimleader/ld, undo/u, kill/k, 'ESC' ends the current command. SPEED: each cad_command call costs a model turn (~30 s), so send a whole sheet (or a big part of it) per call: 100-200 commands, lines, dimensions and its TEXT items together. Do not split a sheet into small batches, do not screenshot or press Escape between batches; if a batch FAILED, just resend what did not land.
   4. TEXT: one item 'TEXT|x,y|height|内容' per text, e.g. ['TEXT|1000,800|500|一层吊顶平面图 1:50',
      'TEXT|2000,2700|250|历史沿革']. It opens the Text dialog, pastes the string (Chinese is fine), sets the height
      (≈175 for 3.5 mm at 1:50, 250-500 for titles), presses OK and places it; no clicking in the dialog. Never send a bare

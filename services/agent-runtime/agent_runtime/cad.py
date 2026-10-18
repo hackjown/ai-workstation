@@ -332,6 +332,186 @@ def _parse_text(c: str):
     return None
 
 
+
+# ---- sheet macros: expand into the same LibreCAD commands a draftsman would type -----------------------------
+SHEET_PITCH, SHEET_W, SHEET_H = 25000, 21000, 14850   # A3 at 1:50, sheet n at x = n*25000
+MIN_SHEET_ENTITIES = int(os.environ.get("AIW_CAD_MIN_SHEET_ENTITIES", "40"))
+_POINT = re.compile(r"^\s*@?-?\d")
+
+
+def _f(v: float) -> str:
+    return str(int(v)) if float(v).is_integer() else f"{v:.1f}"
+
+
+def _pt(x: float, y: float) -> str:
+    return f"{_f(x)},{_f(y)}"
+
+
+def _nums(s: str) -> list[float]:
+    return [float(v) for v in re.split(r"[ ,，]+", s.strip()) if v]
+
+
+def _xy(s: str) -> tuple[float, float]:
+    a = _nums(s)
+    return a[0], a[1]
+
+
+def _macro(c: str) -> list[str] | None:
+    """FRAME / NOTE / DIMH / DIMV / LEADER -> plain LibreCAD commands, or None when c is not a macro."""
+    m = re.match(r"(?i)^\s*(frame|note|dimh|dimv|leader)\s*\|(.*)$", c)
+    if not m:
+        return None
+    kind, bits = m.group(1).upper(), [b.strip() for b in m.group(2).split("|")]
+    out: list[str] = []
+    if kind == "FRAME":  # FRAME|n|图名|图号|比例|工程名称
+        n = int(float(bits[0] or 0))
+        title = bits[1] if len(bits) > 1 else ""
+        no = bits[2] if len(bits) > 2 else ""
+        scale = bits[3] if len(bits) > 3 and bits[3] else "1:50"
+        proj = bits[4] if len(bits) > 4 else ""
+        ox = n * SHEET_PITCH
+        x1, y1, x2, y2 = ox + 1250, 500, ox + SHEET_W - 500, SHEET_H - 500   # 25 mm binding edge, 10 mm others
+        bx, bw, bh = x2 - 9000, 9000, 2000                                   # 180 x 40 mm title block
+        out += ["rectangle", _pt(ox, 0), _pt(ox + SHEET_W, SHEET_H), "ESC",
+                "rectangle", _pt(x1, y1), _pt(x2, y2), "ESC",
+                "rectangle", _pt(bx, y1), _pt(x2, y1 + bh), "ESC",
+                "line", _pt(bx, y1 + bh / 2), _pt(x2, y1 + bh / 2), "ESC",
+                "line", _pt(bx + 5600, y1), _pt(bx + 5600, y1 + bh), "ESC"]
+        if proj:
+            out.append(f"TEXT|{_pt(bx + 150, y1 + bh / 2 + 330)}|220|{proj}")
+        out.append(f"TEXT|{_pt(bx + 150, y1 + 300)}|350|{title}")
+        out.append(f"TEXT|{_pt(bx + 5750, y1 + bh / 2 + 330)}|200|图号 {no}")
+        out.append(f"TEXT|{_pt(bx + 5750, y1 + 330)}|200|比例 {scale}")
+        return out
+    if kind == "NOTE":  # NOTE|x,y|h|第一行;第二行;...   (top line at y, going down)
+        x, y = _xy(bits[0])
+        h = float(bits[1]) if len(bits) > 2 and re.fullmatch(r"\d+(\.\d+)?", bits[1]) else 175.0
+        body = bits[2] if len(bits) > 2 else bits[1]
+        for i, line in enumerate([t for t in re.split(r"[;；\n]", body) if t.strip()]):
+            out.append(f"TEXT|{_pt(x, y - i * h * 1.8)}|{_f(h)}|{line.strip()}")
+        return out
+    if kind in ("DIMH", "DIMV"):  # DIMH|y_measured|y_dimline|x1,x2,x3...   DIMV|x_measured|x_dimline|y1,y2,...
+        base, line, vals = float(bits[0]), float(bits[1]), _nums(bits[2])
+        side = 1 if line >= base else -1
+        tool = "dimhorizontal" if kind == "DIMH" else "dimvertical"
+        P = (lambda a, b: _pt(a, b)) if kind == "DIMH" else (lambda a, b: _pt(b, a))
+        for a, b in zip(vals, vals[1:]):
+            out += [tool, P(a, base), P(b, base), P((a + b) / 2, line)]
+        if len(vals) > 2:  # overall dimension one row further out
+            out += [tool, P(vals[0], base), P(vals[-1], base), P((vals[0] + vals[-1]) / 2, line + side * 600)]
+        out.append("ESC")
+        return out
+    if kind == "LEADER":  # LEADER|x1,y1|x2,y2|h|文字   arrow end at x1,y1, label on a shelf from x2,y2
+        (ax, ay), (bx, by) = _xy(bits[0]), _xy(bits[1])
+        h = float(bits[2]) if len(bits) > 3 else 175.0
+        label = bits[3] if len(bits) > 3 else bits[2]
+        shelf = max(600.0, len(label) * h * 1.05)
+        d = 1 if bx >= ax else -1
+        out += ["line", _pt(ax, ay), _pt(bx, by), _pt(bx + d * shelf, by), "ESC",
+                "circle", _pt(ax, ay), _f(h * 0.25), "ESC",
+                f"TEXT|{_pt(bx if d > 0 else bx - shelf, by + h * 0.3)}|{_f(h)}|{label}"]
+        return out
+    return None
+
+
+def expand(commands: list[str]) -> list[str]:
+    """Macros expanded; everything else passes through unchanged."""
+    out: list[str] = []
+    for c in commands:
+        c = str(c)
+        try:
+            m = _macro(c)
+        except (ValueError, IndexError):
+            m = None
+            out.append(f"#BAD {c}")
+            continue
+        out.extend(m if m is not None else [c])
+    return out
+
+
+def resume_index(commands: list[str], done: int) -> int:
+    """After a batch was cut off with `done` items typed, where to restart so no tool is left half-fed:
+    back up to the item that started the tool (a point never starts one)."""
+    i = max(0, min(done, len(commands)))
+    while i > 0 and i < len(commands) and _POINT.match(commands[i]):
+        i -= 1
+    return i
+
+
+SPLIT_PDF_SCRIPT = r'''# AIW: one PDF page per A3 sheet, rendered by LibreCAD itself (librecad dxf2pdf). Sheet n sits at x = n*PITCH.
+import json, os, re, shutil, subprocess, sys, tempfile
+src, out = sys.argv[1], sys.argv[2]
+PITCH, W, H, MIN = 25000.0, 21000.0, 14850.0, int(sys.argv[3]) if len(sys.argv) > 3 else 40
+tmp = tempfile.mkdtemp(prefix="aiw_pdf_")
+env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+def dxf2pdf(dxf, pdf):  # dxf2pdf ignores -o for a single file and writes <name>.pdf beside it
+    subprocess.run(["librecad", "dxf2pdf", "-a", "-m", "-p", "420x297", "-f", "0,0,0,0", dxf],
+                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+    made = dxf[:-4] + ".pdf"
+    if made != pdf and os.path.exists(made):
+        shutil.move(made, pdf)
+    return os.path.exists(pdf) and os.path.getsize(pdf) > 0
+counts, pages = {}, []
+try:
+    import ezdxf
+    from ezdxf import bbox
+    doc = ezdxf.readfile(src)
+    groups = {}
+    for e in doc.modelspace():
+        try:
+            b = bbox.extents([e])
+            if not b.has_data:
+                continue
+            n = int(b.center.x // PITCH)
+        except Exception:
+            continue
+        groups.setdefault(n, set()).add(e.dxf.handle)
+    for n in sorted(groups):
+        if n < 0 or n > 60:
+            continue
+        counts[n] = len(groups[n])
+        d = ezdxf.readfile(src)
+        m = d.modelspace()
+        for e in list(m):
+            if e.dxf.handle not in groups[n]:
+                m.delete_entity(e)
+        f = os.path.join(tmp, "sheet%02d.dxf" % n)
+        d.saveas(f)
+        if dxf2pdf(f, f[:-4] + ".pdf"):
+            pages.append(f[:-4] + ".pdf")
+except ImportError:
+    pass
+if not pages:  # no ezdxf: the whole drawing on one page
+    one = os.path.join(tmp, "all.pdf")
+    shutil.copy(src, os.path.join(tmp, "all.dxf"))
+    if dxf2pdf(os.path.join(tmp, "all.dxf"), one):
+        pages.append(one)
+if not pages:
+    print("pdf failed: librecad dxf2pdf produced nothing"); sys.exit(6)
+ok = False
+if len(pages) == 1:
+    shutil.copy(pages[0], out); ok = True
+if not ok and shutil.which("pdfunite"):
+    ok = subprocess.run(["pdfunite", *pages, out]).returncode == 0
+if not ok and shutil.which("gs"):
+    ok = subprocess.run(["gs", "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite", "-sOutputFile=" + out, *pages]).returncode == 0
+if not ok:
+    try:
+        from pypdf import PdfWriter
+        w = PdfWriter()
+        for p in pages:
+            w.append(p)
+        w.write(out); ok = True
+    except Exception:
+        pass
+if not ok:
+    print("pdf failed: could not merge pages (apt install poppler-utils)"); sys.exit(6)
+thin = [n for n, c in counts.items() if c < MIN]
+print("pdf %s: %d pages" % (out, len(pages)))
+print("AIW_SHEETS " + json.dumps({"counts": counts, "thin": thin}))
+'''
+
+
 def librecad_type_command(commands: list[str], open_path: str | None = None) -> str:
     """Shell line that brings LibreCAD to the front (launching it, optionally on a file), maximises it, and types
     each command into its command line followed by Enter, the way a person would. Runs on the VM desktop.
@@ -357,32 +537,53 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
                  ' || xdotool windowmove "$W" 0 0 windowsize "$W" 100% 100% 2>/dev/null; true)')
     # LibreCAD only takes a typed point for some tools after the mouse has moved over the canvas
     parts.append('hover(){ eval "$(xdotool getwindowgeometry --shell "$W")"; '
-                 'xdotool mousemove $((X+WIDTH*2/5)) $((Y+HEIGHT/2)); sleep 0.15; '
-                 'xdotool mousemove $((X+WIDTH*2/5+9)) $((Y+HEIGHT/2+7)); sleep 0.15; }')
+                 'xdotool mousemove $((X+WIDTH*2/5)) $((Y+HEIGHT/2)); sleep 0.05; '
+                 'xdotool mousemove $((X+WIDTH*2/5+9)) $((Y+HEIGHT/2+7)); sleep 0.05; }')
     parts.append("hover")
     # a dialog left open by an earlier step (e.g. an unfinished Text dialog) swallows every keystroke: close it
     parts.append("(for N in '^Text$' '^Hatch' '^Save Drawing As'; do for D in $(xdotool search --onlyvisible --name \"$N\" 2>/dev/null); do "
                  'xdotool windowfocus "$D" 2>/dev/null; xdotool key --window "$D" Escape; sleep 0.3; done; done; true)')
-    texts, dialog = 0, False
-    for c in commands:
+    commands = expand(commands)
+    # progress file: after a timeout the loop reads how far the batch got and resumes from there
+    parts.append('PF="$HOME/.cache/aiw-cad-progress"; mkdir -p "$HOME/.cache"; echo 0 > "$PF"')
+    texts, dialog, bad = 0, False, []
+    for i, c in enumerate(commands):
         c = str(c)
+        if i:
+            parts.append(f'echo {i} > "$PF"')
+        if c.startswith("#BAD "):
+            bad.append(c[5:])
+            continue
+        mp = re.match(r"(?i)^\s*pdf\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*$", c)
+        if mp:  # PDF|cad/x.dxf|cad/x.pdf: LibreCAD's own dxf2pdf, one A3 page per sheet
+            import base64
+            fs = []
+            for f in mp.groups():
+                f = f.replace('"', "").replace("`", "").replace("$(", "")
+                fs.append(f if f.startswith("/") else "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/" + f.lstrip("~/").removeprefix("workspace/"))
+            b64 = base64.b64encode(SPLIT_PDF_SCRIPT.encode()).decode()
+            parts.append(f'echo {b64} | base64 -d > /tmp/aiw_splitpdf.py && python3 /tmp/aiw_splitpdf.py "{fs[0]}" "{fs[1]}" {MIN_SHEET_ENTITIES}')
+            continue
         t = _parse_text(c)
         if t:
             pt, h, body = t
             texts += 1
+            # the same steps a person takes, with no idle waits: poll for the dialog instead of sleeping
             parts.append(
-                "xdotool key Escape; sleep 0.15; xdotool key Escape; sleep 0.2; "
-                "xdotool key ctrl+m; xdotool type --delay 25 -- text; xdotool key Return; "
-                "D=; for i in $(seq 1 20); do D=$(xdotool search --onlyvisible --name '^Text$' 2>/dev/null | tail -1); "
-                '[ -n "$D" ] && break; sleep 0.2; done; '
-                '[ -n "$D" ] || { echo "Text dialog did not open"; exit 4; }; sleep 0.3; '
+                "xdotool key Escape Escape; sleep 0.08; "
                 f"printf %s {shlex.quote(body)} | xclip -selection clipboard -i >/dev/null 2>&1; "
+                f"xdotool key ctrl+m; xdotool type --delay {TYPE_DELAY_MS} -- text; xdotool key Return; "
+                "D=; for i in $(seq 1 60); do D=$(xdotool search --onlyvisible --name '^Text$' 2>/dev/null | tail -1); "
+                '[ -n "$D" ] && break; sleep 0.05; done; '
+                '[ -n "$D" ] || { echo "Text dialog did not open"; exit 4; }; '
+                # the first Text dialog of a batch can take a moment to load its font list before it takes a paste
+                f"sleep {0.6 if texts == 1 else 0.2}; "
                 "xdotool key ctrl+a; "
                 f"if command -v xclip >/dev/null; then xdotool key ctrl+v; else xdotool type --delay 30 -- {shlex.quote(body)}; fi; "
-                f"sleep 0.2; xdotool key Tab ctrl+a; xdotool type -- {shlex.quote(h)}; xdotool key Return; "
-                "for i in $(seq 1 20); do xdotool search --onlyvisible --name '^Text$' >/dev/null 2>&1 || break; sleep 0.2; done; "
-                f"hover; xdotool key ctrl+m; xdotool type --delay 25 -- {shlex.quote(pt)}; xdotool key Return; sleep 0.5; "
-                "xdotool key Escape; sleep 0.2")
+                f"sleep 0.08; xdotool key Tab ctrl+a; xdotool type --delay {TYPE_DELAY_MS} -- {shlex.quote(h)}; xdotool key Return; "
+                "for i in $(seq 1 60); do xdotool search --onlyvisible --name '^Text$' >/dev/null 2>&1 || break; sleep 0.05; done; "
+                f"hover; xdotool key ctrl+m; xdotool type --delay {TYPE_DELAY_MS} -- {shlex.quote(pt)}; xdotool key Return; sleep 0.2; "
+                "xdotool key Escape; sleep 0.05")
             continue
         m = re.match(r"(?i)^\s*save\s*\|\s*(.+?)\s*$", c)
         if m:  # File > Save as... (ctrl+shift+s is Save ALL in LibreCAD, and shortcuts are dead while the command line has focus)
@@ -394,7 +595,10 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
                 "xdotool key alt+f; sleep 0.6; xdotool key a; "
                 "SD=; for i in $(seq 1 20); do SD=$(xdotool search --onlyvisible --name 'Save Drawing As' 2>/dev/null | tail -1); "
                 '[ -n "$SD" ] && break; sleep 0.2; done; [ -n "$SD" ] || { echo "Save As dialog did not open"; exit 5; }; '
-                f'sleep 0.3; xdotool key ctrl+a; xdotool type --delay 15 -- "{path}"; xdotool key Return; sleep 1.5; '
+                # paste the path: xdotool type drops Chinese characters (丹防援荣图.dxf for 兴丹路消防救援站荣誉室施工图.dxf)
+                f'sleep 0.3; printf %s "{path}" | xclip -selection clipboard -i >/dev/null 2>&1; '
+                f'xdotool key ctrl+a; if command -v xclip >/dev/null; then xdotool key ctrl+v; else xdotool type --delay 15 -- "{path}"; fi; '
+                'sleep 0.2; xdotool key Return; sleep 1.5; '
                 # overwrite confirmation, if any
                 "xdotool search --onlyvisible --name 'Save Drawing As' >/dev/null 2>&1 && { xdotool key alt+y; sleep 0.3; xdotool key Return; sleep 1; }; "
                 f'[ -s "{path}" ] && echo "saved {path}" || {{ echo "save failed: {path} not written"; exit 5; }}')
@@ -407,7 +611,7 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
         # typed commands went nowhere
         parts.append(f"xdotool key ctrl+m; xdotool type --delay {TYPE_DELAY_MS} -- {shlex.quote(c)}; xdotool key Return; sleep {STEP_PAUSE_S}")
     last = str(commands[-1]).strip().lower() if commands else ""
-    if last.startswith("save"):
+    if last.startswith("save") or last.startswith("pdf"):
         last = "za"  # no zoom after a save
     dialog = last in ("text", "txt", "mtext", "mtxt", "hatch", "ha")  # a dialog is now open; leave it to the agent
     if not dialog and not (last.startswith("zoom") or last in ("za", "zw", "zp", "zv")):
@@ -416,5 +620,8 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
     tail = "; the dialog is open now, fill it in" if dialog else ", then zoomauto"
     if texts:
         tail += f" ({texts} texts placed)"
+    if bad:
+        tail += f"; SKIPPED malformed macros: {bad[:5]}"
+    parts.append(f'echo {len(commands)} > "$PF"')
     parts.append("echo " + shlex.quote(f"typed {len(commands)} commands{tail}"))
     return " && ".join(parts)

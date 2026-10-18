@@ -6,6 +6,7 @@ Task -> Planner -> [checkpoint] Observe -> LLM Decision -> Policy -> Execute
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import base64
 import io
@@ -195,6 +196,8 @@ class AgentLoop:
         self._last_ok: Optional[tuple] = None
         self._cad_ok = 0           # successful cad_command batches
         self._last_ok_cad = False  # did the last cad_command go through
+        self._sheet_audit: dict = {}  # entities per sheet from the last PDF export
+        self._cad_pdf_ok = False      # PDF made by LibreCAD (PDF|...), not by soffice
         self._prev_sig: Optional[tuple] = None
         self._rep = 0
         self._last_tool: Optional[str] = None
@@ -292,6 +295,22 @@ class AgentLoop:
                         "saved as DXF via File > Save As, and sent with send_file before done. Continue with the next "
                         "unfinished sheet in cad/plan.md now (cad_command). If you have no plan yet, write it first.")
                 continue
+            if (decision.tool == "done" and self._cad_task and self._sent_file and self._done_rejects < 6
+                    and self.step < self.cfg.max_steps - 3 and (not self._cad_pdf_ok or self._sheet_audit.get("thin"))):
+                self._done_rejects += 1
+                thin = self._sheet_audit.get("thin")
+                await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                await self.emit(EventType.VALIDATION, success=False, change=0.0,
+                                message=f"拒绝 done：图纸不完整（内容太少的图：{thin}）" if thin else "拒绝 done：PDF 不是用 LibreCAD 导出的")
+                self.history.append(f"{self.step}. done REJECTED: " + (f"sheets {thin} are nearly empty" if thin else "no LibreCAD PDF"))
+                note = (f"REJECTED: sheets {thin} have too few entities ({self._sheet_audit.get('counts')}); each sheet needs its "
+                        "full content from cad/plan.md: geometry, every panel/component, dimension chains (DIMH/DIMV), "
+                        "material leaders (LEADER), notes (NOTE), view title. Draw what is missing, then SAVE, PDF and "
+                        "send_file both again." if thin else
+                        "REJECTED: export the PDF with cad_command ['SAVE|cad/<name>.dxf', 'PDF|cad/<name>.dxf|cad/<name>.pdf'] "
+                        "(LibreCAD's own dxf2pdf, one A3 page per sheet); soffice mangles DXF. Then send_file the PDF.")
+                self._after_send = 0
+                continue
             if decision.tool == "done" and not self._acted and _needs_action(self.task.prompt) and self._done_rejects < 2:
                 self._done_rejects += 1
                 await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
@@ -303,7 +322,8 @@ class AgentLoop:
                         "Do not invent results.")
                 continue
             llm_ms = int((time.time() - t_llm) * 1000)
-            if self._sent_file and decision.tool not in ("done", "fail", "send_file"):
+            if (self._sent_file and decision.tool not in ("done", "fail", "send_file")
+                    and not (self._cad_task and (not self._cad_pdf_ok or self._sheet_audit.get("thin")))):
                 self._after_send += 1
                 if self._after_send >= 2:  # the file is already with the user; stop wandering
                     decision.tool, decision.args = "done", {"summary": f"已生成并发送 {self._sent_file}。"}
@@ -553,33 +573,67 @@ class AgentLoop:
 
     async def _cad_command(self, a: dict, intent: str) -> str:
         """Type LibreCAD command-line commands into the visible LibreCAD window (xdotool), like a person drafting."""
-        cmds = [str(c) for c in (a.get("commands") or []) if str(c).strip()]
-        if not cmds:
+        raw = [str(c) for c in (a.get("commands") or []) if str(c).strip()]
+        if not raw:
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="missing args ['commands']", result={})
             return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
-        cmds = cmds[:CAD_MAX_BATCH]
-        cmd = _cad.librecad_type_command(cmds, a.get("open") or None)
-        texts = sum(1 for c in cmds if _cad._parse_text(c))
-        # ~0.2 s per typed command, ~3 s per text (dialog), plus start-up; a fixed 120 s cut long batches off
-        budget = int(min(900, 60 + 0.4 * len(cmds) + 5 * texts))
-        r = await self.tools.run("shell", {"command": cmd, "timeout": budget}, intent=intent)
-        res = r.result if isinstance(r.result, dict) else {}
-        ok = r.success and (res.get("exit_code", 0) == 0)
+        cmds = _cad.expand(raw[:CAD_MAX_BATCH])[:CAD_MAX_EXPANDED]
+        r, res, ok, out = await self._type_cad(cmds, a.get("open") or None, intent)
+        resumed = ""
+        if not ok and res.get("timed_out"):
+            # the batch was cut off: find how far it got and type the rest once, instead of the model resending
+            # everything (which drew every finished line twice)
+            done = await self._cad_progress()
+            if done is not None and done < len(cmds):
+                start = _cad.resume_index(cmds, done)
+                rest = (["ESC"] if start else []) + cmds[start:]
+                r, res, ok, out = await self._type_cad(rest, None, intent)
+                resumed = f" (cut off after {done} items; resumed automatically from item {start})"
         self._last_ok_cad = ok
-        out = ((res.get("stdout") or "") + (res.get("stderr") or "") or (r.error or ""))[-400:]
+        m = re.search(r"AIW_SHEETS (\{.*\})", out)
+        if m:
+            try:
+                self._sheet_audit = json.loads(m.group(1))
+                self._cad_pdf_ok = True
+            except ValueError:
+                pass
         await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=ok, error=None if ok else out[-200:],
-                        result={"commands": cmds[:80], "count": len(cmds)})
+                        result={"commands": raw[:80], "count": len(raw), "typed": len(cmds)})
         if ok:
             self._acted = True
             self._fresh = None
             self._cad_ok += 1
-        more = (f" (only the first {CAD_MAX_BATCH} were typed; send the rest next)"
-                if len(a.get("commands") or []) > CAD_MAX_BATCH else "")
+        more = (f" (only the first {CAD_MAX_BATCH} were typed; send the rest next)" if len(raw) > CAD_MAX_BATCH else "")
+        audit = ""
+        if m and self._sheet_audit.get("thin"):
+            audit = (f" THIN SHEETS {self._sheet_audit['thin']} (entities per sheet {self._sheet_audit.get('counts')}): "
+                     f"those sheets are not finished; draw their missing content, save and export again.")
         if ok:
-            return (f"typed {len(cmds)} commands into LibreCAD{more}: {out.strip()}. Continue straight on with the next "
-                    f"batch from cad/plan.md; no screenshot or Escape needed.")
-        return (f"FAILED: {out}. The next cad_command closes any leftover dialog and leaves the running tool by itself, "
-                f"so do not press Escape or take screenshots: resend the commands that did not land.")
+            return (f"typed {len(cmds)} commands into LibreCAD{resumed}{more}: {out.strip()[-600:]}.{audit} Continue straight on "
+                    f"with the next batch from cad/plan.md; no screenshot or Escape needed.")
+        return (f"FAILED{resumed}: {out[-400:]}. The next cad_command closes any leftover dialog and leaves the running tool "
+                f"by itself, so do not press Escape or take screenshots: resend only the commands that did not land.")
+
+    async def _type_cad(self, cmds: list[str], open_path, intent: str):
+        cmd = _cad.librecad_type_command(cmds, open_path)
+        texts = sum(1 for c in cmds if _cad._parse_text(c))
+        pdf = any(c.lower().startswith("pdf|") for c in cmds)
+        # measured on the VM (2026-10-18): ~0.5-1 s per typed item and ~3 s per text once the drawing is big
+        budget = int(min(1200, 60 + 1.0 * len(cmds) + 4 * texts + (240 if pdf else 0)))
+        r = await self.tools.run("shell", {"command": cmd, "timeout": budget}, intent=intent)
+        res = r.result if isinstance(r.result, dict) else {}
+        ok = r.success and (res.get("exit_code", 0) == 0)
+        out = ((res.get("stdout") or "") + (res.get("stderr") or "") or (r.error or ""))[-1500:]
+        return r, res, ok, out
+
+    async def _cad_progress(self):
+        r = await self.tools.run("shell", {"command": 'cat "$HOME/.cache/aiw-cad-progress" 2>/dev/null', "timeout": 15},
+                                 intent="read LibreCAD batch progress")
+        res = r.result if isinstance(r.result, dict) else {}
+        try:
+            return int((res.get("stdout") or "").strip().split()[-1])
+        except (ValueError, IndexError):
+            return None
 
     async def _cad_draw(self, a: dict, intent: str) -> str:
         """Write the drawing body into a script with the CAD prelude, run it on the VM (ezdxf), open the DXF in
@@ -772,6 +826,7 @@ def _needs_action(prompt: str) -> bool:
 
 
 CAD_MAX_BATCH = 200
+CAD_MAX_EXPANDED = 600
 _NO_SCREEN_TOOLS = {"read_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "open_app"}
 

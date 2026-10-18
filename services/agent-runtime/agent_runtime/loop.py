@@ -193,6 +193,8 @@ class AgentLoop:
         self._sent_file, self._after_send = None, 0
         self._last_sent_thumb = None
         self._last_ok: Optional[tuple] = None
+        self._cad_ok = 0           # successful cad_command batches
+        self._last_ok_cad = False  # did the last cad_command go through
         self._prev_sig: Optional[tuple] = None
         self._rep = 0
         self._last_tool: Optional[str] = None
@@ -207,9 +209,19 @@ class AgentLoop:
                 await self.emit(EventType.RESUMED, takeover=self.control.resumed_after_takeover)
             self.step += 1
             blind = self._last_tool in _NO_SCREEN_TOOLS and self.step > 1
+            # a CAD batch that went through needs no fresh look (screenshot + vision cost ~15 s a step);
+            # look again every 4th batch so a drawing error is still caught
+            if (self._last_tool == "cad_command" and self._last_ok_cad and self.step > 1
+                    and self._cad_ok % 4 != 0):
+                blind = True
+                cad_blind = True
+            else:
+                cad_blind = False
             if blind:  # a shell/file step does not change the screen: skip the screenshot and the vision call
                 before, shown = None, self._last_shown
                 note = ((note + "\n") if note else "") + (
+                    "Screen not re-read: the last LibreCAD batch went through. Send the next batch from your plan; "
+                    "the screen is shown again every few batches." if cad_blind else
                     "Screen not re-read: your last step was a shell/file action. Keep working in the shell; "
                     "call screenshot only if you need to see the desktop.")
             else:
@@ -545,19 +557,29 @@ class AgentLoop:
         if not cmds:
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="missing args ['commands']", result={})
             return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
-        cmd = _cad.librecad_type_command(cmds[:80], a.get("open") or None)
-        r = await self.tools.run("shell", {"command": cmd, "timeout": 120}, intent=intent)
+        cmds = cmds[:CAD_MAX_BATCH]
+        cmd = _cad.librecad_type_command(cmds, a.get("open") or None)
+        texts = sum(1 for c in cmds if _cad._parse_text(c))
+        # ~0.2 s per typed command, ~3 s per text (dialog), plus start-up; a fixed 120 s cut long batches off
+        budget = int(min(900, 60 + 0.4 * len(cmds) + 5 * texts))
+        r = await self.tools.run("shell", {"command": cmd, "timeout": budget}, intent=intent)
         res = r.result if isinstance(r.result, dict) else {}
         ok = r.success and (res.get("exit_code", 0) == 0)
+        self._last_ok_cad = ok
         out = ((res.get("stdout") or "") + (res.get("stderr") or "") or (r.error or ""))[-400:]
         await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=ok, error=None if ok else out[-200:],
                         result={"commands": cmds[:80], "count": len(cmds)})
         if ok:
             self._acted = True
             self._fresh = None
-        more = " (only the first 80 were typed)" if len(cmds) > 80 else ""
-        return (f"typed {min(len(cmds), 80)} commands into LibreCAD{more}: {out.strip()}. Check the screenshot and the "
-                f"command history at the bottom of LibreCAD for errors before continuing." if ok else f"FAILED: {out}")
+            self._cad_ok += 1
+        more = (f" (only the first {CAD_MAX_BATCH} were typed; send the rest next)"
+                if len(a.get("commands") or []) > CAD_MAX_BATCH else "")
+        if ok:
+            return (f"typed {len(cmds)} commands into LibreCAD{more}: {out.strip()}. Continue straight on with the next "
+                    f"batch from cad/plan.md; no screenshot or Escape needed.")
+        return (f"FAILED: {out}. The next cad_command closes any leftover dialog and leaves the running tool by itself, "
+                f"so do not press Escape or take screenshots: resend the commands that did not land.")
 
     async def _cad_draw(self, a: dict, intent: str) -> str:
         """Write the drawing body into a script with the CAD prelude, run it on the VM (ezdxf), open the DXF in
@@ -749,6 +771,7 @@ def _needs_action(prompt: str) -> bool:
     return any(w in p for w in _ACTION_WORDS)
 
 
+CAD_MAX_BATCH = 200
 _NO_SCREEN_TOOLS = {"read_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "open_app"}
 

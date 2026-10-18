@@ -28,7 +28,9 @@ Rules:
      Read each design image with `read_image` and a focused question (板块从左到右的名称和宽度, 门的位置...).
      Never re-read a file whose content is already in PREVIOUS STEPS.
   2. WRITE THE PLAN (text, not drawing): `files_write` cad/plan.md, written directly as cad_command items per sheet
-     (absolute mm, sheet n at origin x = n*25000; model space 1:1 mm, A3 at 1:50 = 21000 x 14850). Every sheet is
+     (mm, model space 1:1, A3 at 1:50 = 21000 x 14850, sheet n at origin x = n*25000). Write each sheet's points
+     SHEET-LOCAL (x 0..21000, y 0..14850) after its FRAME|n: cad_command moves them onto sheet n (absolute x works
+     too). A batch that continues a sheet without its FRAME starts with 'SHEET|n'. Every sheet is
      COMPLETE, not a sketch. Minimum content:
      - every sheet: FRAME (frame + title block), the view title (TEXT h 400) with scale, notes where needed.
      - 平面/拆除/天花: walls with thickness (two lines or rectangles), door opening + swing arc, every wall-mounted
@@ -46,7 +48,8 @@ Rules:
      Commands: line/li, polyline/pl, rectangle/rec (two corners), circle/ci (centre, radius), arc, offset, move,
      mirror, hatch, dimhorizontal/dh, dimvertical/dv, dimaligned/da (point1, point2, dimension-line position),
      undo/u, 'ESC' ends the current command. Shorthand items (typed out as those same commands):
-       'FRAME|n|图名|图号|1:50|工程名称'  A3 frame + title block for sheet n
+       'FRAME|n|图名|图号|1:50|工程名称'  A3 frame + title block for sheet n; later points are on sheet n
+       'SHEET|n'   continue on sheet n (points sheet-local or absolute)
        'TEXT|x,y|height|内容'            one text (≈175 body, 250 labels, 400 titles; Chinese is fine)
        'NOTE|x,y|175|第一行;第二行;...'   a block of note lines downwards from x,y
        'DIMH|y_measured|y_dimline|x1,x2,x3,...'   chain of horizontal dims + overall; 'DIMV|x_measured|x_dimline|y1,y2,...'

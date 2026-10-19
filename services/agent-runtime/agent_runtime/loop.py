@@ -223,6 +223,9 @@ class AgentLoop:
         self._cad_pdf_ok = False      # PDF made by LibreCAD (PDF|...), not by soffice
         self._cad_sheet = 0           # sheet the next cad_command points belong to (set by FRAME|n / SHEET|n)
         self._cad_frames: set = set()  # sheets this task drew a FRAME for
+        self._cad_text_boxes: dict = {}  # sheet -> [(box, text)] of texts typed so far (overlap check)
+        self._cad_typed_texts: set = set()
+        self._cad_rejects: dict = {}  # sheet -> batches sent back by the layout check (typed anyway after 2)
         self._prev_sig: Optional[tuple] = None
         self._rep = 0
         self._last_tool: Optional[str] = None
@@ -611,7 +614,34 @@ class AgentLoop:
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="missing args ['commands']", result={})
             return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
         # points go onto the current sheet (FRAME|n / SHEET|n), whether given sheet-locally or absolutely
-        cmds, self._cad_sheet, moved = _cad.place(raw[:CAD_MAX_BATCH], self._cad_sheet)
+        sheet_before = self._cad_sheet
+        drawn: list = []
+        cmds, self._cad_sheet, moved = _cad.place(raw[:CAD_MAX_BATCH], self._cad_sheet, drawn)
+        # a text already typed at the same spot (the model redoing a sheet) would only be drawn on top of itself
+        dup = {c for c in cmds if _cad._parse_text(c) and c in self._cad_typed_texts}
+        if dup:
+            cmds = [c for c in cmds if c not in dup]
+            drawn = [d for d in drawn if d[1] not in dup]
+        bad = [c[5:] for c in cmds if c.startswith("#BAD ")]
+        issues, boxes = _cad.layout_issues(drawn, self._cad_text_boxes)
+        key = self._cad_sheet
+        if (bad or issues) and self._cad_rejects.get(key, 0) < 2:
+            # checked before typing: a misplaced or unreadable batch is cheaper to fix in the plan than on the canvas
+            self._cad_rejects[key] = self._cad_rejects.get(key, 0) + 1
+            self._cad_sheet = sheet_before
+            await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="layout check",
+                            result={"commands": raw[:80], "count": len(raw), "bad": bad[:10], "issues": issues[:20]})
+            msg = "NOT TYPED, nothing was drawn: fix these and send the whole batch again."
+            if bad:
+                msg += (f" UNKNOWN COMMANDS {bad[:6]}: use 'line|x1,y1|x2,y2|...', 'rect|x1,y1|x2,y2', 'circle|x,y|r', "
+                        f"'arc|cx,cy|r|a1|a2', TEXT/TEXTC/NOTE/LEADER/DIMH/DIMV, or plain tool names with one point per item.")
+            if issues:
+                msg += (f" LAYOUT ({len(issues)}): " + "; ".join(issues[:12]) +
+                        f". Sheet-local limits: drawing area x {_cad.FRAME_X1}..{_cad.FRAME_X2}, y {_cad.FRAME_Y1}..{_cad.FRAME_Y2}; "
+                        f"the title block fills x>{_cad.TB_X1}, y<{_cad.TB_Y2}. TEXT|x,y is the LOWER LEFT corner and a hanzi "
+                        f"is about one text height wide; use TEXTC|x,y|h|... to centre a label on x,y. Move views/labels, "
+                        f"shorten or split long labels, and keep text clear of other text.")
+            return msg
         for c in raw[:CAD_MAX_BATCH]:
             mf = re.match(r"(?i)^\s*frame\s*\|\s*(\d+)", str(c))
             if mf:
@@ -647,11 +677,22 @@ class AgentLoop:
             self._acted = True
             self._fresh = None
             self._cad_ok += 1
+            for sh, b, body in boxes:
+                self._cad_text_boxes.setdefault(sh, []).append((b, body))
+            self._cad_typed_texts.update(c for c in cmds if _cad._parse_text(c))
+            self._cad_rejects[key] = 0
         more = (f" (only the first {CAD_MAX_BATCH} were typed; send the rest next)" if len(raw) > CAD_MAX_BATCH else "")
+        if dup:
+            more += f" ({len(dup)} texts already on the drawing at the same spot were skipped)"
+        if issues:
+            more += f" (typed although the layout check still finds: {'; '.join(issues[:6])})"
         audit = ""
         if m and self._sheet_audit.get("thin"):
             audit = (f" THIN SHEETS {self._sheet_audit['thin']} (entities per sheet {self._sheet_audit.get('counts')}): "
                      f"those sheets are not finished; draw their missing content, save and export again.")
+            if self._sheet_audit.get("no_geometry"):
+                audit += (f" Sheets {self._sheet_audit['no_geometry']} have texts but almost no lines/rectangles "
+                          f"(geometry per sheet {self._sheet_audit.get('geometry')}): draw the walls, outlines and panels.")
         if m and self._sheet_audit.get("stray"):
             audit += (f" STRAY ENTITIES per sheet {self._sheet_audit['stray']}: they reach outside their sheet and were "
                       f"left out of the PDF; undo/redraw them inside the sheet.")
@@ -669,7 +710,8 @@ class AgentLoop:
         texts = sum(1 for c in cmds if _cad._parse_text(c))
         pdf = any(c.lower().startswith("pdf|") for c in cmds)
         # measured on the VM (2026-10-18): ~0.5-1 s per typed item and ~3 s per text once the drawing is big
-        budget = int(min(1200, 60 + 1.0 * len(cmds) + 4 * texts + (240 if pdf else 0)))
+        # 2026-10-20 VM run: ~6.5 s per text and ~1.2 s per other item; 4 s per text cut 4 batches off mid-way
+        budget = int(min(1800, 60 + 1.5 * len(cmds) + 9 * texts + (300 if pdf else 0)))
         r = await self.tools.run("shell", {"command": cmd, "timeout": budget}, intent=intent)
         res = r.result if isinstance(r.result, dict) else {}
         ok = r.success and (res.get("exit_code", 0) == 0)

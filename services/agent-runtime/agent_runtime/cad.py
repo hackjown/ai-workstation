@@ -490,25 +490,58 @@ PITCH, W, H, MIN = 25000.0, 21000.0, 14850.0, int(sys.argv[3]) if len(sys.argv) 
 tmp = tempfile.mkdtemp(prefix="aiw_pdf_")
 env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
 def dxf2pdf(dxf, pdf):  # dxf2pdf ignores -o for a single file and writes <name>.pdf beside it
-    subprocess.run(["librecad", "dxf2pdf", "-a", "-m", "-p", "420x297", "-f", "0,0,0,0", dxf],
-                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+    try:
+        subprocess.run(["librecad", "dxf2pdf", "-a", "-m", "-p", "420x297", "-f", "0,0,0,0", dxf],
+                       env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    except subprocess.TimeoutExpired:
+        return False
     made = dxf[:-4] + ".pdf"
     if made != pdf and os.path.exists(made):
         shutil.move(made, pdf)
     return os.path.exists(pdf) and os.path.getsize(pdf) > 0
-counts, pages = {}, []
+counts, pages, stray = {}, [], {}
 try:
     import ezdxf
-    from ezdxf import bbox
     doc = ezdxf.readfile(src)
-    groups = {}
+    # sheet of an entity from its own defining points (ezdxf.bbox measured every text with fonts and took >5 min
+    # on a 3000-entity drawing, so every PDF export timed out). An entity reaching outside its sheet (a stray
+    # line drawn from a local to an absolute point) would shrink the page to a speck: left out and reported.
+    def pts(e):
+        t, g = e.dxftype(), e.dxf.get
+        if t == "LINE":
+            return [g("start"), g("end")]
+        if t == "LWPOLYLINE":
+            return [(p[0], p[1]) for p in e.get_points()]
+        if t == "POLYLINE":
+            return [v.dxf.location for v in e.vertices]
+        if t in ("CIRCLE", "ARC"):
+            c, r = g("center"), float(g("radius") or 0)
+            return [(c[0] - r, c[1] - r), (c[0] + r, c[1] + r)]
+        if t == "DIMENSION":
+            return [p for p in (g("defpoint"), g("defpoint2"), g("defpoint3"), g("text_midpoint")) if p is not None]
+        if t == "HATCH":
+            out = []
+            for path in e.paths:
+                out += [(v[0], v[1]) for v in getattr(path, "vertices", [])]
+                for ed in getattr(path, "edges", []):
+                    for a in ("start", "end", "center"):
+                        if hasattr(ed, a):
+                            out.append(getattr(ed, a))
+            return out
+        p = g("insert")
+        return [p] if p is not None else []
+    groups, stray = {}, {}
     for e in doc.modelspace():
         try:
-            b = bbox.extents([e])
-            if not b.has_data:
-                continue
-            n = int(b.center.x // PITCH)
+            P = [p for p in pts(e) if p is not None]
         except Exception:
+            P = []
+        if not P:
+            continue
+        n = int(P[0][0] // PITCH)
+        lo, hi = n * PITCH - 1500, n * PITCH + W + 1500
+        if any(not (lo <= p[0] <= hi) or not (-1500 <= p[1] <= H + 1500) for p in P):
+            stray[n] = stray.get(n, 0) + 1
             continue
         groups.setdefault(n, set()).add(e.dxf.handle)
     for n in sorted(groups):
@@ -553,8 +586,14 @@ if not ok:
     print("pdf failed: could not merge pages (apt install poppler-utils)"); sys.exit(6)
 thin = [n for n, c in counts.items() if c < MIN]
 print("pdf %s: %d pages" % (out, len(pages)))
-print("AIW_SHEETS " + json.dumps({"counts": counts, "thin": thin}))
+print("AIW_SHEETS " + json.dumps({"counts": counts, "thin": thin, "stray": stray}))
 '''
+
+
+# before LibreCAD starts: text angle 0, alignment bottom-left, width 1 (the Text dialog starts from these)
+_TEXT_DEFAULTS = ("C=$HOME/.config/LibreCAD/LibreCAD.conf; [ -f \"$C\" ] && sed -i "
+                  "-e '/^TextAngle=/d' -e '/^TextAlignmentT=/d' -e '/^TextWidthRelation=/d' "
+                  "-e 's/^\\[Draw\\]$/[Draw]\\nTextAngle=0\\nTextAlignmentT=7\\nTextWidthRelation=1/' \"$C\"; true")
 
 
 def librecad_type_command(commands: list[str], open_path: str | None = None) -> str:
@@ -566,10 +605,10 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
     parts = ["export DISPLAY=${DISPLAY:-:0}", _librecad_font_setup()]
     if open_path:
         safe = str(open_path).replace('"', "").replace("`", "").replace("$(", "")
-        parts.append(f'(pkill -x librecad; sleep 1; nohup librecad "${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}/{safe}" >/dev/null 2>&1 &)')
+        parts.append(f'(pkill -x librecad; sleep 1; {_TEXT_DEFAULTS}; nohup librecad "${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}/{safe}" >/dev/null 2>&1 &)')
         parts.append("sleep 4")
     else:
-        parts.append("(pgrep -x librecad >/dev/null || (nohup librecad >/dev/null 2>&1 &); true)")
+        parts.append("(pgrep -x librecad >/dev/null || { " + _TEXT_DEFAULTS + "; (nohup librecad >/dev/null 2>&1 &); }; true)")
     # first start shows a Welcome (language/units) dialog; accept its defaults
     parts.append("for i in $(seq 1 25); do xdotool search --onlyvisible --name '^LibreCAD' >/dev/null 2>&1 && break; "
                  "WL=$(xdotool search --onlyvisible --name '^Welcome$' 2>/dev/null | head -1); "
@@ -611,7 +650,7 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
                 f = f.replace('"', "").replace("`", "").replace("$(", "")
                 fs.append(f if f.startswith("/") else "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/" + f.lstrip("~/").removeprefix("workspace/"))
             b64 = base64.b64encode(SPLIT_PDF_SCRIPT.encode()).decode()
-            parts.append(f'echo {b64} | base64 -d > /tmp/aiw_splitpdf.py && python3 /tmp/aiw_splitpdf.py "{fs[0]}" "{fs[1]}" {MIN_SHEET_ENTITIES}')
+            parts.append(f'echo {b64} | base64 -d > /tmp/aiw_splitpdf.py && timeout 280 python3 /tmp/aiw_splitpdf.py "{fs[0]}" "{fs[1]}" {MIN_SHEET_ENTITIES}')
             continue
         t = _parse_text(c)
         if t:
@@ -629,7 +668,10 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
                 f"sleep {0.6 if texts == 1 else 0.2}; "
                 "xdotool key ctrl+a; "
                 f"if command -v xclip >/dev/null; then xdotool key ctrl+v; else xdotool type --delay 30 -- {shlex.quote(body)}; fi; "
-                f"sleep 0.08; xdotool key Tab ctrl+a; xdotool type --delay {TYPE_DELAY_MS} -- {shlex.quote(h)}; xdotool key Return; "
+                # Tab order teText > leHeight > leAngle. The angle is remembered from the last text, so one stray value
+                # rotated every later text (2026-10-19 PDF): set height AND angle every time
+                f"sleep 0.08; xdotool key Tab ctrl+a; xdotool type --delay {TYPE_DELAY_MS} -- {shlex.quote(h)}; "
+                f"xdotool key Tab ctrl+a; xdotool type --delay {TYPE_DELAY_MS} -- 0; xdotool key Return; "
                 "for i in $(seq 1 60); do xdotool search --onlyvisible --name '^Text$' >/dev/null 2>&1 || break; sleep 0.05; done; "
                 f"hover; xdotool key ctrl+m; xdotool type --delay {TYPE_DELAY_MS} -- {shlex.quote(pt)}; xdotool key Return; sleep 0.2; "
                 "xdotool key Escape; sleep 0.05")
@@ -640,6 +682,11 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
             if not path.startswith("/"):
                 path = "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/" + path.lstrip("~/").removeprefix("workspace/")
             parts.append(
+                # LibreCAD restarted on an empty new drawing would overwrite the real file with nothing (2026-10-19:
+                # an 832 KB DXF became 15 KB): refuse, the agent reopens the file with open= first
+                f'case "$(xdotool getwindowname "$W" 2>/dev/null)" in *unnamed*) [ "$(stat -c%s "{path}" 2>/dev/null || echo 0)" -gt 30000 ] && '
+                f'{{ echo "SAVE REFUSED: LibreCAD shows an empty new drawing, saving would wipe {path}. Send cad_command with '
+                f'open=<that file> to reopen it, then continue"; exit 7; }};; esac; '
                 f'mkdir -p "$(dirname "{path}")"; xdotool key Escape; sleep 0.15; xdotool key Escape; sleep 0.2; '
                 "xdotool key alt+f; sleep 0.6; xdotool key a; "
                 "SD=; for i in $(seq 1 20); do SD=$(xdotool search --onlyvisible --name 'Save Drawing As' 2>/dev/null | tail -1); "

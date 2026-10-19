@@ -41,6 +41,15 @@ Rules:
        (做法 from the quote), panel names as text.
      - 节点: a layered section per node (each layer a rectangle/hatch with its thickness), LEADER per layer naming it.
      A finished elevation is usually 80-200 items; a sheet under ~40 entities is rejected at the end.
+     LAYOUT (checked before typing; a batch that breaks it comes back untyped with the offending items):
+     - sheet-local drawing area x 1250..20500, y 500..14350; the title block fills x>11500, y<2500: keep out.
+     - place each view in the free area and leave room around it for dimension chains (≈600-1500 outside the
+       object) and leader labels; at 1:50 a 10 m wall is 10000 wide, so start it near x 2500, base y ≈ 4000.
+     - a hanzi is about one text height wide: a 175 label of 12 characters is ≈2100 long. A label must fit its
+       panel (else put it on a LEADER outside), and no text may overlap another: NOTE lines are 1.8×height apart,
+       so the next block starts below the last line of the previous one.
+     - draw each part at its real position from the quote/images (e.g. the 标题底板 at the TOP of the wall, 踢脚 at the
+       bottom), never squeezed into a strip.
      Sizes missing from both files: `ask_user` once with ALL of them; never invent. plan.md is your checklist.
   3. Never start or kill LibreCAD from shell (pkill kills your own shell): the first `cad_command` starts it,
      brings it to the front and maximises it. DRAW with `cad_command` (types into LibreCAD's command line; the view
@@ -50,7 +59,9 @@ Rules:
      undo/u, 'ESC' ends the current command. Shorthand items (typed out as those same commands):
        'FRAME|n|图名|图号|1:50|工程名称'  A3 frame + title block for sheet n; later points are on sheet n
        'SHEET|n'   continue on sheet n (points sheet-local or absolute)
-       'TEXT|x,y|height|内容'            one text (≈175 body, 250 labels, 400 titles; Chinese is fine)
+       'line|x1,y1|x2,y2|x3,y3...' (|C closes)   'rect|x1,y1|x2,y2'   'circle|x,y|r'   'arc|cx,cy|r|a1|a2'
+       'TEXT|x,y|height|内容'   x,y is the text's LOWER LEFT corner (≈175 body, 250 labels, 400 titles)
+       'TEXTC|x,y|height|内容'  the same text CENTRED on x,y (panel names, view titles)
        'NOTE|x,y|175|第一行;第二行;...'   a block of note lines downwards from x,y
        'DIMH|y_measured|y_dimline|x1,x2,x3,...'   chain of horizontal dims + overall; 'DIMV|x_measured|x_dimline|y1,y2,...'
        'LEADER|x1,y1|x2,y2|175|材料做法'   leader from the object (x1,y1) to a labelled shelf at x2,y2

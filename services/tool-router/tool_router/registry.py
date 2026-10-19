@@ -81,11 +81,11 @@ TOOLS: list[ToolSpec] = [
              "Units are mm at 1:1. Examples: ['line','0,0','6000,0','6000,10000','0,10000','0,0','ESC'], "
              "['rectangle','0,0','@1500,150'], ['circle','3000,750','350'], ['polyline','0,0','@1000,0','@0,500','ESC'], "
              "['dimhorizontal','0,0','6000,0','3000,-800']. Use 'ESC' to finish a command. After each call the view zooms "
-             "to fit the whole drawing automatically. Shorthand items: 'TEXT|x,y|height|内容' (Chinese ok), "
+             "to fit the whole drawing automatically. Shorthand items: 'line|x1,y1|x2,y2|...' (add '|C' to close), 'rect|x1,y1|x2,y2', 'circle|x,y|r', 'arc|cx,cy|r|a1|a2'; 'TEXT|x,y|height|内容' (x,y = LOWER LEFT corner, Chinese ok), 'TEXTC|x,y|height|内容' (centred on x,y), "
              "'FRAME|n|图名|图号|1:50|工程名称' (A3 frame + title block of sheet n at x=n*25000; the points after it may be "
              "sheet-local 0..21000 and are moved onto sheet n), 'SHEET|n' (continue on sheet n), 'NOTE|x,y|175|行1;行2', "
              "'DIMH|y_measured|y_dimline|x1,x2,...' / 'DIMV|x_measured|x_dimline|y1,y2,...' (dimension chains), "
-             "'LEADER|x1,y1|x2,y2|175|材料', 'SAVE|cad/name.dxf', 'PDF|cad/name.dxf|cad/name.pdf' (LibreCAD dxf2pdf, a page "
+             "'LEADER|x1,y1|x2,y2|175|材料', (drawing area sheet-local x 1250..20500, y 500..14350; title block x>11500,y<2500; a batch with points outside, in the title block, overlapping texts or unknown commands is sent back untyped), 'SAVE|cad/name.dxf', 'PDF|cad/name.dxf|cad/name.pdf' (LibreCAD dxf2pdf, a page "
              "per sheet). Send a whole sheet (100-200 items) per call. Never type a bare 'text'.",
              {"commands": {"type": "array", "items": {"type": "string"}},
               "open": {"type": "string", "description": "optional .dxf path relative to ~/workspace to open first"}},

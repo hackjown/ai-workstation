@@ -356,13 +356,50 @@ def _xy(s: str) -> tuple[float, float]:
     return a[0], a[1]
 
 
+_KNOWN_PIPE = re.compile(r"(?i)^\s*(#bad |(text|txt|save|pdf|sheet|frame)\s*\|)")
+
+
 def _macro(c: str) -> list[str] | None:
-    """FRAME / NOTE / DIMH / DIMV / LEADER -> plain LibreCAD commands, or None when c is not a macro."""
-    m = re.match(r"(?i)^\s*(frame|note|dimh|dimv|leader)\s*\|(.*)$", c)
+    """FRAME / NOTE / DIMH / DIMV / LEADER and the one-line geometry forms LINE|p1|p2|..., RECT|p1|p2,
+    CIRCLE|c|r, ARC|c|r|a1|a2 -> plain LibreCAD commands, or None when c is not a macro.
+    The 2026-10-20 run wrote every line and rectangle as 'rectangle|2000,2000|12000,8000'; typed as is, LibreCAD
+    ignored it, so no wall or panel outline reached the drawing while texts and dimensions did."""
+    m = re.match(r"(?i)^\s*(textc|frame|note|dimh|dimv|leader|line|li|l|pline|polyline|pl|rect|rectangle|rec|circle|ci|c|arc|a)\s*\|(.*)$", c)
     if not m:
+        if "|" in c and not _KNOWN_PIPE.match(c):
+            raise ValueError("unknown command form")  # -> '#BAD', reported back instead of typed into nowhere
         return None
     kind, bits = m.group(1).upper(), [b.strip() for b in m.group(2).split("|")]
     out: list[str] = []
+    pts = lambda bs: [_pt(*_xy(b)) for b in bs if b]
+    if kind == "TEXTC":  # TEXTC|x,y|h|内容: text centred on x,y (TEXT is left-aligned: x,y is its lower left corner)
+        x, y = _xy(bits[0])
+        h = float(bits[1]) if len(bits) > 2 else 250.0
+        body = bits[2] if len(bits) > 2 else bits[1]
+        x1, _, x2, _ = text_box(x, y, h, body)
+        return [f"TEXT|{_pt(round(x - (x2 - x1) / 2), round(y - h / 2))}|{_f(h)}|{body}"]
+    if kind in ("LINE", "LI", "L", "PLINE", "POLYLINE", "PL"):
+        close = bool(bits) and bits[-1].upper() in ("C", "CLOSE")
+        P = pts(bits[:-1] if close else bits)
+        if len(P) < 2:
+            raise ValueError("line needs two points")
+        return ["line", *P, *([P[0]] if close else []), "ESC"]
+    if kind in ("RECT", "RECTANGLE", "REC"):
+        P = pts(bits)
+        if len(P) != 2:
+            raise ValueError("rectangle needs two corners")
+        return ["rectangle", *P, "ESC"]
+    if kind in ("CIRCLE", "CI", "C"):
+        return ["circle", pts(bits[:1])[0], _f(float(bits[1])), "ESC"]
+    if kind in ("ARC", "A"):  # ARC|cx,cy|r|start°|end° counter-clockwise, typed as a fine line chain
+        import math             # (LibreCAD's own arc prompts misread typed radius/angles: wrong centre and radius)
+        cx, cy = _xy(bits[0])
+        r, a1, a2 = float(bits[1]), float(bits[2]), float(bits[3])
+        if a2 <= a1:
+            a2 += 360
+        n = max(4, int((a2 - a1) / 7.5))
+        return ["line", *[_pt(round(cx + r * math.cos(math.radians(a1 + (a2 - a1) * i / n)), 1),
+                              round(cy + r * math.sin(math.radians(a1 + (a2 - a1) * i / n)), 1)) for i in range(n + 1)], "ESC"]
     if kind == "FRAME":  # FRAME|n|图名|图号|比例|工程名称
         n = int(float(bits[0] or 0))
         title = bits[1] if len(bits) > 1 else ""
@@ -433,7 +470,91 @@ _ABS_POINT = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 _SHEET = re.compile(r"(?i)^\s*(frame|sheet)\s*\|\s*(-?\d+(?:\.\d+)?)")
 
 
-def place(commands: list[str], sheet: int = 0) -> tuple[list[str], int, int]:
+# sheet-local layout limits (FRAME): inner border and the 180 x 40 mm title block in its lower right corner
+FRAME_X1, FRAME_Y1, FRAME_X2, FRAME_Y2 = 1250, 500, SHEET_W - 500, SHEET_H - 500
+TB_X1, TB_Y2 = FRAME_X2 - 9000, FRAME_Y1 + 2000
+
+
+def text_box(x: float, y: float, h: float, body: str) -> tuple[float, float, float, float]:
+    """Rough extent of a left-aligned single-line text: a hanzi is about one text height wide, latin ~0.6."""
+    w = sum(0.95 if ord(ch) > 0x2e80 else 0.6 for ch in body) * h
+    return x, y, x + w, y + h
+
+
+def _overlap(a, b) -> float:
+    """Overlapping area as a share of the smaller box."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1])) or 1.0
+    return w * h / small
+
+
+def layout_issues(items: list[tuple[int, str]], prior_boxes: dict | None = None) -> tuple[list[str], list]:
+    """items: (sheet, expanded command) for everything the model drew itself (not FRAME output).
+    Finds points or texts outside the sheet's inner border, inside the title block, and texts that overlap a
+    text of this batch or one already on the sheet (prior_boxes: sheet -> [(box, body)]).
+    The 2026-10-20 run drew elevations across the title block, labels on top of each other and leaders above
+    the border. Returns (issues, new text boxes as (sheet, box, body))."""
+    issues, boxes = [], []
+    prior_boxes = prior_boxes or {}
+    tool, prev = "", None
+
+    def where(sheet, x, y):
+        lx = x - sheet * SHEET_PITCH
+        if not (FRAME_X1 - 1 <= lx <= FRAME_X2 + 1 and FRAME_Y1 - 1 <= y <= FRAME_Y2 + 1):
+            return "outside the border"
+        if lx > TB_X1 + 1 and y < TB_Y2 - 1:
+            return "inside the title block"
+        return ""
+
+    for sheet, e in items:
+        t = _parse_text(e)
+        if t:
+            try:
+                x, y = _xy(t[0])
+                h = float(t[1])
+            except (ValueError, IndexError):
+                continue
+            b = text_box(x, y, h, t[2])
+            bad = where(sheet, b[0], b[1]) or where(sheet, b[2], b[3]) or where(sheet, b[2], b[1])
+            ox = sheet * SHEET_PITCH
+            if bad:
+                issues.append(f"text '{t[2][:16]}' at {_pt(x - ox, y)} (ends near x={_f(round(b[2] - ox))}) is {bad}")
+            for pb, pbody in prior_boxes.get(sheet, []) + [(bb, bd) for s2, bb, bd in boxes if s2 == sheet]:
+                if _overlap(b, pb) > 0.25:
+                    issues.append(f"text '{t[2][:16]}' at {_pt(x - ox, y)} overlaps text '{pbody[:16]}'")
+                    break
+            boxes.append((sheet, b, t[2]))
+            continue
+        m = _ABS_POINT.match(e)
+        if m:
+            x, y = float(m.group(1)), float(m.group(2))
+            ox = sheet * SHEET_PITCH
+            bad = where(sheet, x, y)
+            if bad:
+                issues.append(f"point {_pt(x - ox, y)} is {bad}")
+            elif prev is not None and tool in ("line", "li", "l", "rectangle", "rec", "rect", "polyline", "pl"):
+                # the edges between two good points can still cross the title block (a rectangle from 2000,2000
+                # to 12000,5000 runs through it)
+                (px, py) = prev
+                segs = ([((px, py), (x, py)), ((x, py), (x, y)), ((x, y), (px, y)), ((px, y), (px, py))]
+                        if tool.startswith("rec") else [((px, py), (x, y))])
+                for (ax, ay), (bx, by) in segs:
+                    hit = next((k for k in range(1, 20) if where(sheet, ax + (bx - ax) * k / 20, ay + (by - ay) * k / 20)), None)
+                    if hit:
+                        hx, hy = ax + (bx - ax) * hit / 20, ay + (by - ay) * hit / 20
+                        issues.append(f"{tool} from {_pt(px - ox, py)} to {_pt(x - ox, y)} runs "
+                                      f"{where(sheet, hx, hy)} near {_pt(round(hx - ox), round(hy))}")
+                        break
+            prev = (x, y)
+            continue
+        tool, prev = e.strip().lower(), None
+    return issues, boxes
+
+
+def place(commands: list[str], sheet: int = 0, drawn: list | None = None) -> tuple[list[str], int, int]:
     """Expand macros and put every point on its sheet. 'FRAME|n|...' (or 'SHEET|n') makes sheet n current, and from
     then on a point given sheet-locally (x left of the sheet's origin n*25000) is moved onto it, so both
     'line 2000,3000' after FRAME|4 and the absolute 'line 102000,3000' land on sheet 4. Without this the model drew
@@ -471,6 +592,8 @@ def place(commands: list[str], sheet: int = 0) -> tuple[list[str], int, int]:
             elif _ABS_POINT.match(e):
                 e = shift(e)
             out.append(e)
+            if drawn is not None:
+                drawn.append((sheet, e))
     return out, sheet, moved
 
 
@@ -499,7 +622,7 @@ def dxf2pdf(dxf, pdf):  # dxf2pdf ignores -o for a single file and writes <name>
     if made != pdf and os.path.exists(made):
         shutil.move(made, pdf)
     return os.path.exists(pdf) and os.path.getsize(pdf) > 0
-counts, pages, stray = {}, [], {}
+counts, pages, stray, geom = {}, [], {}, {}
 try:
     import ezdxf
     doc = ezdxf.readfile(src)
@@ -530,7 +653,7 @@ try:
             return out
         p = g("insert")
         return [p] if p is not None else []
-    groups, stray = {}, {}
+    groups, stray, geom = {}, {}, {}
     for e in doc.modelspace():
         try:
             P = [p for p in pts(e) if p is not None]
@@ -544,6 +667,8 @@ try:
             stray[n] = stray.get(n, 0) + 1
             continue
         groups.setdefault(n, set()).add(e.dxf.handle)
+        if e.dxftype() in ("LINE", "LWPOLYLINE", "POLYLINE", "CIRCLE", "ARC", "HATCH", "INSERT", "SPLINE", "ELLIPSE"):
+            geom[n] = geom.get(n, 0) + 1
     for n in sorted(groups):
         if n < 0 or n > 60:
             continue
@@ -585,8 +710,12 @@ if not ok:
 if not ok:
     print("pdf failed: could not merge pages (apt install poppler-utils)"); sys.exit(6)
 thin = [n for n, c in counts.items() if c < MIN]
+# the frame alone is 3 rectangles + 2 lines; a sheet with little more than that has texts but no drawing
+# (2026-10-20: every line/rectangle was lost and the texts-only sheets passed as finished)
+nogeom = [n for n in counts if geom.get(n, 0) < 15 and n > 1]
+thin = sorted(set(thin) | set(nogeom))
 print("pdf %s: %d pages" % (out, len(pages)))
-print("AIW_SHEETS " + json.dumps({"counts": counts, "thin": thin, "stray": stray}))
+print("AIW_SHEETS " + json.dumps({"counts": counts, "thin": thin, "stray": stray, "geometry": geom, "no_geometry": nogeom}))
 '''
 
 

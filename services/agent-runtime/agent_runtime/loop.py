@@ -24,6 +24,7 @@ from tool_router.registry import SUBAGENT_TOOLS
 
 from . import cad as _cad
 
+_CAD_RESUME = re.compile(r"(?i)继续|接着|续画|补画|resume|continue")
 _LIBRECAD_PROC = re.compile(r"(?i)(nohup\s+librecad|(^|[;&|(]\s*)librecad\s*($|[&>;)])|p?kill(all)?\b[^;&|]*librecad)")
 from .control import AgentControl, StopRequested
 from .grounding import convert_desc, coord_instruction, coord_mode, locate, model_name
@@ -159,6 +160,8 @@ class AgentLoop:
         plan_job = None
         if self.cfg.make_plan and _needs_action(self.task.prompt):
             plan_job = asyncio.create_task(self._plan())  # plan in parallel with the first step, not before it
+        if self._cad_task and not _CAD_RESUME.search(self.task.prompt or ""):
+            await self._cad_fresh_start()
         try:
             await asyncio.wait_for(self._run(), self.cfg.timeout_s)
         except asyncio.TimeoutError:
@@ -175,6 +178,24 @@ class AgentLoop:
         ev = {TaskStatus.SUCCEEDED: EventType.TASK_FINISHED}.get(self.task.status, EventType.TASK_FAILED)
         await self.emit(ev, status=self.task.status.value, result=self.task.result, steps=self.step)
         return self.task
+
+    async def _cad_fresh_start(self):
+        """A new drawing task starts from an empty cad/ folder and a fresh LibreCAD. The 2026-10-19 run found the
+        previous run's DXF, plan.md and PDF there, took itself for a resumed task and never drew a line; and an
+        old drawing left open in LibreCAD would have the new sheets drawn on top of it. Old files are moved, not
+        deleted."""
+        cmd = ('R="${VM_AGENT_FILES_ROOT:-$HOME/workspace}/' + _cad.CAD_DIR + '"; mkdir -p "$R"; cd "$R" && '
+               'if ls -A | grep -qv "^_old$"; then B="_old/$(date +%Y%m%d-%H%M%S)"; mkdir -p "$B"; '
+               'for f in * .[!.]*; do [ -e "$f" ] && [ "$f" != _old ] && mv -- "$f" "$B/"; done; echo "moved to cad/$B"; fi; '
+               'pkill -x librecad; rm -f "$HOME/.cache/aiw-cad-progress"; true')
+        try:
+            r = await self.tools.run("shell", {"command": cmd, "timeout": 30}, intent="start the drawing from an empty cad/ folder")
+            res = r.result if isinstance(r.result, dict) else {}
+            moved = (res.get("stdout") or "").strip()
+            if moved:
+                self.history.append(f"0. previous drawing files {moved}; this task draws everything anew (cad/ is empty)")
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _plan(self):
         try:
@@ -201,6 +222,7 @@ class AgentLoop:
         self._sheet_audit: dict = {}  # entities per sheet from the last PDF export
         self._cad_pdf_ok = False      # PDF made by LibreCAD (PDF|...), not by soffice
         self._cad_sheet = 0           # sheet the next cad_command points belong to (set by FRAME|n / SHEET|n)
+        self._cad_frames: set = set()  # sheets this task drew a FRAME for
         self._prev_sig: Optional[tuple] = None
         self._rep = 0
         self._last_tool: Optional[str] = None
@@ -590,6 +612,10 @@ class AgentLoop:
             return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
         # points go onto the current sheet (FRAME|n / SHEET|n), whether given sheet-locally or absolutely
         cmds, self._cad_sheet, moved = _cad.place(raw[:CAD_MAX_BATCH], self._cad_sheet)
+        for c in raw[:CAD_MAX_BATCH]:
+            mf = re.match(r"(?i)^\s*frame\s*\|\s*(\d+)", str(c))
+            if mf:
+                self._cad_frames.add(int(mf.group(1)))
         cmds = cmds[:CAD_MAX_EXPANDED]
         r, res, ok, out = await self._type_cad(cmds, a.get("open") or None, intent)
         resumed = ""
@@ -608,6 +634,11 @@ class AgentLoop:
             try:
                 self._sheet_audit = json.loads(m.group(1))
                 self._cad_pdf_ok = True
+                # a sheet framed in this task but absent from the PDF is unfinished too (an empty save passed before)
+                have = {int(k) for k in (self._sheet_audit.get("counts") or {})}
+                thin = {int(n) for n in self._sheet_audit.get("thin") or []}
+                thin |= {n for n in self._cad_frames if n not in have}
+                self._sheet_audit["thin"] = sorted(thin)
             except ValueError:
                 pass
         await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=ok, error=None if ok else out[-200:],
@@ -621,6 +652,9 @@ class AgentLoop:
         if m and self._sheet_audit.get("thin"):
             audit = (f" THIN SHEETS {self._sheet_audit['thin']} (entities per sheet {self._sheet_audit.get('counts')}): "
                      f"those sheets are not finished; draw their missing content, save and export again.")
+        if m and self._sheet_audit.get("stray"):
+            audit += (f" STRAY ENTITIES per sheet {self._sheet_audit['stray']}: they reach outside their sheet and were "
+                      f"left out of the PDF; undo/redraw them inside the sheet.")
         if moved:
             more += (f" (sheet {self._cad_sheet}: {moved} sheet-local points were placed at origin x="
                      f"{self._cad_sheet * _cad.SHEET_PITCH}; keep using local or absolute coordinates, both land right)")

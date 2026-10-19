@@ -319,3 +319,68 @@ def test_split_pdf_is_fast_and_reports_stray(tmp_path):
 def test_cad_resume_words():
     from agent_runtime.loop import _CAD_RESUME
     assert _CAD_RESUME.search("继续画完剩下的图") and not _CAD_RESUME.search("打开 LibreCAD 画施工图")
+
+
+# ---- V1.3.9 ----
+def test_one_line_geometry_forms_expand():
+    from agent_runtime import cad
+    out, _, _ = cad.place(["FRAME|2|a|2|1:50|p", "rectangle|2000,3000|12000,9000", "line|1,2|3,4|5,6|C",
+                           "circle|6000,6000|300", "arc|4000,6000|800|0|90"], 0)
+    i = out.index("rectangle", 20)
+    assert out[i:i + 4] == ["rectangle", "52000,3000", "62000,9000", "ESC"]
+    assert ["line", "50001,2", "50003,4", "50005,6", "50001,2", "ESC"] == out[i + 4:i + 10]
+    assert out[i + 10:i + 14] == ["circle", "56000,6000", "300", "ESC"]
+    assert out[i + 14] == "line" and out[i + 15] == "54800,6000" and out[-2] == "54000,6800"
+
+
+def test_unknown_pipe_command_is_reported_not_typed():
+    from agent_runtime import cad
+    out, _, _ = cad.place(["hatch|1,2|3,4", "TEXT|1,1|175|a|b"], 0)
+    assert out[0] == "#BAD hatch|1,2|3,4" and out[1].startswith("TEXT|")
+
+
+def test_textc_centres():
+    from agent_runtime import cad
+    (t,), _, _ = cad.place(["TEXTC|10000,5000|200|一二三四"], 0)
+    pt, h, body = cad._parse_text(t)
+    x, y = cad._xy(pt)
+    assert abs(x - (10000 - 2 * 0.95 * 200)) < 2 and y == 4900
+
+
+def test_layout_issues():
+    from agent_runtime import cad
+    drawn = []
+    cad.place(["FRAME|4|x|4|1:50|p", "rect|2000,2000|12000,5000", "TEXT|3000,8000|250|历史沿革",
+               "TEXT|3200,8050|250|领导关怀", "line|900,3000|5000,3000", "TEXT|3000,14300|175|太高"], 0, drawn)
+    issues, boxes = cad.layout_issues(drawn)
+    s = " ".join(issues)
+    assert "rectangle from 2000,2000 to 12000,5000 runs inside the title block" in s and "overlaps text '历史沿革'" in s
+    assert "900,3000 is outside the border" in s and "'太高'" in s and len(boxes) == 3
+    ok = []
+    cad.place(["FRAME|4|x|4|1:50|p", "rect|2500,4000|12500,7000", "TEXTC|7500,5500|250|历史沿革"], 0, ok)
+    assert cad.layout_issues(ok)[0] == []
+
+
+async def test_cad_layout_check_sends_batch_back_untyped(env):  # noqa: F811
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    loop = AgentLoop(Task(prompt="继续在 LibreCAD 画施工图"), "s-lay", comp, LLMRouter([ScriptedProvider([])]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=2, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")))
+    loop._cad_frames, loop._cad_text_boxes, loop._cad_typed_texts, loop._cad_rejects = set(), {}, set(), {}
+    loop._cad_sheet, loop._cad_ok = 0, 0
+    typed = []
+
+    async def fake_type(cmds, open_path, intent):
+        typed.append(cmds)
+        return None, {}, True, "typed"
+    loop._type_cad = fake_type
+    r = await loop._cad_command({"commands": ["FRAME|4|x|4|1:50|p", "rect|2000,2000|12000,5000", "bogus|1,2"]}, "i")
+    assert r.startswith("NOT TYPED") and "title block" in r and "bogus" in r and not typed
+    r = await loop._cad_command({"commands": ["FRAME|4|x|4|1:50|p", "rect|2500,4000|12500,7000",
+                                              "TEXTC|7500,5500|250|历史沿革"]}, "i")
+    assert typed and "NOT TYPED" not in r
+    r = await loop._cad_command({"commands": ["SHEET|4", "TEXTC|7500,5500|250|历史沿革"]}, "i")
+    assert "already on the drawing" in r

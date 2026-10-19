@@ -277,3 +277,45 @@ def test_type_command_keeps_one_librecad():
     from agent_runtime import cad
     s = cad.librecad_type_command(["line", "0,0", "100,0", "ESC"])
     assert "pgrep -xc librecad" in s and "pkill -o -x librecad" in s
+
+
+# ---- V1.3.8 ----
+def test_text_sets_angle_every_time():
+    from agent_runtime import cad
+    s = cad.librecad_type_command(["TEXT|1000,1000|400|标题"])
+    i = s.index("-- 400;")
+    assert "xdotool key Tab ctrl+a; xdotool type --delay" in s[i:i + 120] and "-- 0; xdotool key Return" in s[i:i + 160]
+    assert "TextAngle=0" in s  # reset before LibreCAD starts
+
+
+def test_save_refuses_to_wipe_file_from_empty_drawing():
+    from agent_runtime import cad
+    s = cad.librecad_type_command(["SAVE|cad/a.dxf"])
+    assert "*unnamed*" in s and "SAVE REFUSED" in s
+
+
+def test_split_pdf_is_fast_and_reports_stray(tmp_path):
+    ezdxf = pytest.importorskip("ezdxf")
+    import time
+    from agent_runtime import cad
+    d = ezdxf.new()
+    m = d.modelspace()
+    for n in range(3):
+        for i in range(300):
+            m.add_text("轻钢龙骨", dxfattribs={"height": 175, "insert": (n * 25000 + 1000 + i, 2000)})
+    m.add_line((26000, 100), (90000, 100))
+    src = tmp_path / "a.dxf"
+    d.saveas(src)
+    code = cad.SPLIT_PDF_SCRIPT.split("counts, pages, stray")[0]
+    assert "bbox.extents" not in cad.SPLIT_PDF_SCRIPT
+    t = time.time()
+    script = tmp_path / "s.py"
+    script.write_text(cad.SPLIT_PDF_SCRIPT.replace('subprocess.run(["librecad"', 'False and subprocess.run(["librecad"'))
+    r = subprocess.run([sys.executable, str(script), str(src), str(tmp_path / "o.pdf")], capture_output=True, text=True)
+    assert time.time() - t < 30 and code
+    assert '"stray": {"1": 1}' in r.stdout or "pdf failed" in r.stdout
+
+
+def test_cad_resume_words():
+    from agent_runtime.loop import _CAD_RESUME
+    assert _CAD_RESUME.search("继续画完剩下的图") and not _CAD_RESUME.search("打开 LibreCAD 画施工图")

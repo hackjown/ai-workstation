@@ -24,7 +24,12 @@ from tool_router.registry import SUBAGENT_TOOLS
 
 from . import cad as _cad
 
-_CAD_RESUME = re.compile(r"(?i)继续|接着|续画|补画|resume|continue")
+# Only an explicit "go on with the earlier drawing" resumes. The bare words matched far too much: run 3ac's prompt said
+# "把那张补画完整" (redraw that thin sheet) and was taken for a resume, so the previous run's DXF stayed in cad/, LibreCAD
+# kept the old drawing open and all 12 sheets were drawn on top of the old 12 (doubled titles and notes).
+_CAD_RESUME = re.compile(r"(?i)(继续|接着|接上)(之前|上次|上一次|刚才|原来|前面|未完成|没画完|画完|画剩)|"
+                         r"在(原|旧|之前|上次|已有)的?(图|图纸|dxf|文件)(上|基础|里)|(上次|之前|刚才)(没|未)(画完|完成)|"
+                         r"\bresume\b|continue (the )?(previous|earlier|last|unfinished)")
 _LIBRECAD_PROC = re.compile(r"(?i)(nohup\s+librecad|(^|[;&|(]\s*)librecad\s*($|[&>;)])|p?kill(all)?\b[^;&|]*librecad)")
 from .control import AgentControl, StopRequested
 from .grounding import convert_desc, coord_instruction, coord_mode, locate, model_name
@@ -68,6 +73,8 @@ class AgentLoop:
             self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400")))
             self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800")))
         self.validator = Validator()
+        self._cad_keys_saved: set = set()
+        self._cad_keys_unsaved: set = set()
         self.recovery = Recovery(computer)
         self._emit_fn = emit
         self.history: list[str] = []
@@ -160,7 +167,7 @@ class AgentLoop:
         plan_job = None
         if self.cfg.make_plan and _needs_action(self.task.prompt):
             plan_job = asyncio.create_task(self._plan())  # plan in parallel with the first step, not before it
-        if self._cad_task and not _CAD_RESUME.search(self.task.prompt or ""):
+        if self._cad_task and not self._cad_resuming():
             await self._cad_fresh_start()
         try:
             await asyncio.wait_for(self._run(), self.cfg.timeout_s)
@@ -178,6 +185,10 @@ class AgentLoop:
         ev = {TaskStatus.SUCCEEDED: EventType.TASK_FINISHED}.get(self.task.status, EventType.TASK_FAILED)
         await self.emit(ev, status=self.task.status.value, result=self.task.result, steps=self.step)
         return self.task
+
+    def _cad_resuming(self) -> bool:
+        src = str(getattr(self.task, "source", "") or "").lower()
+        return src in ("retry", "resume") or bool(_CAD_RESUME.search(self.task.prompt or ""))
 
     async def _cad_fresh_start(self):
         """A new drawing task starts from an empty cad/ folder and a fresh LibreCAD. The 2026-10-19 run found the
@@ -226,6 +237,10 @@ class AgentLoop:
         self._cad_text_boxes: dict = {}  # sheet -> [(box, text)] of texts typed so far (overlap check)
         self._cad_typed_texts: set = set()
         self._cad_rejects: dict = {}  # sheet -> batches sent back by the layout check (typed anyway after 2)
+        # every one-line item (line|, rect|, TEXT|, DIMH|, FRAME|n ...) that landed, in its absolute form: a batch sent
+        # again after a timeout, a dialog error or a reopen skips what is already there instead of drawing it twice
+        self._cad_keys_saved: set = set()    # landed and saved in the DXF
+        self._cad_keys_unsaved: set = set()  # landed since the last save (lost if LibreCAD restarts)
         self._prev_sig: Optional[tuple] = None
         self._rep = 0
         self._last_tool: Optional[str] = None
@@ -615,8 +630,18 @@ class AgentLoop:
             return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
         # points go onto the current sheet (FRAME|n / SHEET|n), whether given sheet-locally or absolutely
         sheet_before = self._cad_sheet
+        if a.get("open"):  # LibreCAD is restarted on the file: whatever was typed since the last save is gone
+            self._cad_keys_unsaved.clear()
+        raw, keys, already = _cad.dedupe(raw[:CAD_MAX_BATCH], self._cad_sheet,
+                                         self._cad_keys_saved | self._cad_keys_unsaved)
+        if already and not any(k is not None or not _cad._SHEET.match(c) for c, k in zip(raw, keys)):
+            self._cad_sheet = _cad.place(raw, self._cad_sheet)[1]
+            await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=True, error=None,
+                            result={"commands": raw[:80], "count": already, "typed": 0, "skipped": already})
+            return (f"nothing typed: all {already} items are already on the drawing from earlier batches of this task. "
+                    f"Go on with the next sheet in cad/plan.md; never resend a finished sheet.")
         drawn: list = []
-        cmds, self._cad_sheet, moved = _cad.place(raw[:CAD_MAX_BATCH], self._cad_sheet, drawn)
+        cmds, self._cad_sheet, moved = _cad.place(raw, self._cad_sheet, drawn)
         # a text already typed at the same spot (the model redoing a sheet) would only be drawn on top of itself
         dup = {c for c in cmds if _cad._parse_text(c) and c in self._cad_typed_texts}
         if dup:
@@ -642,22 +667,39 @@ class AgentLoop:
                         f"is about one text height wide; use TEXTC|x,y|h|... to centre a label on x,y. Move views/labels, "
                         f"shorten or split long labels, and keep text clear of other text.")
             return msg
-        for c in raw[:CAD_MAX_BATCH]:
+        for c in raw:
             mf = re.match(r"(?i)^\s*frame\s*\|\s*(\d+)", str(c))
             if mf:
                 self._cad_frames.add(int(mf.group(1)))
         cmds = cmds[:CAD_MAX_EXPANDED]
         r, res, ok, out = await self._type_cad(cmds, a.get("open") or None, intent)
         resumed = ""
+        landed = len(cmds) if ok else 0
+        if not ok:
+            landed = await self._cad_progress() or 0
         if not ok and res.get("timed_out"):
             # the batch was cut off: find how far it got and type the rest once, instead of the model resending
             # everything (which drew every finished line twice)
-            done = await self._cad_progress()
-            if done is not None and done < len(cmds):
+            done = landed
+            if done < len(cmds):
                 start = _cad.resume_index(cmds, done)
+                landed = start
                 rest = (["ESC"] if start else []) + cmds[start:]
                 r, res, ok, out = await self._type_cad(rest, None, intent)
+                if ok:
+                    landed = len(cmds)
+                else:
+                    p2 = await self._cad_progress() or 0
+                    landed = max(start, start + p2 - (1 if start else 0))
                 resumed = f" (cut off after {done} items; resumed automatically from item {start})"
+        if "SAVE REFUSED" in out:  # LibreCAD came back on an empty drawing: nothing unsaved survived
+            self._cad_keys_unsaved.clear()
+            landed = 0
+        for k in _cad.landed_keys(raw, keys, sheet_before, landed):
+            self._cad_keys_unsaved.add(k)
+        if ok and re.search(r"saved \S", out):
+            self._cad_keys_saved |= self._cad_keys_unsaved
+            self._cad_keys_unsaved.clear()
         self._last_ok_cad = ok
         m = re.search(r"AIW_SHEETS (\{.*\})", out)
         if m:
@@ -682,8 +724,9 @@ class AgentLoop:
             self._cad_typed_texts.update(c for c in cmds if _cad._parse_text(c))
             self._cad_rejects[key] = 0
         more = (f" (only the first {CAD_MAX_BATCH} were typed; send the rest next)" if len(raw) > CAD_MAX_BATCH else "")
-        if dup:
-            more += f" ({len(dup)} texts already on the drawing at the same spot were skipped)"
+        if dup or already:
+            more += (f" ({already + len(dup)} items already drawn earlier in this task were skipped, so nothing is drawn twice;"
+                     f" never resend finished sheets)")
         if issues:
             more += f" (typed although the layout check still finds: {'; '.join(issues[:6])})"
         audit = ""

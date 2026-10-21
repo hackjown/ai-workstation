@@ -319,6 +319,10 @@ def test_split_pdf_is_fast_and_reports_stray(tmp_path):
 def test_cad_resume_words():
     from agent_runtime.loop import _CAD_RESUME
     assert _CAD_RESUME.search("继续画完剩下的图") and not _CAD_RESUME.search("打开 LibreCAD 画施工图")
+    assert _CAD_RESUME.search("（继续之前被中断的任务）画施工图") and _CAD_RESUME.search("在原图上补两张立面")
+    # run 3ac: a fresh task whose instructions say how to fix a thin sheet is not a resume
+    assert not _CAD_RESUME.search("如果提示 THIN SHEETS，就把那张补画完整，再保存并重新导出。每画完一张就保存一次")
+    assert not _CAD_RESUME.search("画完一张继续下一张，不要 continue 旧文件以外的东西")
 
 
 # ---- V1.3.9 ----
@@ -384,3 +388,81 @@ async def test_cad_layout_check_sends_batch_back_untyped(env):  # noqa: F811
     assert typed and "NOT TYPED" not in r
     r = await loop._cad_command({"commands": ["SHEET|4", "TEXTC|7500,5500|250|历史沿革"]}, "i")
     assert "already on the drawing" in r
+
+
+# ---- V1.3.10: nothing is drawn twice ----
+def test_dedupe_skips_items_already_drawn():
+    from agent_runtime import cad
+    batch = ["FRAME|4|左侧墙|4|1:50|p", "rect|2000,3000|4000,5000", "TEXTC|3000,6000|250|历史沿革",
+             "line|2000,3000|4000,3000", "SAVE|cad/x.dxf"]
+    raw, keys, skipped = cad.dedupe(batch, 0, set())
+    assert raw == batch and skipped == 0 and keys[-1] is None
+    have = set(cad.landed_keys(raw, keys, 0, 10 ** 6))
+    # the same sheet again, written with absolute points this time, plus one new line
+    again = ["FRAME|4|左侧墙立面|建施-04|1:50|p", "rect|102000,3000|104000,5000", "TEXTC|3000,6000|250|历史沿革",
+             "line|2000,4000|4000,4000"]
+    raw2, keys2, skipped2 = cad.dedupe(again, 0, have)
+    assert skipped2 == 3 and raw2 == ["SHEET|4", "line|2000,4000|4000,4000"]
+    out, sheet, _ = cad.place(raw2, 0)
+    assert sheet == 4 and out[:3] == ["line", "102000,4000", "104000,4000"]
+    # duplicates inside one batch go too
+    raw3, _, s3 = cad.dedupe(["rect|0,0|1,1", "rect|0,0|1,1"], 0, set())
+    assert s3 == 1 and len(raw3) == 1
+
+
+def test_landed_keys_only_counts_finished_items():
+    from agent_runtime import cad
+    raw = ["FRAME|1|a|1|1:50|p", "rect|2000,3000|4000,5000", "line|2000,3000|4000,3000"]
+    raw, keys, _ = cad.dedupe(raw, 0, set())
+    n_frame = len(cad.expand([raw[0]]))
+    got = cad.landed_keys(raw, keys, 0, n_frame + 2)  # cut off inside the rect
+    assert got == ["FRAME|1"]
+    got = cad.landed_keys(raw, keys, 0, n_frame + 4)
+    assert len(got) == 2
+
+
+async def test_cad_resend_after_failure_draws_only_the_rest(env):  # noqa: F811
+    """Run 3ac: sheet 0 timed out, then a Text dialog error, then the model reopened the file and sent the whole
+    sheet again. Items that landed must not be typed a second time; items lost with an unsaved restart must."""
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    loop = AgentLoop(Task(prompt="在 LibreCAD 画施工图"), "s-dup", comp, LLMRouter([ScriptedProvider([])]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=2, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")))
+    loop._cad_frames, loop._cad_text_boxes, loop._cad_typed_texts, loop._cad_rejects = set(), {}, set(), {}
+    loop._cad_sheet, loop._cad_ok = 0, 0
+    typed, plan = [], []
+
+    async def fake_type(cmds, open_path, intent):
+        typed.append(list(cmds))
+        return plan.pop(0)(cmds)
+    loop._type_cad = fake_type
+    progress = {"n": 0}
+
+    async def fake_progress():
+        return progress["n"]
+    loop._cad_progress = fake_progress
+    sheet = ["FRAME|0|目录|0|1:50|p", "rect|2500,3000|18500,12000", "line|2500,11200|18500,11200",
+             "line|2500,10400|18500,10400", "SAVE|cad/x.dxf"]
+    n_frame = len(__import__("agent_runtime").cad.expand([sheet[0]]))
+
+    def fail_after_rect(cmds):  # the frame and the rectangle land, then a dialog error
+        progress["n"] = n_frame + 4
+        return None, {}, False, "Text dialog did not open"
+    plan.append(fail_after_rect)
+    await loop._cad_command({"commands": sheet}, "i")
+    plan.append(lambda cmds: (None, {}, True, "saved /x.dxf"))
+    r = await loop._cad_command({"commands": sheet}, "i")
+    assert "2 items already drawn" in r
+    assert typed[-1][:3] == ["line", "2500,11200", "18500,11200"] and "rectangle" not in typed[-1]
+    # everything is saved now; a third resend types nothing at all
+    r = await loop._cad_command({"commands": sheet[:4]}, "i")
+    assert r.startswith("nothing typed") and len(typed) == 2
+    # unsaved work is forgotten when LibreCAD is reopened on the file
+    plan.append(lambda cmds: (None, {}, True, "typed"))
+    await loop._cad_command({"commands": ["SHEET|0", "line|3000,5000|9000,5000"]}, "i")
+    plan.append(lambda cmds: (None, {}, True, "typed"))
+    await loop._cad_command({"open": "cad/x.dxf", "commands": ["SHEET|0", "line|3000,5000|9000,5000"]}, "i")
+    assert typed[-1][:3] == ["line", "3000,5000", "9000,5000"]

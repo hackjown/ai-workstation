@@ -597,6 +597,60 @@ def place(commands: list[str], sheet: int = 0, drawn: list | None = None) -> tup
     return out, sheet, moved
 
 
+def _item_key(c: str, sheet: int) -> tuple[str | None, int, int]:
+    """(key, expanded length, sheet afterwards) of one cad_command item. The key is the item's absolute, expanded form,
+    so 'rect|2000,3000|4000,5000' after FRAME|4 and 'rect|102000,3000|104000,5000' are the same drawing. A FRAME's key
+    is its sheet alone (a second frame on a sheet is always a duplicate). Bare tool names and single points (the
+    multi-item style) and SAVE/PDF get no key: they are never skipped."""
+    c = str(c)
+    ms = _SHEET.match(c)
+    if ms:
+        n = max(0, int(float(ms.group(2))))
+        if ms.group(1).upper() == "SHEET":
+            return None, 0, n
+        return f"FRAME|{n}", len(expand([c])), n
+    out, sheet2, _ = place([c], sheet)
+    low = c.strip().lower()
+    if "|" not in c or low.startswith(("save", "pdf", "#")) or any(e.startswith("#BAD ") for e in out):
+        return None, len(out), sheet2
+    return "\x1f".join(out), len(out), sheet2
+
+
+def dedupe(raw: list[str], sheet: int, have: set) -> tuple[list[str], list, int]:
+    """Drop items already drawn in this task (or twice in this batch). Run 3ac (2026-10-20) resent sheet 0 three
+    times after a timeout and a dialog error and drew it on top of itself. A skipped FRAME|n becomes SHEET|n so the
+    following sheet-local points still land on sheet n. Returns (items to type, their keys, items skipped)."""
+    out, keys, seen, skipped = [], [], set(), 0
+    for c in raw:
+        k, _n, nxt = _item_key(c, sheet)
+        if k is not None and (k in have or k in seen):
+            skipped += 1
+            if k.startswith("FRAME|"):
+                out.append(f"SHEET|{nxt}")
+                keys.append(None)
+            sheet = nxt
+            continue
+        if k is not None:
+            seen.add(k)
+        out.append(c)
+        keys.append(k)
+        sheet = nxt
+    return out, keys, skipped
+
+
+def landed_keys(raw: list[str], keys: list, sheet: int, landed: int) -> list[str]:
+    """Keys of the items whose whole expansion was typed, given `landed` expanded commands went in."""
+    got, pos = [], 0
+    for c, k in zip(raw, keys):
+        _k, n, sheet = _item_key(c, sheet)
+        pos += n
+        if pos > landed:
+            break
+        if k is not None:
+            got.append(k)
+    return got
+
+
 def resume_index(commands: list[str], done: int) -> int:
     """After a batch was cut off with `done` items typed, where to restart so no tool is left half-fed:
     back up to the item that started the tool (a point never starts one)."""

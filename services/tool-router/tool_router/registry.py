@@ -86,7 +86,7 @@ TOOLS: list[ToolSpec] = [
              "sheet-local 0..21000 and are moved onto sheet n), 'SHEET|n' (continue on sheet n), 'NOTE|x,y|175|行1;行2', "
              "'DIMH|y_measured|y_dimline|x1,x2,...' / 'DIMV|x_measured|x_dimline|y1,y2,...' (dimension chains), "
              "'LEADER|x1,y1|x2,y2|175|材料', (drawing area sheet-local x 1250..20500, y 500..14350; title block x>11500,y<2500; a batch with points outside, in the title block, overlapping texts or unknown commands is sent back untyped), 'SAVE|cad/name.dxf', 'PDF|cad/name.dxf|cad/name.pdf' (LibreCAD dxf2pdf, a page "
-             "per sheet). Send a whole sheet (100-200 items) per call. Never type a bare 'text'.",
+             "per sheet). Send a whole sheet (100-200 items) per call. Items already drawn in this task are skipped, so resending a failed sheet only types what is missing. Never type a bare 'text'.",
              {"commands": {"type": "array", "items": {"type": "string"}},
               "open": {"type": "string", "description": "optional .dxf path relative to ~/workspace to open first"}},
              ["commands"]),

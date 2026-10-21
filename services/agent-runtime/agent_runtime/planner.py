@@ -68,6 +68,9 @@ Rules:
        'SAVE|cad/name.dxf'   'PDF|cad/name.dxf|cad/name.pdf'
      SPEED: every call costs a model turn, so send ONE WHOLE SHEET per call (100-200 items incl. its texts). Do not
      split a sheet into small batches; no screenshot or Escape between batches. A cut-off batch resumes by itself.
+     Every one-line item already drawn in this task is skipped automatically, so after a FAILED batch just send the
+     same sheet again (only the missing items get typed). Each sheet gets exactly ONE FRAME; draw each element once
+     (a 'rect' needs no extra 'line' items along its own edges). Never redraw a finished sheet.
   4. Never send a bare 'text' and never click inside the Text dialog. Layers: Layer List panel when useful.
   5. SAVE after every sheet (['SAVE|cad/<name>.dxf']; Chinese file names are fine). FINISH: SAVE, then
      ['PDF|cad/<name>.dxf|cad/<name>.pdf'] (LibreCAD's own dxf2pdf, one A3 page per sheet, and it reports entities per

@@ -27,7 +27,10 @@ Rules:
      if both fail: `soffice --headless -env:UserInstallation=file:///tmp/lo_conv --convert-to xlsx FILE`.
      Read each design image with `read_image` and a focused question (板块从左到右的名称和宽度, 门的位置...).
      Never re-read a file whose content is already in PREVIOUS STEPS.
-  2. WRITE THE PLAN (text, not drawing): `files_write` cad/plan.md, written directly as cad_command items per sheet
+  2. WRITE THE PLAN (text, not drawing) IN PARTS: one `files_write` per sheet. The first call writes cad/plan.md
+     with the key sizes and sheet 0; every later call adds ONE sheet with append=true. A whole 12-sheet plan in one
+     call is far too long for one reply (it was cut off and the task failed). Keep your reasoning short; the
+     numbers belong in the file, not in your thoughts. Write it directly as cad_command items per sheet
      (mm, model space 1:1, A3 at 1:50 = 21000 x 14850, sheet n at origin x = n*25000). Write each sheet's points
      SHEET-LOCAL (x 0..21000, y 0..14850) after its FRAME|n: cad_command moves them onto sheet n (absolute x works
      too). A batch that continues a sheet without its FRAME starts with 'SHEET|n'. Every sheet is

@@ -71,6 +71,18 @@ class SessionManager:
             self._computers[machine_id] = self._computer_factory(m)
         return self._computers[machine_id]
 
+    def drop_computer(self, machine_id: str) -> None:
+        """Forget the cached connection, e.g. after the VM's address changed in 设置."""
+        c = self._computers.pop(machine_id, None)
+        close = getattr(getattr(c, "provider", None), "close", None)
+        if close:
+            try:
+                res = close()
+                if asyncio.iscoroutine(res):
+                    asyncio.get_event_loop().create_task(res)
+            except Exception:  # noqa: BLE001
+                pass
+
     def model_settings(self) -> dict:
         return self.store.kv_get("models", {}) or {}
 

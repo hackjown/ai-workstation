@@ -233,3 +233,22 @@ async def test_openapi_import_and_http_tool(stack, monkeypatch):
     app_tools = await load_tools(stack[3].state.store, stack[3].state.secrets)
     out = await app_tools["ext_demo_getItem"][1]({"id": "42"})
     assert out["data"] == {"ok": 1} and seen["url"].endswith("/items/42") and seen["headers"]["X-Key"] == "k123"
+
+
+async def test_vm_ip_setting_repoints_machine(stack, monkeypatch):
+    client, backend, scripts, app, providers, tmp = stack
+    monkeypatch.setenv("VM_AGENT_PORT", str(PORT))
+    r = await client.put("/api/settings/vm", json={"ip": "bad ip!"})
+    assert r.status_code == 400
+    r = await client.put("/api/settings/vm", json={"ip": "127.0.0.1", "auto": False})
+    assert r.status_code == 200 and r.json()["agent_endpoint"] == f"ws://127.0.0.1:{PORT}"
+    g = (await client.get("/api/settings/vm")).json()
+    assert g["ip"] == "127.0.0.1"
+    m = (await client.get("/api/machines/ai-linux-001")).json()
+    assert m["agent"].get("ok")  # reconnected through the new endpoint
+    # saved address survives a restart and beats the env/config value
+    from aiw_api.main import _apply_saved_vm_ip
+    store = app.state.store
+    store.kv_set("vm_net", {"ip": "10.9.8.7"})
+    _apply_saved_vm_ip(store, app.state.settings)
+    assert store.machine("ai-linux-001")["agent_endpoint"].startswith("ws://10.9.8.7:")

@@ -466,3 +466,43 @@ async def test_cad_resend_after_failure_draws_only_the_rest(env):  # noqa: F811
     plan.append(lambda cmds: (None, {}, True, "typed"))
     await loop._cad_command({"open": "cad/x.dxf", "commands": ["SHEET|0", "line|3000,5000|9000,5000"]}, "i")
     assert typed[-1][:3] == ["line", "3000,5000", "9000,5000"]
+
+
+# ---- V1.3.11: a reply without a tool call is retried, not fatal ----
+async def test_no_tool_call_is_retried_not_fatal(env):  # noqa: F811
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, LLMDecision
+    from llm_router.router import LLMProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    seen = []
+
+    class Flaky(LLMProvider):
+        name = "flaky"
+        n = 0
+
+        async def decide(self, req):
+            Flaky.n += 1
+            seen.append(req)
+            if Flaky.n <= 2:
+                return LLMDecision("long reasoning ...", "fail", {"reason": "model returned no tool call (output cut off by max_tokens)"})
+            return LLMDecision("ok", "done", {"summary": "完成"})
+    loop = AgentLoop(Task(prompt="看一下屏幕"), "s-nc", comp, LLMRouter([Flaky()]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=6, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")))
+    t = await loop.run()
+    assert t.status.value == "succeeded" and Flaky.n == 3
+
+
+def test_openai_thinking_budget(monkeypatch):
+    from llm_router.providers.openai import OpenAIProvider
+    monkeypatch.delenv("AIW_LLM_MAX_TOKENS_THINKING", raising=False)
+    monkeypatch.delenv("AIW_LLM_MAX_TOKENS", raising=False)
+    assert OpenAIProvider(model="m", api_key="k", thinking="on")._max_tokens() == 16384
+    assert OpenAIProvider(model="m", api_key="k", thinking="off")._max_tokens() == 4096
+
+
+def test_files_write_has_append():
+    from tool_router.registry import TOOLS
+    spec = next(t for t in TOOLS if t.name == "files_write")
+    assert "append" in spec.params

@@ -59,8 +59,9 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("browser_forward", "browser.forward", "Browser forward."),
     ToolSpec("files_list", "files.list", "List files under the VM workspace.", {"path": {"type": "string"}}, ["path"]),
     ToolSpec("files_read", "files.read", "Read a text file in the VM workspace.", {"path": {"type": "string"}}, ["path"]),
-    ToolSpec("files_write", "files.write", "Write a text file in the VM workspace.",
-             {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
+    ToolSpec("files_write", "files.write", "Write a text file in the VM workspace. append=true adds the content to the "
+             "end of the file instead of replacing it (write a long file in parts, e.g. one sheet of plan.md per call).",
+             {"path": {"type": "string"}, "content": {"type": "string"}, "append": {"type": "boolean"}}, ["path", "content"]),
     ToolSpec("files_download", "files.download", "Download a URL into the VM workspace (downloads/).",
              {"url": {"type": "string"}, "path": {"type": "string"}}, ["url"]),
     ToolSpec("send_file", "files.read",

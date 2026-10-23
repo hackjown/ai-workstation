@@ -75,12 +75,14 @@ class OpenAIProvider(LLMProvider):
             "tools": [{"type": "function", "function": t} for t in req.tools],
             "tool_choice": self.tool_choice,
             # a long script inside `command` gets cut (and arrives as {}) on gateways with a small default
-            "max_tokens": int(os.environ.get("AIW_LLM_MAX_TOKENS", "4096")),
+            "max_tokens": self._max_tokens(),
         }
         required = {t["name"]: (t.get("parameters") or {}).get("required") or [] for t in req.tools}
         data, msg, calls, name, args = {}, {}, [], "", {}
         attempts, out_tokens = 0, 0
-        async with httpx.AsyncClient(timeout=180) as c:
+        # a thinking model writing a long reply needs minutes, not the 180 s that suits a quick decision
+        wait = float(os.environ.get("AIW_LLM_TIMEOUT_S", "600" if self.thinking != "off" else "180"))
+        async with httpx.AsyncClient(timeout=wait) as c:
             for attempt in range(3):
                 if attempt == 2:  # some gateways (e.g. GLM) only behave with tool_choice=auto
                     body["tool_choice"] = "auto"
@@ -91,11 +93,17 @@ class OpenAIProvider(LLMProvider):
                 msg = choice["message"]
                 calls = msg.get("tool_calls") or []
                 if not calls:
-                    # Some compatible gateways ignore tool_choice=required and answer in prose.
+                    # Some compatible gateways ignore tool_choice=required and answer in prose. With thinking on,
+                    # DeepSeek also spent the whole max_tokens reasoning about a 12-sheet plan and was cut off before
+                    # any tool call, three times in a row (run ac3, 402 s, then the task failed).
+                    cut = choice.get("finish_reason") == "length"
+                    said = (msg.get("content") or "")[-1500:]
+                    ask = ("Your previous reply was CUT OFF at the length limit before any tool call. Do not repeat that "
+                           "reasoning: think in a few lines, then call exactly one tool now. Split long content: write "
+                           "one part per call (files_write with append=true adds to the file)."
+                           if cut else "Do not reply in text. Call exactly one of the provided tools now (use done/fail to finish).")
                     body["messages"] = body["messages"][:2] + [
-                        {"role": "assistant", "content": msg.get("content") or ""},
-                        {"role": "user", "content": "Do not reply in text. Call exactly one of the provided tools now "
-                                                    "(use done/fail to finish)."}]
+                        {"role": "assistant", "content": said}, {"role": "user", "content": ask}]
                     continue
                 fn = calls[0].get("function") or {}
                 name, args = fn.get("name") or "", parse_args(fn.get("arguments"))
@@ -116,9 +124,19 @@ class OpenAIProvider(LLMProvider):
                                 + ". Call the tool again with every required argument filled in. "
                                   "For long scripts first write the file with files_write, then run it with a short shell command."}]
         if not calls:
-            return LLMDecision(msg.get("content") or "", "fail", {"reason": "model returned no tool call"}, raw=data)
+            cut = (data.get("choices") or [{}])[0].get("finish_reason") == "length"
+            return LLMDecision(strip_think(msg.get("content") or "")[-3000:], "fail",
+                               {"reason": "model returned no tool call" + (" (output cut off by max_tokens)" if cut else "")},
+                               raw=data)
         usage = {**(data.get("usage") or {}), "attempts": attempts, "out_tokens": out_tokens}
         return LLMDecision(strip_think(msg.get("content") or ""), name, args, raw=data, usage=usage)
+
+    def _max_tokens(self) -> int:
+        """Output budget per decision. A long script inside `command` gets cut (and arrives as {}) on gateways with a
+        small default; a thinking model also spends its reasoning out of the same budget, so it gets more."""
+        if self.thinking != "off":
+            return int(os.environ.get("AIW_LLM_MAX_TOKENS_THINKING", "16384"))
+        return int(os.environ.get("AIW_LLM_MAX_TOKENS", "4096"))
 
     def _extras(self) -> dict:
         if self.thinking != "off" or not self._extras_ok:

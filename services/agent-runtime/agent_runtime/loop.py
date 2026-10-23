@@ -225,6 +225,7 @@ class AgentLoop:
         shots = 0
         self._acted = False
         self._done_rejects = 0
+        self._nocall = 0  # consecutive replies without a tool call
         self._sent_file, self._after_send = None, 0
         self._last_sent_thumb = None
         self._last_ok: Optional[tuple] = None
@@ -354,6 +355,23 @@ class AgentLoop:
                         "(LibreCAD's own dxf2pdf, one A3 page per sheet); soffice mangles DXF. Then send_file the PDF.")
                 self._after_send = 0
                 continue
+            if (decision.tool == "fail" and str(decision.args.get("reason") or "").startswith("model returned no tool call")
+                    and self._nocall < 3):
+                # a reply without a tool call is a model hiccup, not the agent giving up: one bad turn (a thinking
+                # model cut off mid-reasoning) ended run ac3 at step 10 before a single line was drawn
+                self._nocall += 1
+                await self.emit(EventType.DECISION, thought=(decision.thought or "")[-1500:], tool="(none)", args={})
+                await self.emit(EventType.VALIDATION, success=False, change=0.0,
+                                message=f"模型这一步没有调用工具（第 {self._nocall} 次），已提示重试")
+                self.history.append(f"{self.step}. (no tool call: {decision.args.get('reason')})")
+                note = ("Your last reply contained NO tool call" +
+                        (" because it was cut off by the output limit" if "cut off" in str(decision.args.get("reason")) else "") +
+                        ". Keep the reasoning to a few lines and call exactly one tool. Long content goes in parts: "
+                        "files_write one sheet per call (append=true adds to the file), cad_command one sheet per call.")
+                self.step -= 1
+                continue
+            if decision.tool != "fail":
+                self._nocall = 0
             if decision.tool == "done" and not self._acted and _needs_action(self.task.prompt) and self._done_rejects < 2:
                 self._done_rejects += 1
                 await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)

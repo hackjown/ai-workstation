@@ -120,6 +120,32 @@ class Snap(BaseModel):
     name: str
 
 
+_HOST_RE = __import__("re").compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def _vm_endpoints(ip: str) -> dict:
+    return {"agent_endpoint": f"ws://{ip}:{os.environ.get('VM_AGENT_PORT', '8765')}",
+            "desktop_endpoint": f"http://{ip}:{os.environ.get('AIW_NOVNC_PORT', '6080')}"}
+
+
+def _set_vm_ip(store, mid: str, ip: str) -> dict:
+    """Point a machine at a new address: the agent WebSocket and the noVNC proxy both follow."""
+    m = store.machine(mid)
+    if not m:
+        raise KeyError(mid)
+    m = {**m, **_vm_endpoints(ip), "ip": ip}
+    store.upsert_machine(m)
+    store.set_machine_status(mid, m.get("status") or "unknown", ip)
+    return m
+
+
+def _apply_saved_vm_ip(store, settings) -> None:
+    """The address saved in 设置 beats AIW_VM_IP from .env, so a new DHCP lease needs no .env edit or restart."""
+    net = store.kv_get("vm_net", {}) or {}
+    if net.get("ip") and settings.machines:
+        _set_vm_ip(store, settings.machines[0].id, net["ip"])
+
+
 def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_factory=None, vm_runtime=None) -> FastAPI:
     settings = settings or Settings()
     os.makedirs(os.path.dirname(settings.db_path) or ".", exist_ok=True)
@@ -128,6 +154,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         store.upsert_machine({"id": m.id, "name": m.name or m.id, "provider": m.provider,
                               "provider_vm_id": m.provider_vm_id, "agent_endpoint": m.agent_endpoint,
                               "desktop_endpoint": m.desktop_http})
+    _apply_saved_vm_ip(store, settings)
     secrets = SecretBox(store, os.path.dirname(settings.db_path) or ".")
     notifier = Notifier(store, secrets)
 
@@ -522,6 +549,54 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         except Exception as e:  # noqa: BLE001
             return {"models": [], "error": str(e)[:300]}
 
+    # ------------------------------------------------------------- settings: VM address
+    def _main_mid() -> str:
+        return settings.machines[0].id if settings.machines else "ai-linux-001"
+
+    def _repoint(ip: str) -> dict:
+        mid = _main_mid()
+        if sessions.busy_session(mid):
+            raise HTTPException(409, "有任务正在运行，先停止任务再改 IP")
+        m = _set_vm_ip(store, mid, ip)
+        sessions.drop_computer(mid)  # the next call opens a WebSocket to the new address
+        return m
+
+    @app.get("/api/settings/vm", dependencies=[Depends(auth)])
+    async def get_vm_net():
+        net = store.kv_get("vm_net", {}) or {}
+        m = store.machine(_main_mid()) or {}
+        return {"ip": net.get("ip"), "auto": bool(net.get("auto")), "env_ip": os.environ.get("AIW_VM_IP"),
+                "agent_endpoint": m.get("agent_endpoint"), "pve": bool(vm_runtime)}
+
+    @app.put("/api/settings/vm", dependencies=[Depends(auth)])
+    async def put_vm_net(body: dict):
+        ip = str(body.get("ip") or "").strip()
+        if ip and not _HOST_RE.match(ip):
+            raise HTTPException(400, "IP 或主机名格式不对")
+        net = {"ip": ip or None, "auto": bool(body.get("auto"))}
+        target = ip or os.environ.get("AIW_VM_IP") or "127.0.0.1"   # empty = back to .env
+        m = _repoint(target)
+        store.kv_set("vm_net", net)
+        return {**net, "agent_endpoint": m["agent_endpoint"]}
+
+    @app.post("/api/settings/vm/detect", dependencies=[Depends(auth)])
+    async def detect_vm_ip():
+        """Ask Proxmox (qemu-guest-agent) for the VM's current IPv4."""
+        _need_vm()
+        st = await vm_runtime.status(_main_mid())
+        if not st.ip:
+            raise HTTPException(404, "PVE 没有返回 IP：虚拟机要开机，并安装 qemu-guest-agent")
+        return {"ip": st.ip}
+
+    async def _follow_pve_ip(mid: str, ip: Optional[str]) -> None:
+        net = store.kv_get("vm_net", {}) or {}
+        m = store.machine(mid) or {}
+        if (net.get("auto") and ip and mid == _main_mid() and not sessions.busy_session(mid)
+                and _vm_endpoints(ip)["agent_endpoint"] != m.get("agent_endpoint")):
+            _set_vm_ip(store, mid, ip)
+            sessions.drop_computer(mid)
+            store.kv_set("vm_net", {**net, "ip": ip})
+
     @app.get("/api/settings/notify", dependencies=[Depends(auth)])
     async def get_notify():
         return store.kv_get("notify", {}) or {}
@@ -646,6 +721,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             try:
                 st = await vm_runtime.status(mid)
                 store.set_machine_status(mid, st.state.value, st.ip)
+                await _follow_pve_ip(mid, st.ip)
                 out["vm"] = st.model_dump()
             except Exception as e:  # noqa: BLE001
                 out["vm_error"] = str(e)

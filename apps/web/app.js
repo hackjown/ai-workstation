@@ -537,8 +537,8 @@ function connectEvents() {
 
 /* ---------------------------------------------------------------- settings ("Apps") */
 async function loadSettings() {
-  const [prof, mems, models, notify, integ, secs] = await Promise.all([api("GET", "/api/profile"), api("GET", "/api/memories"), api("GET", "/api/settings/models"),
-    api("GET", "/api/settings/notify"), api("GET", "/api/integrations"), api("GET", "/api/secrets")]);
+  const [prof, mems, models, notify, integ, secs, vmnet] = await Promise.all([api("GET", "/api/profile"), api("GET", "/api/memories"), api("GET", "/api/settings/models"),
+    api("GET", "/api/settings/notify"), api("GET", "/api/integrations"), api("GET", "/api/secrets"), api("GET", "/api/settings/vm").catch(() => ({}))]);
   S.profile = prof;
   const av = (k) => `<button type="button" class="avatar" style="background:${AVATAR_BG[k]};${(prof.avatar || "sky") === k ? "outline:2px solid var(--blueDark)" : ""}" onclick="this.form.avatar.value='${k}';[...this.parentNode.children].forEach(b=>b.style.outline='');this.style.outline='2px solid var(--blueDark)'">${avatarSVG()}</button>`;
   $("settingsPage").innerHTML = `
@@ -576,6 +576,13 @@ async function loadSettings() {
       <select name="thinking"><option value="off" ${(models.thinking || "off") === "off" ? "selected" : ""}>关闭（推荐，更快）</option><option value="on" ${models.thinking === "on" ? "selected" : ""}>模型默认</option></select>
     </div>
     <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="fetchModels(true)">刷新模型列表</button><span id="modelListNote" class="small"></span></div></form>
+
+  <form class="card sec" id="sVmNet" onsubmit="saveVmNet(event)"><h3>${icon("plug")} 虚拟机地址</h3>
+    <div class="muted">AI 电脑（VM）的 IP 变了就在这里改，保存立即生效，不用改 .env、不用重启。留空则用 .env 里的 AIW_VM_IP${vmnet.env_ip ? "（" + esc(vmnet.env_ip) + "）" : ""}。</div>
+    <div class="kv"><span class="muted">IP / 主机名</span><input name="ip" value="${esc(vmnet.ip || "")}" placeholder="${esc(vmnet.env_ip || "192.168.50.x")}" />
+    <span class="muted">自动跟随<div class="small">PVE 报告的新 IP</div></span><label><input type="checkbox" name="auto" ${vmnet.auto ? "checked" : ""} ${vmnet.pve ? "" : "disabled"} /> 自动更新${vmnet.pve ? "" : "（未配置 PVE）"}</label></div>
+    <div class="small muted">当前连接：${esc(vmnet.agent_endpoint || "-")}</div>
+    <div class="row gap wrap"><button class="btn primary">保存</button>${vmnet.pve ? `<button type="button" class="btn" onclick="detectVmIp()">从 PVE 检测</button>` : ""}</div></form>
 
   <form class="card sec" id="sNotify" onsubmit="saveNotify(event)"><h3>${icon("bell")} 手机推送</h3>
     <div class="muted">任务完成、失败、需要确认或回答、追踪触发时推送。iPhone 推荐 Bark。</div>
@@ -676,6 +683,15 @@ async function saveModels(e) {
   const v = (n) => (f[n].value === "__custom" ? "" : f[n].value);
   await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), fallback: v("fallback"), subagent_model: v("subagent_model"), base_url: f.base_url.value, thinking: f.thinking.value });
   toast("已保存，下个任务生效"); loadSettings();
+}
+async function saveVmNet(e) {
+  e.preventDefault(); const f = e.target;
+  try { const r = await api("PUT", "/api/settings/vm", { ip: f.ip.value.trim(), auto: f.auto.checked }); toast("已保存，现连接 " + r.agent_endpoint); }
+  catch (err) { toast("保存失败：" + (err.message || err)); }
+}
+async function detectVmIp() {
+  try { const r = await api("POST", "/api/settings/vm/detect"); document.querySelector("#sVmNet [name=ip]").value = r.ip; toast("检测到 " + r.ip + "，点保存生效"); }
+  catch (err) { toast("检测失败：" + (err.message || err)); }
 }
 async function saveNotify(e) { e.preventDefault(); const f = e.target; await api("PUT", "/api/settings/notify", { bark_url: f.bark_url.value, ntfy_url: f.ntfy_url.value, webhook_url: f.webhook_url.value }); toast("已保存"); }
 async function addMcp(e) {

@@ -167,11 +167,12 @@ class SessionManager:
         return {"task": t, "session_id": t.get("session_id"), "queued": queued, "thread_id": thread_id}
 
     async def _start_task_row(self, row: dict) -> LiveSession:
+        ctx = self.build_context(row.get("thread_id"), exclude_task=row["id"])
         steps, secs = _budget(row["prompt"], row.get("max_steps") or 40,
-                              row.get("timeout_s") or float(os.environ.get("AIW_TASK_TIMEOUT", "900")))
+                              row.get("timeout_s") or float(os.environ.get("AIW_TASK_TIMEOUT", "900")), ctx)
         task = Task(id=row["id"], prompt=row["prompt"], machine_id=row["machine_id"], thread_id=row.get("thread_id"),
                     source=row.get("source") or "chat", max_steps=steps, timeout_s=secs)
-        task.context = self.build_context(task.thread_id, exclude_task=task.id)
+        task.context = ctx
         return await self.start(task)
 
     async def drain(self, machine_id: str):
@@ -462,10 +463,11 @@ def _title(prompt: str) -> str:
     return p[:24] + ("…" if len(p) > 24 else "")
 
 
-def _budget(prompt: str, max_steps: int, timeout_s: float) -> tuple[int, float]:
-    """Drawing a construction set in the CAD GUI takes hundreds of steps and hours, not 40 steps / 15 min."""
-    from agent_runtime.cad import is_cad_task
-    if is_cad_task(prompt):
+def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str] = None) -> tuple[int, float]:
+    """Drawing a construction set in the CAD GUI takes hundreds of steps and hours, not 40 steps / 15 min.
+    A revision in a drawing thread gets the same budget (it saves, exports and sends the whole set again)."""
+    from agent_runtime.cad import cad_mode
+    if cad_mode(prompt, context):
         return (max(max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400"))),
                 max(timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800"))))
     return max_steps, timeout_s

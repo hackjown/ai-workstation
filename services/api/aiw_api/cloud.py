@@ -11,6 +11,7 @@ runs it holds an activity lease that it renews (`hold`), so the machine never pa
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import asyncio
 import contextlib
 import logging
@@ -32,6 +33,19 @@ AGENT_PORT = 8765
 LEASE_TTL = 900        # seconds; renewed every LEASE_TTL/3 while a task runs
 _ID = re.compile(r"[^a-z0-9-]+")
 
+
+
+def _cooldown_left(until) -> float:
+    """Seconds until an InstaBox cooldownUntil (ISO, UTC) ends; 0 when absent, unreadable or already past."""
+    if not until:
+        return 0.0
+    try:
+        t = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return max(0.0, (t - datetime.now(timezone.utc)).total_seconds())
+    except ValueError:
+        return 0.0
 
 class CloudError(RuntimeError):
     pass
@@ -278,8 +292,11 @@ class CloudManager:
         st = m.get("state")
         if st == "running":
             return
-        if m.get("cooldownUntil"):
-            raise CloudError(f"InstaBox is cooling down after its 8-hour run limit until {m['cooldownUntil']}")
+        cd = _cooldown_left(m.get("cooldownUntil"))
+        if cd > 0:  # a past cooldownUntil can linger on the record: only a future one blocks the start
+            local = (datetime.now(timezone.utc) + timedelta(seconds=cd)).astimezone(timezone(timedelta(hours=8)))
+            raise CloudError(f"InstaBox 连续运行满 8 小时后的强制冷却期，约 {int(cd // 60) + 1} 分钟后"
+                             f"（北京时间 {local:%H:%M}）可再次启动 (cooldownUntil {m['cooldownUntil']})")
         self._log(mid, f"waking the machine ({st})")
         await ib.lifecycle(rid, "start" if st == "stopped" else "resume")
         for _ in range(60):

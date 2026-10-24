@@ -708,3 +708,13 @@ def test_v151_untangle_deals_labels_in_point_order():
     cad.place(out, 8, d)
     iss, _ = cad.layout_issues(d, {})
     assert n and not [i for i in iss if "crosses another leader" in i]
+
+
+def test_follow_up_naming_another_sheet_is_a_revision():
+    # task-ed7: "图5的门也要跟图4一样，改完导出给我" missed revise mode, ran as a plain 40-step / 900 s task with thinking on
+    from agent_runtime.cad import cad_mode
+    ctx = "兴丹路消防救援站荣誉室施工图.dxf LibreCAD 平面图"
+    for p in ["图5的门也要跟图4一样，改完导出给我", "图号6也照着图4改", "第7张也一样"]:
+        assert cad_mode(p, ctx) == "revise", p
+    assert cad_mode("图5的门也要跟图4一样", None) is None
+    assert cad_mode("图5全部重画", ctx) != "revise"

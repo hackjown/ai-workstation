@@ -49,7 +49,7 @@ Rules:
      - sheet-local drawing area x 1250..20500, y 500..14350; the title block fills x>11500, y<2500: keep out.
      - place each view in the free area and leave room around it for dimension chains (≈600-1500 outside the
        object) and leader labels; at 1:50 a 10 m wall is 10000 wide, so start it near x 2500, base y ≈ 4000.
-     - a hanzi is about one text height wide: a 175 label of 12 characters is ≈2100 long. A label must fit its
+     - a hanzi is about 1.25 text heights wide: a 175 label of 12 characters is ≈2600 long. A label must fit its
        panel (else put it on a LEADER outside), and no text may overlap another: NOTE lines are 1.8×height apart,
        so the next block starts below the last line of the previous one.
      - a label must stay inside its table cell / panel / title-block cell: no line may cross a text (a too-long

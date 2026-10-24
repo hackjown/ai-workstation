@@ -68,12 +68,15 @@ class AgentLoop:
         self.computer, self.llm, self.tools = computer, llm, tools
         self.control = control or AgentControl()
         self.cfg = config or LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s)
-        self._cad_task = _cad.is_cad_task(task.prompt)
+        self._cad_mode = _cad.cad_mode(task.prompt, task.context)  # fresh | revise | None
+        self._cad_task = self._cad_mode is not None
+        self._cad_file: Optional[str] = None  # the DXF this task saves to (a revision edits it in place)
         if self._cad_task and config is None:  # drawing a set in the GUI takes hundreds of steps
             self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400")))
             self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800")))
         self.validator = Validator()
         self._cad_keys_saved: set = set()
+        self._cad_touched: set = set()
         self._cad_keys_unsaved: set = set()
         self.recovery = Recovery(computer)
         self._emit_fn = emit
@@ -167,7 +170,9 @@ class AgentLoop:
         plan_job = None
         if self.cfg.make_plan and _needs_action(self.task.prompt):
             plan_job = asyncio.create_task(self._plan())  # plan in parallel with the first step, not before it
-        if self._cad_task and not self._cad_resuming():
+        if self._cad_mode == "revise":
+            await self._cad_revise_start()
+        elif self._cad_task and not self._cad_resuming():
             await self._cad_fresh_start()
         try:
             await asyncio.wait_for(self._run(), self.cfg.timeout_s)
@@ -208,6 +213,40 @@ class AgentLoop:
         except Exception:  # noqa: BLE001
             pass
 
+    async def _cad_revise_start(self):
+        """A follow-up in a drawing thread fixes the drawing that exists: open the newest DXF in cad/ in LibreCAD,
+        remember its texts for the layout check, and tell the model to change only what the user named."""
+        find = ('cd "${VM_AGENT_FILES_ROOT:-$HOME/workspace}" 2>/dev/null && ls -t ' + _cad.CAD_DIR +
+                '/*.dxf 2>/dev/null | grep -v -e "_view" -e "/_" | head -1')
+        try:
+            r = await self.tools.run("shell", {"command": find, "timeout": 20}, intent="find the drawing to revise")
+            path = ((r.result or {}).get("stdout") or "").strip().splitlines() if isinstance(r.result, dict) else []
+        except Exception:  # noqa: BLE001
+            path = []
+        if not path:
+            self.history.append("0. REVISION requested, but cad/ holds no drawing yet: draw the set as a new task would.")
+            return
+        self._cad_file = path[0]
+        texts = []
+        try:
+            r = await self.tools.run("shell", {"command": _cad.edit_command(self._cad_file, [], texts=True), "timeout": 60},
+                                     intent="read the texts of the existing drawing")
+            info = _cad.parse_edit(((r.result or {}).get("stdout") or "") if isinstance(r.result, dict) else "")
+            texts = (info or {}).get("texts") or []
+        except Exception:  # noqa: BLE001
+            pass
+        self._seed_boxes = _cad.seed_text_boxes(texts)
+        try:
+            await self._type_cad([], self._cad_file, "open the drawing to revise in LibreCAD")
+        except Exception:  # noqa: BLE001
+            pass
+        self.history.append(
+            f"0. REVISION of the existing drawing {self._cad_file} (now open in LibreCAD, {len(texts)} texts on it). "
+            "Change ONLY what the user asked; never redraw a sheet or a FRAME. Per fix: cad_command ['SHEET|n', "
+            "'LIST|x1,y1|x2,y2'] to see what is there, then ['SHEET|n', 'ERASE|x1,y1|x2,y2' (deletes everything lying "
+            "fully inside the window) or 'ERASETEXT|exact text', then the corrected items]. Then SAVE to the same file, "
+            "PDF, send_file both, and done listing each change.")
+
     async def _plan(self):
         try:
             steps = await make_plan(self.llm, self.task.prompt, self.task.context)
@@ -235,8 +274,9 @@ class AgentLoop:
         self._cad_pdf_ok = False      # PDF made by LibreCAD (PDF|...), not by soffice
         self._cad_sheet = 0           # sheet the next cad_command points belong to (set by FRAME|n / SHEET|n)
         self._cad_frames: set = set()  # sheets this task drew a FRAME for
-        self._cad_text_boxes: dict = {}  # sheet -> [(box, text)] of texts typed so far (overlap check)
+        self._cad_text_boxes: dict = getattr(self, "_seed_boxes", None) or {}  # sheet -> [(box, text)] typed so far (a revision starts with the drawing's)
         self._cad_typed_texts: set = set()
+        self._cad_touched: set = set()  # sheets this task drew or erased on
         self._cad_rejects: dict = {}  # sheet -> batches sent back by the layout check (typed anyway after 2)
         # every one-line item (line|, rect|, TEXT|, DIMH|, FRAME|n ...) that landed, in its absolute form: a batch sent
         # again after a timeout, a dialog error or a reopen skips what is already there instead of drawing it twice
@@ -646,6 +686,23 @@ class AgentLoop:
         if not raw:
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="missing args ['commands']", result={})
             return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
+        for c in raw:
+            ms = re.match(r"(?i)^\s*save\s*\|\s*(\S.*\.dxf)\s*$", c) or re.match(r"(?i)^\s*pdf\s*\|\s*([^|]+\.dxf)\s*\|", c)
+            if ms:
+                self._cad_file = ms.group(1).strip()
+        edits, raw, _ = _cad.split_edits(raw, self._cad_sheet)
+        edit_note, open_path = "", a.get("open") or None
+        if edits:
+            res_e = await self._cad_edits(edits, intent)
+            if isinstance(res_e, str) and res_e.startswith("FAILED"):
+                return res_e
+            edit_note, reopen = res_e
+            if reopen:
+                open_path = self._cad_file
+            if not [c for c in raw if not _cad._SHEET.match(c)]:
+                if reopen:
+                    await self._type_cad([], open_path, intent)
+                return edit_note + " Now send the corrected items for this spot (no FRAME), then SAVE."
         # points go onto the current sheet (FRAME|n / SHEET|n), whether given sheet-locally or absolutely
         sheet_before = self._cad_sheet
         if a.get("open"):  # LibreCAD is restarted on the file: whatever was typed since the last save is gone
@@ -660,6 +717,7 @@ class AgentLoop:
                     f"Go on with the next sheet in cad/plan.md; never resend a finished sheet.")
         drawn: list = []
         cmds, self._cad_sheet, moved = _cad.place(raw, self._cad_sheet, drawn)
+        self._cad_touched |= {sh for sh, _ in drawn}
         # a text already typed at the same spot (the model redoing a sheet) would only be drawn on top of itself
         dup = {c for c in cmds if _cad._parse_text(c) and c in self._cad_typed_texts}
         if dup:
@@ -690,7 +748,7 @@ class AgentLoop:
             if mf:
                 self._cad_frames.add(int(mf.group(1)))
         cmds = cmds[:CAD_MAX_EXPANDED]
-        r, res, ok, out = await self._type_cad(cmds, a.get("open") or None, intent)
+        r, res, ok, out = await self._type_cad(cmds, open_path, intent)
         resumed = ""
         landed = len(cmds) if ok else 0
         if not ok:
@@ -728,6 +786,8 @@ class AgentLoop:
                 have = {int(k) for k in (self._sheet_audit.get("counts") or {})}
                 thin = {int(n) for n in self._sheet_audit.get("thin") or []}
                 thin |= {n for n in self._cad_frames if n not in have}
+                if self._cad_mode == "revise":  # a revision answers for what it touched, not the whole old set
+                    thin &= set(self._cad_frames) | set(self._cad_touched)
                 self._sheet_audit["thin"] = sorted(thin)
             except ValueError:
                 pass
@@ -760,11 +820,64 @@ class AgentLoop:
         if moved:
             more += (f" (sheet {self._cad_sheet}: {moved} sheet-local points were placed at origin x="
                      f"{self._cad_sheet * _cad.SHEET_PITCH}; keep using local or absolute coordinates, both land right)")
+        more = (" " + edit_note if edit_note else "") + more
         if ok:
             return (f"typed {len(cmds)} commands into LibreCAD{resumed}{more}: {out.strip()[-600:]}.{audit} Continue straight on "
                     f"with the next batch from cad/plan.md; no screenshot or Escape needed.")
         return (f"FAILED{resumed}: {out[-400:]}. The next cad_command closes any leftover dialog and leaves the running tool "
                 f"by itself, so do not press Escape or take screenshots: resend only the commands that did not land.")
+
+    async def _cad_edits(self, edits: list[dict], intent: str):
+        """ERASE / ERASETEXT / LIST on the saved DXF. Unsaved strokes are saved first, so nothing typed is lost;
+        after an erase LibreCAD is reopened on the file. Returns (note for the model, reopen?) or 'FAILED ...'."""
+        if not self._cad_file:
+            return ("FAILED: ERASE/LIST work on the saved drawing, and this task has not saved one yet. "
+                    "SAVE|cad/<name>.dxf first.")
+        if any(e["op"] != "list" for e in edits) or self._cad_keys_unsaved:
+            r0, _, ok0, out0 = await self._type_cad([f"SAVE|{self._cad_file}"], None, "save before editing")
+            if not ok0:
+                return f"FAILED: could not save before editing: {out0[-300:]}"
+            self._cad_keys_saved |= self._cad_keys_unsaved
+            self._cad_keys_unsaved.clear()
+        r = await self.tools.run("shell", {"command": _cad.edit_command(self._cad_file, edits), "timeout": 120}, intent=intent)
+        res = r.result if isinstance(r.result, dict) else {}
+        info = _cad.parse_edit(res.get("stdout") or "")
+        if not info:
+            err = ((res.get("stderr") or "") + (r.error or ""))[-400:]
+            if "ezdxf" in err:
+                err += " (install it: shell `sudo apt-get install -y python3-ezdxf`)"
+            await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error=err[-200:], result={"edits": edits})
+            return f"FAILED: editing {self._cad_file} did not work: {err}"
+        erased = int(info.get("erased") or 0)
+        self._cad_touched |= {e.get("sheet") for e in edits if e["op"] != "list"}
+        if erased:
+            # what was erased may be drawn again: forget the skip keys and the text memory of the touched sheets
+            self._cad_keys_saved.clear()
+            self._cad_keys_unsaved.clear()
+            self._cad_typed_texts.clear()
+            for sh in {e.get("sheet") for e in edits if e["op"] != "list"}:
+                self._cad_text_boxes.pop(sh, None)
+            try:
+                r2 = await self.tools.run("shell", {"command": _cad.edit_command(self._cad_file, [], texts=True), "timeout": 60},
+                                          intent="re-read the texts after erasing")
+                i2 = _cad.parse_edit(((r2.result or {}).get("stdout") or "") if isinstance(r2.result, dict) else "")
+                if i2:
+                    self._cad_text_boxes = _cad.seed_text_boxes(i2.get("texts") or [])
+            except Exception:  # noqa: BLE001
+                pass
+        listed = info.get("list") or []
+        await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=True, error=None,
+                        result={"edits": edits, "erased": erased, "listed": len(listed)})
+        note = ""
+        if any(e["op"] != "list" for e in edits):
+            note += f"erased {erased} entities from {self._cad_file} (LibreCAD reopened on it)."
+            if not erased:
+                note += " Nothing lay fully inside the window(s): LIST the spot and use a window that encloses the items."
+        if listed:
+            note += " LIST (sheet-local x,y of each entity's box):\n" + "\n".join(listed[:150])
+        elif any(e["op"] == "list" for e in edits):
+            note += " LIST: nothing inside that window."
+        return note.strip(), erased > 0
 
     async def _type_cad(self, cmds: list[str], open_path, intent: str):
         cmd = _cad.librecad_type_command(cmds, open_path)

@@ -373,6 +373,8 @@ def _macro(c: str) -> list[str] | None:
     out: list[str] = []
     pts = lambda bs: [_pt(*_xy(b)) for b in bs if b]
     if kind == "TEXTC":  # TEXTC|x,y|h|内容: text centred on x,y (TEXT is left-aligned: x,y is its lower left corner)
+        if len(bits) >= 4 and all(_NUM.match(b) for b in bits[:3]):  # TEXTC|x|y|h|内容 (task-960 wrote it so)
+            bits = [f"{bits[0]},{bits[1]}"] + bits[2:]
         x, y = _xy(bits[0])
         h = float(bits[1]) if len(bits) > 2 else 250.0
         body = bits[2] if len(bits) > 2 else bits[1]
@@ -1307,3 +1309,149 @@ def seed_text_boxes(texts: list) -> dict:
     for sh, b, body in boxes:
         out.setdefault(sh, []).append((b, body))
     return out
+
+
+# --- layout auto-fix -----------------------------------------------------------------------------------------------
+# task-960 (2026-10-24): every layout rejection made the model re-plan the whole sheet in its head for 10-13 minutes
+# (2 sheets in 79 min, 55 of them thinking). Most findings are mechanical: a label sitting on a line, two labels
+# touching, a total dimension sent twice, a dimension row just outside the border, TEXTC written as x|y. These are
+# fixed here, before typing, by trying nearby positions; only what no nearby spot fixes goes back to the model.
+_TEXTLIKE = re.compile(r"(?i)^\s*(text|txt|textc|note|leader)\s*\|")
+_BARRIER = re.compile(r"(?i)^\s*((frame|sheet|save|pdf)\s*\||(text|txt|mtext|mtxt|hatch|ha)\s*$)")
+_NUM = re.compile(r"^\s*-?\d+(\.\d+)?\s*$")
+
+
+def normalize(c: str) -> str:
+    """'TEXT|x|y|h|内容' / 'TEXTC|x|y|h|内容' (the x,y pair split by a bar) -> 'TEXT|x,y|h|内容'."""
+    m = re.match(r"(?i)^\s*(text|txt|textc)\s*\|\s*(-?\d+(?:\.\d+)?)\s*\|\s*(-?\d+(?:\.\d+)?)\s*\|\s*(\d+(?:\.\d+)?)\s*\|(.*)$", c)
+    if m:
+        return f"{m.group(1).upper()}|{m.group(2)},{m.group(3)}|{m.group(4)}|{m.group(5)}"
+    return c
+
+
+def _units(raw: list[str]) -> list[list[str]]:
+    """Commands grouped into drawable units: a tool name or macro plus the points/values/ESC that follow it."""
+    units: list[list[str]] = []
+    for c in raw:
+        s = str(c).strip()
+        attach = units and (_ABS_POINT.match(s) or s.startswith("@") or _NUM.match(s) or s.upper() in ("ESC", "ESCAPE"))
+        if attach and not _BARRIER.match(units[-1][0]):
+            units[-1].append(c)
+        else:
+            units.append([c])
+    return units
+
+
+def _reorder(units: list[list[str]]) -> list[list[str]]:
+    """Between FRAME/SAVE/... barriers, geometry first and labels after it, so a label is checked (and moved)
+    against every line of its sheet instead of a later line being blamed for crossing it."""
+    out, geo, txt = [], [], []
+    for u in units:
+        if _BARRIER.match(str(u[0])):
+            out += geo + txt + [u]
+            geo, txt = [], []
+        elif _TEXTLIKE.match(str(u[0])):
+            txt.append(u)
+        else:
+            geo.append(u)
+    return out + geo + txt
+
+
+def _variants(c: str, issues: list[str]):
+    """Nearby alternatives for one label/dimension command, closest first."""
+    bits = [b.strip() for b in c.split("|")]
+    kind = bits[0].upper()
+    try:
+        if kind in ("TEXT", "TXT", "TEXTC") and len(bits) >= 4:
+            (x, y), h, body = _xy(bits[1]), float(bits[2]), "|".join(bits[3:])
+            steps = sorted({(dx, dy) for dx in (0, -1, 1, -2, 2, -3, 3) for dy in (0, .6, -.6, 1.2, -1.2, 1.8, -1.8, 2.5, -2.5)}
+                           - {(0, 0)}, key=lambda d: abs(d[0]) + abs(d[1]))
+            for k in (1.0, 0.85, 0.7):
+                hh = max(120.0, round(h * k / 5) * 5)
+                for dx, dy in ([(0, 0)] if k < 1 else []) + steps[: (40 if k == 1 else 12)]:
+                    yield f"{kind}|{_pt(round(x + dx * h), round(y + dy * h))}|{_f(hh)}|{body}"
+        elif kind == "NOTE" and len(bits) >= 4:
+            (x, y), h, body = _xy(bits[1]), float(bits[2]), "|".join(bits[3:])
+            for k in (1.0, 0.9, 0.8):
+                hh = max(120.0, round(h * k / 5) * 5)
+                for dy in (0, .5, -.5, 1, -1, 2, -2, 3, -3):
+                    if k == 1 and dy == 0:
+                        continue
+                    yield f"NOTE|{_pt(x, round(y + dy * h))}|{_f(hh)}|{body}"
+        elif kind == "LEADER" and len(bits) >= 4:
+            (ax, ay), (bx, by), h, label = _xy(bits[1]), _xy(bits[2]), float(bits[3]), "|".join(bits[4:])
+            if any("longer than" in i for i in issues):  # pull the label towards the point it names
+                for f in (0.75, 0.6, 0.45, 0.3):
+                    yield f"LEADER|{bits[1]}|{_pt(round(ax + (bx - ax) * f), round(ay + (by - ay) * f))}|{_f(h)}|{label}"
+            for dy in (.8, -.8, 1.6, -1.6, 2.4, -2.4, 3.2, -3.2, 4.5, -4.5):
+                for dx in (0, 2, -2):
+                    yield f"LEADER|{bits[1]}|{_pt(round(bx + dx * h), round(by + dy * h))}|{_f(h)}|{label}"
+        elif kind in ("DIMH", "DIMV") and len(bits) >= 4:
+            base, line = float(bits[1]), float(bits[2])
+            side = 1 if line >= base else -1
+            for k in (1, 2, 3, 4, 5, 6, 8, 10):
+                for sgn in (1, -1):
+                    nl = line + sgn * k * 250
+                    if (nl - base) * side >= 400:  # stays on its side of the object, clear of it
+                        yield f"{kind}|{bits[1]}|{_f(nl)}|{'|'.join(bits[3:])}"
+    except (ValueError, IndexError):
+        return
+
+
+def _fat_issues(c: str, sheet: int, acc: dict) -> bool:
+    """A moved label must be clear with room to spare: the check shrinks text boxes a little, so the first spot
+    that passes would leave the text grazing the line it was moved off (前言 at 3185 under a line at 3200)."""
+    bits = [b.strip() for b in c.split("|")]
+    kind = bits[0].upper()
+    try:
+        if kind in ("TEXT", "TXT", "TEXTC", "NOTE") and len(bits) >= 4:
+            (x, y), h = _xy(bits[1]), float(bits[2])
+            dy = -0.15 * h if kind != "TEXTC" else 0
+            fat = f"{kind}|{_pt(round(x - 0.1 * h), round(y + dy))}|{_f(round(h * 1.3))}|{'|'.join(bits[3:])}"
+        elif kind == "LEADER" and len(bits) >= 5:
+            fat = f"LEADER|{bits[1]}|{bits[2]}|{_f(round(float(bits[3]) * 1.3))}|{'|'.join(bits[4:])}"
+        else:
+            return False
+        d: list = []
+        place([fat], sheet, d)
+        return bool(layout_issues(d, acc)[0])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def autofix(raw: list[str], sheet: int, prior_boxes: dict | None = None) -> tuple[list[str], list[str]]:
+    """Returns (commands to type, notes on what was moved/dropped). Units that still have an issue are kept as sent,
+    and the normal layout check reports them."""
+    units = _reorder(_units([normalize(str(c)) for c in raw]))
+    acc = {k: list(v) for k, v in (prior_boxes or {}).items()}
+    out, notes, cur = [], [], sheet
+    for u in units:
+        d: list = []
+        try:
+            _, nxt, _ = place(u, cur, d)
+        except Exception:  # noqa: BLE001  a malformed unit is reported by the regular check
+            out += u
+            continue
+        iss, bx = layout_issues(d, acc)
+        if iss and len(u) == 1 and not _BARRIER.match(u[0]):
+            c = u[0]
+            nums = _nums(c.split("|")[3]) if re.match(r"(?i)^\s*dim[hv]\s*\|", c) and c.count("|") >= 3 else []
+            if any("is already drawn" in i for i in iss) and len(nums) == 2:
+                notes.append(f"dropped {c[:40]} (that span is already dimensioned)")
+                continue
+            for cand in _variants(c, iss):
+                d2: list = []
+                try:
+                    place([cand], cur, d2)
+                except Exception:  # noqa: BLE001
+                    continue
+                i2, b2 = layout_issues(d2, acc)
+                if not i2 and not _fat_issues(cand, cur, acc):
+                    notes.append(f"{c[:40]} -> {cand[:44]}")
+                    u, bx = [cand], b2
+                    break
+        out += u
+        cur = nxt
+        for sh, b, bd in bx:
+            acc.setdefault(sh, []).append((b, bd))
+    return out, notes

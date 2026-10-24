@@ -718,3 +718,36 @@ def test_follow_up_naming_another_sheet_is_a_revision():
         assert cad_mode(p, ctx) == "revise", p
     assert cad_mode("图5的门也要跟图4一样", None) is None
     assert cad_mode("图5全部重画", ctx) != "revise"
+
+
+def test_erasetext_window_is_parsed_sheet_local():
+    from agent_runtime.cad import split_edits, SHEET_PITCH
+    edits, rest, _ = split_edits(["SHEET|5", "ERASETEXT|入口|2800,7900|3300,8400", "ERASETEXT|D"], 0)
+    assert edits[0]["box"] == [5 * SHEET_PITCH + 2800, 7900, 5 * SHEET_PITCH + 3300, 8400]
+    assert "box" not in edits[1] and edits[1]["sheet"] == 5
+
+
+def test_erasetext_is_exact_and_refuses_ambiguous(tmp_path):
+    # task-2c3: 'ERASETEXT|D' / 'ERASETEXT|入口' wiped '入口墙D' and other labels on sheet 5
+    ezdxf = pytest.importorskip("ezdxf")
+    import json, subprocess, sys
+    from agent_runtime.cad import _EDIT_PY, SHEET_PITCH
+    doc = ezdxf.new()
+    m = doc.modelspace()
+    ox = 5 * SHEET_PITCH
+    m.add_text("入口", dxfattribs={"insert": (ox + 3000, 8150), "height": 250})
+    m.add_text("入口墙D立面", dxfattribs={"insert": (ox + 8000, 2000), "height": 250})
+    m.add_text("D", dxfattribs={"insert": (ox + 4156, 7375), "height": 250})
+    m.add_text("D", dxfattribs={"insert": (ox + 9000, 7375), "height": 250})
+    f = tmp_path / "a.dxf"
+    doc.saveas(f)
+    run = lambda ed: json.loads(subprocess.run([sys.executable, "-c", _EDIT_PY, str(f), json.dumps(ed)],
+                                               capture_output=True, text=True).stdout.split("AIW_EDIT ", 1)[1])
+    o = run([{"op": "erasetext", "text": "入口", "sheet": 5}])
+    assert o["erased"] == 1
+    o = run([{"op": "erasetext", "text": "D", "sheet": 5}])
+    assert o["erased"] == 0 and o["ambiguous"][0]["text"] == "D"
+    o = run([{"op": "erasetext", "text": "D", "sheet": 5, "box": [ox + 4000, 7200, ox + 4500, 7800]}])
+    assert o["erased"] == 1
+    left = sorted(t.dxf.text for t in ezdxf.readfile(f).modelspace().query("TEXT"))
+    assert left == ["D", "入口墙D立面"]

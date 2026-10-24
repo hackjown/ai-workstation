@@ -1,7 +1,7 @@
 /* AI Workstation console (vanilla JS, no build step). */
 "use strict";
 const Q = new URLSearchParams(location.search);
-const MID = Q.get("machine") || "ai-linux-001";
+let MID = Q.get("machine") || localStorage.getItem("aiw_machine") || "ai-linux-001";
 let TOKEN = Q.get("token") || localStorage.getItem("aiw_token") || "";
 if (!TOKEN) TOKEN = (prompt("输入 AIW_API_TOKEN") || "").trim();
 if (TOKEN) { localStorage.setItem("aiw_token", TOKEN); document.cookie = "aiw_token=" + TOKEN + "; path=/; SameSite=Strict"; }
@@ -455,9 +455,13 @@ async function loadDesktop() {
   const viewOnly = !S.take;
   try {
     const d = await api("GET", `/api/machines/${MID}/desktop?view_only=${viewOnly}`);
-    const url = d.novnc_url + (TOKEN ? "&token=" + encodeURIComponent(TOKEN) : "");
     const target = S.view === "computer" ? "big" : "small";
     const el = target === "big" ? $("deskBig") : $("desk");
+    if (!d.novnc_url) {  // a paused cloud computer: nothing to show until a task or 开机 wakes it
+      el.src = "about:blank"; deskLoaded[target] = null;
+      $("deskMode").textContent = "云电脑已自动暂停 · 发任务或点开机会自动唤醒"; return;
+    }
+    const url = d.external ? d.novnc_url : d.novnc_url + (TOKEN ? "&token=" + encodeURIComponent(TOKEN) : "");
     if (deskLoaded[target] !== url) { el.src = url; deskLoaded[target] = url; }
     if (target === "big") { $("desk").src = "about:blank"; deskLoaded.small = null; } else if (S.view !== "computer") { $("deskBig").src = "about:blank"; deskLoaded.big = null; }
   } catch (e) { toast("桌面：" + e.message); }
@@ -501,10 +505,82 @@ async function refreshMachine() {
     const up = !!(m.agent && m.agent.ok);
     S.agentFails = up ? 0 : S.agentFails + 1;
     if (up || S.agentFails >= 2) { const p = $("pillAgent"); p.textContent = up ? "Agent 在线" : "Agent 离线"; p.className = "chip " + (up ? "ok" : "bad"); p.title = up ? "" : (m.agent && m.agent.error) || ""; }
-    const vm = m.vm ? (m.vm.state === "running" ? "运行中" : m.vm.state) : m.vm_error ? "未连接 PVE" : m.status;
-    $("pcTitle").textContent = (up ? "电脑已连接" : "电脑未连接") + " · " + MID;
+    const vm = m.vm ? ({ running: "运行中", paused: "已暂停", suspended: "已暂停", stopped: "已关机" }[m.vm.state] || m.vm.state) : m.vm_error ? "未连接 PVE" : m.status;
+    if (m.agent && m.agent.paused) { const p = $("pillAgent"); p.textContent = "云电脑暂停中"; p.className = "chip"; p.title = m.agent.error; }
+    $("pcTitle").textContent = (up ? "电脑已连接" : "电脑未连接") + " · " + (m.name || MID);
     $("pcSub").textContent = `VM ${vm}${m.vm && m.vm.ip ? " · " + m.vm.ip : ""}${m.vm && m.vm.mem_bytes ? " · " + Math.round(m.vm.mem_bytes / 1073741824) + " GB" : ""} · 浏览器、终端、文件和完整桌面`;
   } catch (e) { $("pillAgent").textContent = "API 错误"; $("pillAgent").className = "chip bad"; }
+}
+
+/* ---------------------------------------------------------------- machine picker */
+async function loadMachines() {
+  let ms = [];
+  try { ms = await api("GET", "/api/machines"); } catch (e) { return; }
+  if (!ms.some((m) => m.id === MID) && ms.length) { MID = ms[0].id; localStorage.setItem("aiw_machine", MID); }
+  let sel = $("machineSel");
+  if (ms.length < 2) { if (sel) sel.remove(); return; }
+  if (!sel) {
+    sel = document.createElement("select"); sel.id = "machineSel"; sel.className = "machinesel"; sel.title = "选择电脑";
+    sel.onchange = () => pickMachine(sel.value);
+    $("pcTitle").parentElement.appendChild(sel);
+  }
+  sel.innerHTML = ms.map((m) => `<option value="${esc(m.id)}" ${m.id === MID ? "selected" : ""}>${esc(m.name || m.id)}${m.provider === "instabox" ? "（云）" : ""}</option>`).join("");
+}
+function pickMachine(id) {
+  MID = id; localStorage.setItem("aiw_machine", id);
+  deskLoaded = { small: null, big: null }; S.agentFails = 0;
+  loadDesktop(); refreshMachine(); toast("已切换到 " + id);
+}
+
+/* ---------------------------------------------------------------- cloud computers */
+const CLOUD_ST = { adding: "添加中", creating: "创建机器中", installing: "安装中", ready: "可用", error: "出错" };
+function cloudCard(list) {
+  const rows = list.map((c) => `<div class="cloudrow"><div class="grow"><b>${esc(c.name)}</b> <span class="chip ${c.status === "ready" ? "ok" : c.status === "error" ? "bad" : ""}">${CLOUD_ST[c.status] || esc(c.status)}</span>
+      <div class="small muted">${esc(c.id)} · InstaBox ${esc(c.remote_id || "")}</div>
+      <div class="small muted">${esc((c.log || []).slice(-1)[0] || c.error || "")}</div></div>
+      <button type="button" class="btn sm" onclick="pickMachine('${esc(c.id)}');go('chat')">使用</button>
+      <button type="button" class="btn sm" onclick="cloudSetup('${esc(c.id)}')">重新安装</button>
+      <button type="button" class="btn sm danger" onclick="cloudRemove('${esc(c.id)}')">移除</button></div>`).join("");
+  return `<form class="card sec" id="sCloud" onsubmit="cloudAdd(event)"><h3>${icon("plug")} 云电脑</h3>
+    <div class="muted">添加 InstaBox 云电脑（免费 1 台 4 核 8G）。添加后会自动装好 LibreCAD、中文字体和 vm-agent，聊天里切换电脑即可使用。空闲 30 分钟会自动暂停，发任务时自动唤醒，任务运行期间不会暂停。</div>
+    <div id="cloudList">${rows || '<div class="small muted">还没有云电脑</div>'}</div>
+    <div class="kv"><span class="muted">名称</span><input name="name" placeholder="instabox" value="instabox" />
+    <span class="muted">API Key</span><input name="api_key" type="password" placeholder="ibk_…（instabox.sh → Profile → API keys）" />
+    <span class="muted">机器</span><select name="remote_id"><option value="">新建一台</option></select></div>
+    <div class="row gap wrap"><button type="button" class="btn" onclick="cloudLookup()">读取已有机器</button><button class="btn primary">添加</button><span id="cloudNote" class="small"></span></div></form>`;
+}
+async function cloudRefresh() {
+  let list = [];
+  try { list = await api("GET", "/api/cloud"); } catch (e) { return; }
+  const box = $("cloudList"); if (!box) return;
+  const tmp = document.createElement("div"); tmp.innerHTML = cloudCard(list);
+  box.innerHTML = tmp.querySelector("#cloudList").innerHTML;
+  clearTimeout(cloudRefresh._t);
+  if (list.some((c) => !["ready", "error"].includes(c.status))) cloudRefresh._t = setTimeout(cloudRefresh, 4000);
+  else loadMachines();
+}
+async function cloudLookup() {
+  const f = $("sCloud"); const key = f.api_key.value.trim();
+  if (!key) return toast("先填 API Key");
+  $("cloudNote").textContent = "读取中…";
+  try {
+    const r = await api("POST", "/api/cloud/instabox/machines", { api_key: key });
+    f.remote_id.innerHTML = `<option value="">新建一台</option>` + r.machines.map((m) => `<option value="${esc(m.id)}" ${m.in_use ? "disabled" : ""}>${esc(m.name)} · ${esc(m.state)} · ${m.spec ? m.spec.vcpus + "核 " + Math.round(m.spec.memMiB / 1024) + "G" : ""}${m.in_use ? "（已添加）" : ""}</option>`).join("");
+    const free = r.machines.find((m) => !m.in_use); if (free) f.remote_id.value = free.id;
+    $("cloudNote").textContent = `账号 ${r.account}：${r.machines.length} 台机器`;
+  } catch (e) { $("cloudNote").textContent = "读取失败：" + e.message; }
+}
+async function cloudAdd(e) {
+  e.preventDefault(); const f = e.target;
+  try {
+    await api("POST", "/api/cloud", { provider: "instabox", name: f.name.value.trim(), api_key: f.api_key.value.trim(), remote_id: f.remote_id.value });
+    f.api_key.value = ""; toast("已添加，正在安装（约 3-6 分钟）"); cloudRefresh();
+  } catch (err) { toast("添加失败：" + err.message); }
+}
+async function cloudSetup(id) { try { await api("POST", `/api/cloud/${id}/setup`); toast("开始重新安装"); setTimeout(cloudRefresh, 800); } catch (e) { toast(e.message); } }
+async function cloudRemove(id) {
+  if (!confirm("从 AIW 移除这台云电脑？InstaBox 上的机器本身会保留。")) return;
+  try { await api("DELETE", `/api/cloud/${id}`); if (MID === id) pickMachine("ai-linux-001"); cloudRefresh(); loadMachines(); } catch (e) { toast(e.message); }
 }
 
 /* ---------------------------------------------------------------- notifications */
@@ -537,6 +613,8 @@ function connectEvents() {
 
 /* ---------------------------------------------------------------- settings ("Apps") */
 async function loadSettings() {
+  const cloudList = await api("GET", "/api/cloud").catch(() => []);
+  if (cloudList.some((c) => !["ready", "error"].includes(c.status))) setTimeout(cloudRefresh, 3000);
   const [prof, mems, models, notify, integ, secs, vmnet] = await Promise.all([api("GET", "/api/profile"), api("GET", "/api/memories"), api("GET", "/api/settings/models"),
     api("GET", "/api/settings/notify"), api("GET", "/api/integrations"), api("GET", "/api/secrets"), api("GET", "/api/settings/vm").catch(() => ({}))]);
   S.profile = prof;
@@ -576,6 +654,8 @@ async function loadSettings() {
       <select name="thinking"><option value="off" ${(models.thinking || "off") === "off" ? "selected" : ""}>关闭（推荐，更快）</option><option value="on" ${models.thinking === "on" ? "selected" : ""}>模型默认</option></select>
     </div>
     <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="fetchModels(true)">刷新模型列表</button><span id="modelListNote" class="small"></span></div></form>
+
+  ${cloudCard(cloudList)}
 
   <form class="card sec" id="sVmNet" onsubmit="saveVmNet(event)"><h3>${icon("plug")} 虚拟机地址</h3>
     <div class="muted">AI 电脑（VM）的 IP 变了就在这里改，保存立即生效，不用改 .env、不用重启。留空则用 .env 里的 AIW_VM_IP${vmnet.env_ip ? "（" + esc(vmnet.env_ip) + "）" : ""}。</div>
@@ -713,7 +793,7 @@ async function delSecret(n) { if (!confirm("删除密钥 " + n + "？")) return;
 /* ---------------------------------------------------------------- boot */
 paintIcons();
 api("GET", "/api/profile").then((p) => { S.profile = p; applyProfile(); renderChat(); }).catch(() => {});
-go("chat"); loadThreads(); refreshThread(true); loadDraft(); loadDesktop(); refreshMachine(); loadNotes(); connectEvents();
+go("chat"); loadThreads(); refreshThread(true); loadDraft(); loadMachines().then(() => { loadDesktop(); refreshMachine(); }); loadNotes(); connectEvents();
 setInterval(refreshMachine, 10000);
 setInterval(() => { if (busyTask && S.view === "chat") renderChat(); }, 5000);
 if (NATIVE) { document.body.classList.add("native"); NATIVE.postMessage({ op: "ready" }); }

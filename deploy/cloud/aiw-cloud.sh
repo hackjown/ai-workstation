@@ -45,7 +45,17 @@ do_install() {
   DISPLAY=$DISP bash "$R/deploy/vm/librecad-setup.sh" >>"$LOG" 2>&1 || true
   step browser
   "$V/bin/python" -m playwright install chromium >>"$LOG" 2>&1 || true
+  DISPLAY=$DISP desktop_icons >>"$LOG" 2>&1 || true
   echo INSTALLED > "$ST"
+}
+
+desktop_icons() {  # "打开桌面上的 LibreCAD": put launchers on the XFCE desktop
+  D=$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop"); mkdir -p "$D"
+  for a in librecad libreoffice-writer libreoffice-calc; do
+    f=/usr/share/applications/$a.desktop; [ -f "$f" ] || continue
+    cp -f "$f" "$D/"; chmod +x "$D/$a.desktop"
+    gio set "$D/$a.desktop" metadata::trusted true 2>/dev/null || true
+  done
 }
 
 screen_size() {
@@ -77,6 +87,7 @@ DISPLAY=$DISP
 ENV
   umask 022
   screen_size
+  [ -f "$(xdg-user-dir DESKTOP 2>/dev/null || echo $HOME/Desktop)/librecad.desktop" ] || DISPLAY=$DISP desktop_icons >/dev/null 2>&1 || true
   # restart when the token changed (a new API host) or the agent died
   if pgrep -f "vm_agent.server.websocket" >/dev/null && cmp -s "$S/vm-agent.env" "$S/vm-agent.env.running"; then
     echo AGENT_UP; return 0

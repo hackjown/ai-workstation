@@ -218,3 +218,8 @@ pre.code { background:#fff; border:1px solid var(--line); border-radius:16px; pa
 @keyframes pulse { 50% { opacity:.3; } }
 
 #sendBtn.busy{opacity:.55;pointer-events:none}
+
+/* V1.4 cloud computers */
+.machinesel { margin-top: 4px; max-width: 100%; font-size: 13px; padding: 3px 6px; border-radius: 8px; }
+.cloudrow { display: flex; gap: 8px; align-items: center; padding: 8px 0; border-bottom: 1px solid rgba(127,127,127,.15); flex-wrap: wrap; }
+.cloudrow .grow { min-width: 180px; }

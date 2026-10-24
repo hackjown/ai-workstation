@@ -164,6 +164,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     sessions = SessionManager(store, settings, llm_factory, computer_factory, notifier=notifier, secrets=secrets,
                               vm_runtime=vm_runtime)
     scheduler = Scheduler(store, sessions, notifier)
+    from .cloud import CloudError, CloudManager
+    cloud = CloudManager(store, secrets, settings.agent_token, on_change=sessions.drop_computer)
+    sessions.cloud = cloud
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -173,6 +176,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             log.warning("recovery failed: %s", e)
         if settings.scheduler_enabled:
             scheduler.start()
+        for e in cloud.list():  # a setup interrupted by an API restart carries on
+            if e.get("status") in ("adding", "creating", "installing"):
+                cloud.start_setup(e["id"])
         yield
         await scheduler.stop()
         for s in sessions.live.values():
@@ -180,6 +186,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     app = FastAPI(title="AI Workstation API", version="1.1.0", lifespan=lifespan)
     app.state.store, app.state.sessions, app.state.settings = store, sessions, settings
+    app.state.cloud = cloud
     app.state.scheduler, app.state.notifier, app.state.secrets = scheduler, notifier, secrets
 
     # ------------------------------------------------------------- auth
@@ -597,6 +604,55 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             sessions.drop_computer(mid)
             store.kv_set("vm_net", {**net, "ip": ip})
 
+    # ------------------------------------------------------------- cloud computers (InstaBox)
+    @app.get("/api/cloud", dependencies=[Depends(auth)])
+    async def cloud_list():
+        return cloud.list()
+
+    @app.post("/api/cloud/instabox/machines", dependencies=[Depends(auth)])
+    async def cloud_remote_machines(body: dict):
+        """The machines an InstaBox key can see, so 设置 can offer 'use an existing one'."""
+        from .cloud import InstaBox
+        key = str(body.get("api_key") or "").strip()
+        if not key:
+            raise HTTPException(400, "api_key required")
+        try:
+            ib = InstaBox(key)
+            me, ms = await ib.me(), await ib.machines()
+        except CloudError as e:
+            raise HTTPException(400, str(e))
+        used = {e.get("remote_id") for e in cloud.entries().values()}
+        return {"account": me.get("email") or me.get("login"), "allowed_specs": me.get("allowedSpecs"),
+                "machines": [{"id": m["id"], "name": m.get("name"), "state": m.get("state"),
+                              "template": (m.get("template") or {}).get("id"), "spec": m.get("spec"),
+                              "in_use": m["id"] in used} for m in ms]}
+
+    @app.post("/api/cloud", dependencies=[Depends(auth)])
+    async def cloud_add(body: dict):
+        if str(body.get("provider") or "instabox") != "instabox":
+            raise HTTPException(400, "only InstaBox is supported for now")
+        try:
+            return await cloud.add(str(body.get("name") or "").strip() or "instabox", str(body.get("api_key") or ""),
+                                   str(body.get("remote_id") or "").strip() or None)
+        except CloudError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/cloud/{mid}/setup", dependencies=[Depends(auth)])
+    async def cloud_setup(mid: str):
+        if not cloud.is_cloud(mid):
+            raise HTTPException(404)
+        cloud.start_setup(mid)
+        return {"ok": True}
+
+    @app.delete("/api/cloud/{mid}", dependencies=[Depends(auth)])
+    async def cloud_remove(mid: str):
+        if not cloud.is_cloud(mid):
+            raise HTTPException(404)
+        if sessions.busy_session(mid):
+            raise HTTPException(409, "stop the running agent session first")
+        cloud.remove(mid)   # only forgets it here; the InstaBox machine itself is kept
+        return {"ok": True}
+
     @app.get("/api/settings/notify", dependencies=[Depends(auth)])
     async def get_notify():
         return store.kv_get("notify", {}) or {}
@@ -700,6 +756,11 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         local = os.path.join(d, f"{int(time.time())}-{name}")
         with open(local, "wb") as f:
             f.write(raw)
+        if cloud.is_cloud(body.machine_id):
+            try:
+                await cloud.wake(body.machine_id)
+            except CloudError as e:
+                raise HTTPException(503, str(e))
         r = await sessions.computer(body.machine_id).execute("files.upload", {"path": f"uploads/{name}", "content_b64": body.content_b64},
                                                             observe=False, timeout=120)
         if not r.success:
@@ -717,7 +778,21 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if not m:
             raise HTTPException(404)
         out = {**m}
-        if vm_runtime:
+        if cloud.is_cloud(mid):
+            try:
+                st = await cloud.state(mid)
+            except Exception as e:  # noqa: BLE001
+                st = {"state": "unknown", "error": str(e)[:200]}
+            e = cloud.entry(mid) or {}
+            out["vm"], out["cloud"] = st, {k: e.get(k) for k in ("provider", "status", "error", "remote_id")}
+            if e.get("status") != "ready":
+                out["agent"] = {"ok": False, "error": f"云电脑{ {'adding': '添加中', 'creating': '创建中', 'installing': '安装中', 'error': '安装失败'}.get(e.get('status'), e.get('status')) }"}
+                return out
+            if st.get("state") != "running":
+                # paused: don't poke it (a probe would only fail); the next task or 开机 wakes it
+                out["agent"] = {"ok": False, "paused": True, "error": "已自动暂停，任务开始时自动唤醒"}
+                return out
+        if vm_runtime and not cloud.is_cloud(mid):
             try:
                 st = await vm_runtime.status(mid)
                 store.set_machine_status(mid, st.state.value, st.ip)
@@ -742,6 +817,14 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     for op in ("start", "stop", "restart"):
         async def _vm(mid: str, _op=op):
+            if cloud.is_cloud(mid):
+                if sessions.busy_session(mid) and _op != "start":
+                    raise HTTPException(409, "stop the running agent session first")
+                try:
+                    await cloud.power(mid, _op)
+                except CloudError as e:
+                    raise HTTPException(502, str(e))
+                return {"ok": True}
             _need_vm()
             if sessions.busy_session(mid) and _op != "start":
                 raise HTTPException(409, "stop the running agent session first")
@@ -751,6 +834,11 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.post("/api/machines/{mid}/snapshot", dependencies=[Depends(auth)])
     async def snapshot(mid: str, body: Snap):
+        if cloud.is_cloud(mid):
+            try:
+                return await cloud.client(mid).snapshot(cloud.entry(mid)["remote_id"], body.name)
+            except CloudError as e:
+                raise HTTPException(502, str(e))
         _need_vm()
         return await vm_runtime.snapshot(mid, body.name)
 
@@ -772,6 +860,15 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     async def desktop(mid: str, view_only: bool = True):
         if not store.machine(mid):
             raise HTTPException(404)
+        if cloud.is_cloud(mid):
+            # InstaBox's own viewer: a short-lived link, view-only enforced by its server
+            try:
+                st = await cloud.state(mid)
+                if st.get("state") != "running":
+                    return {"novnc_url": None, "paused": True, "external": True}
+                return {"novnc_url": await cloud.desktop_url(mid, view_only), "external": True}
+            except CloudError as e:
+                raise HTTPException(502, str(e))
         path = f"ws/desktop/{mid}"
         vnc_pw = os.environ.get("AIW_VNC_PASSWORD", "")
         pw_q = f"&password={quote(vnc_pw, safe='')}" if vnc_pw else ""

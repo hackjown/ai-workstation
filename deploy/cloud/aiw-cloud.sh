@@ -27,6 +27,13 @@ do_install() {
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv git curl xdotool x11-utils x11-xserver-utils \
       wmctrl scrot fonts-noto-cjk librecad xclip >>"$LOG" 2>&1 || { echo "FAILED apt" > "$ST"; return 1; }
   fi
+  step office
+  if ! command -v soffice >/dev/null && [ -z "${AIW_NO_OFFICE:-}" ]; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >>"$LOG" 2>&1
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends libreoffice-writer libreoffice-calc \
+      libreoffice-impress libreoffice-gtk3 libreoffice-l10n-zh-cn python3-openpyxl python3-docx python3-matplotlib \
+      python3-ezdxf poppler-utils imagemagick >>"$LOG" 2>&1 || echo "office install failed (non-fatal)" >>"$LOG"
+  fi
   step repo
   if [ -d "$R/.git" ]; then git -C "$R" pull -q --ff-only >>"$LOG" 2>&1 || true
   else git clone -q --depth 1 "$REPO_URL" "$R" >>"$LOG" 2>&1 || { echo "FAILED repo" > "$ST"; return 1; }; fi

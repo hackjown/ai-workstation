@@ -1157,11 +1157,12 @@ def librecad_type_command(commands: list[str], open_path: str | None = None, she
 # --- revising a finished drawing ---------------------------------------------------------------------------------
 # The user checks the set and asks for local fixes ("左侧墙的标题底板要放到顶上", "节点图标注压线了"). Those are made
 # on the drawing that exists: erase the wrong part, draw the right one, save and export again. Nothing is redrawn.
-_CAD_REVISE = re.compile(r"修改|修正|改一下|改成|改为|改到|改掉|调整|局部|有误|不对|错了|有问题|挪|移到|移动|往(上|下|左|右)|"
+_CAD_REVISE = re.compile(r"修改|修正|改一下|改完|改好|改下|也改|也要|跟图|和图|同图|一样|同样|照着|照图|参照|参考图|按图|"
+                         r"(图号?|第)\s*\d+\s*(张|号)?(的|也|里|上)|改成|改为|改到|改掉|调整|局部|有误|不对|错了|有问题|挪|移到|移动|往(上|下|左|右)|"
                          r"删掉|删除|去掉|补上|补画|加上|增加|添加|替换|换成|放大|缩小|对齐|压线|重叠|"
                          r"在(原|已有|画好|现有)的?(图|基础|图纸)", re.I)
 _CAD_REDRAW = re.compile(r"重新画|重画|从头|全部重|重新出图|redraw|from scratch", re.I)
-_CAD_TOPIC = re.compile(r"图|墙|标注|尺寸|文字|字|引线|节点|标题|板块|版面|线|框|天花|吊顶|门|踢脚|灯带|做法|比例|图例|dxf|pdf", re.I)
+_CAD_TOPIC = re.compile(r"图|第\s*\d+\s*张|墙|标注|尺寸|文字|字|引线|节点|标题|板块|版面|线|框|天花|吊顶|门|踢脚|灯带|做法|比例|图例|dxf|pdf", re.I)
 _CAD_CONTEXT = re.compile(r"施工图|\.dxf|librecad|cad_command|立面图|平面图", re.I)
 
 

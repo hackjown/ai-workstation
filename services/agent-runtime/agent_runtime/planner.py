@@ -126,6 +126,13 @@ Rules:
   If the task says to open, search, type, click, create or run anything, you must actually do it with tools first.
 - NEVER invent facts. Everything in `summary` must be visible in a screenshot you were shown or in a tool result.
 - Always fill `summary` in `done` with the actual answer for the user (in the user's language).
+- File conversion tools on the computer (deploy/vm/toolbox-setup.sh; `bash ~/ai-workstation/deploy/vm/toolbox-setup.sh check`
+  lists what is there): office `soffice --headless --convert-to pdf|docx|xlsx|pptx`, `pandoc`; PDF `qpdf`, `pdftk`,
+  `mutool` (`mutool poster -x 2` splits an A3 spread into two A4 pages and keeps vector text), `gs`, `pdftotext`,
+  `pdftoppm`, `img2pdf`, python `pypdf`/`fitz`/`pdfplumber`, PDF to Word `pdf2docx`; OCR `ocrmypdf -l chi_sim+eng`,
+  `tesseract`; images `magick`, `cwebp`, `heif-convert`, `rsvg-convert`, `inkscape`, `exiftool`; audio/video
+  `ffmpeg`, `ffprobe`, `sox`, `mediainfo`, `yt-dlp`; e-books `ebook-convert`; archives `7z`, `zip`, `unzip`, `zstd`;
+  text `iconv`, `uchardet`, `enca`, `dos2unix`, `jq`. Prefer these over rasterising or writing your own converter.
 - When the user wants a file (a document, sheet, PDF, image...), save it under ~/workspace and call `send_file`
   so it appears in their chat window, then `done`. Files outside ~/workspace must be copied there first (shell `cp`).
 - Every tool call must carry all required arguments (shell needs `command`). For scripts longer than a few lines,

@@ -952,7 +952,64 @@ _TEXT_DEFAULTS = ("C=$HOME/.config/LibreCAD/LibreCAD.conf; [ -f \"$C\" ] && sed 
                   "-e 's/^\\[Draw\\]$/[Draw]\\nTextAngle=0\\nTextAlignmentT=7\\nTextWidthRelation=1/' \"$C\"; true")
 
 
-def librecad_type_command(commands: list[str], open_path: str | None = None) -> str:
+# After every batch the view goes to the sheet being drawn. Zoom Auto alone fitted ALL sheets (0..300000 mm wide
+# by sheet 12), so the sheet being drawn was a 60-pixel sliver, and a batch that failed or ended in a dialog never
+# zoomed at all: the user watching saw an empty black canvas (2026-10-24, InstaBox and 104). LibreCAD's zoomwindow
+# takes no typed points, so: Zoom Auto, find the canvas and the drawn frames on a screenshot, then drag a zoom
+# window around sheet n with the mouse.
+_VIEW_PY = r'''
+import sys, subprocess
+from PIL import Image
+n, P, SW, SH = int(sys.argv[1]), 25000.0, 21000.0, 14850.0
+subprocess.run(["import", "-window", "root", "/tmp/aiw-view.png"], check=True)
+im = Image.open("/tmp/aiw-view.png").convert("RGB"); W, H = im.size; px = im.load()
+blk = lambda c: c[0] < 12 and c[1] < 12 and c[2] < 12
+rows = [y for y in range(0, H, 2) if sum(blk(px[x, y]) for x in range(0, W, 8)) > W / 8 * 0.45]
+if not rows: sys.exit(0)
+y0, y1 = min(rows), max(rows)
+ys = range(y0, y1, 6)
+colblk = [x for x in range(W) if sum(blk(px[x, y]) for y in ys) > len(ys) * 0.4]
+if not colblk: sys.exit(0)
+runs, start, prev = [], colblk[0], colblk[0]
+for x in colblk[1:] + [10 ** 9]:
+    if x - prev > 3:
+        runs.append((start, prev)); start = x
+    prev = x
+x0, x1 = max(runs, key=lambda r: r[1] - r[0])
+if x1 - x0 < 200 or y1 - y0 < 150: sys.exit(0)
+# bright pixels inside the canvas are the drawing (frames are white); grid dots are dim
+pts = [(x, y) for y in range(y0 + 2, y1 - 1) for x in range(x0 + 2, x1 - 1, 1) if min(px[x, y]) > 170]
+if len(pts) < 20: sys.exit(0)
+dx0, dx1 = min(p[0] for p in pts), max(p[0] for p in pts)
+dy0, dy1 = min(p[1] for p in pts), max(p[1] for p in pts)
+f = (dy1 - dy0) / SH  # every sheet is one A3 frame tall, so the drawn height is the sheet height
+if f <= 0: sys.exit(0)
+m = 700.0
+ax, bx = dx0 + (n * P - m) * f, dx0 + (n * P + SW + m) * f
+ay, by = dy1 + m * f, dy0 - m * f
+ax, bx = max(x0 + 1, ax), min(x1 - 1, bx)
+if bx - ax < 8: sys.exit(0)
+print(int(ax), int(ay), int(bx), int(by))
+'''
+
+
+def _view_command(sheet: int | None) -> str:
+    """Shell function aiw_view: leave the running tool, Zoom Auto, then zoom onto sheet `sheet` (skipped while a
+    dialog is open, so a pending Text dialog is not disturbed)."""
+    import shlex
+    za = "xdotool key ctrl+m; xdotool type --delay 25 -- za; xdotool key Return; sleep 0.6"
+    body = ("xdotool search --onlyvisible --name '^(Text|Hatch.*|Save Drawing As)$' >/dev/null 2>&1 && return 0; "
+            "xdotool key Escape; sleep 0.1; xdotool key Escape; sleep 0.1; " + za)
+    if sheet is not None:
+        body += ("; eval \"$(xdotool getwindowgeometry --shell \"$W\" 2>/dev/null)\"; xdotool mousemove $((X+WIDTH-40)) $((Y+40)); "
+                 f"sleep 0.2; R=$(python3 -c {shlex.quote(_VIEW_PY)} {int(sheet)} 2>/dev/null); "
+                 'if [ -n "$R" ]; then set -- $R; xdotool key ctrl+m; xdotool type --delay 25 -- zoomwindow; xdotool key Return; sleep 0.3; '
+                 "xdotool mousemove $1 $2; sleep 0.1; xdotool mousedown 1; sleep 0.1; xdotool mousemove $((($1+$3)/2)) $((($2+$4)/2)); "
+                 "sleep 0.1; xdotool mousemove $3 $4; sleep 0.1; xdotool mouseup 1; sleep 0.4; xdotool key Escape; fi")
+    return "aiw_view(){ " + body + "; return 0; }"
+
+
+def librecad_type_command(commands: list[str], open_path: str | None = None, sheet: int | None = None) -> str:
     """Shell line that brings LibreCAD to the front (launching it, optionally on a file), maximises it, and types
     each command into its command line followed by Enter, the way a person would. Runs on the VM desktop.
     'TEXT|x,y|height|内容' draws a whole text: opens the Text dialog, pastes the string (Chinese works through the
@@ -984,6 +1041,9 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
                  'xdotool mousemove $((X+WIDTH*2/5)) $((Y+HEIGHT/2)); sleep 0.05; '
                  'xdotool mousemove $((X+WIDTH*2/5+9)) $((Y+HEIGHT/2+7)); sleep 0.05; }')
     parts.append("hover")
+    # whatever happens to the batch (done, failed, timed out), the user watching ends up looking at the sheet
+    parts.append(_view_command(sheet))
+    parts.append("trap 'aiw_view' EXIT")
     # a dialog left open by an earlier step (e.g. an unfinished Text dialog) swallows every keystroke: close it
     parts.append("(for N in '^Text$' '^Hatch' '^Save Drawing As'; do for D in $(xdotool search --onlyvisible --name \"$N\" 2>/dev/null); do "
                  'xdotool windowfocus "$D" 2>/dev/null; xdotool key --window "$D" Escape; sleep 0.3; done; done; true)')
@@ -1066,10 +1126,9 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
     if last.startswith("save") or last.startswith("pdf"):
         last = "za"  # no zoom after a save
     dialog = last in ("text", "txt", "mtext", "mtxt", "hatch", "ha")  # a dialog is now open; leave it to the agent
-    if not dialog and not (last.startswith("zoom") or last in ("za", "zw", "zp", "zv")):
-        # fit the whole drawing so the screenshot shows what was drawn (a fresh view only shows ~0..1000 mm)
-        parts.append("xdotool key ctrl+m; xdotool type --delay 25 -- za; xdotool key Return; sleep 0.5")  # zoom resumes the running tool
-    tail = "; the dialog is open now, fill it in" if dialog else ", then zoomauto"
+    if dialog or last.startswith("zoom") or last in ("za", "zw", "zp", "zv"):
+        parts.append("trap - EXIT")  # the model asked for this view / left a dialog open on purpose
+    tail = "; the dialog is open now, fill it in" if dialog else (f", then showed sheet {sheet}" if sheet is not None else ", then zoomauto")
     if texts:
         tail += f" ({texts} texts placed)"
     if bad:

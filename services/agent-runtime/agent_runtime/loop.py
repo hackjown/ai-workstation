@@ -278,7 +278,7 @@ class AgentLoop:
         self._cad_text_boxes: dict = getattr(self, "_seed_boxes", None) or {}  # sheet -> [(box, text)] typed so far (a revision starts with the drawing's)
         self._cad_typed_texts: set = set()
         self._cad_touched: set = set()  # sheets this task drew or erased on
-        self._cad_rejects: dict = {}  # sheet -> batches sent back by the layout check (typed anyway after 2)
+        self._cad_rejects: dict = {}  # sheet -> batches sent back by the layout check (typed anyway after AIW_CAD_MAX_REJECTS=2; a resend costs ~8 s with thinking off)
         # every one-line item (line|, rect|, TEXT|, DIMH|, FRAME|n ...) that landed, in its absolute form: a batch sent
         # again after a timeout, a dialog error or a reopen skips what is already there instead of drawing it twice
         self._cad_keys_saved: set = set()    # landed and saved in the DXF
@@ -336,7 +336,10 @@ class AgentLoop:
                 # drafting sheets from cad/plan.md is transcription: with thinking on, DeepSeek spent 11-13 min per
                 # sheet reasoning about label positions in its head and often ran out of budget before any tool call
                 # (task-960: 2 sheets in 79 min). The layout auto-fix moves colliding labels instead.
-                thinking=(os.environ.get("AIW_CAD_DRAW_THINKING", "off") if self._cad_task and getattr(self, "_cad_calls", 0) else None))
+                # Before the first sheet too (AIW_CAD_PLAN_THINKING): run e7d's planning step thought for 809 s and
+                # returned no tool call; the brief carries the coordinates, so planning is transcription as well.
+                thinking=((os.environ.get("AIW_CAD_DRAW_THINKING", "off") if getattr(self, "_cad_calls", 0)
+                           else os.environ.get("AIW_CAD_PLAN_THINKING", "off")) if self._cad_task else None))
             decision = None
             tries = int(os.environ.get("AIW_DECIDE_RETRIES", "4"))
             for attempt in range(tries):
@@ -739,7 +742,7 @@ class AgentLoop:
         bad = [c[5:] for c in cmds if c.startswith("#BAD ")]
         issues, boxes = _cad.layout_issues(drawn, self._cad_text_boxes)
         key = self._cad_sheet
-        if (bad or issues) and self._cad_rejects.get(key, 0) < int(os.environ.get("AIW_CAD_MAX_REJECTS", "1")):
+        if (bad or issues) and self._cad_rejects.get(key, 0) < int(os.environ.get("AIW_CAD_MAX_REJECTS", "2")):
             # checked before typing: a misplaced or unreadable batch is cheaper to fix in the plan than on the canvas
             self._cad_rejects[key] = self._cad_rejects.get(key, 0) + 1
             self._cad_sheet = sheet_before
@@ -755,7 +758,7 @@ class AgentLoop:
                 msg += (f" LAYOUT ({len(issues)}): " + "; ".join(issues[:12]) +
                         f". Sheet-local limits: drawing area x {_cad.FRAME_X1}..{_cad.FRAME_X2}, y {_cad.FRAME_Y1}..{_cad.FRAME_Y2}; "
                         f"the title block fills x>{_cad.TB_X1}, y<{_cad.TB_Y2}. TEXT|x,y is the LOWER LEFT corner and a hanzi "
-                        f"is about one text height wide; use TEXTC|x,y|h|... to centre a label on x,y. Move views/labels, "
+                        f"is about 1.25 text heights wide (digits 0.75); use TEXTC|x,y|h|... to centre a label on x,y. Move views/labels, "
                         f"shorten or split long labels, and keep text clear of other text.")
             return msg
         for c in raw:
@@ -832,8 +835,11 @@ class AgentLoop:
                 audit += (f" Sheets {self._sheet_audit['no_geometry']} have texts but almost no lines/rectangles "
                           f"(geometry per sheet {self._sheet_audit.get('geometry')}): draw the walls, outlines and panels.")
         if m and self._sheet_audit.get("stray"):
+            at = self._sheet_audit.get("stray_at") or {}
             audit += (f" STRAY ENTITIES per sheet {self._sheet_audit['stray']}: they reach outside their sheet and were "
-                      f"left out of the PDF; undo/redraw them inside the sheet.")
+                      f"left out of the PDF. Where (sheet-local): {json.dumps(at, ensure_ascii=False)[:600]}. Remove each "
+                      f"with ONE 'SHEET|n' + 'ERASE|x1,y1|x2,y2' around those coordinates (or ERASETEXT|text), redraw it "
+                      f"inside x {_cad.FRAME_X1}..{_cad.FRAME_X2}, then export again; no LIST needed.")
         if moved:
             more += (f" (sheet {self._cad_sheet}: {moved} sheet-local points were placed at origin x="
                      f"{self._cad_sheet * _cad.SHEET_PITCH}; keep using local or absolute coordinates, both land right)")

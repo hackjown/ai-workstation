@@ -628,3 +628,20 @@ async def test_cad_edit_without_saved_file_is_refused(env):  # noqa: F811
     loop._cad_sheet = 0
     r = await loop._cad_command({"commands": ["SHEET|2", "LIST|2"]}, "i")
     assert r.startswith("FAILED") and "SAVE" in r
+
+
+def test_autofix_moves_labels_and_drops_duplicate_dims():
+    raw = ["FRAME|2|平面布置图|02|1:50|x", "line|2200,3200|4500,3200", "TEXT|3300,3080|175|前言",
+           "DIMH|3000|1500|2000,4500,5500,8000", "DIMH|3000|900|2000,8000"]
+    out, notes = cad.autofix(raw, 2, {})
+    drawn = []
+    cad.place(out, 2, drawn)
+    assert cad.layout_issues(drawn, {})[0] == []
+    assert not any(c.startswith("DIMH|3000|900") for c in out)
+    assert any("前言" in c and "3080" not in c for c in out)
+    assert notes
+
+
+def test_textc_split_xy_form_is_understood():
+    assert not any(c.startswith("#BAD") for c in cad.expand(["TEXTC|10500|13600|400|图纸目录"]))
+    assert cad.normalize("TEXT|9700|13600|400|图纸目录") == "TEXT|9700,13600|400|图纸目录"

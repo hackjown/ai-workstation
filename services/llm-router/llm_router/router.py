@@ -23,6 +23,7 @@ class LLMRequest:
     screen: tuple[int, int] = (0, 0)
     note: Optional[str] = None  # e.g. "user took over and returned control"
     screen_desc: Optional[str] = None  # set when a separate vision model read the screenshot
+    thinking: Optional[str] = None  # per-step override of the provider's thinking setting ("off" while drafting CAD)
 
 
 @dataclass

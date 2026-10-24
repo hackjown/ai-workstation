@@ -445,7 +445,7 @@ def _macro(c: str) -> list[str] | None:
         (ax, ay), (bx, by) = _xy(bits[0]), _xy(bits[1])
         h = float(bits[2]) if len(bits) > 3 else 175.0
         label = bits[3] if len(bits) > 3 else bits[2]
-        shelf = max(600.0, len(label) * h * 1.05)
+        shelf = max(600.0, text_box(0, 0, h, label)[2] + h * 0.3)
         d = 1 if bx >= ax else -1
         out += ["line", _pt(ax, ay), _pt(bx, by), _pt(bx + d * shelf, by), "ESC",
                 "circle", _pt(ax, ay), _f(h * 0.25), "ESC",
@@ -481,16 +481,18 @@ TB_X1, TB_Y2 = FRAME_X2 - 9000, FRAME_Y1 + 2000
 def _cw(ch: str) -> float:
     """Width of one character in text heights, as LibreCAD's CJK font draws it (measured on the 2026-10-23 PDF:
     the 0.95 estimate let titles run into the next title-block cell)."""
+    # measured again on run e7d's PDF (2026-10-24): '入口形象墙正面立面图（十六字方针）' at h=400 spans 8460, i.e.
+    # 1.24 h per hanzi, and '1:50' adds ~2.5 h. With 1.05 the check passed panel labels that ran into each other.
     o = ord(ch)
     if o > 0x2e80 or ch in "（）【】，。：；、":
-        return 1.05
+        return 1.25
     if ch in "()[]-.,:;|/ ":
-        return 0.45
-    return 0.65
+        return 0.4
+    return 0.75
 
 
 def text_box(x: float, y: float, h: float, body: str) -> tuple[float, float, float, float]:
-    """Rough extent of a left-aligned single-line text: a hanzi is about one text height wide, latin ~0.65."""
+    """Rough extent of a left-aligned single-line text: a hanzi is about 1.25 text heights wide, latin ~0.75."""
     w = sum(_cw(ch) for ch in body) * h
     return x, y, x + w, y + h
 
@@ -851,7 +853,7 @@ def dxf2pdf(dxf, pdf):  # dxf2pdf ignores -o for a single file and writes <name>
     if made != pdf and os.path.exists(made):
         shutil.move(made, pdf)
     return os.path.exists(pdf) and os.path.getsize(pdf) > 0
-counts, pages, stray, geom = {}, [], {}, {}
+counts, pages, stray, geom, stray_at = {}, [], {}, {}, {}
 try:
     import ezdxf
     doc = ezdxf.readfile(src)
@@ -882,7 +884,7 @@ try:
             return out
         p = g("insert")
         return [p] if p is not None else []
-    groups, stray, geom = {}, {}, {}
+    groups, stray, geom, stray_at = {}, {}, {}, {}
     for e in doc.modelspace():
         try:
             P = [p for p in pts(e) if p is not None]
@@ -890,10 +892,21 @@ try:
             P = []
         if not P:
             continue
-        n = int(P[0][0] // PITCH)
-        lo, hi = n * PITCH - 1500, n * PITCH + W + 1500
-        if any(not (lo <= p[0] <= hi) or not (-1500 <= p[1] <= H + 1500) for p in P):
+        # the sheet whose band holds every point: a label written left of sheet 5's origin (x<0 locally) lies in
+        # the gap after sheet 4, and taking floor(x/PITCH) blamed sheet 4 for it (run e7d: 20 min of LIST/ERASE
+        # on the wrong sheet)
+        xs = [p[0] for p in P]
+        n0 = int(min(xs) // PITCH)
+        n = next((k for k in (n0, n0 + 1, int(max(xs) // PITCH))
+                  if all(k * PITCH - 1500 <= p[0] <= k * PITCH + W + 1500 and -1500 <= p[1] <= H + 1500 for p in P)), None)
+        if n is None:
+            n = n0 if n0 * PITCH - 1500 <= min(xs) else n0 + 1
             stray[n] = stray.get(n, 0) + 1
+            if len(stray_at.setdefault(n, [])) < 8:
+                lx = [round(x - n * PITCH) for x in xs]
+                ly = [round(p[1]) for p in P]
+                what = e.dxftype() + ((" '" + str(e.dxf.get("text") or "")[:12] + "'") if e.dxftype() in ("TEXT", "MTEXT") else "")
+                stray_at[n].append("%s x %d..%d y %d..%d" % (what, min(lx), max(lx), min(ly), max(ly)))
             continue
         groups.setdefault(n, set()).add(e.dxf.handle)
         if e.dxftype() in ("LINE", "LWPOLYLINE", "POLYLINE", "CIRCLE", "ARC", "HATCH", "INSERT", "SPLINE", "ELLIPSE"):
@@ -944,7 +957,8 @@ thin = [n for n, c in counts.items() if c < MIN]
 nogeom = [n for n in counts if geom.get(n, 0) < 15 and n > 1]
 thin = sorted(set(thin) | set(nogeom))
 print("pdf %s: %d pages" % (out, len(pages)))
-print("AIW_SHEETS " + json.dumps({"counts": counts, "thin": thin, "stray": stray, "geometry": geom, "no_geometry": nogeom}))
+print("AIW_SHEETS " + json.dumps({"counts": counts, "thin": thin, "stray": stray, "stray_at": stray_at, "geometry": geom,
+                                  "no_geometry": nogeom}, ensure_ascii=False))
 '''
 
 
@@ -1380,6 +1394,11 @@ def _variants(c: str, issues: list[str]):
                     yield f"NOTE|{_pt(x, round(y + dy * h))}|{_f(hh)}|{body}"
         elif kind == "LEADER" and len(bits) >= 4:
             (ax, ay), (bx, by), h, label = _xy(bits[1]), _xy(bits[2]), float(bits[3]), "|".join(bits[4:])
+            if any("outside the border" in i or "title block" in i for i in issues):
+                # a label written leftwards off the sheet (run e7d: 'LEADER|2640,4120|1500,4120' put its text at x<0,
+                # counted as stray and dropped from the PDF): put it on the other side of the point
+                yield f"LEADER|{bits[1]}|{_pt(round(2 * ax - bx), round(by))}|{_f(h)}|{label}"
+                yield f"LEADER|{bits[1]}|{_pt(round(2 * ax - bx), round(2 * ay - by))}|{_f(h)}|{label}"
             if any("longer than" in i for i in issues):  # pull the label towards the point it names
                 for f in (0.75, 0.6, 0.45, 0.3):
                     yield f"LEADER|{bits[1]}|{_pt(round(ax + (bx - ax) * f), round(ay + (by - ay) * f))}|{_f(h)}|{label}"
@@ -1419,12 +1438,95 @@ def _fat_issues(c: str, sheet: int, acc: dict) -> bool:
         return False
 
 
+_HARD = ("outside the border", "inside the title block")
+
+
+def _clamp(c: str, sheet: int) -> str | None:
+    """Last resort for a label that no nearby spot fits: slide it inside the inner border and above the title
+    block, keeping its leader point. A label off the sheet is dropped from the PDF (run e7d spent 20 min hunting
+    such 'stray' leaders), so a label inside with a graze is the better of the two."""
+    bits = [b.strip() for b in c.split("|")]
+    kind = bits[0].upper()
+    if kind not in ("TEXT", "TXT", "TEXTC", "NOTE", "LEADER") or len(bits) < 4:
+        return None
+    d: list = []
+    try:
+        place([c], sheet, d)
+    except Exception:  # noqa: BLE001
+        return None
+    ox = sheet * SHEET_PITCH
+    bxs = []
+    for _, e in d:
+        t = _parse_text(e)
+        if t:
+            x, y = _xy(t[0])
+            b = text_box(x, y, float(t[1]), t[2])
+            bxs.append((b[0] - ox, b[1], b[2] - ox, b[3]))
+    if not bxs:
+        return None
+    x1, y1 = min(b[0] for b in bxs), min(b[1] for b in bxs)
+    x2, y2 = max(b[2] for b in bxs), max(b[3] for b in bxs)
+    m = 100
+    dx = (FRAME_X1 + m - x1) if x1 < FRAME_X1 + m else (FRAME_X2 - m - x2) if x2 > FRAME_X2 - m else 0
+    dy = (FRAME_Y1 + m - y1) if y1 < FRAME_Y1 + m else (FRAME_Y2 - m - y2) if y2 > FRAME_Y2 - m else 0
+    if x2 + dx > TB_X1 and y1 + dy < TB_Y2:
+        dy = TB_Y2 + m - y1
+    if not dx and not dy:
+        return None
+    try:
+        if kind == "LEADER":
+            (bx, by) = _xy(bits[2])
+            return f"LEADER|{bits[1]}|{_pt(round(bx + dx), round(by + dy))}|{bits[3]}|{'|'.join(bits[4:])}"
+        (x, y) = _xy(bits[1])
+        return f"{kind}|{_pt(round(x + dx), round(y + dy))}|{bits[2]}|{'|'.join(bits[3:])}"
+    except (ValueError, IndexError):
+        return None
+
+
+def untangle(raw: list[str], sheet: int = 0) -> tuple[list[str], int]:
+    """Leaders whose labels stand in one column (same side, label x within ~1500) get their label rows re-dealt in
+    the order of the points they name, at least 2.2 text heights apart, so no two cross. Run e7d's narrow walls
+    (形象墙, 前言, 结束语) fanned 6-8 leaders from one panel to a label list in random order: every one crossed."""
+    rx = re.compile(r"(?i)^\s*leader\s*\|([^|]+)\|([^|]+)\|([^|]+)\|(.*)$")
+    cur, groups = sheet, {}
+    for i, c in enumerate(raw):
+        ms = _SHEET.match(str(c))
+        if ms:
+            cur = max(0, int(float(ms.group(2))))
+            continue
+        m = rx.match(str(c))
+        if not m:
+            continue
+        try:
+            (ax, ay), (bx, by), h = _xy(m.group(1)), _xy(m.group(2)), float(m.group(3))
+        except (ValueError, IndexError):
+            continue
+        side = 1 if bx >= ax else -1
+        key = (cur, side, round(bx / 1500))
+        groups.setdefault(key, []).append((i, ax, ay, bx, by, h, m.group(4)))
+    out, n = list(raw), 0
+    for g in groups.values():
+        if len(g) < 2:
+            continue
+        gap = max(x[5] for x in g) * 2.2
+        rows = sorted(x[4] for x in g)
+        for k in range(1, len(rows)):  # spread rows that sit closer than one label line
+            rows[k] = max(rows[k], rows[k - 1] + gap)
+        for (i, ax, ay, bx, by, h, label), ny in zip(sorted(g, key=lambda x: (x[2], x[1])), rows):
+            new = f"LEADER|{_pt(ax, ay)}|{_pt(bx, ny)}|{_f(h)}|{label}"
+            if abs(ny - by) > 0.5:
+                n += 1
+            out[i] = new
+    return out, n
+
+
 def autofix(raw: list[str], sheet: int, prior_boxes: dict | None = None) -> tuple[list[str], list[str]]:
     """Returns (commands to type, notes on what was moved/dropped). Units that still have an issue are kept as sent,
     and the normal layout check reports them."""
-    units = _reorder(_units([normalize(str(c)) for c in raw]))
+    raw, nun = untangle([normalize(str(c)) for c in raw], sheet)
+    units = _reorder(_units(raw))
     acc = {k: list(v) for k, v in (prior_boxes or {}).items()}
-    out, notes, cur = [], [], sheet
+    out, notes, cur = [], ([f"re-dealt {nun} leader labels in point order so they do not cross"] if nun else []), sheet
     for u in units:
         d: list = []
         try:
@@ -1450,6 +1552,18 @@ def autofix(raw: list[str], sheet: int, prior_boxes: dict | None = None) -> tupl
                     notes.append(f"{c[:40]} -> {cand[:44]}")
                     u, bx = [cand], b2
                     break
+            else:
+                cl = _clamp(c, cur) if any(h in i for i in iss for h in _HARD) else None
+                if cl:
+                    d3: list = []
+                    try:
+                        place([cl], cur, d3)
+                        i3, b3 = layout_issues(d3, acc)
+                        if not any(h in i for i in i3 for h in _HARD):
+                            notes.append(f"{c[:40]} -> {cl[:44]} (pulled inside the sheet)")
+                            u, bx = [cl], b3
+                    except Exception:  # noqa: BLE001
+                        pass
         out += u
         cur = nxt
         for sh, b, bd in bx:

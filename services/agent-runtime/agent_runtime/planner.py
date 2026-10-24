@@ -23,9 +23,10 @@ Rules:
   files_write of DXF, no delegate for drawing) unless the user explicitly asks for a script. This is a LONG task
   (hundreds of steps): do not stop until every sheet is drawn, saved and sent. Workflow:
   1. READ ONCE. `files_list` uploads/. Read the quote list with ONE `shell` script that prints every non-empty row
-     compactly (序号 | 项目 | 数量 | 单位 | 备注; skip price/formula columns). .xlsx: openpyxl; old .xls: `import xlrd`;
-     if both fail: `soffice --headless -env:UserInstallation=file:///tmp/lo_conv --convert-to xlsx FILE`.
-     Read each design image with `read_image` and a focused question (板块从左到右的名称和宽度, 门的位置...).
+     compactly (序号 | 项目 | 数量 | 单位 | 备注; skip price/formula columns). .xlsx: openpyxl; old .xls: convert it first (xlrd is usually missing):
+     `soffice --headless -env:UserInstallation=file:///tmp/lo_conv --convert-to xlsx FILE`.
+     Read ALL design images in ONE `read_image` call: paths=[every image], question asking for 板块从左到右的名称和宽度,
+     标题/底板位置, 门的位置, 可读尺寸 (they are read in parallel; one call per image wastes ~50 s each).
      Never re-read a file whose content is already in PREVIOUS STEPS.
   2. WRITE THE PLAN (text, not drawing) IN PARTS: one `files_write` per sheet. The first call writes cad/plan.md
      with the key sizes and sheet 0; every later call adds ONE sheet with append=true. A whole 12-sheet plan in one

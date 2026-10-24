@@ -684,8 +684,12 @@ async function loadSettings() {
 
   <div class="card sec" id="sInteg"><h3>${icon("plug")} 集成</h3>
     <div class="muted">让 Agent 直接调 API，而不是点网页。MCP 服务器（Streamable HTTP）、OpenAPI 规范或自定义 HTTP 工具。请求头里可以用 {{secret:名字}} 引用下方加密保存的密钥。</div>
+    <div class="label">推荐 MCP（一键添加）</div>
+    <div class="list">${MCP_PRESETS.map((p) => { const on = (integ.mcp_servers || []).some((m) => m.name === p.name);
+      return `<div class="item"><div class="grow"><b>${esc(p.title)}</b>${p.secret ? ' <span class="chip">需 Key</span>' : ' <span class="chip ok">免费</span>'}<div class="small">${esc(p.desc)}</div></div>
+      <div class="acts">${on ? '<span class="chip ok">已添加</span>' : `<button type="button" class="btn sm primary" onclick="addPreset('${p.name}')">添加</button>`}</div></div>`; }).join("")}</div>
     <div class="label">MCP 服务器</div>
-    <div class="list">${(integ.mcp_servers || []).map((m, i) => `<div class="item"><div class="grow"><b>${esc(m.name)}</b><div class="small">${esc(m.url)}</div></div><div class="acts"><button class="btn sm danger" onclick="delMcp(${i})">删除</button></div></div>`).join("") || `<div class="small">没有</div>`}</div>
+    <div class="list">${(integ.mcp_servers || []).map((m, i) => `<div class="item"><div class="grow"><b>${esc(m.name)}</b><div class="small">${esc(m.url)}</div><div class="small muted" id="mcpT${i}"></div></div><div class="acts"><button class="btn sm" onclick="testMcp(${i})">测试</button><button class="btn sm danger" onclick="delMcp(${i})">删除</button></div></div>`).join("") || `<div class="small">没有</div>`}</div>
     <form class="grid2" onsubmit="addMcp(event)"><input name="name" placeholder="名称，例如 gmail" required /><input name="url" placeholder="https://…/mcp" required />
       <input name="hk" placeholder="请求头名（可空），例如 Authorization" /><input name="hv" placeholder="值，例如 Bearer {{secret:gmail_token}}" /><button class="btn primary span2">添加 MCP 服务器</button></form>
     <div class="label">导入 OpenAPI</div>
@@ -788,6 +792,42 @@ async function addMcp(e) {
   e.preventDefault(); const f = e.target; const cur = (await api("GET", "/api/integrations")).mcp_servers || [];
   cur.push({ name: f.name.value, url: f.url.value, headers: f.hk.value ? { [f.hk.value]: f.hv.value } : {} });
   try { await api("PUT", "/api/integrations", { mcp_servers: cur }); toast("已添加"); loadSettings(); } catch (err) { toast(err.message); }
+}
+const MCP_PRESETS = [
+  { name: "exa", title: "Exa 联网搜索", desc: "搜网页、读网页全文，查规范、材料、做法（免费，无需 Key）", url: "https://mcp.exa.ai/mcp" },
+  { name: "jina", title: "Jina 网页阅读", desc: "把任意网址转成干净正文、给网页截图（读网页免 Key）", url: "https://mcp.jina.ai/v1" },
+  { name: "context7", title: "Context7 技术文档", desc: "查 ezdxf、LibreOffice、Python 库的最新文档和示例", url: "https://mcp.context7.com/mcp" },
+  { name: "deepwiki", title: "DeepWiki", desc: "读懂任意 GitHub 开源项目（结构、用法、问答）", url: "https://mcp.deepwiki.com/mcp" },
+  { name: "mslearn", title: "Microsoft Learn", desc: "Office、Excel、Windows 官方文档和代码示例", url: "https://learn.microsoft.com/api/mcp" },
+  { name: "amap", title: "高德地图", desc: "地点搜索、路线规划、天气、地址转坐标（高德开放平台免费申请「Web 服务」Key）",
+    url: "https://mcp.amap.com/mcp?key={{secret:amap_key}}", secret: "amap_key", keyName: "高德 Web 服务 Key" },
+  { name: "github", title: "GitHub", desc: "读写你的仓库、Issue、PR（GitHub 个人访问令牌）",
+    url: "https://api.githubcopilot.com/mcp/", headers: { Authorization: "Bearer {{secret:github_token}}" }, secret: "github_token", keyName: "GitHub 个人访问令牌（ghp_… / github_pat_…）" },
+];
+async function addPreset(name) {
+  const p = MCP_PRESETS.find((x) => x.name === name); if (!p) return;
+  try {
+    if (p.secret) {
+      const have = (await api("GET", "/api/secrets")).some((x) => (x.name || x) === p.secret);
+      if (!have) {
+        const v = prompt(`填入${p.keyName}（加密保存，不再显示）`); if (!v || !v.trim()) return;
+        await api("PUT", `/api/secrets/${p.secret}`, { value: v.trim() });
+      }
+    }
+    toast("连接测试中…");
+    const t = await api("POST", "/api/integrations/mcp/test", { url: p.url, headers: p.headers || {} });
+    if (!t.tools.length) throw new Error(p.secret ? "没有返回任何工具，Key 可能无效（可在下方密钥里删掉 " + p.secret + " 重填）" : "没有返回任何工具");
+    const cur = (await api("GET", "/api/integrations")).mcp_servers || [];
+    cur.push({ name: p.name, url: p.url, headers: p.headers || {} });
+    await api("PUT", "/api/integrations", { mcp_servers: cur });
+    toast(`已添加 ${p.title}：${t.tools.length} 个工具`); loadSettings();
+  } catch (err) { toast("添加失败：" + err.message); }
+}
+async function testMcp(i) {
+  const m = ((await api("GET", "/api/integrations")).mcp_servers || [])[i]; const el = $("mcpT" + i); if (!m || !el) return;
+  el.textContent = "测试中…";
+  try { const t = await api("POST", "/api/integrations/mcp/test", { url: m.url, headers: m.headers || {} }); el.textContent = `可用 · ${t.tools.length} 个工具：${t.tools.slice(0, 8).join("、")}${t.tools.length > 8 ? "…" : ""}`; }
+  catch (err) { el.textContent = "不可用：" + err.message; }
 }
 async function delMcp(i) { const cur = (await api("GET", "/api/integrations")).mcp_servers || []; cur.splice(i, 1); await api("PUT", "/api/integrations", { mcp_servers: cur }); loadSettings(); }
 async function importOpenAPI(e) {

@@ -517,18 +517,23 @@ async function loadMachines() {
   let ms = [];
   try { ms = await api("GET", "/api/machines"); } catch (e) { return; }
   if (!ms.some((m) => m.id === MID) && ms.length) { MID = ms[0].id; localStorage.setItem("aiw_machine", MID); }
-  let sel = $("machineSel");
-  if (ms.length < 2) { if (sel) sel.remove(); return; }
-  if (!sel) {
-    sel = document.createElement("select"); sel.id = "machineSel"; sel.className = "machinesel"; sel.title = "选择电脑";
-    sel.onchange = () => pickMachine(sel.value);
-    $("pcTitle").parentElement.appendChild(sel);
+  const opts = ms.map((m) => `<option value="${esc(m.id)}" ${m.id === MID ? "selected" : ""}>${esc(m.name || m.id)}${m.provider === "instabox" ? "（云）" : ""}</option>`).join("");
+  // one picker on the 电脑 page and one on the chat's desktop pane, always shown so it is easy to find
+  for (const [id, anchor] of [["machineSel", "pcTitle"], ["machineSel2", "deskTitle"]]) {
+    let sel = $(id); const a = $(anchor);
+    if (!a) continue;
+    if (!sel) {
+      sel = document.createElement("select"); sel.id = id; sel.className = "machinesel"; sel.title = "选择电脑";
+      sel.onchange = () => pickMachine(sel.value);
+      a.parentElement.appendChild(sel);
+    }
+    sel.innerHTML = opts; sel.disabled = ms.length < 2;
   }
-  sel.innerHTML = ms.map((m) => `<option value="${esc(m.id)}" ${m.id === MID ? "selected" : ""}>${esc(m.name || m.id)}${m.provider === "instabox" ? "（云）" : ""}</option>`).join("");
 }
 function pickMachine(id) {
   MID = id; localStorage.setItem("aiw_machine", id);
   deskLoaded = { small: null, big: null }; S.agentFails = 0;
+  for (const sid of ["machineSel", "machineSel2"]) { const s = $(sid); if (s) s.value = id; }
   loadDesktop(); refreshMachine(); toast("已切换到 " + id);
 }
 
@@ -545,7 +550,7 @@ function cloudCard(list) {
     <div class="muted">添加 InstaBox 云电脑（免费 1 台 4 核 8G）。添加后会自动装好 LibreCAD、中文字体和 vm-agent，聊天里切换电脑即可使用。空闲 30 分钟会自动暂停，发任务时自动唤醒，任务运行期间不会暂停。</div>
     <div id="cloudList">${rows || '<div class="small muted">还没有云电脑</div>'}</div>
     <div class="kv"><span class="muted">名称</span><input name="name" placeholder="instabox" value="instabox" />
-    <span class="muted">API Key</span><input name="api_key" type="password" placeholder="ibk_…（instabox.sh → Profile → API keys）" />
+    <span class="muted">API Key</span><input name="api_key" type="password" autocomplete="off" placeholder="ibk_…（添加后加密保存在服务器，不再显示）" />
     <span class="muted">机器</span><select name="remote_id"><option value="">新建一台</option></select></div>
     <div class="row gap wrap"><button type="button" class="btn" onclick="cloudLookup()">读取已有机器</button><button class="btn primary">添加</button><span id="cloudNote" class="small"></span></div></form>`;
 }
@@ -567,15 +572,20 @@ async function cloudLookup() {
     const r = await api("POST", "/api/cloud/instabox/machines", { api_key: key });
     f.remote_id.innerHTML = `<option value="">新建一台</option>` + r.machines.map((m) => `<option value="${esc(m.id)}" ${m.in_use ? "disabled" : ""}>${esc(m.name)} · ${esc(m.state)} · ${m.spec ? m.spec.vcpus + "核 " + Math.round(m.spec.memMiB / 1024) + "G" : ""}${m.in_use ? "（已添加）" : ""}</option>`).join("");
     const free = r.machines.find((m) => !m.in_use); if (free) f.remote_id.value = free.id;
-    $("cloudNote").textContent = `账号 ${r.account}：${r.machines.length} 台机器`;
+    $("cloudNote").textContent = `账号 ${r.account}：${r.machines.length} 台机器。选好机器后点「添加」才会保存`;
   } catch (e) { $("cloudNote").textContent = "读取失败：" + e.message; }
 }
 async function cloudAdd(e) {
-  e.preventDefault(); const f = e.target;
+  e.preventDefault(); const f = e.target; const btn = f.querySelector("button.primary");
+  if (!f.api_key.value.trim()) { $("cloudNote").textContent = "先填 API Key"; return; }
+  btn.disabled = true; $("cloudNote").textContent = "添加中…";
   try {
-    await api("POST", "/api/cloud", { provider: "instabox", name: f.name.value.trim(), api_key: f.api_key.value.trim(), remote_id: f.remote_id.value });
-    f.api_key.value = ""; toast("已添加，正在安装（约 3-6 分钟）"); cloudRefresh();
-  } catch (err) { toast("添加失败：" + err.message); }
+    const r = await api("POST", "/api/cloud", { provider: "instabox", name: f.name.value.trim(), api_key: f.api_key.value.trim(), remote_id: f.remote_id.value });
+    f.api_key.value = "";
+    $("cloudNote").textContent = `已保存为「${r.name}」，正在安装（约 3-6 分钟），完成后点该行的「使用」`;
+    toast("已添加，正在安装"); cloudRefresh(); loadMachines();
+  } catch (err) { $("cloudNote").textContent = "添加失败：" + err.message; toast("添加失败：" + err.message); }
+  finally { btn.disabled = false; }
 }
 async function cloudSetup(id) { try { await api("POST", `/api/cloud/${id}/setup`); toast("开始重新安装"); setTimeout(cloudRefresh, 800); } catch (e) { toast(e.message); } }
 async function cloudRemove(id) {

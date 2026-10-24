@@ -47,6 +47,7 @@ do_install() {
   "$V/bin/python" -m playwright install chromium >>"$LOG" 2>&1 || true
   DISPLAY=$DISP desktop_icons >>"$LOG" 2>&1 || true
   echo INSTALLED > "$ST"
+  toolbox_bg
 }
 
 desktop_icons() {  # "打开桌面上的 LibreCAD": put launchers on the XFCE desktop
@@ -73,6 +74,14 @@ screen_size() {
   xrandr --output "$out" --mode "$SCREEN" 2>/dev/null || xrandr --fb "$SCREEN" 2>/dev/null || true
 }
 
+toolbox_bg() {  # everyday conversion tools (deploy/vm/toolbox-setup.sh), installed once in the background
+  ls "$S"/toolbox-ready-v* >/dev/null 2>&1 && return 0
+  pgrep -f "toolbox-setup.sh" >/dev/null && return 0
+  ( setsid nohup bash -c "git -C '$R' pull -q --ff-only >>'$S/toolbox.log' 2>&1; \
+      [ -f '$R/deploy/vm/toolbox-setup.sh' ] && bash '$R/deploy/vm/toolbox-setup.sh' install" \
+      >/dev/null 2>&1 </dev/null & )
+}
+
 do_ensure() {
   : "${VM_AGENT_TOKEN:?VM_AGENT_TOKEN missing}"
   [ "$(cat "$ST" 2>/dev/null)" = INSTALLED ] || { echo "NOT_INSTALLED $(cat "$ST" 2>/dev/null)"; return 2; }
@@ -87,6 +96,7 @@ DISPLAY=$DISP
 ENV
   umask 022
   screen_size
+  toolbox_bg
   [ -f "$(xdg-user-dir DESKTOP 2>/dev/null || echo $HOME/Desktop)/librecad.desktop" ] || DISPLAY=$DISP desktop_icons >/dev/null 2>&1 || true
   # restart when the token changed (a new API host) or the agent died
   if pgrep -f "vm_agent.server.websocket" >/dev/null && cmp -s "$S/vm-agent.env" "$S/vm-agent.env.running"; then

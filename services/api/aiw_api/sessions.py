@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -58,6 +59,7 @@ class SessionManager:
         self._computers: dict[str, Computer] = {}
         self.held_threads: set[str] = set()   # queue paused because the user pressed stop
         self._drain_lock = asyncio.Lock()
+        self.cloud = None  # CloudManager, set by the API
 
     # ------------------------------------------------------------------ factories
     def _default_computer(self, machine: dict) -> Computer:
@@ -303,6 +305,7 @@ class SessionManager:
         live.cleanup = cleanup
 
         async def runner():
+            nonlocal computer
             self.store.update_task(task.id, TaskStatus.RUNNING.value)
             try:
                 # integrations (MCP servers) are loaded here, off the request path: POST /api/tasks returns at once
@@ -312,12 +315,21 @@ class SessionManager:
                 except Exception as e:  # noqa: BLE001
                     log.warning("integrations unavailable: %s", e)
                     extra = {}
-                loop = AgentLoop(task, sid, computer, self._llm(), ToolExecutor(computer, confirm=confirm, audit=audit),
-                                 control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
-                                 subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(), system_extra=system_extra.strip(),
-                                 config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
-                                                   artifacts_dir=self.settings.artifacts_dir))
-                t = await loop.run()
+                hold = contextlib.nullcontext()
+                cloud = getattr(self, "cloud", None)
+                if cloud and cloud.is_cloud(task.machine_id) and not cleanup:
+                    # an InstaBox machine may be paused (30 idle minutes): wake it, and keep it awake till the end
+                    await cloud.wake(task.machine_id)
+                    hold = cloud.hold(task.machine_id)
+                    computer = self.computer(task.machine_id)   # a restarted agent means a fresh connection
+                async with hold:
+                    loop = AgentLoop(task, sid, computer, self._llm(), ToolExecutor(computer, confirm=confirm, audit=audit),
+                                     control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
+                                     subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(),
+                                     system_extra=system_extra.strip(),
+                                     config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
+                                                       artifacts_dir=self.settings.artifacts_dir))
+                    t = await loop.run()
                 status, result = t.status.value, t.result
             except Exception as e:  # noqa: BLE001
                 status, result = "failed", f"{type(e).__name__}: {e}"

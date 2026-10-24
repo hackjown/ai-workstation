@@ -51,6 +51,12 @@ Rules:
      - a hanzi is about one text height wide: a 175 label of 12 characters is ≈2100 long. A label must fit its
        panel (else put it on a LEADER outside), and no text may overlap another: NOTE lines are 1.8×height apart,
        so the next block starts below the last line of the previous one.
+     - a label must stay inside its table cell / panel / title-block cell: no line may cross a text (a too-long
+       label goes on a LEADER outside, or gets a smaller height).
+     - LEADERs: keep each one short (label just outside the object, under ~6000 at 1:50) and never let two cross:
+       stack the labels in the same order as the points they name, about 1.8×height apart.
+     - dimensions: one DIMH/DIMV chain per side already adds the overall dimension; never dimension the same span
+       again. Segments under ~600 cannot hold their number: give them their own row further out.
      - draw each part at its real position from the quote/images (e.g. the 标题底板 at the TOP of the wall, 踢脚 at the
        bottom), never squeezed into a strip.
      Sizes missing from both files: `ask_user` once with ALL of them; never invent. plan.md is your checklist.

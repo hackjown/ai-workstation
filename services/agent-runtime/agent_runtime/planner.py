@@ -80,6 +80,32 @@ Rules:
      Every one-line item already drawn in this task is skipped automatically, so after a FAILED batch just send the
      same sheet again (only the missing items get typed). Each sheet gets exactly ONE FRAME; draw each element once
      (a 'rect' needs no extra 'line' items along its own edges). Never redraw a finished sheet.
+     LAYOUT RECIPES (sheet-local, 1:50; what a finished professional set looks like):
+     - 立面: floor line y=4000 drawn from x0-400 to x0+L+400; side walls 240 thick as hatched rectangles; ceiling
+       line at y=4000+3000, slab at +3300 with the strip between hatched; level marks ±0.000 / +3.000 / +3.300 just
+       left of the wall. Wall start x0 ≈ 2400 for a 10 m wall, centred for shorter ones. Labels go in TWO bands of
+       stacked rows: above the slab (rows y = slab+300, +650, +1000, ...) and below the floor (rows y = 4000-1300,
+       -1650, ...). Each LEADER goes straight up (or down) from its object to its row, then a short shelf; give the
+       RIGHTMOST object the row nearest the wall, so leaders never cross labels. DIMH of panel widths + overall 500
+       below the floor; DIMV of 踢脚/版面底/版面顶/标题底/标题顶/吊顶/楼板 400 right of the wall. Panel names TEXTC
+       centred in each panel (250); 说明 NOTE top-left (x 1600, y 13900); view title TEXTC 400 centred under the
+       drawing (y≈1700) with '1:50' (250) below it, clear of the title block.
+     - 平面/拆除/天花: room 10000x6000 at x0≈3000, y0≈4200; walls 240 as double lines; door opening with swing arc;
+       segment DIMH/DIMV chains 600 outside the walls and the overall chain 1200 outside, on two sides; LEADER labels
+       in the margin nearest their object (a column right of the room at x≈14000 for the right half, rows above or
+       below the room for the rest; rows 450 apart in the order of their points; every leader under 6000); legend
+       box bottom-left above the view title.
+     - 节点: a node is 1-30 mm thick, invisible at 1:50, so draw every node ENLARGED x10 (label it 1:5): each layer
+       a rect of thickness x10, layers in build-up order, hatch the substrate; LEADERs from each layer to a column
+       of labels on one side (450 apart, same order as the layers); node title TEXTC under each node; 2-3 rows
+       of nodes per sheet, each in its own area.
+     - 目录/说明: a table with rect cells and row lines; text sits 120 inside its cell (height <= cell height - 150);
+       设计说明 as NOTE blocks in 2 columns (x 1600 and x 11000), headed by TEXT 250.
+     REVISION (the user checked a set and asks for fixes in a follow-up): never redraw, never repeat a FRAME. For
+     each fix: ['SHEET|n','LIST|x1,y1|x2,y2'] shows the entities in that window (sheet-local boxes); then
+     ['SHEET|n','ERASE|x1,y1|x2,y2', ...corrected items] deletes everything lying fully inside the window and draws
+     the replacement in the same call ('ERASETEXT|exact text' deletes one label). Keep windows tight so nothing
+     else is lost. Then SAVE to the SAME file, PDF, send_file both, and list every change in done.
   4. Never send a bare 'text' and never click inside the Text dialog. Layers: Layer List panel when useful.
   5. SAVE after every sheet (['SAVE|cad/<name>.dxf']; Chinese file names are fine). FINISH: SAVE, then
      ['PDF|cad/<name>.dxf|cad/<name>.pdf'] (LibreCAD's own dxf2pdf, one A3 page per sheet, and it reports entities per

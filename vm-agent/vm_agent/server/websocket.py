@@ -74,6 +74,32 @@ async def serve(host: str, port: int, router: Router, token: str | None, ready: 
         await (stop.wait() if stop else asyncio.Future())
 
 
+def _kick_toolbox():
+    """Install the everyday conversion toolbox (office, PDF, OCR, images, audio/video, e-books, archives) once, in
+    the background, on the machine this agent runs on: deploy/vm/toolbox-setup.sh, marker ~/.config/aiw/toolbox-ready-v*.
+    Without a password-less sudo it only records NEEDS_SUDO; then run the script once by hand."""
+    import glob
+    import subprocess
+    from pathlib import Path
+    if os.environ.get("AIW_NO_TOOLBOX"):
+        return
+    cfg = Path.home() / ".config" / "aiw"
+    if glob.glob(str(cfg / "toolbox-ready-v*")):
+        return
+    script = Path(__file__).resolve().parents[2] / "deploy" / "vm" / "toolbox-setup.sh"
+    if not script.is_file():
+        return
+    try:
+        if subprocess.run(["pgrep", "-f", "toolbox-setup.sh"], capture_output=True).returncode == 0:
+            return
+        cfg.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["bash", str(script), "install"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        log.info("toolbox install started in the background (%s)", script)
+    except Exception as ex:  # noqa: BLE001
+        log.warning("toolbox install not started: %s", ex)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=os.environ.get("VM_AGENT_HOST", "0.0.0.0"))
@@ -85,6 +111,7 @@ def main():
     token = os.environ.get("VM_AGENT_TOKEN")
     if not token:
         log.warning("VM_AGENT_TOKEN not set: agent is UNAUTHENTICATED")
+    _kick_toolbox()
     router = Router(make_backend(args.backend), args.max_width)
     asyncio.run(serve(args.host, args.port, router, token))
 

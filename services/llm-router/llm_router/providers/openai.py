@@ -77,6 +77,16 @@ class OpenAIProvider(LLMProvider):
             # a long script inside `command` gets cut (and arrives as {}) on gateways with a small default
             "max_tokens": self._max_tokens(),
         }
+        saved = self.thinking
+        if getattr(req, "thinking", None):
+            self.thinking = req.thinking.lower()
+            body["max_tokens"] = self._max_tokens()
+        try:
+            return await self._decide(req, body)
+        finally:
+            self.thinking = saved
+
+    async def _decide(self, req: LLMRequest, body: dict) -> LLMDecision:
         required = {t["name"]: (t.get("parameters") or {}).get("required") or [] for t in req.tools}
         data, msg, calls, name, args = {}, {}, [], "", {}
         attempts, out_tokens = 0, 0
@@ -98,6 +108,11 @@ class OpenAIProvider(LLMProvider):
                     # any tool call, three times in a row (run ac3, 402 s, then the task failed).
                     cut = choice.get("finish_reason") == "length"
                     said = (msg.get("content") or "")[-1500:]
+                    if cut and self.thinking != "off":
+                        # the whole budget went into hidden reasoning (16k tokens, ~4.5 min on DeepSeek, three times
+                        # in a row = 13 min with nothing drawn, task-960): answer the retry without thinking
+                        self.thinking = "off"
+                        body["max_tokens"] = int(os.environ.get("AIW_LLM_MAX_TOKENS_THINKING", "16384"))
                     ask = ("Your previous reply was CUT OFF at the length limit before any tool call. Do not repeat that "
                            "reasoning: think in a few lines, then call exactly one tool now. Split long content: write "
                            "one part per call (files_write with append=true adds to the file)."

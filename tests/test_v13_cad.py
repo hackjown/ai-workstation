@@ -78,7 +78,7 @@ def test_librecad_command_line():
     assert f"xdotool type --delay {cad.TYPE_DELAY_MS} -- line" in s and "-- @6000,0" in s and "key Escape" in s
     assert 'librecad "${VM_AGENT_FILES_ROOT:-$HOME/workspace}/cad/a.dxf"' in s
     assert s.rstrip().endswith("then zoomauto'") and "-- za;" in s
-    assert "-- za;" not in cad.librecad_type_command(["text"])
+    assert "trap - EXIT" in cad.librecad_type_command(["text"])
 
 
 def test_cad_task_detection():

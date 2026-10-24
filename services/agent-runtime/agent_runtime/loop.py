@@ -816,7 +816,7 @@ class AgentLoop:
         if a.get("open", True):
             view = info.get("view_dxf") or info["dxf"]
             await self.tools.run("shell", {"command": f"cd \"${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}/{_cad.CAD_DIR}\" && pkill -x librecad; "
-                                           f"(DISPLAY=:0 nohup librecad '{view}' >/dev/null 2>&1 &) ; sleep 2; echo ok",
+                                           f"(nohup librecad '{view}' >/dev/null 2>&1 &) ; sleep 2; echo ok",
                                            "timeout": 20}, intent=intent)
         sent = []
         if a.get("deliver", True):

@@ -1,6 +1,7 @@
 """V1.3: cad_draw builds an ezdxf script with the helper prelude; read_image describes files for drafting."""
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -535,3 +536,95 @@ def test_layout_clean_elevation_passes():
                "TEXTC|4500,5500|250|历史沿革", "DIMH|4000|3200|2500,6500,8500,10500,12500",
                "LEADER|12500,6500|13300,7200|175|面层：PVC板", "LEADER|12500,5000|13300,5600|175|基层：轻钢龙骨"], 0, d)
     assert cad.layout_issues(d)[0] == []
+
+
+# ---------------------------------------------------------------- V1.4.1: local revisions
+def test_cad_mode_revision_in_drawing_thread():
+    from agent_runtime import cad
+    ctx = "EARLIER IN THIS CONVERSATION:\n- user: 打开桌面上的 LibreCAD 画施工图\n  result (succeeded): cad/x.dxf"
+    assert cad.cad_mode("左侧墙的标题底板位置不对，改到顶上", ctx) == "revise"
+    assert cad.cad_mode("节点图的引线压线了，调整一下", ctx) == "revise"
+    assert cad.cad_mode("把立面图重新画一遍", ctx) == "fresh"
+    assert cad.cad_mode("帮我添加一个 Excel 表格", ctx) is None      # not about the drawing
+    assert cad.cad_mode("为什么上次失败", ctx) is None
+    assert cad.cad_mode("打开 LibreCAD 画施工图", None) == "fresh"
+    assert cad.cad_mode("要出的图：0. 目录 ... " + "x" * 700 + " 施工图 把那张补画完整", ctx) == "fresh"
+
+
+def test_split_edits_sheet_local_and_absolute():
+    from agent_runtime import cad
+    e, rest, sh = cad.split_edits(["SHEET|4", "ERASE|2000,3000|5000,6000", "ERASE|101000,100|102000,200",
+                                   "ERASETEXT|历史沿革", "LIST|4", "rect|1,1|2,2"], 0)
+    assert e[0]["box"] == [102000, 3000, 105000, 6000] and e[0]["sheet"] == 4
+    assert e[1]["box"] == [101000, 100, 102000, 200]
+    assert e[2] == {"op": "erasetext", "text": "历史沿革", "sheet": 4}
+    assert e[3]["op"] == "list" and e[3]["box"][0] == 100000
+    assert rest == ["SHEET|4", "rect|1,1|2,2"] and sh == 4
+
+
+def test_edit_script_erases_window_and_lists(tmp_path):
+    ezdxf = pytest.importorskip("ezdxf")
+    import subprocess
+    from agent_runtime import cad
+    (tmp_path / "cad").mkdir()
+    d = ezdxf.new(); m = d.modelspace()
+    m.add_line((102500, 3000), (104000, 3000))
+    m.add_text("历史沿革", height=250, dxfattribs={"insert": (102600, 4000)})
+    m.add_line((110000, 3000), (112000, 3000))
+    d.saveas(tmp_path / "cad" / "t.dxf")
+    e, _, _ = cad.split_edits(["SHEET|4", "LIST|4", "ERASE|2000,2500|5000,5000"], 0)
+    out = subprocess.run(["bash", "-c", cad.edit_command("cad/t.dxf", e, texts=True)], capture_output=True, text=True,
+                         env={**os.environ, "VM_AGENT_FILES_ROOT": str(tmp_path)}).stdout
+    info = cad.parse_edit(out)
+    assert info["erased"] == 2 and len(info["list"]) == 3 and info["texts"] == []
+    assert len(ezdxf.readfile(tmp_path / "cad" / "t.dxf").modelspace()) == 1
+
+
+def test_seed_text_boxes_feed_layout_check():
+    from agent_runtime import cad
+    boxes = cad.seed_text_boxes([[102000, 4000, 250, "历史沿革"]])
+    issues, _ = cad.layout_issues([(4, "TEXT|102100,4050|250|领导关怀")], boxes)
+    assert any("overlap" in i or "重叠" in i or "on top" in i for i in issues), issues
+
+
+async def test_cad_erase_then_redraw_same_item(env):  # noqa: F811
+    """A revision erases a spot and draws the corrected item there, even if an identical item was typed before."""
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    loop = AgentLoop(Task(prompt="在 LibreCAD 画施工图"), "s-rev", comp, LLMRouter([ScriptedProvider([])]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=2, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")))
+    loop._cad_frames, loop._cad_text_boxes, loop._cad_typed_texts, loop._cad_rejects = set(), {}, set(), {}
+    loop._cad_sheet, loop._cad_ok = 0, 0
+    typed, opened = [], []
+
+    async def fake_type(cmds, open_path, intent):
+        typed.append(cmds); opened.append(open_path)
+        return None, {}, True, "saved cad/x.dxf" if any(str(c).startswith("SAVE") for c in cmds) else "typed"
+
+    async def fake_edits(edits, intent):
+        loop._cad_keys_saved.clear(); loop._cad_keys_unsaved.clear(); loop._cad_typed_texts.clear()
+        return "erased 3 entities", True
+    loop._type_cad = fake_type
+    r = await loop._cad_command({"commands": ["FRAME|4|x|4|1:50|p", "rect|2500,4000|12500,7000", "SAVE|cad/x.dxf"]}, "i")
+    assert loop._cad_file == "cad/x.dxf"
+    loop._cad_edits = fake_edits
+    r = await loop._cad_command({"commands": ["SHEET|4", "ERASE|2000,3500|13000,7500", "rect|2500,4000|12500,7000"]}, "i")
+    assert "erased 3" in r and "NOT TYPED" not in r and "already" not in r
+    assert opened[-1] == "cad/x.dxf" and any("102500" in str(c) for c in typed[-1]), typed[-1]
+    assert 4 in loop._cad_touched
+
+
+async def test_cad_edit_without_saved_file_is_refused(env):  # noqa: F811
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    loop = AgentLoop(Task(prompt="在 LibreCAD 画施工图"), "s-rev2", comp, LLMRouter([ScriptedProvider([])]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=2, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")))
+    loop._cad_sheet = 0
+    r = await loop._cad_command({"commands": ["SHEET|2", "LIST|2"]}, "i")
+    assert r.startswith("FAILED") and "SAVE" in r

@@ -306,6 +306,15 @@ class CloudManager:
         raise CloudError("InstaBox machine did not come back to running")
 
     async def _ensure_agent(self, ib: InstaBox, rid: str, mid: str):
+        # refresh the machine's copy of aiw-cloud.sh once per API process: a machine set up by an older version keeps
+        # its old script otherwise (the toolbox install, for one, rides on `ensure`)
+        synced = self.__dict__.setdefault("_script_synced", set())
+        if rid not in synced:
+            with contextlib.suppress(Exception):
+                await ib.exec(rid, f"mkdir -p $HOME/.config/aiw && cat > {REMOTE_SCRIPT}.new && "
+                                   f"mv -f {REMOTE_SCRIPT}.new {REMOTE_SCRIPT} && chmod +x {REMOTE_SCRIPT}",
+                              60, stdin=SCRIPT.read_text())
+                synced.add(rid)
         r = await ib.exec(rid, f"bash {REMOTE_SCRIPT} ensure", 60, envs={"VM_AGENT_TOKEN": self.agent_token})
         out = (r.get("stdout") or "").strip()
         if not out.startswith("AGENT_"):

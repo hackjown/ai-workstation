@@ -72,10 +72,12 @@ TOOLS: list[ToolSpec] = [
              "Read an image or a PDF page in ~/workspace (an uploaded design drawing, rendering, sketch, quote-sheet "
              "photo, or a cad_draw preview) with the vision model. Returns a structured Chinese description: drawing "
              "type, every readable dimension, components left-to-right, materials, and unclear points. Ask a specific "
-             "question to focus it, e.g. '电视墙从左到右每段宽度是多少'.",
+             "question to focus it, e.g. '电视墙从左到右每段宽度是多少'. Several images: pass them all in `paths` in ONE "
+             "call; they are read in parallel (about 50 s in total instead of 50 s each).",
              {"path": {"type": "string", "description": "relative to ~/workspace, e.g. uploads/设计图.jpg"},
+              "paths": {"type": "array", "items": {"type": "string"}, "description": "several images read at once"},
               "page": {"type": "integer", "description": "PDF page, 1-based"},
-              "question": {"type": "string"}}, ["path"]),
+              "question": {"type": "string"}}, []),
     ToolSpec("cad_command", None,
              "Draw in the LibreCAD window on the desktop, like a draftsman typing at its command line. Each item of "
              "`commands` is typed into LibreCAD's command line and followed by Enter, in order; the user watches it. "

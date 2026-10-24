@@ -244,8 +244,11 @@ class AgentLoop:
             f"0. REVISION of the existing drawing {self._cad_file} (now open in LibreCAD, {len(texts)} texts on it). "
             "Change ONLY what the user asked; never redraw a sheet or a FRAME. Per fix: cad_command ['SHEET|n', "
             "'LIST|x1,y1|x2,y2'] to see what is there, then ['SHEET|n', 'ERASE|x1,y1|x2,y2' (deletes everything lying "
-            "fully inside the window) or 'ERASETEXT|exact text', then the corrected items]. Then SAVE to the same file, "
-            "PDF, send_file both, and done listing each change.")
+            "fully inside the window: check the ERASED list it returns) or 'ERASETEXT|exact whole text|x1,y1|x2,y2' (one "
+            "label; the window is needed when the text occurs more than once), then the corrected items]. Labels, walls "
+            "and index letters the user did not name stay as they are: if a new line clashes with one, move your item or "
+            "shift that label slightly, never delete it. Then SAVE to the same file, PDF, send_file both, and done "
+            "listing each change.")
 
     async def _plan(self):
         try:
@@ -749,6 +752,13 @@ class AgentLoop:
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="layout check",
                             result={"commands": raw[:80], "count": len(raw), "bad": bad[:10], "issues": issues[:20]})
             msg = "NOT TYPED, nothing was drawn: fix these and send the whole batch again."
+            if edits:  # task-2c3: the erase had run, the model believed it had not and erased again further out
+                msg = ("The ERASE/ERASETEXT part of this batch WAS applied (" + edit_note.strip() + "); do not send it again. "
+                       "The drawing part was NOT TYPED: fix these and send only the drawing commands again.")
+            if self._cad_mode == "revise" and issues:
+                msg += (" This is a revision: a label the user did not name that now clashes with your new lines stays on the "
+                        "drawing. Move your new item, or move that label a little (ERASETEXT|exact text|x1,y1|x2,y2, then "
+                        "the same text nearby); never delete it.")
             if fixed:
                 msg += f" (already auto-fixed and kept in the batch: {len(fixed)} items; fix only what is listed here)"
             if bad:
@@ -894,7 +904,14 @@ class AgentLoop:
         note = ""
         if any(e["op"] != "list" for e in edits):
             note += f"erased {erased} entities from {self._cad_file} (LibreCAD reopened on it)."
-            if not erased:
+            gone = info.get("gone") or []
+            if gone:  # task-2c3: a wide window took the 形象墙 polyline and labels along with the door, unnoticed
+                note += (" ERASED: " + "; ".join(gone[:25]) + (f"; ... {len(gone) - 25} more" if len(gone) > 25 else "") +
+                         ". If any of these is not part of what the user asked to change, draw it again exactly as it was.")
+            for amb in info.get("ambiguous") or []:
+                note += (f" ERASETEXT|{amb['text']} matched {len(amb['at'])} texts on the sheet (at {', '.join(amb['at'])}); "
+                         f"nothing was erased. Name the one to remove with a window: ERASETEXT|{amb['text']}|x1,y1|x2,y2.")
+            if not erased and not info.get("ambiguous"):
                 note += " Nothing lay fully inside the window(s): LIST the spot and use a window that encloses the items."
         if listed:
             note += " LIST (sheet-local x,y of each entity's box):\n" + "\n".join(listed[:150])

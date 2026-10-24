@@ -33,7 +33,8 @@ APT_GROUPS=(
   "python:python3-pip python3-venv python3-openpyxl python3-xlrd python3-docx python3-pptx python3-pandas python3-matplotlib python3-lxml python3-bs4 python3-markdown python3-yaml python3-chardet python3-ezdxf python3-qrcode"
 )
 # not packaged (or too old) in Debian: user-level pip, never touching the system Python's own packages
-PIP_PKGS="python-pptx pdf2docx"
+# pdf2docx pulls numpy 2 into ~/.local, which breaks Debian 12 C extensions built on numpy 1: upgrade those too
+PIP_PKGS="python-pptx pdf2docx pandas numexpr bottleneck matplotlib"
 # fallback via pip only when the Debian package is missing (e.g. pdfplumber on Debian 12)
 PIP_FALLBACK="pdfplumber:pdfplumber pandas:pandas fitz:pymupdf pypdf:pypdf reportlab:reportlab openpyxl:openpyxl docx:python-docx"
 

@@ -34,13 +34,15 @@ APT_GROUPS=(
 )
 # not packaged (or too old) in Debian: user-level pip, never touching the system Python's own packages
 PIP_PKGS="python-pptx pdf2docx"
+# fallback via pip only when the Debian package is missing (e.g. pdfplumber on Debian 12)
+PIP_FALLBACK="pdfplumber:pdfplumber pandas:pandas fitz:pymupdf pypdf:pypdf reportlab:reportlab openpyxl:openpyxl docx:python-docx"
 
 status() {
   if [ -f "$MARK" ]; then echo "READY v$VER"; elif [ -s "$ST" ]; then cat "$ST"; else echo NONE; fi
 }
 
 check() {
-  for c in soffice pandoc pdftotext pdftoppm qpdf gs mutool pdftk img2pdf ocrmypdf tesseract convert magick cwebp \
+  for c in soffice pandoc pdftotext pdftoppm qpdf gs mutool pdftk img2pdf ocrmypdf tesseract convert cwebp \
            heif-convert rsvg-convert inkscape ffmpeg ffprobe sox lame flac mediainfo yt-dlp ebook-convert 7z zip unzip \
            unrar-free zstd jq dos2unix uchardet enca; do
     command -v "$c" >/dev/null && echo "ok      $c" || echo "missing $c"
@@ -73,6 +75,9 @@ run() {
   if python3 -m pip --version >/dev/null 2>&1; then
     # shellcheck disable=SC2086
     for p in $PIP_PKGS; do python3 -m pip install -q --user --break-system-packages "$p" >>"$LOG" 2>&1 || true; done
+    for mp in $PIP_FALLBACK; do
+      python3 -c "import ${mp%%:*}" 2>/dev/null || python3 -m pip install -q --user --break-system-packages "${mp#*:}" >>"$LOG" 2>&1 || true
+    done
   fi
   # ImageMagick's Debian policy refuses PDF/PS: allow them, the agent converts PDFs to images all the time
   for pol in /etc/ImageMagick-6/policy.xml /etc/ImageMagick-7/policy.xml; do

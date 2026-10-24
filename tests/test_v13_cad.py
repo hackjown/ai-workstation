@@ -349,7 +349,7 @@ def test_textc_centres():
     (t,), _, _ = cad.place(["TEXTC|10000,5000|200|一二三四"], 0)
     pt, h, body = cad._parse_text(t)
     x, y = cad._xy(pt)
-    assert abs(x - (10000 - 2 * 1.05 * 200)) < 2 and y == 4900
+    assert abs(x - (10000 - 2 * 1.25 * 200)) < 2 and y == 4900
 
 
 def test_layout_issues():
@@ -645,3 +645,66 @@ def test_autofix_moves_labels_and_drops_duplicate_dims():
 def test_textc_split_xy_form_is_understood():
     assert not any(c.startswith("#BAD") for c in cad.expand(["TEXTC|10500|13600|400|图纸目录"]))
     assert cad.normalize("TEXT|9700|13600|400|图纸目录") == "TEXT|9700,13600|400|图纸目录"
+
+
+def test_v151_label_off_the_sheet_is_pulled_inside():
+    """run e7d: 'LEADER|2640,4120|1500,4120' wrote its label leftwards off sheet 5 (stray, dropped from the PDF)."""
+    from agent_runtime import cad
+    raw = ["SHEET|5", "LEADER|2640,4120|1500,4120|175|黑钛拉丝不锈钢踢脚线 高100"]
+    out, notes = cad.autofix(raw, 5, {})
+    d: list = []
+    cad.place(out, 5, d)
+    iss, _ = cad.layout_issues(d, {})
+    assert not [i for i in iss if "outside the border" in i], (out, iss)
+    assert notes
+
+
+def test_v151_text_past_the_right_border_is_clamped():
+    from agent_runtime import cad
+    c = "TEXT|19000,9000|250|吊顶：轻钢龙骨9厘夹板打底面封石膏板"
+    cl = cad._clamp(c, 0)
+    x, _ = cad._xy(cl.split("|")[1])
+    b = cad.text_box(x, 9000, 250, c.split("|")[3])
+    assert b[2] <= cad.FRAME_X2 and b[0] >= cad.FRAME_X1
+
+
+def test_v151_text_into_title_block_moves_up():
+    from agent_runtime import cad
+    cl = cad._clamp("TEXT|14000,900|175|说明文字", 2)
+    assert cad._xy(cl.split("|")[1])[1] >= cad.TB_Y2
+
+
+def test_v151_hanzi_width_matches_librecad():
+    from agent_runtime import cad
+    # '入口形象墙正面立面图（十六字方针）' at h=400 measured 8460 wide on run e7d's PDF
+    w = cad.text_box(0, 0, 400, "入口形象墙正面立面图（十六字方针）")[2]
+    assert 8000 <= w <= 8800
+
+
+def test_v151_stray_goes_to_the_sheet_it_sits_on(tmp_path):
+    ezdxf = pytest.importorskip("ezdxf")
+    from agent_runtime import cad
+    d = ezdxf.new()
+    m = d.modelspace()
+    for n in (4, 5):
+        for i in range(50):
+            m.add_line((n * 25000 + 2000, 2000 + i), (n * 25000 + 9000, 2000 + i))
+    m.add_text("踢脚线", dxfattribs={"height": 175, "insert": (5 * 25000 - 1100, 4120)})  # left of sheet 5's origin
+    m.add_text("远处", dxfattribs={"height": 175, "insert": (5 * 25000 + 30000, 4120)})
+    src = tmp_path / "a.dxf"
+    d.saveas(src)
+    script = tmp_path / "s.py"
+    script.write_text(cad.SPLIT_PDF_SCRIPT.replace('subprocess.run(["librecad"', 'False and subprocess.run(["librecad"'))
+    r = subprocess.run([sys.executable, str(script), str(src), str(tmp_path / "o.pdf")], capture_output=True, text=True)
+    if "AIW_SHEETS" in r.stdout:
+        assert '"4"' not in r.stdout.split('"stray"')[1].split("}")[0]
+
+
+def test_v151_untangle_deals_labels_in_point_order():
+    from agent_runtime import cad
+    raw = ["SHEET|8", "LEADER|4000,6000|6500,4400|175|甲", "LEADER|4000,4500|6500,6200|175|乙", "LEADER|4000,5200|6500,5300|175|丙"]
+    out, n = cad.untangle(raw, 8)
+    d: list = []
+    cad.place(out, 8, d)
+    iss, _ = cad.layout_issues(d, {})
+    assert n and not [i for i in iss if "crosses another leader" in i]

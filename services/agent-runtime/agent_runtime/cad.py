@@ -1204,7 +1204,15 @@ def split_edits(commands: list[str], sheet: int = 0) -> tuple[list[dict], list[s
         ox = cur * SHEET_PITCH
         if op == "erasetext":
             if args and args[0]:
-                edits.append({"op": "erasetext", "text": args[0], "sheet": cur})
+                ed = {"op": "erasetext", "text": args[0], "sheet": cur}
+                if len(args) >= 3:  # ERASETEXT|内容|x1,y1|x2,y2: only that text inside that window
+                    try:
+                        (x1, y1), (x2, y2) = _xy(args[1]), _xy(args[2])
+                        ox = cur * SHEET_PITCH
+                        ed["box"] = [min(x1, x2) + ox, min(y1, y2), max(x1, x2) + ox, max(y1, y2)]
+                    except Exception:  # noqa: BLE001
+                        pass
+                edits.append(ed)
             continue
         if op == "list" and len(args) == 1 and re.fullmatch(r"\d+", args[0]):
             n = int(args[0])
@@ -1247,14 +1255,18 @@ def body(e):
     return ""
 def inside(b, w): return b and b[0] >= w[0] - 1 and b[1] >= w[1] - 1 and b[2] <= w[2] + 1 and b[3] <= w[3] + 1
 def r(v): return int(round(v))
-out = {"erased": 0, "list": [], "texts": []}
+out = {"erased": 0, "list": [], "texts": [], "gone": []}
 changed = False
 for ed in edits:
     if ed["op"] in ("erase", "list"):
         w = ed["box"]
         hit = [e for e in msp if inside(ext(e), w)]
         if ed["op"] == "erase":
-            for e in hit: msp.delete_entity(e)
+            ox = (int(w[0]) // P) * P
+            for e in hit:
+                b = ext(e); s = body(e)
+                out["gone"].append(f"{e.dxftype()} {r(b[0]-ox)},{r(b[1])}..{r(b[2]-ox)},{r(b[3])}" + (f" '{s[:30]}'" if s else ""))
+                msp.delete_entity(e)
             out["erased"] += len(hit); changed = changed or bool(hit)
         else:
             ox = (int(w[0]) // P) * P
@@ -1263,11 +1275,29 @@ for ed in edits:
                 out["list"].append(f"{e.dxftype()} {r(b[0]-ox)},{r(b[1])}..{r(b[2]-ox)},{r(b[3])}" + (f" '{s[:40]}'" if s else ""))
             if len(hit) > 150: out["list"].append(f"... {len(hit) - 150} more")
     elif ed["op"] == "erasetext":
-        n = ed.get("sheet")
-        for e in [e for e in msp if e.dxftype() in ("TEXT", "MTEXT") and ed["text"] in body(e)]:
+        # task-2c3: 'ERASETEXT|D' matched every text containing a D on the sheet and 'ERASETEXT|入口' took '入口墙D...'
+        # with it. A text is now erased only when its whole content equals the given one, and when that matches
+        # more than one text without a window, nothing is erased and the candidates are listed.
+        n, want, w = ed.get("sheet"), ed["text"].strip(), ed.get("box")
+        cand = []
+        for e in msp:
+            if e.dxftype() not in ("TEXT", "MTEXT") or body(e).strip() != want:
+                continue
             b = ext(e)
             if n is not None and b and not (n * P - 1 <= b[0] <= n * P + W + 1):
                 continue
+            if w and not (b and w[0] - 1 <= (b[0] + b[2]) / 2 <= w[2] + 1 and w[1] - 1 <= (b[1] + b[3]) / 2 <= w[3] + 1):
+                continue
+            cand.append((e, b))
+        if len(cand) > 1 and not w:
+            ox = (n or 0) * P
+            out.setdefault("ambiguous", []).append(
+                {"text": want, "at": [f"{r(b[0]-ox)},{r(b[1])}" for _, b in cand if b][:12]})
+            continue
+        for e, b in cand:
+            if b:
+                ox = (n or 0) * P
+                out["gone"].append(f"{e.dxftype()} {r(b[0]-ox)},{r(b[1])} '{body(e)[:30]}'")
             msp.delete_entity(e); out["erased"] += 1; changed = True
 if "--texts" in sys.argv:  # every text on the drawing, for the layout check of the revision
     for e in msp.query("TEXT"):

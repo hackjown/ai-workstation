@@ -269,6 +269,7 @@ class AgentLoop:
         self._last_sent_thumb = None
         self._last_ok: Optional[tuple] = None
         self._cad_ok = 0           # successful cad_command batches
+        self._cad_calls = 0        # cad_command calls, accepted or not (drafting has begun)
         self._last_ok_cad = False  # did the last cad_command go through
         self._sheet_audit: dict = {}  # entities per sheet from the last PDF export
         self._cad_pdf_ok = False      # PDF made by LibreCAD (PDF|...), not by soffice
@@ -331,7 +332,11 @@ class AgentLoop:
                 system=self.system, task=self._task_with_plan(), history=self.history,
                 screenshot_b64=send_shot, tools=tool_schemas([t[0] for t in self.extra_tools.values()],
                                    hide=() if _cad.script_drawing_allowed(self.task.prompt) else ("cad_draw",)),
-                screen=shown, note=note, screen_desc=desc)
+                screen=shown, note=note, screen_desc=desc,
+                # drafting sheets from cad/plan.md is transcription: with thinking on, DeepSeek spent 11-13 min per
+                # sheet reasoning about label positions in its head and often ran out of budget before any tool call
+                # (task-960: 2 sheets in 79 min). The layout auto-fix moves colliding labels instead.
+                thinking=(os.environ.get("AIW_CAD_DRAW_THINKING", "off") if self._cad_task and getattr(self, "_cad_calls", 0) else None))
             decision = None
             tries = int(os.environ.get("AIW_DECIDE_RETRIES", "4"))
             for attempt in range(tries):
@@ -683,6 +688,7 @@ class AgentLoop:
     async def _cad_command(self, a: dict, intent: str) -> str:
         """Type LibreCAD command-line commands into the visible LibreCAD window (xdotool), like a person drafting."""
         raw = [str(c) for c in (a.get("commands") or []) if str(c).strip()]
+        self._cad_calls = getattr(self, "_cad_calls", 0) + 1
         if not raw:
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="missing args ['commands']", result={})
             return "FAILED: cad_command needs `commands`, e.g. ['line','0,0','6000,0','ESC']"
@@ -707,8 +713,15 @@ class AgentLoop:
         sheet_before = self._cad_sheet
         if a.get("open"):  # LibreCAD is restarted on the file: whatever was typed since the last save is gone
             self._cad_keys_unsaved.clear()
-        raw, keys, already = _cad.dedupe(raw[:CAD_MAX_BATCH], self._cad_sheet,
-                                         self._cad_keys_saved | self._cad_keys_unsaved)
+        have = self._cad_keys_saved | self._cad_keys_unsaved
+        raw, keys, already = _cad.dedupe(raw[:CAD_MAX_BATCH], self._cad_sheet, have)
+        fixed: list = []
+        if os.environ.get("AIW_CAD_AUTOFIX", "1") != "0" and raw:
+            # after dedupe: an item resent at its old spot must be skipped as already drawn, not moved off itself
+            raw, fixed = _cad.autofix(raw, self._cad_sheet, self._cad_text_boxes)
+            raw, keys, more_dup = _cad.dedupe(raw, self._cad_sheet, have)
+            already += more_dup
+        self._cad_fixed = fixed
         if already and not any(k is not None or not _cad._SHEET.match(c) for c, k in zip(raw, keys)):
             self._cad_sheet = _cad.place(raw, self._cad_sheet)[1]
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=True, error=None,
@@ -726,13 +739,15 @@ class AgentLoop:
         bad = [c[5:] for c in cmds if c.startswith("#BAD ")]
         issues, boxes = _cad.layout_issues(drawn, self._cad_text_boxes)
         key = self._cad_sheet
-        if (bad or issues) and self._cad_rejects.get(key, 0) < 2:
+        if (bad or issues) and self._cad_rejects.get(key, 0) < int(os.environ.get("AIW_CAD_MAX_REJECTS", "1")):
             # checked before typing: a misplaced or unreadable batch is cheaper to fix in the plan than on the canvas
             self._cad_rejects[key] = self._cad_rejects.get(key, 0) + 1
             self._cad_sheet = sheet_before
             await self.emit(EventType.ACTION_RESULT, tool="cad_command", success=False, error="layout check",
                             result={"commands": raw[:80], "count": len(raw), "bad": bad[:10], "issues": issues[:20]})
             msg = "NOT TYPED, nothing was drawn: fix these and send the whole batch again."
+            if fixed:
+                msg += f" (already auto-fixed and kept in the batch: {len(fixed)} items; fix only what is listed here)"
             if bad:
                 msg += (f" UNKNOWN COMMANDS {bad[:6]}: use 'line|x1,y1|x2,y2|...', 'rect|x1,y1|x2,y2', 'circle|x,y|r', "
                         f"'arc|cx,cy|r|a1|a2', TEXT/TEXTC/NOTE/LEADER/DIMH/DIMV, or plain tool names with one point per item.")
@@ -807,6 +822,8 @@ class AgentLoop:
                      f" never resend finished sheets)")
         if issues:
             more += f" (typed although the layout check still finds: {'; '.join(issues[:6])})"
+        if getattr(self, "_cad_fixed", None):
+            more += f" (layout auto-fixed {len(self._cad_fixed)} items: {'; '.join(self._cad_fixed[:5])})"
         audit = ""
         if m and self._sheet_audit.get("thin"):
             audit = (f" THIN SHEETS {self._sheet_audit['thin']} (entities per sheet {self._sheet_audit.get('counts')}): "
@@ -947,6 +964,22 @@ class AgentLoop:
                 f"opened in LibreCAD: {bool(a.get('open', True))}.{tip}")
 
     async def _read_image(self, a: dict) -> str:
+        """read_image with paths=[...]: all images at once. Read one per step, the 8 design images of task-960 took
+        7.5 min (about 50 s each on the vision model); in parallel they take about as long as the slowest one."""
+        paths = [str(p) for p in (a.get("paths") or []) if str(p).strip()]
+        if a.get("path") and str(a["path"]) not in paths:
+            paths.insert(0, str(a["path"]))
+        if len(paths) <= 1:
+            return await self._read_image_one({**a, "path": paths[0] if paths else ""})
+        sem = asyncio.Semaphore(int(os.environ.get("AIW_READ_IMAGE_PARALLEL", "4")))
+
+        async def one(p):
+            async with sem:
+                return await self._read_image_one({**a, "path": p, "paths": None})
+        outs = await asyncio.gather(*[one(p) for p in paths[:12]])
+        return "\n\n".join(outs)
+
+    async def _read_image_one(self, a: dict) -> str:
         """Read an image (or one PDF page) from ~/workspace and have the vision model describe it for drafting."""
         path = (a.get("path") or "").strip().lstrip("/")
         for pre in ("home/aiw/workspace/", "workspace/", "~/workspace/"):
@@ -954,7 +987,7 @@ class AgentLoop:
                 path = path[len(pre):]
         if not path:
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error="missing args ['path']", result={})
-            return "FAILED: read_image needs `path` (relative to ~/workspace)"
+            return "FAILED: read_image needs `path` or `paths` (relative to ~/workspace)"
         if path.lower().endswith(".pdf"):
             page = int(a.get("page") or 1)
             stem = f".preview/{_cad.safe_name(Path(path).stem)}-p{page}"

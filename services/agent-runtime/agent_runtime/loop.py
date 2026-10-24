@@ -880,7 +880,7 @@ class AgentLoop:
         return note.strip(), erased > 0
 
     async def _type_cad(self, cmds: list[str], open_path, intent: str):
-        cmd = _cad.librecad_type_command(cmds, open_path)
+        cmd = _cad.librecad_type_command(cmds, open_path, getattr(self, "_cad_sheet", None))
         texts = sum(1 for c in cmds if _cad._parse_text(c))
         pdf = any(c.lower().startswith("pdf|") for c in cmds)
         # measured on the VM (2026-10-18): ~0.5-1 s per typed item and ~3 s per text once the drawing is big

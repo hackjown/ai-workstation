@@ -83,7 +83,7 @@ class ToolExecutor:
             payload.setdefault("settle", SETTLE[spec.action] * float(os.environ.get("AIW_SETTLE_SCALE", "1")))
         observe = spec.action not in ("computer.screenshot", "shell.exec") and not spec.action.startswith("files.")
         r = await self.computer.execute(spec.action, payload, observe=observe,
-                                        timeout=float(args.get("timeout", _default_timeout(spec.action, args))))
+                                        timeout=float(args.get("timeout", _default_timeout(spec.action, payload))))
         await self._audit({"phase": "result", "tool": name, "action": spec.action, "success": r.success,
                            "error": r.error, "duration_ms": r.duration_ms})
         return ToolOutcome(name, spec.action, r.success, decision, r.result, r.error, r.screenshot)
@@ -108,6 +108,11 @@ _INSTALL = _re.compile(r"\b(pip3?|apt(-get)?|npm|pnpm|yarn|conda|uv)\b.*\b(insta
 
 def _default_timeout(action: str, args: dict) -> float:
     """Shell commands get 60s, package installs and downloads 300s (a mirror can be slow)."""
+    if action == "files.read" and args.get("binary"):
+        # send_file: the whole file comes back base64 in one message. Through the InstaBox tunnel a 3.4 MB PDF did
+        # not arrive within 30 s (task-a0e), three tries failed and the jammed socket timed out the next shell too.
+        import os
+        return float(os.environ.get("AIW_SEND_FILE_TIMEOUT", "300"))
     if action != "shell.exec":
         return 30
     return 300 if _INSTALL.search(str(args.get("command", ""))) else 60

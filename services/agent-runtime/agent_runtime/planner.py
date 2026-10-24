@@ -105,8 +105,8 @@ Rules:
      REVISION (the user checked a set and asks for fixes in a follow-up): never redraw, never repeat a FRAME. For
      each fix: ['SHEET|n','LIST|x1,y1|x2,y2'] shows the entities in that window (sheet-local boxes); then
      ['SHEET|n','ERASE|x1,y1|x2,y2', ...corrected items] deletes everything lying fully inside the window and draws
-     the replacement in the same call ('ERASETEXT|exact text' deletes one label). Keep windows tight so nothing
-     else is lost. Then SAVE to the SAME file, PDF, send_file both, and list every change in done.
+     the replacement in the same call ('ERASETEXT|exact whole text|x1,y1|x2,y2' deletes one label). Keep windows
+     tight so nothing else is lost, and never delete labels the user did not name. Then SAVE to the SAME file, PDF, send_file both, and list every change in done.
   4. Never send a bare 'text' and never click inside the Text dialog. Layers: Layer List panel when useful.
   5. SAVE after every sheet (['SAVE|cad/<name>.dxf']; Chinese file names are fine). FINISH: SAVE, then
      ['PDF|cad/<name>.dxf|cad/<name>.pdf'] (LibreCAD's own dxf2pdf, one A3 page per sheet, and it reports entities per

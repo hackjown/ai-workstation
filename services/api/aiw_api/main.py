@@ -718,6 +718,20 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             store.kv_set("mcp_servers", body["mcp_servers"])
         return await get_integrations()
 
+    @app.post("/api/integrations/mcp/test", dependencies=[Depends(auth)])
+    async def test_mcp(body: dict):
+        """Connect to an MCP server (saved or not) and list its tools, so a preset or a typo shows up at once."""
+        from .integrations import MCPClient
+        url = str(body.get("url") or "")
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(400, "url must be http(s)")
+        hdr = {str(k): secrets.expand(str(v)) for k, v in (body.get("headers") or {}).items()}
+        try:
+            tools = await asyncio.wait_for(MCPClient(secrets.expand(url), hdr).list_tools(), 25)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"MCP server did not answer: {type(e).__name__}: {str(e)[:200]}")
+        return {"tools": [t.get("name") for t in tools]}
+
     @app.post("/api/integrations/openapi", dependencies=[Depends(auth)])
     async def import_openapi(body: OpenAPIIn):
         spec = body.spec

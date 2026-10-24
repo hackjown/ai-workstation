@@ -1077,3 +1077,174 @@ def librecad_type_command(commands: list[str], open_path: str | None = None) -> 
     parts.append(f'echo {len(commands)} > "$PF"')
     parts.append("echo " + shlex.quote(f"typed {len(commands)} commands{tail}"))
     return " && ".join(parts)
+
+
+# --- revising a finished drawing ---------------------------------------------------------------------------------
+# The user checks the set and asks for local fixes ("左侧墙的标题底板要放到顶上", "节点图标注压线了"). Those are made
+# on the drawing that exists: erase the wrong part, draw the right one, save and export again. Nothing is redrawn.
+_CAD_REVISE = re.compile(r"修改|修正|改一下|改成|改为|改到|改掉|调整|局部|有误|不对|错了|有问题|挪|移到|移动|往(上|下|左|右)|"
+                         r"删掉|删除|去掉|补上|补画|加上|增加|添加|替换|换成|放大|缩小|对齐|压线|重叠|"
+                         r"在(原|已有|画好|现有)的?(图|基础|图纸)", re.I)
+_CAD_REDRAW = re.compile(r"重新画|重画|从头|全部重|重新出图|redraw|from scratch", re.I)
+_CAD_TOPIC = re.compile(r"图|墙|标注|尺寸|文字|字|引线|节点|标题|板块|版面|线|框|天花|吊顶|门|踢脚|灯带|做法|比例|图例|dxf|pdf", re.I)
+_CAD_CONTEXT = re.compile(r"施工图|\.dxf|librecad|cad_command|立面图|平面图", re.I)
+
+
+def cad_mode(prompt: str, context: str | None = None) -> str | None:
+    """'fresh' (start from an empty cad/ folder), 'revise' (edit the drawing the thread already has), or None (not a
+    drawing task). A follow-up in a drawing thread is a revision unless it asks for a redraw or is a whole new brief:
+    the user re-sent the full 12-sheet prompt in the same thread before, and that must still start fresh."""
+    p = prompt or ""
+    in_thread = bool(_CAD_CONTEXT.search(context or ""))
+    full_brief = len(p) > 600 or "FRAME|" in p or "要出的图" in p
+    if in_thread and not full_brief and not _CAD_REDRAW.search(p) and (is_cad_task(p) or (_CAD_REVISE.search(p) and _CAD_TOPIC.search(p))):
+        return "revise"
+    if is_cad_task(p):
+        return "fresh"
+    return None
+
+
+_EDIT = re.compile(r"(?i)^\s*(erase|erasetext|list)\s*\|(.*)$")
+
+
+def split_edits(commands: list[str], sheet: int = 0) -> tuple[list[dict], list[str], int]:
+    """Pull 'ERASE|x1,y1|x2,y2', 'ERASETEXT|内容' and 'LIST|x1,y1|x2,y2' (or 'LIST|n' for sheet n) out of a batch.
+    Window points follow the same rule as drawing points: sheet-local after FRAME|n / SHEET|n, or absolute.
+    Returns (edits, the drawing commands left, the sheet current at the end)."""
+    edits, rest = [], []
+    cur = sheet
+    for c in commands:
+        c = str(c)
+        ms = _SHEET.match(c)
+        if ms:
+            cur = max(0, int(float(ms.group(2))))
+            rest.append(c)
+            continue
+        m = _EDIT.match(c)
+        if not m:
+            rest.append(c)
+            continue
+        op, args = m.group(1).lower(), [a.strip() for a in m.group(2).split("|")]
+        ox = cur * SHEET_PITCH
+        if op == "erasetext":
+            if args and args[0]:
+                edits.append({"op": "erasetext", "text": args[0], "sheet": cur})
+            continue
+        if op == "list" and len(args) == 1 and re.fullmatch(r"\d+", args[0]):
+            n = int(args[0])
+            edits.append({"op": "list", "box": [n * SHEET_PITCH, 0, n * SHEET_PITCH + SHEET_W, SHEET_H], "sheet": n})
+            continue
+        try:
+            (x1, y1), (x2, y2) = _xy(args[0]), _xy(args[1])
+        except (ValueError, IndexError):
+            rest.append(f"#BAD {c}")
+            continue
+        if ox > 0 and max(x1, x2) < ox - 2000:  # sheet-local window
+            x1, x2 = x1 + ox, x2 + ox
+        box = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+        edits.append({"op": op, "box": box, "sheet": int(box[0] // SHEET_PITCH)})
+    return edits, rest, cur
+
+
+_EDIT_PY = r'''
+import json, sys
+import ezdxf
+from ezdxf import bbox
+path, edits = sys.argv[1], json.loads(sys.argv[2])
+P, W = 25000, 21000
+doc = ezdxf.readfile(path)
+msp = doc.modelspace()
+cache = bbox.Cache()
+def ext(e):
+    try:
+        b = bbox.extents([e], cache=cache, fast=True)
+        return (b.extmin.x, b.extmin.y, b.extmax.x, b.extmax.y) if b.has_data else None
+    except Exception:
+        return None
+def body(e):
+    t = e.dxftype()
+    if t == "TEXT": return e.dxf.text
+    if t == "MTEXT": return e.plain_text()
+    if t == "DIMENSION":
+        try: return "dim " + str(round(e.get_measurement()))
+        except Exception: return "dim"
+    return ""
+def inside(b, w): return b and b[0] >= w[0] - 1 and b[1] >= w[1] - 1 and b[2] <= w[2] + 1 and b[3] <= w[3] + 1
+def r(v): return int(round(v))
+out = {"erased": 0, "list": [], "texts": []}
+changed = False
+for ed in edits:
+    if ed["op"] in ("erase", "list"):
+        w = ed["box"]
+        hit = [e for e in msp if inside(ext(e), w)]
+        if ed["op"] == "erase":
+            for e in hit: msp.delete_entity(e)
+            out["erased"] += len(hit); changed = changed or bool(hit)
+        else:
+            ox = (int(w[0]) // P) * P
+            for e in hit[:150]:
+                b = ext(e); s = body(e)
+                out["list"].append(f"{e.dxftype()} {r(b[0]-ox)},{r(b[1])}..{r(b[2]-ox)},{r(b[3])}" + (f" '{s[:40]}'" if s else ""))
+            if len(hit) > 150: out["list"].append(f"... {len(hit) - 150} more")
+    elif ed["op"] == "erasetext":
+        n = ed.get("sheet")
+        for e in [e for e in msp if e.dxftype() in ("TEXT", "MTEXT") and ed["text"] in body(e)]:
+            b = ext(e)
+            if n is not None and b and not (n * P - 1 <= b[0] <= n * P + W + 1):
+                continue
+            msp.delete_entity(e); out["erased"] += 1; changed = True
+if "--texts" in sys.argv:  # every text on the drawing, for the layout check of the revision
+    for e in msp.query("TEXT"):
+        try:
+            out["texts"].append([r(e.dxf.insert.x), r(e.dxf.insert.y), round(e.dxf.height), e.dxf.text[:60]])
+        except Exception:
+            pass
+    for e in msp.query("MTEXT"):
+        try:
+            h = e.dxf.char_height
+            for k, line in enumerate(e.plain_text().split("\n")[:20]):  # top-left anchored lines, downwards
+                out["texts"].append([r(e.dxf.insert.x), r(e.dxf.insert.y - h * (1 + 1.6 * k)), round(h), line[:60]])
+        except Exception:
+            pass
+if changed:
+    doc.saveas(path)
+print("AIW_EDIT " + json.dumps(out, ensure_ascii=False))
+'''
+
+
+def edit_command(path: str, edits: list[dict], texts: bool = False) -> str:
+    """Shell line that applies ERASE/ERASETEXT/LIST to the saved DXF with ezdxf (reading and deleting, never drawing)
+    and prints 'AIW_EDIT {json}'. LibreCAD is reopened on the file afterwards by the caller."""
+    import json as _j
+    import shlex
+    safe = str(path).replace('"', "").replace("`", "").replace("$(", "")
+    return (f'cd "${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}" && python3 -c {shlex.quote(_EDIT_PY)} '
+            f'"{safe}" {shlex.quote(_j.dumps(edits, ensure_ascii=False))}' + (" --texts" if texts else ""))
+
+
+def parse_edit(out: str) -> dict | None:
+    import json as _j
+    m = re.search(r"AIW_EDIT (\{.*\})", out or "")
+    if not m:
+        return None
+    try:
+        return _j.loads(m.group(1))
+    except ValueError:
+        return None
+
+
+def seed_text_boxes(texts: list) -> dict:
+    """Text boxes of a drawing that already exists, so the layout check of a revision knows what is on the sheet."""
+    items = []
+    for t in texts or []:
+        try:
+            x, y, h, body = float(t[0]), float(t[1]), float(t[2]), str(t[3])
+        except (ValueError, IndexError, TypeError):
+            continue
+        if body.strip():
+            items.append((int(x // SHEET_PITCH), f"TEXT|{_pt(x, y)}|{_f(h)}|{body}"))
+    _, boxes = layout_issues(items, {})
+    out: dict = {}
+    for sh, b, body in boxes:
+        out.setdefault(sh, []).append((b, body))
+    return out

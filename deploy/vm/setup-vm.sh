@@ -59,6 +59,7 @@ python3 -m venv ~/.aiw-venv
 # Chinese font for LibreCAD (its own fonts have no hanzi); cad_command also does this on first use
 ~/.aiw-venv/bin/pip install fonttools
 bash "$REPO/deploy/vm/librecad-setup.sh" || true
+bash "$REPO/deploy/vm/toolbox-setup.sh" install || true   # office/PDF/OCR/image/audio-video/e-book/archive tools
 mkdir -p ~/workspace/downloads
 
 # VNC password file (x11vnc refuses unauthenticated clients)

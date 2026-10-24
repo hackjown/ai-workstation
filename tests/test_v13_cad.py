@@ -348,7 +348,7 @@ def test_textc_centres():
     (t,), _, _ = cad.place(["TEXTC|10000,5000|200|一二三四"], 0)
     pt, h, body = cad._parse_text(t)
     x, y = cad._xy(pt)
-    assert abs(x - (10000 - 2 * 0.95 * 200)) < 2 and y == 4900
+    assert abs(x - (10000 - 2 * 1.05 * 200)) < 2 and y == 4900
 
 
 def test_layout_issues():
@@ -359,7 +359,8 @@ def test_layout_issues():
     issues, boxes = cad.layout_issues(drawn)
     s = " ".join(issues)
     assert "rectangle from 2000,2000 to 12000,5000 runs inside the title block" in s and "overlaps text '历史沿革'" in s
-    assert "900,3000 is outside the border" in s and "'太高'" in s and len(boxes) == 3
+    assert "900,3000 is outside the border" in s and "'太高'" in s
+    assert len([b for b in boxes if not str(b[2]).startswith(chr(0))]) == 3
     ok = []
     cad.place(["FRAME|4|x|4|1:50|p", "rect|2500,4000|12500,7000", "TEXTC|7500,5500|250|历史沿革"], 0, ok)
     assert cad.layout_issues(ok)[0] == []
@@ -506,3 +507,31 @@ def test_files_write_has_append():
     from tool_router.registry import TOOLS
     spec = next(t for t in TOOLS if t.name == "files_write")
     assert "append" in spec.params
+
+
+def test_layout_v1313_generic_checks():
+    """2026-10-23 PDF: titles past their cell, labels crossed by panel edges, crossing leaders, doubled overall
+    dimensions, dimension numbers on top of each other."""
+    from agent_runtime import cad
+    d = []
+    cad.place(["FRAME|4|x|4|1:50|p",
+               "rect|2500,4000|4000,9000", "TEXT|2600,6000|250|历史沿革板块很长的标签",       # runs out of its panel
+               "LEADER|3000,5000|9000,12000|175|面层",                                         # too long
+               "LEADER|3000,8000|5000,6000|175|基层", "LEADER|3500,6000|5000,8200|175|踢脚",  # cross each other
+               "DIMH|4000|3000|2500,2600,2950,4000",                                          # 100 and 350: numbers collide
+               "DIMH|4000|2400|2500,4000"], 0, d)                                             # overall drawn twice
+    s = " | ".join(cad.layout_issues(d)[0])
+    assert "is crossed by line" in s and "longer than" in s and "crosses another leader" in s
+    assert "is already drawn" in s and "cannot hold their number" in s
+    (title,) = [c for c in cad.expand(["FRAME|7|入口形象墙正面(十六字方针)立面图|07|1:50|兴丹路消防救援站荣誉室"]) if c.startswith("TEXT") and "入口" in c]
+    pt, h, body = cad._parse_text(title)
+    assert cad.text_box(0, 0, float(h), body)[2] <= 5300
+
+
+def test_layout_clean_elevation_passes():
+    from agent_runtime import cad
+    d = []
+    cad.place(["FRAME|4|x|4|1:50|p", "rect|2500,4000|12500,7000", "rect|2500,4000|6500,7000",
+               "TEXTC|4500,5500|250|历史沿革", "DIMH|4000|3200|2500,6500,8500,10500,12500",
+               "LEADER|12500,6500|13300,7200|175|面层：PVC板", "LEADER|12500,5000|13300,5600|175|基层：轻钢龙骨"], 0, d)
+    assert cad.layout_issues(d)[0] == []

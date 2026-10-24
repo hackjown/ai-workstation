@@ -414,9 +414,10 @@ def _macro(c: str) -> list[str] | None:
                 "rectangle", _pt(bx, y1), _pt(x2, y1 + bh), "ESC",
                 "line", _pt(bx, y1 + bh / 2), _pt(x2, y1 + bh / 2), "ESC",
                 "line", _pt(bx + 5600, y1), _pt(bx + 5600, y1 + bh), "ESC"]
+        # titles shrink to their cell: '入口形象墙正面(十六字方针)' at 350 ran into the 比例 cell (2026-10-23)
         if proj:
-            out.append(f"TEXT|{_pt(bx + 150, y1 + bh / 2 + 330)}|220|{proj}")
-        out.append(f"TEXT|{_pt(bx + 150, y1 + 300)}|350|{title}")
+            out.append(f"TEXT|{_pt(bx + 150, y1 + bh / 2 + 330)}|{_f(fit_height(proj, 220, 5300))}|{proj}")
+        out.append(f"TEXT|{_pt(bx + 150, y1 + 300)}|{_f(fit_height(title, 350, 5300))}|{title}")
         out.append(f"TEXT|{_pt(bx + 5750, y1 + bh / 2 + 330)}|200|图号 {no}")
         out.append(f"TEXT|{_pt(bx + 5750, y1 + 330)}|200|比例 {scale}")
         return out
@@ -475,10 +476,27 @@ FRAME_X1, FRAME_Y1, FRAME_X2, FRAME_Y2 = 1250, 500, SHEET_W - 500, SHEET_H - 500
 TB_X1, TB_Y2 = FRAME_X2 - 9000, FRAME_Y1 + 2000
 
 
+def _cw(ch: str) -> float:
+    """Width of one character in text heights, as LibreCAD's CJK font draws it (measured on the 2026-10-23 PDF:
+    the 0.95 estimate let titles run into the next title-block cell)."""
+    o = ord(ch)
+    if o > 0x2e80 or ch in "（）【】，。：；、":
+        return 1.05
+    if ch in "()[]-.,:;|/ ":
+        return 0.45
+    return 0.65
+
+
 def text_box(x: float, y: float, h: float, body: str) -> tuple[float, float, float, float]:
-    """Rough extent of a left-aligned single-line text: a hanzi is about one text height wide, latin ~0.6."""
-    w = sum(0.95 if ord(ch) > 0x2e80 else 0.6 for ch in body) * h
+    """Rough extent of a left-aligned single-line text: a hanzi is about one text height wide, latin ~0.65."""
+    w = sum(_cw(ch) for ch in body) * h
     return x, y, x + w, y + h
+
+
+def fit_height(body: str, h: float, width: float, h_min: float = 120.0) -> float:
+    """The largest height <= h at which body fits in width."""
+    w1 = text_box(0, 0, 1.0, body)[2] or 1.0
+    return max(h_min, min(h, (width / w1) // 5 * 5))
 
 
 def _overlap(a, b) -> float:
@@ -491,15 +509,81 @@ def _overlap(a, b) -> float:
     return w * h / small
 
 
+def _pad(b, k=0.15):
+    """A text box with its line gap: two texts closer than ~0.3 h read as one smudge."""
+    h = b[3] - b[1]
+    return b[0], b[1] - h * k, b[2], b[3] + h * k
+
+
+def _shrink(b, k=0.12):
+    dx, dy = (b[2] - b[0]) * k, (b[3] - b[1]) * k
+    return b[0] + dx, b[1] + dy, b[2] - dx, b[3] - dy
+
+
+def _seg_hits_box(seg, b) -> bool:
+    """Does the segment pass through the box (Liang-Barsky clip)?"""
+    (x1, y1, x2, y2), (bx1, by1, bx2, by2) = seg, b
+    dx, dy = x2 - x1, y2 - y1
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x1 - bx1), (dx, bx2 - x1), (-dy, y1 - by1), (dy, by2 - y1)):
+        if p == 0:
+            if q < 0:
+                return False
+            continue
+        r = q / p
+        if p < 0:
+            t0 = max(t0, r)
+        else:
+            t1 = min(t1, r)
+        if t0 > t1:
+            return False
+    return True
+
+
+def _segs_cross(a, b) -> bool:
+    """Proper crossing of two segments (touching ends do not count)."""
+    def orient(px, py, qx, qy, rx, ry):
+        return (qx - px) * (ry - py) - (qy - py) * (rx - px)
+    (ax1, ay1, ax2, ay2), (bx1, by1, bx2, by2) = a, b
+    d1, d2 = orient(bx1, by1, bx2, by2, ax1, ay1), orient(bx1, by1, bx2, by2, ax2, ay2)
+    d3, d4 = orient(ax1, ay1, ax2, ay2, bx1, by1), orient(ax1, ay1, ax2, ay2, bx2, by2)
+    return d1 * d2 < 0 and d3 * d4 < 0
+
+
+DIM_TEXT_H = float(os.environ.get("AIW_CAD_DIM_TEXT_H", "150"))  # dimension numbers as drawn at 1:50
+LEADER_MAX = float(os.environ.get("AIW_CAD_LEADER_MAX", "6000"))  # 120 mm on paper at 1:50
+SEG, LEAD, DIMK = "\x00seg", "\x00leader", "\x00dim"     # markers for non-text entries in the box memory
+
+
+def _dim_geom(tool: str, p1, p2, p3):
+    """(text box, dimension-line segment, measured span key) of a dimhorizontal/dimvertical, as LibreCAD draws it:
+    the number centred above (left of) the dimension line."""
+    if tool == "dimhorizontal":
+        a, b, line = min(p1[0], p2[0]), max(p1[0], p2[0]), p3[1]
+        txt = _f(round(b - a))
+        w = text_box(0, 0, DIM_TEXT_H, txt)[2]
+        m = (a + b) / 2
+        return (m - w / 2, line + 40, m + w / 2, line + 40 + DIM_TEXT_H), (a, line, b, line), ("H", round(a), round(b)), txt
+    a, b, line = min(p1[1], p2[1]), max(p1[1], p2[1]), p3[0]
+    txt = _f(round(b - a))
+    w = text_box(0, 0, DIM_TEXT_H, txt)[2]
+    m = (a + b) / 2
+    return (line - 40 - DIM_TEXT_H, m - w / 2, line - 40, m + w / 2), (line, a, line, b), ("V", round(a), round(b)), txt
+
+
 def layout_issues(items: list[tuple[int, str]], prior_boxes: dict | None = None) -> tuple[list[str], list]:
     """items: (sheet, expanded command) for everything the model drew itself (not FRAME output).
-    Finds points or texts outside the sheet's inner border, inside the title block, and texts that overlap a
-    text of this batch or one already on the sheet (prior_boxes: sheet -> [(box, body)]).
-    The 2026-10-20 run drew elevations across the title block, labels on top of each other and leaders above
-    the border. Returns (issues, new text boxes as (sheet, box, body))."""
+    Checked before typing, on this batch and on what earlier batches put on the sheet (prior_boxes: sheet ->
+    [(box, body)], where body is the text, or a marker for a line segment, a leader or a dimension):
+    - points, texts, dimension lines outside the sheet's inner border or inside the title block;
+    - texts or dimension numbers on top of each other (dimension chains with segments too short for their number);
+    - texts crossed by a line: a label running out of its table cell, panel or title-block cell;
+    - leaders that cross each other or run more than LEADER_MAX from the object to their label;
+    - the same span dimensioned twice (DIMH/DIMV chains already add the overall dimension).
+    Found on the 2026-10-20 and 2026-10-23 runs. Returns (issues, new memory entries as (sheet, box, body))."""
     issues, boxes = [], []
     prior_boxes = prior_boxes or {}
-    tool, prev = "", None
+    tool, prev, dimpts = "", None, []
 
     def where(sheet, x, y):
         lx = x - sheet * SHEET_PITCH
@@ -509,7 +593,48 @@ def layout_issues(items: list[tuple[int, str]], prior_boxes: dict | None = None)
             return "inside the title block"
         return ""
 
+    def mem(sheet):
+        return prior_boxes.get(sheet, []) + [(bb, bd) for s2, bb, bd in boxes if s2 == sheet]
+
+    def texts(sheet):
+        return [(bb, bd) for bb, bd in mem(sheet) if not str(bd).startswith("\x00") or bd == DIMK]
+
+    def label(bd, bb):
+        return f"dimension {_f(round(max(bb[2] - bb[0], bb[3] - bb[1])))}" if bd == DIMK else f"text '{str(bd)[:16]}'"
+
+    def seg_issue(sheet, seg, what):
+        ox = sheet * SHEET_PITCH
+        for k in range(0, 21):
+            hx, hy = seg[0] + (seg[2] - seg[0]) * k / 20, seg[1] + (seg[3] - seg[1]) * k / 20
+            w = where(sheet, hx, hy)
+            if w:
+                return f"{what} runs {w} near {_pt(round(hx - ox), round(hy))}"
+        return ""
+
+    def struck(sheet, seg, bb, body, by_new_line):
+        ox = sheet * SHEET_PITCH
+        lo = f"line {_pt(round(seg[0] - ox), round(seg[1]))}-{_pt(round(seg[2] - ox), round(seg[3]))}"
+        return (f"text '{str(body)[:16]}' at {_pt(round(bb[0] - ox), round(bb[1]))} is crossed by {lo}: it runs out of "
+                f"its cell/panel or sits on a line (shorten it, lower its height, or move it clear)")
+
     for sheet, e in items:
+        ox = sheet * SHEET_PITCH
+        if e.startswith("#LEADER "):
+            try:
+                (ax, ay), (bx, by) = [_xy(v) for v in e[8:].split("|")[:2]]
+            except (ValueError, IndexError):
+                continue
+            seg = (ax, ay, bx, by)
+            if ((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 > LEADER_MAX:
+                issues.append(f"leader from {_pt(ax - ox, ay)} to {_pt(bx - ox, by)} is longer than {_f(LEADER_MAX)}: "
+                              f"put its label just outside the object, level with the point it names")
+            for pb, bd in mem(sheet):
+                if bd == LEAD and _segs_cross(seg, pb):
+                    issues.append(f"leader from {_pt(ax - ox, ay)} to {_pt(bx - ox, by)} crosses another leader: "
+                                  f"order the labels in the same order as the points they name")
+                    break
+            boxes.append((sheet, seg, LEAD))
+            continue
         t = _parse_text(e)
         if t:
             try:
@@ -519,19 +644,45 @@ def layout_issues(items: list[tuple[int, str]], prior_boxes: dict | None = None)
                 continue
             b = text_box(x, y, h, t[2])
             bad = where(sheet, b[0], b[1]) or where(sheet, b[2], b[3]) or where(sheet, b[2], b[1])
-            ox = sheet * SHEET_PITCH
             if bad:
                 issues.append(f"text '{t[2][:16]}' at {_pt(x - ox, y)} (ends near x={_f(round(b[2] - ox))}) is {bad}")
-            for pb, pbody in prior_boxes.get(sheet, []) + [(bb, bd) for s2, bb, bd in boxes if s2 == sheet]:
-                if _overlap(b, pb) > 0.25:
-                    issues.append(f"text '{t[2][:16]}' at {_pt(x - ox, y)} overlaps text '{pbody[:16]}'")
+            for pb, pbody in texts(sheet):
+                if _overlap(_pad(b), _pad(pb) if pbody != DIMK else pb) > 0.05:
+                    issues.append(f"text '{t[2][:16]}' at {_pt(x - ox, y)} overlaps {label(pbody, pb)}")
                     break
+            else:
+                for pb, pbody in mem(sheet):
+                    if pbody in (SEG, LEAD) and _seg_hits_box(pb, _shrink(b)):
+                        issues.append(struck(sheet, pb, b, t[2], False))
+                        break
             boxes.append((sheet, b, t[2]))
             continue
         m = _ABS_POINT.match(e)
         if m:
             x, y = float(m.group(1)), float(m.group(2))
-            ox = sheet * SHEET_PITCH
+            if tool in ("dimhorizontal", "dimvertical", "dimh", "dimv"):
+                dimpts.append((x, y))
+                if len(dimpts) == 3:
+                    tb, dseg, span, txt = _dim_geom("dimhorizontal" if tool in ("dimhorizontal", "dimh") else "dimvertical", *dimpts)
+                    dimpts = []
+                    w = seg_issue(sheet, dseg, f"dimension {txt}")
+                    if w:
+                        issues.append(w)
+                    dup = next((1 for pb, bd in mem(sheet) if bd == "\x00span" and pb == span), None)
+                    if dup:
+                        issues.append(f"dimension {txt} ({'x' if span[0] == 'H' else 'y'} {_f(span[1] - (ox if span[0] == 'H' else 0))}"
+                                      f"..{_f(span[2] - (ox if span[0] == 'H' else 0))}) is already drawn: a DIMH/DIMV chain adds its "
+                                      f"overall dimension by itself")
+                    else:
+                        for pb, pbody in texts(sheet):
+                            if _overlap(tb, _pad(pb) if pbody != DIMK else pb) > 0.05:
+                                issues.append(f"dimension {txt} near {_pt(round((tb[0] + tb[2]) / 2 - ox), round(tb[1]))} overlaps "
+                                              f"{label(pbody, pb)}: segments under ~{_f(round(DIM_TEXT_H * 4))} cannot hold their "
+                                              f"number; dimension them in a separate row further out, or move the text")
+                                break
+                    boxes.append((sheet, tb, DIMK))
+                    boxes.append((sheet, span, "\x00span"))
+                continue
             bad = where(sheet, x, y)
             if bad:
                 issues.append(f"point {_pt(x - ox, y)} is {bad}")
@@ -542,16 +693,30 @@ def layout_issues(items: list[tuple[int, str]], prior_boxes: dict | None = None)
                 segs = ([((px, py), (x, py)), ((x, py), (x, y)), ((x, y), (px, y)), ((px, y), (px, py))]
                         if tool.startswith("rec") else [((px, py), (x, y))])
                 for (ax, ay), (bx, by) in segs:
-                    hit = next((k for k in range(1, 20) if where(sheet, ax + (bx - ax) * k / 20, ay + (by - ay) * k / 20)), None)
-                    if hit:
-                        hx, hy = ax + (bx - ax) * hit / 20, ay + (by - ay) * hit / 20
-                        issues.append(f"{tool} from {_pt(px - ox, py)} to {_pt(x - ox, y)} runs "
-                                      f"{where(sheet, hx, hy)} near {_pt(round(hx - ox), round(hy))}")
+                    w = seg_issue(sheet, (ax, ay, bx, by), f"{tool} from {_pt(px - ox, py)} to {_pt(x - ox, y)}")
+                    if w:
+                        issues.append(w)
                         break
+            if prev is not None and tool in ("line", "li", "l", "rectangle", "rec", "rect", "polyline", "pl"):
+                (px, py) = prev
+                segs = ([(px, py, x, py), (x, py, x, y), (x, y, px, y), (px, y, px, py)]
+                        if tool.startswith("rec") else [(px, py, x, y)])
+                for sg in segs:
+                    for pb, pbody in texts(sheet):
+                        if pbody != DIMK and _seg_hits_box(sg, _shrink(pb)):
+                            issues.append(struck(sheet, sg, pb, pbody, True))
+                            break
+                    boxes.append((sheet, sg, SEG))
             prev = (x, y)
             continue
-        tool, prev = e.strip().lower(), None
-    return issues, boxes
+        tool, prev, dimpts = e.strip().lower(), None, []
+    # one message per problem is enough for the model; the same text crossed by four rectangle edges is one issue
+    seen, uniq = set(), []
+    for i in issues:
+        if i not in seen:
+            seen.add(i)
+            uniq.append(i)
+    return uniq, boxes
 
 
 def place(commands: list[str], sheet: int = 0, drawn: list | None = None) -> tuple[list[str], int, int]:
@@ -584,6 +749,14 @@ def place(commands: list[str], sheet: int = 0, drawn: list | None = None) -> tup
                 continue  # only sets the origin
             out.extend(expand([c]))  # FRAME is already absolute
             continue
+        ml = re.match(r"(?i)^\s*leader\s*\|([^|]+)\|([^|]+)\|", c)
+        if ml and drawn is not None:
+            try:
+                a1, b1 = shift(_pt(*_xy(ml.group(1)))), shift(_pt(*_xy(ml.group(2))))
+                moved -= (a1 != _pt(*_xy(ml.group(1)))) + (b1 != _pt(*_xy(ml.group(2))))
+                drawn.append((sheet, f"#LEADER {a1}|{b1}"))
+            except (ValueError, IndexError):
+                pass
         for e in expand([c]):
             t = _parse_text(e)
             if t:

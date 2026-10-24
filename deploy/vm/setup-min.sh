@@ -124,6 +124,7 @@ systemctl --user enable --now vm-agent novnc
 # LibreCAD font/template needs the screen up (it restarts LibreCAD)
 sleep 5
 DISPLAY=:1 bash "$REPO/deploy/vm/librecad-setup.sh" || true
+D=$H/Desktop; mkdir -p "$D"; for a in librecad libreoffice-writer libreoffice-calc; do [ -f /usr/share/applications/$a.desktop ] && cp -f /usr/share/applications/$a.desktop "$D/" && chmod +x "$D/$a.desktop"; done
 xfconf-query --display :1 -c xfwm4 -p /general/use_compositing -n -t bool -s false 2>/dev/null || true
 
 echo

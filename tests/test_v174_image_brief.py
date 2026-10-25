@@ -210,3 +210,13 @@ def test_video_model_routing_rule():
     assert v("make an explainer video from this deck")
     assert not v("这个视频说了什么？帮我总结")
     assert not v("下载这个视频的字幕")
+
+
+def test_desktop_free_tasks_skip_the_first_look():
+    from agent_runtime.loop import _GUI_TASK as g
+    for p in ["逐帧查看视频内容，我想要复刻这个视频，逐秒生成视频提示词\n附件：~/workspace/uploads/20261021231654.mp4",
+              "把这个pptx转成pdf", "用 huashu-motion 把我上传的pptx文件做一个视频讲解", "写个python脚本统计csv"]:
+        assert not g.search(p), p
+    for p in ["打开 Chrome，搜索 OpenAI", "去京东看下这个价格", "登录我的邮箱", "用 LibreCAD 画一个平面图",
+              "看看 https://example.com 写了什么"]:
+        assert g.search(p), p

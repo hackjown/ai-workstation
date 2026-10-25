@@ -78,6 +78,22 @@ TOOLS: list[ToolSpec] = [
               "paths": {"type": "array", "items": {"type": "string"}, "description": "several images read at once"},
               "page": {"type": "integer", "description": "PDF page, 1-based"},
               "question": {"type": "string"}}, []),
+    ToolSpec("image_edit", None,
+             "AI image editing: describe a change in words and an image model redraws the photo (make the cabinets "
+             "taller, remove a person, change a wall colour, put the sofa elsewhere, add a sign). For changes a "
+             "script cannot do. The result is scaled back to the original size. AI redraws small text and logos "
+             "badly: afterwards read_image the result and paste those regions back from the original with "
+             "`restore` (aligned automatically). Exact edits (text layers, colours, crops, PSD) are photopea's job.",
+             {"path": {"type": "string", "description": "image to edit, relative to ~/workspace"},
+              "prompt": {"type": "string", "description": "the change only, in plain words; everything else is kept"},
+              "save": {"type": "string", "description": "output .png, relative to ~/workspace (default <name>-ai.png)"},
+              "restore": {"type": "array", "items": {"type": "array", "items": {"type": "number"}},
+                          "description": "[[left, top, right, bottom], ...] in pixels of the ORIGINAL image: regions "
+                                         "copied back from the original (garbled text, labels, logos, faces)"},
+              "original": {"type": "string", "description": "the untouched original to restore from, when `path` "
+                                                            "is already an AI result"},
+              "keep_size": {"type": "boolean", "description": "scale the result to the original size (default true)"}},
+             ["path"]),
     ToolSpec("photopea", None,
              "Edit images like in Photoshop: PSD/PNG/JPG/WebP in Photopea (a Photoshop clone) in a browser window on "
              "the desktop; the user watches it. One call = open files -> run `script` -> save. `script` is Photoshop "
@@ -150,7 +166,7 @@ TOOLS: list[ToolSpec] = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element", "cad_draw", "cad_command", "read_image", "photopea"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element", "cad_draw", "cad_command", "read_image", "photopea", "image_edit"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

@@ -201,6 +201,40 @@ def geometry_user(instr: str, brief: dict, w: int, h: int) -> str:
             '"x_left_top": 台面以上属于目标的物品从哪个x开始（相邻柜子上的东西伸过来时取它们右边，否则等于 x_left）}')
 
 
+def grounding_user(instr: str, brief: dict) -> str:
+    """Qwen3-VL / GLM-V / Gemini are trained to box things in 0-1000 normalized coordinates, not to read pixels off a
+    grid (task-3f3: asked for pixels, it answered 900/850 for everything). Ask in their native format."""
+    return (f"用户要求：「{instr}」\n要改的：{brief.get('target') or '目标柜子'}；参照：{brief.get('reference') or '用户说的参照物'}。\n"
+            "用你的目标定位能力框出下面这些东西，坐标用 0-1000 归一化的 [x1, y1, x2, y2]（左上到右下），只输出 JSON：\n"
+            '{"target_cabinet": 目标柜子从台面前沿上边到柜门下沿（踢脚线以上）的框, '
+            '"items_on_top": 把目标台面上所有物品（咖啡机、水槽龙头、杯子等）一起框住的框, '
+            '"reference_counter": 参照台面前沿那条边（厚度那一条）的框, '
+            '"junction_x": 目标和参照交接处的 x（0-1000）}')
+
+
+def parse_grounding(text: str, w: int, h: int) -> Optional[dict]:
+    """0-1000 boxes -> the pixel geometry the move planner uses."""
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(0))
+        cab, items, ref = (list(map(float, d[k])) for k in ("target_cabinet", "items_on_top", "reference_counter"))
+        if len(cab) != 4 or len(items) != 4 or len(ref) != 4:
+            return None
+        X = lambda v: v * w / 1000.0
+        Y = lambda v: v * h / 1000.0
+        jx = d.get("junction_x")
+        g = {"x_left": X(min(cab[0], cab[2])), "x_right": X(max(cab[0], cab[2])),
+             "top_y": Y(min(items[1], items[3])), "front_top_y": Y(min(cab[1], cab[3])),
+             "base_y": Y(max(cab[1], cab[3])), "target_y": Y(min(ref[1], ref[3])),
+             "x_left_top": X(min(items[0], items[2], cab[0], cab[2]))}
+        g["probe_x"] = X(float(jx)) if jx is not None else (g["x_left"] if X(ref[0]) < g["x_left"] else g["x_right"])
+        return _geometry(g, w, h)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def parse_geometry(text: str, w: int, h: int) -> Optional[dict]:
     m = re.search(r"\{[^{}]*\}", text or "", re.S)
     if not m:

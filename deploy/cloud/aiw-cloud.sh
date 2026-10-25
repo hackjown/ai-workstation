@@ -45,6 +45,8 @@ do_install() {
   DISPLAY=$DISP bash "$R/deploy/vm/librecad-setup.sh" >>"$LOG" 2>&1 || true
   step browser
   "$V/bin/python" -m playwright install chromium >>"$LOG" 2>&1 || true
+  step motion   # huashu-motion videos: node 22, chrome, ffmpeg, uv (task-247)
+  bash "$R/deploy/vm/motion-setup.sh" >>"$LOG" 2>&1 || true
   DISPLAY=$DISP desktop_icons >>"$LOG" 2>&1 || true
   echo INSTALLED > "$ST"
   toolbox_bg

@@ -116,7 +116,9 @@ class SessionManager:
         if not m.get("vision_model") or m.get("vision_model") == m.get("model"):
             return None
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m["vision_model"], None, key, m.get("base_url") or None, None, m.get("thinking"))
+        # the eyes describe pictures; thinking there only adds latency (AIW_VISION_THINKING=on to restore)
+        return LLMRouter.from_settings(m["vision_model"], None, key, m.get("base_url") or None, None,
+                                       os.environ.get("AIW_VISION_THINKING", "off"))
 
     def _image_cfg(self) -> Optional[dict]:
         """The AI image-editing model (image_edit tool), through the same gateway and key as the other models."""
@@ -482,4 +484,9 @@ def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str
     if cad_mode(prompt, context):
         return (max(max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400"))),
                 max(timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800"))))
+    from agent_runtime.loop import _IMAGE_TASK
+    if _IMAGE_TASK.search(prompt or ""):
+        # each AI edit ~70 s, each vision check ~30 s: 900 s ran out on task-4e2 and task-484 (a retry kept the
+        # old 900 s because the API passes its own LoopConfig, so the loop's own image budget never applied)
+        return max_steps, max(timeout_s, float(os.environ.get("AIW_IMAGE_TIMEOUT", "2400")))
     return max_steps, timeout_s

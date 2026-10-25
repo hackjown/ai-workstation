@@ -1096,6 +1096,15 @@ class AgentLoop:
         g = brief.get("geometry")
         if g:  # raise/lower to a reference: image models do this only roughly, so measure and move exactly
             dy = await self._measure_raise(img, f.result["content_b64"], brief, g)
+            up, down = re.search(r"加高|抬高|升高|变高|调高", instr), re.search(r"降低|变矮|压低|调低", instr)
+            if dy is not None and ((up and dy < 0) or (down and dy > 0) or g["top_y"] > g["front_top_y"] - 40):
+                # task-3f3: the vision model read both edges as y=900 and top_y=850, so "加高" became a 13 px lowering
+                # that left the coffee machine behind. A measurement that contradicts the request is not used.
+                return (f"Measuring failed: the vision model's numbers contradict the request (target edge y="
+                        f"{g['front_top_y']}, reference y={g['target_y']}, things on top from y={g['top_y']}). Do NOT "
+                        "edit by guesswork and do not deliver an unchanged picture. ask_user in Chinese: say the "
+                        "automatic measurement was unreliable and ask how much higher it should go (e.g. 约几厘米, or "
+                        "'和左边台面上沿对齐') so you can move it exactly with image_edit move.")
             if dy is not None and abs(dy) < 3:
                 return (f"Measured: the target edge is already level with the reference (y={g['front_top_y']} vs "
                         f"{g['target_y']}, within 3 px). Tell the user it is already level, with those numbers, and "

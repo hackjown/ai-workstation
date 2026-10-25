@@ -30,6 +30,7 @@ APT_GROUPS=(
   "ebook:calibre"
   "archive:zip unzip 7zip p7zip-full unrar-free xz-utils zstd cabextract"
   "text:jq dos2unix uchardet enca file csvkit xmlstarlet"
+  "desktop:wmctrl xdotool"
   "python:python3-pip python3-venv python3-openpyxl python3-xlrd python3-docx python3-pptx python3-pandas python3-matplotlib python3-lxml python3-bs4 python3-markdown python3-yaml python3-chardet python3-ezdxf python3-qrcode"
 )
 # not packaged (or too old) in Debian: user-level pip, never touching the system Python's own packages
@@ -45,9 +46,11 @@ status() {
 check() {
   for c in soffice pandoc pdftotext pdftoppm qpdf gs mutool pdftk img2pdf ocrmypdf tesseract convert cwebp \
            heif-convert rsvg-convert inkscape ffmpeg ffprobe sox lame flac mediainfo yt-dlp ebook-convert 7z zip unzip \
-           unrar-free zstd jq dos2unix uchardet enca; do
+           unrar-free zstd jq dos2unix uchardet enca wmctrl; do
     command -v "$c" >/dev/null && echo "ok      $c" || echo "missing $c"
   done
+  b=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
+  [ -n "$b" ] && echo "ok      browser ($b, for photopea)" || echo "missing browser (chromium, for photopea)"
   for m in pypdf fitz pdfplumber reportlab PIL openpyxl xlrd docx pptx pandas matplotlib lxml bs4 markdown yaml ezdxf; do
     python3 -c "import $m" 2>/dev/null && echo "ok      python:$m" || echo "missing python:$m"
   done
@@ -72,6 +75,12 @@ run() {
       done
     fi
   done
+  # the photopea tool (Photoshop clone in a browser window) needs a Chrome/Chromium; setup-vm.sh installs Google
+  # Chrome, setup-min.sh chromium; Playwright's copy also works. Install chromium only when none is there.
+  if ! command -v google-chrome >/dev/null && ! command -v chromium >/dev/null && ! command -v chromium-browser >/dev/null; then
+    echo "INSTALLING browser" > "$ST"
+    $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chromium >>"$LOG" 2>&1 || failed="$failed chromium"
+  fi
   echo "INSTALLING pip" > "$ST"
   if python3 -m pip --version >/dev/null 2>&1; then
     # shellcheck disable=SC2086

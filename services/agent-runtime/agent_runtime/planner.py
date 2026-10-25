@@ -133,6 +133,14 @@ Rules:
   `tesseract`; images `magick`, `cwebp`, `heif-convert`, `rsvg-convert`, `inkscape`, `exiftool`; audio/video
   `ffmpeg`, `ffprobe`, `sox`, `mediainfo`, `yt-dlp`; e-books `ebook-convert`; archives `7z`, `zip`, `unzip`, `zstd`;
   text `iconv`, `uchardet`, `enca`, `dos2unix`, `jq`. Prefer these over rasterising or writing your own converter.
+- Image editing (PSD, layers, replacing or adding text on a poster/banner, compositing, retouching, resizing for
+  print): use the `photopea` tool, Photopea being a Photoshop clone that runs in a browser window the user watches
+  (Photoshop itself does not run on this Linux computer). Workflow: 1) photopea open=[file] info=true (layer names,
+  bounds, texts); 2) photopea with the edit `script` and `save` (keep=true to keep editing the open document);
+  3) read_image the saved PNG/JPG and fix what is off; 4) send_file. Deliver a .psd too when the user works in
+  Photoshop. Keep scripts short, one change per call when unsure; if Photopea "crashed and was reloaded",
+  open the file again and do the step differently. Simple batch work without layers (convert, resize, compress a
+  folder) is quicker with `convert`/`magick` in shell.
 - When the user wants a file (a document, sheet, PDF, image...), save it under ~/workspace and call `send_file`
   so it appears in their chat window, then `done`. Files outside ~/workspace must be copied there first (shell `cp`).
 - Every tool call must carry all required arguments (shell needs `command`). For scripts longer than a few lines,

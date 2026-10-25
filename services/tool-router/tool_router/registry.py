@@ -88,8 +88,9 @@ TOOLS: list[ToolSpec] = [
              "taller, remove a person, change a wall colour, put the sofa elsewhere, add a sign). For changes a "
              "script cannot do. The result is scaled back to the original size. AI redraws small text and logos "
              "badly: afterwards read_image the result and paste those regions back from the original with "
-             "`restore` (aligned automatically). Exact geometry (raise/lower/widen/shift something by N px) is "
-             "`move`: no AI, the pixels of box are scaled into to; AI models do such changes only roughly. "
+             "`restore` (aligned automatically). `move` (no AI, the pixels of box are "
+             "scaled into to) is only for flat things with nothing on them (a sign, a picture, a logo); furniture made "
+             "taller or lower carries what stands on it, so that is a prompt edit. "
              "Exact edits (text layers, colours, crops, PSD) are photopea's job.",
              {"path": {"type": "string", "description": "image to edit, relative to ~/workspace"},
               "prompt": {"type": "string", "description": "the change only, in plain words; everything else is kept"},

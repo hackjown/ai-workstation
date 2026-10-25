@@ -96,7 +96,7 @@ async def test_edit_uses_chat_then_images_api(monkeypatch):
     real = httpx.AsyncClient
     monkeypatch.setattr(ie.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler)))
     out = await ie.edit("https://gw/v1", "k", "gemini-2.5-flash-image", img, "raise it")
-    assert out == img and calls == ["/v1/chat/completions", "/v1/images/edits"]
+    assert out == img and calls == ["/v1/chat/completions", "/v1/chat/completions", "/v1/images/edits"]
     calls.clear()
     await ie.edit("https://gw/v1", "k", "gpt-image-1", img, "raise it")
     assert calls == ["/v1/images/edits"]
@@ -133,3 +133,41 @@ async def test_loop_image_edit_tool(env, monkeypatch):  # noqa: F811
     assert r.startswith("image_edit OK") and "Restored 1 region" in r and (tmp / "out/final.png").is_file()
     r = await loop._image_edit({"path": "uploads/room.png", "restore": [[1, 2, 3]]})
     assert r.startswith("REFUSED")
+
+
+def test_changed_percent_flags_an_unchanged_result():
+    o = _photo()
+    assert ie.changed_percent(o, o.copy()) == 0
+    c = o.copy()
+    ImageDraw.Draw(c).rectangle([100, 420, 450, 700], fill=(20, 20, 20))
+    assert ie.changed_percent(o, c) > 10
+    _, info = ie.postprocess(_bytes(o), _bytes(o.resize((300, 400))), True, None)
+    assert info["changed"] < 1.5
+
+
+async def test_read_image_cache_and_compare(env, monkeypatch):  # noqa: F811
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    (tmp / "uploads").mkdir()
+    (tmp / "uploads/a.png").write_bytes(_bytes(_photo()))
+    (tmp / "uploads/b.png").write_bytes(_bytes(_photo(300, 400)))
+    loop = AgentLoop(Task(prompt="对比"), "s-rc", comp, LLMRouter([ScriptedProvider([])]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=2, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")))
+    asked = []
+
+    class Eyes:
+        async def describe(self, system, q, b64, max_tokens=1800):
+            asked.append((q, Image.open(io.BytesIO(base64.b64decode(b64))).size))
+            return f"answer {len(asked)}"
+    loop.vision_llm = Eyes()
+    r1 = await loop._read_image({"path": "uploads/a.png", "question": "柜子在哪"})
+    r2 = await loop._read_image({"path": "uploads/a.png", "question": "柜子在哪"})
+    r3 = await loop._read_image({"path": "uploads/a.png", "question": "哪个台面更高"})
+    assert "answer 1" in r1 and r2.startswith("ALREADY READ") and "answer 2" in r3 and len(asked) == 2
+    r4 = await loop._read_image({"paths": ["uploads/a.png", "uploads/b.png"], "compare": True, "question": "台面齐平了吗"})
+    assert r4.startswith("compared side by side (A = uploads/a.png; B = uploads/b.png)") and len(asked) == 3
+    q, size = asked[-1]
+    assert "并排" in q and "台面齐平了吗" in q and size[0] > size[1]  # one wide picture holding both

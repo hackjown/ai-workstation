@@ -186,8 +186,12 @@ class AgentLoop:
         except asyncio.TimeoutError:
             msg = f"timeout after {self.cfg.timeout_s:.0f}s"
             if self._last_image and not getattr(self, "_sent_file", None):
-                try:  # hand over what exists instead of nothing
-                    f = await asyncio.wait_for(self.tools.run("send_file", {"path": self._last_image}), 120)
+                try:  # hand over what exists instead of nothing (task-484: the one try hit a dead tunnel)
+                    for _i in range(3):
+                        f = await asyncio.wait_for(self.tools.run("send_file", {"path": self._last_image}), 120)
+                        if f.success or not _transient(f.error):
+                            break
+                        await asyncio.sleep(5 * (_i + 1))
                     if f.success and isinstance(f.result, dict):
                         await self._deliver_file(f.result)
                         msg += f"；时间用完前的最新一版结果已发给你（{self._last_image}），可能还没完全达到要求"
@@ -358,7 +362,10 @@ class AgentLoop:
                 # Before the first sheet too (AIW_CAD_PLAN_THINKING): run e7d's planning step thought for 809 s and
                 # returned no tool call; the brief carries the coordinates, so planning is transcription as well.
                 thinking=((os.environ.get("AIW_CAD_DRAW_THINKING", "off") if getattr(self, "_cad_calls", 0)
-                           else os.environ.get("AIW_CAD_PLAN_THINKING", "off")) if self._cad_task else None))
+                           else os.environ.get("AIW_CAD_PLAN_THINKING", "off")) if self._cad_task
+                          # an image edit is measure -> move/edit -> compare -> send; task-484 thought 50-70 s per
+                          # step and then 540 s on one step (900 s budget gone with the result already made at 175 s)
+                          else os.environ.get("AIW_IMAGE_THINKING", "off") if self._image_task else None))
             decision = None
             tries = int(os.environ.get("AIW_DECIDE_RETRIES", "4"))
             for attempt in range(tries):
@@ -455,6 +462,9 @@ class AgentLoop:
                 self._after_send += 1
                 if self._after_send >= 2:  # the file is already with the user; stop wandering
                     decision.tool, decision.args = "done", {"summary": f"已生成并发送 {self._sent_file}。"}
+            if (self._image_task and self._last_image and not self._sent_file
+                    and decision.tool not in ("image_edit", "send_file", "done", "fail", "photopea")):
+                self._since_edit = getattr(self, "_since_edit", 0) + 1
             u = decision.usage or {}
             await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args, llm_ms=llm_ms,
                             out_tokens=u.get("out_tokens") or u.get("completion_tokens"), attempts=u.get("attempts"))
@@ -527,6 +537,14 @@ class AgentLoop:
             self.history.append(_hist_line(self.step, decision, outcome, v.message))
             self._last_ok = ((decision.tool, repr(sorted(decision.args.items()))), self.step) if outcome.success else None
             self._fresh = after if (after and outcome.success) else None
+            if decision.tool == "image_edit" and outcome.success:
+                self._since_edit = 0
+            elif self._image_task and getattr(self, "_since_edit", 0) >= int(os.environ.get("AIW_IMAGE_CHECK_STEPS", "3")):
+                # task-484: a deterministic move was made at 175 s, then three more measuring scripts (60-70 s of
+                # thinking each) ran until the 900 s budget was gone and the user got nothing
+                note = (f"You have spent {self._since_edit} steps checking {self._last_image} without editing it. Decide "
+                        f"NOW: if it does what the user asked, send_file {self._last_image}; if a number is off, run "
+                        "image_edit once more with corrected pixels. Do not measure again.")
 
             if not outcome.success and (outcome.error or "").startswith("missing args"):
                 failures += 1
@@ -1095,7 +1113,8 @@ class AgentLoop:
             ch = info["changed"]
             lines.append(f"{ch}% of the picture differs from the original"
                          + (" -- ALMOST NOTHING CHANGED: the model ignored the request. Do not deliver this; run "
-                            "image_edit again with a more concrete prompt (what moves where, by how much)." if ch < 1.5 else "."))
+                            "image_edit again with a more concrete prompt (what moves where, by how much)."
+                            if ch < 1.5 and prompt and not moves else "."))
         lines.append(f"Next: read_image paths=[{orig_path}, {save}] compare=true with a question about the change, to "
                      "check 1) the change is really there and goes the way the user asked and 2) garbled text or "
                      "logos, warped objects. Fix garbled regions with image_edit restore=[[l,t,r,b]] (pixels of the "

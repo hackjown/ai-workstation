@@ -173,3 +173,30 @@ def test_waiting_on_the_user_extends_the_deadline():
         return "ok"
     lp._run = _run
     assert asyncio.run(lp._run_with_deadline()) == "ok"
+
+
+def test_video_qa_refuses_a_teaser_of_a_deck():
+    import json
+    from agent_runtime import video as V
+    p = "用 huashu-motion 把我上传的pptx文件做一个视频讲解\n- ~/workspace/uploads/安盛盛利II至尊_5年缴计划详解.pptx"
+    assert V.doc_path(p).endswith(".pptx")
+    assert "EVERY page" in V.brief(p) and "-16 LUFS" in V.brief(p)
+    bad = {"duration": 106.4, "channels": 1, "lufs": -25.7, "pages": 16, "coverage_file": "c", "missing_pages": [3, 4, 14]}
+    note = V.verdict(json.dumps(bad), p)
+    assert "-25.7" in note and "mono" in note and "[3, 4, 14]" in note and "teaser" in note
+    good = {"duration": 298.3, "channels": 2, "lufs": -16.1, "pages": 16, "coverage_file": "c", "missing_pages": []}
+    assert V.verdict(json.dumps(good), p) is None
+    assert "teaser" not in (V.verdict(json.dumps({**bad, "missing_pages": []}), "做一个30秒的精简版视频 a.pptx") or "")
+
+
+def test_video_qa_script_reads_coverage(tmp_path):
+    import json, subprocess, shutil
+    from agent_runtime import video as V
+    if not shutil.which("ffprobe"):
+        return
+    f = tmp_path / "v.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=d=1", "-ac", "2", str(f)], check=True)
+    (tmp_path / "coverage.md").write_text("第1页 封面 -> s1\n第2-3页 公司 -> s2\n", encoding="utf-8")
+    out = subprocess.run(V.qa_command(str(f), None), shell=True, capture_output=True, text=True).stdout
+    q = json.loads(out.strip().splitlines()[-1])
+    assert q["channels"] == 2 and q["coverage_file"].endswith("coverage.md") and q["pages"] is None

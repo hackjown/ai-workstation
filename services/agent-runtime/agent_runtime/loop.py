@@ -1069,13 +1069,18 @@ class AgentLoop:
         if not brief:
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error="no usable edit brief", result={})
             return None
-        if not brief.get("geometry") and _ib.wants_raise(instr):
-            # task-d2d: the brief left geometry out, so a raise went to the image model, which cannot do it
+        if _ib.wants_raise(instr):
+            # task-d2d: the brief left geometry out. task-3f3: pixel numbers read off a grid were wrong (900/850).
+            # Ask for 0-1000 grounding boxes on the plain picture, the format these models are trained on.
+            plain = img if max(img.size) <= 2000 else img.resize((int(w * 2000 / max(w, h)), int(h * 2000 / max(w, h))))
+            pb = io.BytesIO(); plain.save(pb, "JPEG", quality=90)
+            geyes = getattr(self, "geometry_llm", None) or eyes
             try:
                 gtext = await _retry_once(lambda: asyncio.wait_for(
-                    eyes.describe("你是精确读图的测量员，只输出 JSON。", _ib.geometry_user(instr, brief, w, h),
-                                  base64.b64encode(buf.getvalue()).decode(), 300), self.cfg.vision_timeout_s * 2))
-                brief["geometry"] = _ib.parse_geometry(gtext, w, h)
+                    geyes.describe("你是目标定位模型，只输出 JSON。", _ib.grounding_user(instr, brief),
+                                   base64.b64encode(pb.getvalue()).decode(), 400), self.cfg.vision_timeout_s * 2))
+                brief["geometry"] = (_ib.parse_grounding(gtext, w, h) or _ib.parse_geometry(gtext, w, h)
+                                     or brief.get("geometry"))
                 brief["geometry_raw"] = (gtext or "")[:300]
             except Exception as e:  # noqa: BLE001
                 brief["geometry_raw"] = f"error: {e}"[:300]

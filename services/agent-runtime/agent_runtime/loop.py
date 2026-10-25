@@ -83,7 +83,7 @@ class AgentLoop:
         self.recovery = Recovery(computer)
         self._emit_fn = emit
         self.history: list[str] = []
-        self._images_read: dict[str, tuple[int, str]] = {}  # path -> (step, description): history keeps only ~25 steps
+        self._images_read: dict[str, tuple] = {}  # path -> (step, description, question): history keeps only ~25 steps
         self.step = 0
         self.ask, self.remember = ask, remember
         self.extra_tools = extra_tools or {}
@@ -1057,10 +1057,15 @@ class AgentLoop:
             al = info["align"]
             lines.append(f"Restored {len(boxes)} region(s) from {orig_path}; the AI picture was offset by scale "
                          f"{al['scale']}, dx {al['dx']}, dy {al['dy']} px (residual {al['residual']}).")
-        lines.append("Next: read_image the result (compare with the original) for 1) whether the change is right and "
-                     "2) garbled text or logos, warped objects. Fix garbled regions with image_edit restore=[[l,t,r,b]] "
-                     f"(pixels of the original, original={orig_path}, path={save}, no prompt), other details with "
-                     "photopea, then send_file.")
+        if info.get("changed") is not None:
+            ch = info["changed"]
+            lines.append(f"{ch}% of the picture differs from the original"
+                         + (" -- ALMOST NOTHING CHANGED: the model ignored the request. Do not deliver this; run "
+                            "image_edit again with a more concrete prompt (what moves where, by how much)." if ch < 1.5 else "."))
+        lines.append(f"Next: read_image paths=[{orig_path}, {save}] compare=true with a question about the change, to "
+                     "check 1) the change is really there and goes the way the user asked and 2) garbled text or "
+                     "logos, warped objects. Fix garbled regions with image_edit restore=[[l,t,r,b]] (pixels of the "
+                     f"original, original={orig_path}, path={save}, no prompt), other details with photopea, then send_file.")
         return "\n".join(lines)
 
     async def _photopea(self, a: dict, intent: str) -> str:
@@ -1101,6 +1106,8 @@ class AgentLoop:
         paths = [str(p) for p in (a.get("paths") or []) if str(p).strip()]
         if a.get("path") and str(a["path"]) not in paths:
             paths.insert(0, str(a["path"]))
+        if a.get("compare") and len(paths) >= 2:
+            return await self._read_compare(paths[:4], (a.get("question") or "").strip())
         if len(paths) <= 1:
             return await self._read_image_one({**a, "path": paths[0] if paths else ""})
         sem = asyncio.Semaphore(int(os.environ.get("AIW_READ_IMAGE_PARALLEL", "4")))
@@ -1110,6 +1117,39 @@ class AgentLoop:
                 return await self._read_image_one({**a, "path": p, "paths": None})
         outs = await asyncio.gather(*[one(p) for p in paths[:12]])
         return "\n\n".join(outs)
+
+    async def _read_compare(self, paths: list[str], question: str) -> str:
+        """Several images side by side in ONE picture, labelled A, B, ..., read in one vision call. Reading them one
+        by one cannot compare them: in task-f08 each half of a before/after check was asked "is it level now?" on
+        its own, the model said yes, and an unchanged picture was delivered as done."""
+        imgs = []
+        for p in paths:
+            rp = p.strip().lstrip("/")
+            for pre in ("home/aiw/workspace/", "workspace/", "~/workspace/"):
+                if rp.startswith(pre):
+                    rp = rp[len(pre):]
+            f = await self.tools.run("send_file", {"path": rp})
+            if not f.success or not isinstance(f.result, dict) or not f.result.get("content_b64"):
+                return f"FAILED: cannot read {rp} ({f.error})"
+            try:
+                imgs.append((rp, Image.open(io.BytesIO(base64.b64decode(f.result["content_b64"]))).convert("RGB")))
+            except Exception as e:  # noqa: BLE001
+                return f"FAILED: {rp} is not an image ({e})"
+        b64 = base64.b64encode(_side_by_side([im for _, im in imgs])).decode()
+        labels = "; ".join(f"{chr(65 + i)} = {p}" for i, (p, _) in enumerate(imgs))
+        q = (f"这张图把 {len(imgs)} 张图片左右并排放在一起，从左到右依次标为 "
+             + "、".join(chr(65 + i) for i in range(len(imgs))) + "。请逐张对比回答，并明确指出它们之间的差别"
+             "（没有差别就直接说没有差别）：" + (question or "两张图有什么不同？"))
+        eyes = self.vision_llm or self.llm
+        try:
+            text = await asyncio.wait_for(eyes.describe(_cad.READ_IMAGE_PROMPT, q, b64, 1800), self.cfg.vision_timeout_s * 3)
+        except Exception as e:  # noqa: BLE001
+            await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=str(e)[:200], result={})
+            return f"FAILED: the vision model could not read the images ({type(e).__name__})"
+        self._acted = True
+        await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
+                        result={"compare": [p for p, _ in imgs], "chars": len(text or "")})
+        return f"compared side by side ({labels}):\n{(text or '').strip()[:3500]}"
 
     async def _read_image_one(self, a: dict) -> str:
         """Read an image (or one PDF page) from ~/workspace and have the vision model describe it for drafting."""
@@ -1130,10 +1170,13 @@ class AgentLoop:
                 return f"FAILED: could not render PDF page ({err}); is poppler-utils installed?"
             path = stem + ".png"
         q0 = (a.get("question") or "").strip()
-        if path in self._images_read and not a.get("again"):
-            st, txt = self._images_read[path]
+        prev = self._images_read.get(path)
+        # only the same question is answered from the cache: task-f08 asked a second, sharper question about the
+        # cabinet heights, got the first (generic) reading back, and then guessed the direction of the edit wrongly
+        if prev and not a.get("again") and (not q0 or q0 == (prev[2] if len(prev) > 2 else "")):
+            st, txt = prev[0], prev[1]
             return (f"ALREADY READ at step {st} (not read again, it takes ~50 s). What it showed:\n{txt[:3500]}\n"
-                    "Use this; pass again=true only if you need a different question answered.")
+                    "Use this; ask a different `question` if you need something else from it.")
         f = await self.tools.run("send_file", {"path": path})   # binary read; not delivered to the chat
         if not f.success or not isinstance(f.result, dict) or not f.result.get("content_b64"):
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=f.error, result={})
@@ -1158,7 +1201,7 @@ class AgentLoop:
         self._acted = True
         await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
                         result={"path": path, "chars": len(text or "")})
-        self._images_read[path] = (self.step, (text or "").strip())
+        self._images_read[path] = (self.step, (text or "").strip(), q0)
         return f"image {path} reads:\n{(text or '').strip()[:3500]}"
 
     async def _delegate(self, goal: str) -> str:
@@ -1258,6 +1301,31 @@ def _needs_action(prompt: str) -> bool:
 
 CAD_MAX_BATCH = 200
 CAD_MAX_EXPANDED = 600
+def _side_by_side(imgs: list, height: int = 900) -> bytes:
+    """Images scaled to one height, next to each other with a big A/B/C label on each, as a JPEG."""
+    from PIL import ImageDraw, ImageFont
+    scaled = [im.resize((max(1, round(im.width * height / im.height)), height)) for im in imgs]
+    gap = 16
+    W = sum(im.width for im in scaled) + gap * (len(scaled) - 1)
+    canvas = Image.new("RGB", (W, height + 60), "white")
+    d = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default(size=44)
+    except TypeError:
+        font = ImageFont.load_default()
+    x = 0
+    for i, im in enumerate(scaled):
+        canvas.paste(im, (x, 60))
+        d.text((x + 10, 6), chr(65 + i), fill="red", font=font)
+        x += im.width + gap
+    if canvas.width > 2400:
+        k = 2400 / canvas.width
+        canvas = canvas.resize((2400, round(canvas.height * k)))
+    buf = io.BytesIO()
+    canvas.save(buf, "JPEG", quality=88)
+    return buf.getvalue()
+
+
 _NO_SCREEN_TOOLS = {"read_image", "image_edit", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "open_app"}
 

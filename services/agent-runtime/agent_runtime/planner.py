@@ -139,6 +139,9 @@ Rules:
   out garbled, run image_edit again with path=<the AI result>, original=<the original>, restore=[[l,t,r,b], ...]
   (pixel boxes of those regions in the original, no prompt). Exact finishing (text, colour, crop, PSD) in photopea.
   If image_edit says no image model is set up, tell the user where to set it instead of faking it in Photopea.
+  Exact geometry (raise / lower / widen / shift by a known amount, "和左侧齐平") is NOT a job for the AI model:
+  read_image grid=true to get both edges in pixels, then image_edit move=[{"box":..., "to":...}] (no AI, exact);
+  only then, if a seam shows, image_edit with a short prompt to blend it. At most 2 shell steps for measuring.
   "Make A the same as B" (height, size, colour): first measure both in the picture (read_image with a question
   like "A 的顶边和 B 的顶边分别在图片高度的百分之几处") so the prompt says which way and how much (加高/降低,
   拉宽/缩窄). If the direction is still unclear, ask_user. Before done, the compare=true read must show the

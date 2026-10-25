@@ -76,6 +76,10 @@ class AgentLoop:
         if self._cad_task and config is None:  # drawing a set in the GUI takes hundreds of steps
             self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400")))
             self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800")))
+        self._image_task = bool(_IMAGE_TASK.search(task.prompt or "")) and not self._cad_task
+        if self._image_task and config is None:  # each AI edit takes ~70 s and a check ~30 s (task-4e2 ran out at 900 s)
+            self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_IMAGE_TIMEOUT", "2400")))
+        self._last_image: Optional[str] = None  # newest image_edit output, delivered if the task runs out of time
         self.validator = Validator()
         self._cad_keys_saved: set = set()
         self._cad_touched: set = set()
@@ -180,7 +184,16 @@ class AgentLoop:
         try:
             await asyncio.wait_for(self._run(), self.cfg.timeout_s)
         except asyncio.TimeoutError:
-            self._finish(TaskStatus.FAILED, f"timeout after {self.cfg.timeout_s}s")
+            msg = f"timeout after {self.cfg.timeout_s:.0f}s"
+            if self._last_image and not getattr(self, "_sent_file", None):
+                try:  # hand over what exists instead of nothing
+                    f = await asyncio.wait_for(self.tools.run("send_file", {"path": self._last_image}), 120)
+                    if f.success and isinstance(f.result, dict):
+                        await self._deliver_file(f.result)
+                        msg += f"；时间用完前的最新一版结果已发给你（{self._last_image}），可能还没完全达到要求"
+                except Exception:  # noqa: BLE001
+                    pass
+            self._finish(TaskStatus.FAILED, msg)
         except StopRequested:
             self._finish(TaskStatus.STOPPED, "stopped by user")
         except Exception as e:  # noqa: BLE001
@@ -484,10 +497,11 @@ class AgentLoop:
                 outcome = await self.tools.run(decision.tool, decision.args, intent=decision.thought)
                 await self.emit(EventType.POLICY, level=int(outcome.decision.level), reason=outcome.decision.reason)
                 retryable = (not outcome.success and outcome.decision.allowed and outcome.control is None
-                             and outcome.error and ("timeout" in outcome.error or "Connection" in outcome.error))
+                             and _transient(outcome.error))
                 if not retryable:
                     break
-                await asyncio.sleep(0.5)
+                await self.emit(EventType.RECOVERY, attempt=attempt + 1, note=f"transient error, retrying: {outcome.error[:120]}")
+                await asyncio.sleep(1.5 * (attempt + 1))
             if decision.tool == "send_file" and outcome.success and isinstance(outcome.result, dict):
                 await self._deliver_file(outcome.result)
                 outcome.result = {k: v for k, v in outcome.result.items() if k != "content_b64"}
@@ -1003,15 +1017,21 @@ class AgentLoop:
             return p
         src, prompt = rel(a.get("path")), str(a.get("prompt") or "").strip()
         boxes = a.get("restore") or []
+        moves = a.get("move") or []
+        if isinstance(moves, dict):
+            moves = [moves]
         cfg = self.image_cfg
         err = None
-        if not cfg.get("model") or not cfg.get("key"):
+        if moves and (not isinstance(moves, list) or any(not isinstance(m, dict) or len(m.get("box") or []) != 4
+                                                          or len(m.get("to") or []) != 4 for m in moves)):
+            err = 'move must be {"box": [l,t,r,b], "to": [l,t,r,b]} (or a list of them) in the image\'s pixels'
+        elif prompt and (not cfg.get("model") or not cfg.get("key")):
             err = ("no AI image model is set up: the user picks one under 设置 → 模型 → 改图模型 "
                    "(e.g. gpt-image-1 or gemini-2.5-flash-image). Tell the user; Photopea can still do exact edits")
         elif not src:
             err = "image_edit needs `path` (the image, relative to ~/workspace)"
-        elif not prompt and not boxes:
-            err = "image_edit needs `prompt` (the change, in plain words) or `restore` boxes"
+        elif not prompt and not boxes and not moves:
+            err = "image_edit needs `prompt` (the change, in plain words), `move` or `restore` boxes"
         elif not isinstance(boxes, list) or any(not isinstance(b, (list, tuple)) or len(b) != 4 for b in boxes):
             err = "restore must be a list of [left, top, right, bottom] boxes in the ORIGINAL image's pixels"
         if err:
@@ -1033,6 +1053,9 @@ class AgentLoop:
                 orig_bytes = base64.b64decode(g.result["content_b64"])
         try:
             out = src_bytes
+            if moves:  # exact geometry first; an optional prompt then only blends the seams
+                src_bytes, minfo = await asyncio.to_thread(_ie.move_regions, src_bytes, moves, int(a.get("feather") or 6))
+                out = src_bytes
             if prompt:
                 out = await _ie.edit(cfg.get("base_url") or "", cfg["key"], cfg["model"], src_bytes, _ie.prompt_for(prompt),
                                      float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")))
@@ -1041,18 +1064,29 @@ class AgentLoop:
         except Exception as e:  # noqa: BLE001
             await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=False, error=str(e)[:200], result={})
             return f"FAILED: AI image edit with {cfg['model']}: {str(e)[:600]}"
-        up = await self.computer.execute("files.upload", {"path": save, "content_b64": base64.b64encode(png).decode()},
-                                         observe=False, timeout=120)
+        up = None
+        for _i in range(3):  # a 2 MB upload through the tunnel can hit a blip; the AI result must not be lost to it
+            up = await self.computer.execute("files.upload", {"path": save, "content_b64": base64.b64encode(png).decode()},
+                                             observe=False, timeout=120)
+            if up.success or not _transient(up.error):
+                break
+            await asyncio.sleep(2 * (_i + 1))
         if not up.success:
             await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=False, error=up.error, result={})
             return f"FAILED: could not save {save} on the computer ({up.error})"
         self._acted = True
         self._images_read.pop(save, None)
+        self._last_image = save
         await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=True, error=None,
                         result={"saved": save, **{k: v for k, v in info.items() if k != "orig_size"}})
         w, h = info["size"]
-        lines = [f"image_edit OK: saved {save} ({w}x{h} px; the model returned {info['ai_size'][0]}x{info['ai_size'][1]}"
-                 f"{', scaled back to the original size' if info['ai_size'] != info['size'] else ''})."]
+        if prompt:
+            lines = [f"image_edit OK: saved {save} ({w}x{h} px; the model returned {info['ai_size'][0]}x{info['ai_size'][1]}"
+                     f"{', scaled back to the original size' if info['ai_size'] != info['size'] else ''})."]
+        else:
+            lines = [f"image_edit OK (no AI): saved {save} ({w}x{h} px)."]
+        if moves:
+            lines.append("Moved exactly: " + "; ".join(f"{m['box']} -> {m['to']}" for m in minfo["moves"]) + ".")
         if info.get("align"):
             al = info["align"]
             lines.append(f"Restored {len(boxes)} region(s) from {orig_path}; the AI picture was offset by scale "
@@ -1135,21 +1169,30 @@ class AgentLoop:
                 imgs.append((rp, Image.open(io.BytesIO(base64.b64decode(f.result["content_b64"]))).convert("RGB")))
             except Exception as e:  # noqa: BLE001
                 return f"FAILED: {rp} is not an image ({e})"
-        b64 = base64.b64encode(_side_by_side([im for _, im in imgs])).decode()
+        zoom = None
+        if len(imgs) == 2:
+            try:
+                zoom = _ie.changed_box(imgs[0][1], imgs[1][1].resize(imgs[0][1].size))
+            except Exception:  # noqa: BLE001
+                zoom = None
+        b64 = base64.b64encode(_side_by_side([im for _, im in imgs], zoom=zoom)).decode()
         labels = "; ".join(f"{chr(65 + i)} = {p}" for i, (p, _) in enumerate(imgs))
         q = (f"这张图把 {len(imgs)} 张图片左右并排放在一起，从左到右依次标为 "
-             + "、".join(chr(65 + i) for i in range(len(imgs))) + "。请逐张对比回答，并明确指出它们之间的差别"
-             "（没有差别就直接说没有差别）：" + (question or "两张图有什么不同？"))
+             + "、".join(chr(65 + i) for i in range(len(imgs))) + "。"
+             + ("黄线下面一排是两张图中发生变化的区域（原图像素 " + str(list(zoom)) + "）放大后的对比，细节以下面一排为准。"
+                if zoom else "")
+             + "请逐张对比回答，并明确指出它们之间的差别（没有差别就直接说没有差别）：" + (question or "两张图有什么不同？"))
         eyes = self.vision_llm or self.llm
         try:
-            text = await asyncio.wait_for(eyes.describe(_cad.READ_IMAGE_PROMPT, q, b64, 1800), self.cfg.vision_timeout_s * 3)
+            text = await _retry_once(lambda: asyncio.wait_for(eyes.describe(_cad.READ_IMAGE_PROMPT, q, b64, 1800),
+                                                              self.cfg.vision_timeout_s * 3))
         except Exception as e:  # noqa: BLE001
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=str(e)[:200], result={})
             return f"FAILED: the vision model could not read the images ({type(e).__name__})"
         self._acted = True
         await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
                         result={"compare": [p for p, _ in imgs], "chars": len(text or "")})
-        return f"compared side by side ({labels}):\n{(text or '').strip()[:3500]}"
+        return f"compared side by side ({labels}{'; zoomed on ' + str(list(zoom)) if zoom else ''}):\n{(text or '').strip()[:3500]}"
 
     async def _read_image_one(self, a: dict) -> str:
         """Read an image (or one PDF page) from ~/workspace and have the vision model describe it for drafting."""
@@ -1169,7 +1212,7 @@ class AgentLoop:
                 err = (r.result or {}).get("stderr") if isinstance(r.result, dict) else r.error
                 return f"FAILED: could not render PDF page ({err}); is poppler-utils installed?"
             path = stem + ".png"
-        q0 = (a.get("question") or "").strip()
+        q0 = (a.get("question") or "").strip() + (" [grid]" if a.get("grid") else "")
         prev = self._images_read.get(path)
         # only the same question is answered from the cache: task-f08 asked a second, sharper question about the
         # cabinet heights, got the first (generic) reading back, and then guessed the direction of the edit wrongly
@@ -1183,6 +1226,8 @@ class AgentLoop:
             return f"FAILED: cannot read {path} ({f.error}). Use files_list to find the uploaded file."
         try:
             img = Image.open(io.BytesIO(base64.b64decode(f.result["content_b64"]))).convert("RGB")
+            if a.get("grid"):
+                img = _with_grid(img)
             if max(img.size) > 2000:
                 k = 2000 / max(img.size)
                 img = img.resize((int(img.width * k), int(img.height * k)))
@@ -1192,9 +1237,11 @@ class AgentLoop:
             return f"FAILED: {path} is not an image ({e})"
         eyes = self.vision_llm or self.llm
         q = (a.get("question") or "").strip()
+        if a.get("grid"):
+            q = ("图上画了红色像素网格线，线旁的数字是原图像素坐标（x 向右、y 向下）。回答位置时请用这些像素坐标。" + q)
         try:
-            text = await asyncio.wait_for(eyes.describe(_cad.READ_IMAGE_PROMPT, q or "请按结构描述这张图。", b64, 1800),
-                                          self.cfg.vision_timeout_s * 3)
+            text = await _retry_once(lambda: asyncio.wait_for(
+                eyes.describe(_cad.READ_IMAGE_PROMPT, q or "请按结构描述这张图。", b64, 1800), self.cfg.vision_timeout_s * 3))
         except Exception as e:  # noqa: BLE001
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=str(e)[:200], result={})
             return f"FAILED: the vision model could not read the image ({type(e).__name__})"
@@ -1301,9 +1348,69 @@ def _needs_action(prompt: str) -> bool:
 
 CAD_MAX_BATCH = 200
 CAD_MAX_EXPANDED = 600
-def _side_by_side(imgs: list, height: int = 900) -> bytes:
-    """Images scaled to one height, next to each other with a big A/B/C label on each, as a JPEG."""
+async def _retry_once(make):
+    """Run make() (a fresh coroutine each call); on an exception try once more after a short pause."""
+    try:
+        return await make()
+    except Exception:  # noqa: BLE001
+        await asyncio.sleep(2)
+        return await make()
+
+
+def _with_grid(img, step: int | None = None):
+    """Red pixel grid with coordinate labels, so a vision model can answer positions in real pixels."""
     from PIL import ImageDraw, ImageFont
+    img = img.copy()
+    step = step or (50 if max(img.size) <= 1200 else 100)
+    d = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.load_default(size=max(12, max(img.size) // 70))
+    except TypeError:
+        font = ImageFont.load_default()
+    for x in range(step, img.width, step):
+        d.line([(x, 0), (x, img.height)], fill=(255, 0, 0), width=1)
+        if x % (step * 2) == 0:
+            d.text((x + 2, 2), str(x), fill=(255, 0, 0), font=font)
+    for y in range(step, img.height, step):
+        d.line([(0, y), (img.width, y)], fill=(255, 0, 0), width=1)
+        if y % (step * 2) == 0:
+            d.text((2, y + 2), str(y), fill=(255, 0, 0), font=font)
+    return img
+
+
+_IMAGE_TASK = re.compile(r"\.(png|jpe?g|webp|heic|bmp)\b.*|图片|照片|效果图|P图|修图|改图", re.I | re.S)
+
+
+_TRANSIENT = re.compile(r"timeout|timed out|connection|reset by peer|broken pipe|eof|temporar|unavailable|"
+                        r"\b50[234]\b|bad gateway|too many requests|\b429\b|websocket|not connected", re.I)
+
+
+def _transient(err) -> bool:
+    """Network / model hiccups worth one more try. task-4e2: a shell failed with "TimeoutError: " -- the old check
+    looked for lower-case "timeout" only, so nothing retried."""
+    return bool(err) and bool(_TRANSIENT.search(str(err)))
+
+
+def _side_by_side(imgs: list, height: int = 900, zoom: tuple | None = None) -> bytes:
+    """Images scaled to one height, next to each other with a big A/B/C label on each, as a JPEG. With `zoom`
+    (a box in the first image's pixels) a second row shows that box cut from every image, enlarged: a 2 %
+    height change is ~12 px at full-picture scale and the vision model called it "identical" (task-4e2)."""
+    from PIL import ImageDraw, ImageFont
+    if zoom:
+        top = Image.open(io.BytesIO(_side_by_side(imgs, height))).convert("RGB")
+        crops = []
+        for im in imgs:
+            k = im.width / imgs[0].width
+            crops.append(im.crop(tuple(int(v * k) for v in zoom)))
+        bottom = Image.open(io.BytesIO(_side_by_side(crops, height))).convert("RGB")
+        if bottom.width != top.width:
+            bottom = bottom.resize((top.width, max(1, round(bottom.height * top.width / bottom.width))))
+        canvas = Image.new("RGB", (top.width, top.height + bottom.height + 20), (255, 230, 0))
+        canvas.paste(top, (0, 0))
+        canvas.paste(bottom, (0, top.height + 20))
+        buf = io.BytesIO()
+        canvas.save(buf, "JPEG", quality=88)
+        return buf.getvalue()
     scaled = [im.resize((max(1, round(im.width * height / im.height)), height)) for im in imgs]
     gap = 16
     W = sum(im.width for im in scaled) + gap * (len(scaled) - 1)

@@ -73,3 +73,58 @@ async def test_kickoff_skips_without_image_model(env):  # noqa: F811
     loop = AgentLoop(Task(prompt=ASK), "s-kb2", comp, LLMRouter([ScriptedProvider([])]), ToolExecutor(comp),
                      config=LoopConfig(max_steps=2, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")))
     assert await loop._image_kickoff() is None
+
+
+def test_raise_plan_moves_the_counter_and_what_stands_on_it():
+    g = {"x_left": 185, "x_left_top": 243, "x_right": 845, "top_y": 705, "front_top_y": 887, "base_y": 1188,
+         "target_y": 858, "probe_x": 200}
+    mv = ib.plan_moves(g, 29)
+    assert mv[0] == {"box": [243, 693, 845, 879], "to": [243, 664, 845, 850]}      # things on the counter, not the neighbour's
+    assert mv[1]["to"][1] == 850 and mv[2]["to"] == [185, 888, 845, 1188]          # counter up 29, doors stretch, base kept
+    assert ib._geometry({**g, "top_y": 2000}, 1084, 1451) is None
+
+
+def test_moves_join_without_ghosts_and_blend_keeps_the_move():
+    from PIL import ImageDraw
+    im = Image.new("RGB", (400, 400), (200, 200, 200))
+    d = ImageDraw.Draw(im)
+    d.rectangle([100, 200, 300, 210], fill=(0, 0, 0))       # a counter edge at y 200..210
+    mv = [{"box": [100, 150, 300, 220], "to": [100, 130, 300, 200]}, {"box": [100, 220, 300, 380], "to": [100, 200, 300, 380]}]
+    geo, _ = ie.move_regions(_bytes(im), mv, 6)
+    g = Image.open(io.BytesIO(geo)).convert("L")
+    assert g.getpixel((200, 185)) < 30 and g.getpixel((200, 205)) > 150   # edge moved up 20, no ghost at the joint
+    flat = _bytes(Image.new("RGB", (400, 400), (200, 200, 200)))          # an AI that "undid" the move
+    out = Image.open(io.BytesIO(ie.blend_seams(geo, flat, mv))).convert("L")
+    assert out.getpixel((200, 185)) < 30                                  # the edge survives: AI only on seams
+
+
+async def test_kickoff_measures_and_moves_for_a_raise(env, monkeypatch):  # noqa: F811
+    from agent_runtime import AgentLoop, LoopConfig
+    from aiw_protocols import Task
+    from llm_router import LLMRouter, ScriptedProvider
+    from tool_router import ToolExecutor
+    backend, comp, tmp = env
+    (tmp / "uploads").mkdir()
+    (tmp / "uploads/枫木服务区.png").write_bytes(_bytes(_photo()))   # white cabinet front edge at y=420
+    loop = AgentLoop(Task(prompt=ASK), "s-kb3", comp, LLMRouter([ScriptedProvider([])]), ToolExecutor(comp),
+                     config=LoopConfig(max_steps=2, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")),
+                     image_cfg={"model": "gpt-image-1", "key": "k", "base_url": "https://gw/v1"})
+    replies = [json.dumps({"target": "白柜", "reference": "左侧台面", "ai_prompt": "白柜加高", "question": "",
+                           "geometry": {"x_left": 100, "x_right": 450, "top_y": 380, "front_top_y": 425, "base_y": 650,
+                                        "target_y": 395, "probe_x": 110}}, ensure_ascii=False),
+               '{"front_top_y": 421, "target_y": 400}']
+
+    class Eyes:
+        async def describe(self, system, q, b64, max_tokens=1500):
+            return replies.pop(0)
+    loop.vision_llm = Eyes()
+    seen = {}
+
+    async def fake_edit(base, key, model, img, prompt, timeout=300):
+        seen["prompt"] = prompt
+        return _bytes(Image.new("RGB", (600, 800), (200, 200, 190)))   # an AI that redraws everything flat
+    monkeypatch.setattr(ie, "edit", fake_edit)
+    note = await loop._image_kickoff()
+    assert "raised by 20 px exactly" in note and "只修补接缝" in seen["prompt"]
+    out = Image.open(tmp / "uploads/枫木服务区-修改.png").convert("RGB")
+    assert min(out.getpixel((300, 405))) > 238   # the white cabinet now starts 20 px higher, AI or not

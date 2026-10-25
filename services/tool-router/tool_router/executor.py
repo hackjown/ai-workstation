@@ -84,6 +84,14 @@ class ToolExecutor:
         observe = spec.action not in ("computer.screenshot", "shell.exec") and not spec.action.startswith("files.")
         r = await self.computer.execute(spec.action, payload, observe=observe,
                                         timeout=float(args.get("timeout", _default_timeout(spec.action, payload))))
+        # reads are safe to repeat: retry them here so every caller (read_image, image_edit, photopea) is covered
+        for i in range(2 if spec.action in _SAFE_REPEAT else 0):
+            if r.success or not _TRANSIENT.search(str(r.error or "")):
+                break
+            import asyncio
+            await asyncio.sleep(1.5 * (i + 1))
+            r = await self.computer.execute(spec.action, payload, observe=observe,
+                                            timeout=float(args.get("timeout", _default_timeout(spec.action, payload))))
         await self._audit({"phase": "result", "tool": name, "action": spec.action, "success": r.success,
                            "error": r.error, "duration_ms": r.duration_ms})
         return ToolOutcome(name, spec.action, r.success, decision, r.result, r.error, r.screenshot)
@@ -91,6 +99,12 @@ class ToolExecutor:
     async def _audit(self, rec: dict):
         if self.audit:
             await self.audit(rec)
+
+
+import re as _re0
+_SAFE_REPEAT = {"files.read", "files.list", "computer.screenshot"}
+_TRANSIENT = _re0.compile(r"timeout|timed out|connection|reset by peer|broken pipe|eof|temporar|unavailable|"
+                          r"\b50[234]\b|bad gateway|websocket|not connected", _re0.I)
 
 
 def _redact(p: dict) -> dict:

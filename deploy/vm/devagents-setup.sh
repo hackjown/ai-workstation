@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AIW computer (VM 104 / InstaBox cloud box): WorkBuddy desktop + CodeBuddy CLI (WorkBuddy 终端) + REA reverse-engineering MCP.
+# AIW computer (VM 104 / InstaBox cloud box): WorkBuddy desktop + CodeBuddy CLI (WorkBuddy 终端) + REA reverse-engineering MCP + OfficeCLI.
 #   bash devagents-setup.sh          install / update
 #   bash devagents-setup.sh check    show what is installed
 # Needs: Debian/Ubuntu amd64, sudo. Login to WorkBuddy/CodeBuddy is interactive and done once by the user.
@@ -27,6 +27,7 @@ check() {
   echo "codebuddy $(codebuddy --version 2>/dev/null || echo missing)"
   echo "workbuddy $(dpkg-query -W -f='${Version}' workbuddy 2>/dev/null || echo missing)"
   if [ -f "$HOME/.workbuddy/mcp.json" ] && grep -q '"rea"' "$HOME/.workbuddy/mcp.json"; then echo "rea mcp   registered in ~/.workbuddy/mcp.json"; else echo "rea mcp   not registered"; fi
+  echo "officecli $(officecli --version 2>/dev/null | head -1 || echo missing)"
   echo "rea skill $( [ -d "$HOME/.workbuddy/skills" ] && ls "$HOME/.workbuddy/skills" 2>/dev/null | grep -i -m1 reverse || echo none)"
 }
 [ "${1:-}" = "check" ] && { check; exit 0; }
@@ -86,6 +87,15 @@ mkdir -p "$HOME/.workbuddy"
 npx -y rea-agents@latest setup --client workbuddy --yes >>"$LOG" 2>&1 \
   || echo "WARN: rea setup returned non-zero (often just 'no analysis engine yet'); see $LOG"
 npx -y rea-agents@latest doctor --client workbuddy --json >"$HOME/.config/aiw/rea-doctor.json" 2>>"$LOG" || true
+
+step "OfficeCLI (iOfficeAI, precise docx/xlsx/pptx read/edit/render)"
+curl -fsSL -m 60 https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.sh -o /tmp/officecli-install.sh \
+  && bash /tmp/officecli-install.sh >>"$LOG" 2>&1 || echo "WARN: OfficeCLI install failed, see $LOG"
+hash -r
+# Make its skill visible to WorkBuddy / CodeBuddy too (its installer only knows Claude Code/Copilot/Codex/Cursor...)
+if curl -fsSL -m 30 https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/SKILL.md -o /tmp/officecli-SKILL.md; then
+  for d in "$HOME/.workbuddy/skills/officecli" "$HOME/.codebuddy/skills/officecli"; do mkdir -p "$d" && cp /tmp/officecli-SKILL.md "$d/SKILL.md"; done
+fi
 
 touch "$HOME/.config/aiw/devagents-ready-v1"
 echo; check

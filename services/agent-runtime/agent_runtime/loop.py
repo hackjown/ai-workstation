@@ -97,6 +97,8 @@ class AgentLoop:
         if self._video_task and re.search(r"huashu-motion|\bom\s|讲解|explainer", task.prompt or ""):
             self.history.append(_video.brief(task.prompt))
         self._video_rejects = 0
+        self._desktop_free = (not self._cad_task and not _GUI_TASK.search(task.prompt or "")
+                              and os.environ.get("AIW_ALWAYS_LOOK_FIRST", "0") != "1")
         self._images_read: dict[str, tuple] = {}  # path -> (step, description, question): history keeps only ~25 steps
         self.step = 0
         self.ask, self.remember = ask, remember
@@ -373,6 +375,10 @@ class AgentLoop:
                 await self.emit(EventType.RESUMED, takeover=self.control.resumed_after_takeover)
             self.step += 1
             blind = self._last_tool in _NO_SCREEN_TOOLS and self.step > 1
+            # shell/file work (analyse a video, convert a file, write a script) needs no first look at the desktop:
+            # every task used to open with a screenshot + vision description of an empty Debian desktop
+            first_blind = self.step == 1 and self._desktop_free and not self.control.resumed_after_takeover
+            blind = blind or first_blind
             # a CAD batch that went through needs no fresh look (screenshot + vision cost ~15 s a step);
             # look again every 4th batch so a drawing error is still caught
             if (self._last_tool == "cad_command" and self._last_ok_cad and self.step > 1
@@ -386,6 +392,8 @@ class AgentLoop:
                 note = ((note + "\n") if note else "") + (
                     "Screen not re-read: the last LibreCAD batch went through. Send the next batch from your plan; "
                     "the screen is shown again every few batches." if cad_blind else
+                    "No screenshot: this task looks like shell/file work (files are under ~/workspace, uploads in "
+                    "~/workspace/uploads). Start with shell; call screenshot only if you need the desktop." if first_blind else
                     "Screen not re-read: your last step was a shell/file action. Keep working in the shell; "
                     "call screenshot only if you need to see the desktop.")
             else:
@@ -1617,6 +1625,12 @@ def _with_grid(img, step: int | None = None):
     return img
 
 
+# needs the screen: a browser, a website, a desktop app, or the user pointing at something on screen
+_GUI_TASK = re.compile(
+    r"打开|点击|点一下|双击|浏览器|网页|网站|网址|chrome|firefox|桌面|窗口|屏幕|截图|截屏|界面|登录|登陆|注册|下单|购买|预订|"
+    r"填写|表单|上网|搜索|百度|谷歌|google|bing|淘宝|京东|微信|小红书|抖音|b站|bilibili|youtube|"
+    r"https?://|www\.|\.com\b|\.cn\b|librecad|gimp|inkscape|libreoffice|wps|photopea|vs ?code|应用|软件里|app\b|"
+    r"\bopen\b|\bclick\b|\bbrowse|\bwebsite|\bdesktop|\bscreen|\blog ?in\b|\bsign ?in\b|\bsearch\b", re.I)
 _VIDEO_TASK = re.compile(r"视频|讲解片|宣传片|发布片|动画片|动效|huashu-motion|\bvideo\b|\.mp4\b|explainer", re.I)
 _IMAGE_TASK = re.compile(r"\.(png|jpe?g|webp|heic|bmp)\b.*|图片|照片|效果图|P图|修图|改图", re.I | re.S)
 

@@ -23,6 +23,7 @@ from tool_router import ToolExecutor, tool_schemas
 from tool_router.registry import SUBAGENT_TOOLS
 
 from . import cad as _cad
+from . import video as _video
 from . import image_edit as _ie
 from . import image_brief as _ib
 from . import photopea as _pp
@@ -93,12 +94,9 @@ class AgentLoop:
         self.recovery = Recovery(computer)
         self._emit_fn = emit
         self.history: list[str] = []
-        if self._video_task and re.search(r"huashu-motion|\bom\s", task.prompt or ""):
-            self.history.append(
-                "0. (setup) huashu-motion needs Node 22+, Chrome/Chromium, FFmpeg (+ uv/Kokoro for a Chinese voice). "
-                "First run `~/.claude/skills/huashu-motion/bin/om doctor`; if anything is missing run "
-                "`bash ~/ai-workstation/deploy/vm/motion-setup.sh` (or the copy in the repo) and check again. Ask the "
-                "director's questions in ONE ask_user as soon as you know the material, not after reading everything.")
+        if self._video_task and re.search(r"huashu-motion|\bom\s|讲解|explainer", task.prompt or ""):
+            self.history.append(_video.brief(task.prompt))
+        self._video_rejects = 0
         self._images_read: dict[str, tuple] = {}  # path -> (step, description, question): history keeps only ~25 steps
         self.step = 0
         self.ask, self.remember = ask, remember
@@ -181,6 +179,17 @@ class AgentLoop:
         p.write_bytes(base64.b64decode(b64))
         await self.emit(EventType.FILE, name=name, size=res.get("size"), artifact=str(p),
                         truncated=bool(res.get("size") and res["size"] > p.stat().st_size))
+
+    async def _video_qa(self, path: str) -> Optional[str]:
+        """Loudness, channels, and for a document explainer page coverage and length (task-8bd: 8 of 16 pages, -25.7 LUFS mono)."""
+        try:
+            r = await asyncio.wait_for(self.tools.run("shell", {"command": _video.qa_command(path, _video.doc_path(self.task.prompt)),
+                                                                  "timeout": 300}, intent="check the video before sending it"), 320)
+        except Exception:  # noqa: BLE001
+            return None
+        if not r.success or not isinstance(r.result, dict):
+            return None
+        return _video.verdict(str(r.result.get("stdout") or ""), self.task.prompt)
 
     def add_wait(self, seconds: float) -> None:
         """Time spent waiting on the user extends the deadline (task-247 lost 10 of its 15 min to two unanswered
@@ -490,6 +499,15 @@ class AgentLoop:
                 continue
             if decision.tool != "fail":
                 self._nocall = 0
+            if (decision.tool == "send_file" and self._video_task and self._video_rejects < 3
+                    and re.search(r"\.(mp4|mov|webm)$", str(decision.args.get("path") or ""), re.I)):
+                note = await self._video_qa(str(decision.args.get("path")))
+                if note:
+                    self._video_rejects += 1
+                    await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                    await self.emit(EventType.VALIDATION, success=False, change=0.0, message="视频交付前检查未通过：" + note[:300])
+                    self.history.append(f"{self.step}. send_file REFUSED by video QA")
+                    continue
             if decision.tool == "done" and not self._acted and _needs_action(self.task.prompt) and self._done_rejects < 2:
                 self._done_rejects += 1
                 await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)

@@ -230,28 +230,116 @@ def move_regions(img_bytes: bytes, moves: list, feather: int = 6) -> tuple[bytes
     W, H = img.size
     out = img.copy()
     done = []
-    for mv in moves:
-        box = [int(round(float(v))) for v in mv["box"]]
-        to = [int(round(float(v))) for v in mv["to"]]
-        box = [max(0, min(W, box[0])), max(0, min(H, box[1])), max(0, min(W, box[2])), max(0, min(H, box[3]))]
-        to = [max(0, min(W, to[0])), max(0, min(H, to[1])), max(0, min(W, to[2])), max(0, min(H, to[3]))]
+    clip = lambda b: [max(0, min(W, b[0])), max(0, min(H, b[1])), max(0, min(W, b[2])), max(0, min(H, b[3]))]
+    tos = [clip([int(round(float(v))) for v in mv["to"]]) for mv in moves]
+    for i, mv in enumerate(moves):
+        box = clip([int(round(float(v))) for v in mv["box"]])
+        to = tos[i]
         if box[2] - box[0] < 2 or box[3] - box[1] < 2 or to[2] - to[0] < 2 or to[3] - to[1] < 2:
             raise ValueError(f"empty box in move {mv}")
         piece = img.crop(tuple(box)).resize((to[2] - to[0], to[3] - to[1]), Image.LANCZOS)
-        out.paste(piece, (to[0], to[1]), _feather_mask(piece.size, feather))
+        # an edge shared with another move stays hard: feathering it lets the old picture show through the joint
+        others = [o for j, o in enumerate(tos) if j != i]
+        hard = {"top": any(abs(o[3] - to[1]) <= 1 and o[0] < to[2] and o[2] > to[0] for o in others),
+                "bottom": any(abs(o[1] - to[3]) <= 1 and o[0] < to[2] and o[2] > to[0] for o in others),
+                "left": any(abs(o[2] - to[0]) <= 1 and o[1] < to[3] and o[3] > to[1] for o in others),
+                "right": any(abs(o[0] - to[2]) <= 1 and o[1] < to[3] and o[3] > to[1] for o in others)}
+        out.paste(piece, (to[0], to[1]), _feather_mask(piece.size, feather, hard))
         done.append({"box": box, "to": to})
     buf = io.BytesIO()
     out.save(buf, "PNG")
     return buf.getvalue(), {"moves": done}
 
 
-def _feather_mask(size, feather: int):
-    from PIL import ImageFilter
+def seam_mask(size, moves: list, band: int = 22) -> Image.Image:
+    """Where geometric moves leave seams: each moved area's outer edges (not the joints between moves, which are
+    exact) and whatever the moves vacated without covering it again."""
+    W, H = size
+    tos = [[float(v) for v in mv["to"]] for mv in moves]
+    m = Image.new("L", (W, H), 0)
+    d = ImageDraw.Draw(m)
+
+    def shared(t, side):
+        for o in tos:
+            if o is t:
+                continue
+            if side == "top" and abs(o[3] - t[1]) <= 1 and o[0] < t[2] and o[2] > t[0]:
+                return True
+            if side == "bottom" and abs(o[1] - t[3]) <= 1 and o[0] < t[2] and o[2] > t[0]:
+                return True
+        return False
+    for t in tos:
+        l, top, r, bot = t
+        if not shared(t, "top"):
+            d.rectangle([l - band, top - band, r + band, top + band], fill=255)
+        if not shared(t, "bottom"):
+            d.rectangle([l - band, bot - band, r + band, bot + band], fill=255)
+        d.rectangle([l - band, top - band, l + band, bot + band], fill=255)
+        d.rectangle([r - band, top - band, r + band, bot + band], fill=255)
+    vac = Image.new("L", (W, H), 0)
+    dv = ImageDraw.Draw(vac)
+    for mv in moves:
+        dv.rectangle([float(v) for v in mv["box"]], fill=255)
+    for t in tos:
+        dv.rectangle(t, fill=0)
+    if vac.getbbox():
+        m = ImageChops.lighter(m, vac.filter(ImageFilter.MaxFilter(2 * (band // 2) + 1)))
+    return m.filter(ImageFilter.GaussianBlur(band / 3))
+
+
+def blend_seams(geo_bytes: bytes, ai_bytes: bytes, moves: list, band: int = 22) -> bytes:
+    """Keep the exact geometric result and take the AI's redraw only along the seams, so the AI cannot undo the move
+    (task-0d5/238: asked to raise the counter, the image model redrew it where it was)."""
+    geo = Image.open(io.BytesIO(geo_bytes)).convert("RGB")
+    ai = Image.open(io.BytesIO(ai_bytes)).convert("RGB")
+    if ai.size != geo.size:
+        ai = ai.resize(geo.size, Image.LANCZOS)
+    s, dx, dy, _v = align(geo, ai)
+    W, H = geo.size
+    ox, oy = (W - W * s) / 2 + dx, (H - H * s) / 2 + dy
+    ai_in_geo = ai.transform((W, H), Image.AFFINE, (s, 0, ox, 0, s, oy), Image.BICUBIC)
+    out = geo.copy()
+    out.paste(ai_in_geo, (0, 0), seam_mask((W, H), moves, band))
+    buf = io.BytesIO()
+    out.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def edge_row(img_bytes: bytes, x0: int, x1: int, y_guess: int, reach: int = 14) -> int:
+    """The row near y_guess where columns x0..x1 change brightness most (a counter's front edge): sharpens a vision
+    model's estimate to the pixel."""
+    im = Image.open(io.BytesIO(img_bytes)).convert("L")
+    W, H = im.size
+    x0, x1 = max(0, min(x0, x1)), min(W, max(x0, x1))
+    if x1 - x0 < 4:
+        return y_guess
+    best, by = -1.0, y_guess
+    for y in range(max(1, y_guess - reach), min(H - 1, y_guess + reach + 1)):
+        a = im.crop((x0, y - 1, x1, y)); b = im.crop((x0, y, x1, y + 1))
+        v = ImageStat.Stat(ImageChops.difference(a, b)).mean[0]
+        if v > best:
+            best, by = v, y
+    return by
+
+
+def _feather_mask(size, feather: int, hard: Optional[dict] = None):
     w, h = size
-    m = Image.new("L", size, 0)
     f = max(0, min(feather, w // 4, h // 4))
+    if not f:
+        return Image.new("L", size, 255)
+    hard = hard or {}
+    m = Image.new("L", size, 0)
     m.paste(255, (f, f, w - f, h - f))
-    return m.filter(ImageFilter.GaussianBlur(f / 2)) if f else Image.new("L", size, 255)
+    m = m.filter(ImageFilter.GaussianBlur(f / 2))
+    if hard.get("top"):
+        m.paste(255, (0, 0, w, f * 2))
+    if hard.get("bottom"):
+        m.paste(255, (0, h - f * 2, w, h))
+    if hard.get("left"):
+        m.paste(255, (0, 0, f * 2, h))
+    if hard.get("right"):
+        m.paste(255, (w - f * 2, 0, w, h))
+    return m
 
 
 def changed_box(orig: Image.Image, res: Image.Image, pad: float = 0.08):

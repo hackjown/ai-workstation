@@ -73,10 +73,12 @@ TOOLS: list[ToolSpec] = [
              "photo, or a cad_draw preview) with the vision model. Returns a structured Chinese description: drawing "
              "type, every readable dimension, components left-to-right, materials, and unclear points. Ask a specific "
              "question to focus it, e.g. '电视墙从左到右每段宽度是多少'. Several images: pass them all in `paths` in ONE "
-             "call; they are read in parallel (about 50 s in total instead of 50 s each).",
+             "call; they are read in parallel (about 50 s in total instead of 50 s each). To COMPARE images "
+             "(before/after an edit, two versions) pass compare=true: they are shown side by side in one picture.",
              {"path": {"type": "string", "description": "relative to ~/workspace, e.g. uploads/设计图.jpg"},
               "paths": {"type": "array", "items": {"type": "string"}, "description": "several images read at once"},
               "page": {"type": "integer", "description": "PDF page, 1-based"},
+              "compare": {"type": "boolean", "description": "with paths: read them side by side in one picture"},
               "question": {"type": "string"}}, []),
     ToolSpec("image_edit", None,
              "AI image editing: describe a change in words and an image model redraws the photo (make the cabinets "

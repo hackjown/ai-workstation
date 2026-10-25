@@ -42,6 +42,16 @@ if ! node_ok; then
   curl -fsSL https://deb.nodesource.com/setup_24.x | $SUDO -E bash - >>"$LOG" 2>&1
   $SUDO apt-get install -y -qq nodejs >>"$LOG" 2>&1
 fi
+# An older node earlier on PATH (InstaBox ships one in /usr/local/bin) shadows the apt one: point it at /usr/bin.
+if ! node_ok && [ -x /usr/bin/node ]; then
+  for b in node npm npx; do
+    p=$(command -v $b); if [ -n "$p" ] && [ "$p" != "/usr/bin/$b" ] && [ -e "/usr/bin/$b" ]; then
+      step "replace older $p with a link to /usr/bin/$b (backup $p.bak-old)"
+      [ -L "$p" ] || $SUDO mv "$p" "$p.bak-old"; $SUDO ln -sf "/usr/bin/$b" "$p"
+    fi
+  done
+  hash -r
+fi
 node_ok || { echo "FAILED: Node $(node -v 2>/dev/null) still too old for REA; see $LOG"; exit 1; }
 
 step "CodeBuddy Code CLI (WorkBuddy 终端, command: codebuddy)"

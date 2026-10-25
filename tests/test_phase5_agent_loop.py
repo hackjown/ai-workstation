@@ -63,7 +63,7 @@ async def test_terminal_create_file(env):
     backend, comp, tmp = env
     loop, _ = make_loop(comp, [("shell", {"command": "echo hi > test.txt", "cwd": str(tmp)}),
                                ("done", {"summary": "ok"})], tmp)
-    assert (await loop.run()).status == TaskStatus.SUCCEEDED
+    _t = await loop.run(); assert _t.status == TaskStatus.SUCCEEDED, _t.result
     assert (tmp / "test.txt").read_text().strip() == "hi"
 
 

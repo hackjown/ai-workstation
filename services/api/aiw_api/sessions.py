@@ -118,6 +118,18 @@ class SessionManager:
         key = self.secrets.get("openai_api_key") if self.secrets else None
         return LLMRouter.from_settings(m["vision_model"], None, key, m.get("base_url") or None, None, m.get("thinking"))
 
+    def _image_cfg(self) -> Optional[dict]:
+        """The AI image-editing model (image_edit tool), through the same gateway and key as the other models."""
+        if self._custom_llm:
+            return None
+        m = self.model_settings()
+        model = m.get("image_model") or os.environ.get("AIW_IMAGE_MODEL")
+        key = (self.secrets.get("openai_api_key") if self.secrets else None) or os.environ.get("OPENAI_API_KEY")
+        if not model or not key:
+            return None
+        base = m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        return {"model": model, "key": key, "base_url": base}
+
     # ------------------------------------------------------------------ context
     def build_context(self, thread_id: Optional[str], exclude_task: Optional[str] = None) -> Optional[str]:
         parts = []
@@ -326,7 +338,7 @@ class SessionManager:
                 async with hold:
                     loop = AgentLoop(task, sid, computer, self._llm(), ToolExecutor(computer, confirm=confirm, audit=audit),
                                      control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
-                                     subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(),
+                                     subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(), image_cfg=self._image_cfg(),
                                      system_extra=system_extra.strip(),
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))

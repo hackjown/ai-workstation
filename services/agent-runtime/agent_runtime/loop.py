@@ -23,6 +23,7 @@ from tool_router import ToolExecutor, tool_schemas
 from tool_router.registry import SUBAGENT_TOOLS
 
 from . import cad as _cad
+from . import photopea as _pp
 
 # Only an explicit "go on with the earlier drawing" resumes. The bare words matched far too much: run 3ac's prompt said
 # "把那张补画完整" (redraw that thin sheet) and was taken for a resume, so the previous run's DXF stayed in cad/, LibreCAD
@@ -618,6 +619,8 @@ class AgentLoop:
                     "To reopen a file use cad_command with open='cad/<name>.dxf'.")
         if t == "read_image":
             return await self._read_image(a)
+        if t == "photopea":
+            return await self._photopea(a, decision.thought)
         if t == "remember":
             text = (a.get("text") or "").strip()
             if text and self.remember:
@@ -985,6 +988,38 @@ class AgentLoop:
                if info.get("png") else "")
         return (f"drawing saved: {json_short(short)}; sent to user: {sent or 'nothing'}; "
                 f"opened in LibreCAD: {bool(a.get('open', True))}.{tip}")
+
+    async def _photopea(self, a: dict, intent: str) -> str:
+        """Edit images in Photopea (a Photoshop clone in the browser) on the VM's desktop. The bridge script ships
+        with this image and is written to the VM on first use, so neither VM needs a setup step."""
+        job = _pp.build_job(a)
+        err = _pp.check_job(job)
+        if err:
+            await self.emit(EventType.ACTION_RESULT, tool="photopea", success=False, error=err[:200], result={})
+            return f"REFUSED: {err}"
+        if not getattr(self, "_pp_installed", False):
+            r = await self.tools.run("shell", {"command": _pp.install_command(), "timeout": 60},
+                                     intent="install the Photopea bridge on this computer")
+            out = ((r.result or {}).get("stdout") or "") if isinstance(r.result, dict) else ""
+            if "PP_OK" not in out:
+                e = ((r.result or {}).get("stderr") if isinstance(r.result, dict) else None) or r.error or out
+                await self.emit(EventType.ACTION_RESULT, tool="photopea", success=False, error=str(e)[-200:], result={})
+                return f"FAILED: could not install the Photopea bridge on the computer: {str(e)[-400:]}"
+            self._pp_installed = True
+        r = await self.tools.run("shell", {"command": _pp.run_command(job), "timeout": _pp.shell_timeout(job)},
+                                 intent=intent or "edit the image in Photopea")
+        res_raw = r.result if isinstance(r.result, dict) else {}
+        res = _pp.parse_result(res_raw.get("stdout") or "")
+        if res is None:
+            e = ((res_raw.get("stderr") or "") + (r.error or ""))[-500:] or "no result from the bridge"
+            await self.emit(EventType.ACTION_RESULT, tool="photopea", success=False, error=e[-200:], result={})
+            return f"FAILED: photopea bridge: {e}"
+        ok = bool(res.get("ok"))
+        if ok:
+            self._acted = True
+        await self.emit(EventType.ACTION_RESULT, tool="photopea", success=ok, error=None if ok else str(res.get("error"))[:200],
+                        result={"saved": _pp.saved_paths(res), "log": (res.get("echo") or [])[:5]})
+        return _pp.summarize(res)
 
     async def _read_image(self, a: dict) -> str:
         """read_image with paths=[...]: all images at once. Read one per step, the 8 design images of task-960 took

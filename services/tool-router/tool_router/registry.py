@@ -78,6 +78,30 @@ TOOLS: list[ToolSpec] = [
               "paths": {"type": "array", "items": {"type": "string"}, "description": "several images read at once"},
               "page": {"type": "integer", "description": "PDF page, 1-based"},
               "question": {"type": "string"}}, []),
+    ToolSpec("photopea", None,
+             "Edit images like in Photoshop: PSD/PNG/JPG/WebP in Photopea (a Photoshop clone) in a browser window on "
+             "the desktop; the user watches it. One call = open files -> run `script` -> save. `script` is Photoshop "
+             "ExtendScript-style JavaScript on app.activeDocument (layers, artLayers.add(), LayerKind.TEXT + textItem."
+             "contents/size/font/color/position, layers.getByName, visible, opacity, translate(dx,dy), resize(%,%), "
+             "rotate, resizeImage(w,h), resizeCanvas, crop([l,t,r,b]), selection.select/fill, applyGaussianBlur, "
+             "adjustBrightnessContrast, desaturate, duplicate, remove, merge, flatten). Built-ins: ppLog(...) prints "
+             "values back to you, ppColor('ff3300') makes a SolidColor, ppPlace('logo.png') adds a file listed in "
+             "`place` as a new top layer (it arrives a moment later: move it in a second call with keep=true). "
+             "Chinese text: font 'NotoSansSC-Regular' or 'NotoSansSC-Bold'. layer.bounds[i] and textItem.size are "
+             "UnitValues: read .value. No for-in loops over Photopea objects. Never call saveToOE or app.echoToOE; "
+             "list outputs in `save`. Use info=true to get every layer's name, bounds and text before editing.",
+             {"open": {"type": "array", "items": {"type": "string"},
+                       "description": "files to open, relative to ~/workspace; each becomes a document, the last is active. "
+                                      "Without keep, documents already open are closed first"},
+              "script": {"type": "string", "description": "Photoshop-style JavaScript run on the active document"},
+              "save": {"type": "array", "items": {"type": "string"},
+                       "description": "outputs relative to ~/workspace; format from the extension: .psd .png .jpg "
+                                      "(.jpg:0.8 sets quality) .webp .svg .pdf"},
+              "place": {"type": "array", "items": {"type": "string"}, "description": "images the script can ppPlace"},
+              "fonts": {"type": "array", "items": {"type": "string"}, "description": "font files (.ttf/.otf) to load first"},
+              "keep": {"type": "boolean", "description": "keep working on the documents already open"},
+              "info": {"type": "boolean", "description": "return documents and layers (after the script)"},
+              "timeout": {"type": "integer", "description": "seconds per step, default 90"}}, []),
     ToolSpec("cad_command", None,
              "Draw in the LibreCAD window on the desktop, like a draftsman typing at its command line. Each item of "
              "`commands` is typed into LibreCAD's command line and followed by Enter, in order; the user watches it. "
@@ -126,7 +150,7 @@ TOOLS: list[ToolSpec] = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element", "cad_draw", "cad_command", "read_image"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element", "cad_draw", "cad_command", "read_image", "photopea"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

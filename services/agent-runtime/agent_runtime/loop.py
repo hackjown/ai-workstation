@@ -23,6 +23,7 @@ from tool_router import ToolExecutor, tool_schemas
 from tool_router.registry import SUBAGENT_TOOLS
 
 from . import cad as _cad
+from . import image_edit as _ie
 from . import photopea as _pp
 
 # Only an explicit "go on with the earlier drawing" resumes. The bare words matched far too much: run 3ac's prompt said
@@ -64,7 +65,7 @@ class AgentLoop:
                  config: Optional[LoopConfig] = None, ask: Optional[AskFn] = None,
                  remember: Optional[RememberFn] = None, extra_tools: Optional[dict[str, ExtTool]] = None,
                  subagent_llm: Optional[LLMRouter] = None, system_extra: str = "",
-                 vision_llm: Optional[LLMRouter] = None):
+                 vision_llm: Optional[LLMRouter] = None, image_cfg: Optional[dict] = None):
         self.task, self.session_id = task, session_id
         self.computer, self.llm, self.tools = computer, llm, tools
         self.control = control or AgentControl()
@@ -88,6 +89,7 @@ class AgentLoop:
         self.extra_tools = extra_tools or {}
         self.subagent_llm = subagent_llm
         self.vision_llm = vision_llm  # optional "eyes": reads the screen for a tool model without vision
+        self.image_cfg = image_cfg or {}  # {"base_url", "key", "model"}: the AI image-editing model, if set
         self._seen_hash: Optional[str] = None
         self._seen_desc: Optional[str] = None
         self.system = SYSTEM_PROMPT + (("\n" + system_extra) if system_extra else "")
@@ -619,6 +621,8 @@ class AgentLoop:
                     "To reopen a file use cad_command with open='cad/<name>.dxf'.")
         if t == "read_image":
             return await self._read_image(a)
+        if t == "image_edit":
+            return await self._image_edit(a)
         if t == "photopea":
             return await self._photopea(a, decision.thought)
         if t == "remember":
@@ -989,6 +993,76 @@ class AgentLoop:
         return (f"drawing saved: {json_short(short)}; sent to user: {sent or 'nothing'}; "
                 f"opened in LibreCAD: {bool(a.get('open', True))}.{tip}")
 
+    async def _image_edit(self, a: dict) -> str:
+        """AI image edit through the gateway's image model, then size restore + pasting original regions back."""
+        def rel(p):
+            p = str(p or "").strip().lstrip("/")
+            for pre in ("home/aiw/workspace/", "workspace/", "~/workspace/"):
+                if p.startswith(pre):
+                    p = p[len(pre):]
+            return p
+        src, prompt = rel(a.get("path")), str(a.get("prompt") or "").strip()
+        boxes = a.get("restore") or []
+        cfg = self.image_cfg
+        err = None
+        if not cfg.get("model") or not cfg.get("key"):
+            err = ("no AI image model is set up: the user picks one under 设置 → 模型 → 改图模型 "
+                   "(e.g. gpt-image-1 or gemini-2.5-flash-image). Tell the user; Photopea can still do exact edits")
+        elif not src:
+            err = "image_edit needs `path` (the image, relative to ~/workspace)"
+        elif not prompt and not boxes:
+            err = "image_edit needs `prompt` (the change, in plain words) or `restore` boxes"
+        elif not isinstance(boxes, list) or any(not isinstance(b, (list, tuple)) or len(b) != 4 for b in boxes):
+            err = "restore must be a list of [left, top, right, bottom] boxes in the ORIGINAL image's pixels"
+        if err:
+            await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=False, error=err[:200], result={})
+            return f"REFUSED: {err}"
+        orig_path = rel(a.get("original")) or src
+        save = rel(a.get("save")) or str(Path(src).with_name(Path(src).stem + "-ai.png"))
+        if not save.lower().endswith(".png"):
+            save = str(Path(save).with_suffix(".png"))
+        f = await self.tools.run("send_file", {"path": src})
+        if not f.success or not isinstance(f.result, dict) or not f.result.get("content_b64"):
+            await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=False, error=f.error, result={})
+            return f"FAILED: cannot read {src} ({f.error})"
+        src_bytes = base64.b64decode(f.result["content_b64"])
+        orig_bytes = src_bytes
+        if orig_path != src:  # restore from the untouched original while editing an earlier AI result
+            g = await self.tools.run("send_file", {"path": orig_path})
+            if g.success and isinstance(g.result, dict) and g.result.get("content_b64"):
+                orig_bytes = base64.b64decode(g.result["content_b64"])
+        try:
+            out = src_bytes
+            if prompt:
+                out = await _ie.edit(cfg.get("base_url") or "", cfg["key"], cfg["model"], src_bytes, _ie.prompt_for(prompt),
+                                     float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")))
+            png, info = await asyncio.to_thread(_ie.postprocess, orig_bytes, out, a.get("keep_size", True) is not False,
+                                                boxes, int(a.get("feather") or 6))
+        except Exception as e:  # noqa: BLE001
+            await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=False, error=str(e)[:200], result={})
+            return f"FAILED: AI image edit with {cfg['model']}: {str(e)[:600]}"
+        up = await self.computer.execute("files.upload", {"path": save, "content_b64": base64.b64encode(png).decode()},
+                                         observe=False, timeout=120)
+        if not up.success:
+            await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=False, error=up.error, result={})
+            return f"FAILED: could not save {save} on the computer ({up.error})"
+        self._acted = True
+        self._images_read.pop(save, None)
+        await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=True, error=None,
+                        result={"saved": save, **{k: v for k, v in info.items() if k != "orig_size"}})
+        w, h = info["size"]
+        lines = [f"image_edit OK: saved {save} ({w}x{h} px; the model returned {info['ai_size'][0]}x{info['ai_size'][1]}"
+                 f"{', scaled back to the original size' if info['ai_size'] != info['size'] else ''})."]
+        if info.get("align"):
+            al = info["align"]
+            lines.append(f"Restored {len(boxes)} region(s) from {orig_path}; the AI picture was offset by scale "
+                         f"{al['scale']}, dx {al['dx']}, dy {al['dy']} px (residual {al['residual']}).")
+        lines.append("Next: read_image the result (compare with the original) for 1) whether the change is right and "
+                     "2) garbled text or logos, warped objects. Fix garbled regions with image_edit restore=[[l,t,r,b]] "
+                     f"(pixels of the original, original={orig_path}, path={save}, no prompt), other details with "
+                     "photopea, then send_file.")
+        return "\n".join(lines)
+
     async def _photopea(self, a: dict, intent: str) -> str:
         """Edit images in Photopea (a Photoshop clone in the browser) on the VM's desktop. The bridge script ships
         with this image and is written to the VM on first use, so neither VM needs a setup step."""
@@ -1184,7 +1258,7 @@ def _needs_action(prompt: str) -> bool:
 
 CAD_MAX_BATCH = 200
 CAD_MAX_EXPANDED = 600
-_NO_SCREEN_TOOLS = {"read_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
+_NO_SCREEN_TOOLS = {"read_image", "image_edit", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "open_app"}
 
 

@@ -20,6 +20,18 @@ DOC = re.compile(r"[^\s'\"]+\.(pptx?|pdf|key|docx?)\b", re.I)
 SHORT_ASK = re.compile(r"(\d+)\s*(秒|s\b|sec)|精简|短视频|快剪|竖屏|抖音|一分钟|1分钟|预告", re.I)
 
 
+MAKE_VIDEO = re.compile(
+    r"huashu-motion|hyperframes|remotion|\bom\s+(new|render)|"
+    r"(做|制作|生成|剪辑?|渲染|合成|导出|输出|改|重做|出)[^。\n]{0,24}(视频|动画|讲解片|宣传片|发布片|短片|mp4)|"
+    r"(视频|动画)(讲解|制作|版本|剪辑)|\b(make|create|render|edit|produce)\b[^.\n]{0,30}\b(video|animation|explainer)\b",
+    re.I)
+
+
+def is_video_production(prompt: str) -> bool:
+    """Making or editing a video (routes to the video model), not just mentioning one ("这个视频说了什么")."""
+    return bool(MAKE_VIDEO.search(prompt or ""))
+
+
 def doc_path(prompt: str) -> Optional[str]:
     m = DOC.search(prompt or "")
     return m.group(0) if m else None

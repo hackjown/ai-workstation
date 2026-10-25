@@ -1069,8 +1069,19 @@ class AgentLoop:
         if not brief:
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error="no usable edit brief", result={})
             return None
+        if not brief.get("geometry") and _ib.wants_raise(instr):
+            # task-d2d: the brief left geometry out, so a raise went to the image model, which cannot do it
+            try:
+                gtext = await _retry_once(lambda: asyncio.wait_for(
+                    eyes.describe("你是精确读图的测量员，只输出 JSON。", _ib.geometry_user(instr, brief, w, h),
+                                  base64.b64encode(buf.getvalue()).decode(), 300), self.cfg.vision_timeout_s * 2))
+                brief["geometry"] = _ib.parse_geometry(gtext, w, h)
+                brief["geometry_raw"] = (gtext or "")[:300]
+            except Exception as e:  # noqa: BLE001
+                brief["geometry_raw"] = f"error: {e}"[:300]
         await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
-                        result={"path": src, "brief": _ib.summary(brief)[:300]})
+                        result={"path": src, "brief": _ib.summary(brief)[:300], "raw": (text or "")[:1500],
+                                "geometry": brief.get("geometry"), "geometry_raw": brief.get("geometry_raw")})
         self.history.append(f"{self.step}. read_image {src} -> edit brief: {_ib.summary(brief)[:600]}")
         if brief["question"]:
             return (f"The request can be read two ways ({brief['question']}). Call ask_user with that question "
@@ -1090,15 +1101,23 @@ class AgentLoop:
                         f"{g['target_y']}, within 3 px). Tell the user it is already level, with those numbers, and "
                         "ask whether they meant something else; do not edit.")
             if dy is not None:
-                args = {"path": src, "save": save, "move": _ib.plan_moves(g, dy), "prompt": _ib.blend_prompt(brief, dy)}
+                mv = _ib.plan_moves(g, dy)
+                args = {"path": src, "save": save, "move": mv, "prompt": _ib.blend_prompt(brief, dy)}
+                # a restore box over the moved cabinet would paste the old cabinet back (task-d2d's [650,720,1000,999]);
+                # keep only boxes clear of it, or things standing in front of it on the floor
+                keep = [b for b in keep if b[3] >= g["base_y"] - 20 or not any(
+                    b[0] < m["to"][2] and b[2] > m["to"][0] and b[1] < m["to"][3] and b[3] > m["to"][1] for m in mv)]
                 if keep:
                     args["restore"] = keep
+                self._raise_lock = src
                 measured = (f"Measured: target counter front edge y={g['front_top_y']}, reference y={g['target_y']} -> "
                             f"{'raised' if dy > 0 else 'lowered'} by {abs(dy)} px exactly with move (counter and "
                             "everything on it shifted, doors stretched, base kept), the AI only blended the seams.")
                 how = (f"量好了：{brief['target'] or '目标'}台面前沿 y={g['front_top_y']}，{brief['reference'] or '参照'} "
                        f"y={g['target_y']}，{'上移' if dy > 0 else '下移'} {abs(dy)} 像素（台面和上面的东西一起动，柜门拉伸，"
                        "踢脚线不动），AI 只修接缝")
+        if not measured and _ib.wants_raise(instr):
+            how = ("没能量出两处台面的位置，只能让 AI 直接改（AI 对精确对齐不可靠，结果要严格核对）：" + _ib.summary(brief)[:160])
         self.step += 1
         await self.emit(EventType.DECISION, thought=how, tool="image_edit", args=args)
         await self.emit(EventType.ACTION, tool="image_edit", args=args)
@@ -1178,6 +1197,10 @@ class AgentLoop:
             err = "image_edit needs `prompt` (the change, in plain words), `move` or `restore` boxes"
         elif not isinstance(boxes, list) or any(not isinstance(b, (list, tuple)) or len(b) != 4 for b in boxes):
             err = "restore must be a list of [left, top, right, bottom] boxes in the ORIGINAL image's pixels"
+        if not err and prompt and not moves and getattr(self, "_raise_lock", None) == src:
+            err = ("the raise was measured and made exactly at the start; a prompt-only edit of the original lets the "
+                   "image model redraw the cabinet where it was (task-d2d). Fix seams by repeating the first image_edit "
+                   "(same move and restore, new prompt), or deliver the result")
         if err:
             await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=False, error=err[:200], result={})
             return f"REFUSED: {err}"

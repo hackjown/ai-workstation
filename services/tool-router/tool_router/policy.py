@@ -68,7 +68,7 @@ SENSITIVE_PATH = re.compile(r"(\.ssh/|id_rsa|\.env\b|\.aws/|credentials|\.pem$|\
 PAY_WORDS = re.compile(r"(checkout|payment|pay now|place order|立即支付|确认付款|下单|支付)", re.I)
 
 
-_RMRF = re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-r\s+-f|-f\s+-r)\s+([^;&|\n]+)")
+_RMRF = re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-r\s+-f|-f\s+-r|-f|-r|-rf)\s+([^;&|\n]+)")
 _PROTECTED = {"workspace", "uploads", "outputs", "home", "data", ".", "..", "~", "/"}
 
 
@@ -78,7 +78,7 @@ def scratch_delete(cmd: str) -> bool:
     still asks. Scratch: /tmp/<name>..., ~/workspace/<name>..., or a bare relative <name>/... when the command cd's into ~/workspace
     (the shell starts in ~, so without that cd a bare name is not known to be scratch)."""
     hits = list(_RMRF.finditer(cmd))
-    if not hits or re.search(r"\$\(|`|\*|\.\.", cmd):
+    if not hits or re.search(r"\$\(|`|\.\.", cmd):
         return False
     cds = re.findall(r"\bcd\s+([^;&|\s]+)", cmd)
     rel_ok = bool(cds) and all(c.rstrip("/") in ("~/workspace", "$HOME/workspace", "/data/home/workspace", "/home/aiw/workspace") for c in cds)
@@ -88,6 +88,14 @@ def scratch_delete(cmd: str) -> bool:
             if not t or t.startswith("-"):
                 continue
             first = t.split("/")[0]
+            if "*" in t:  # a glob only in the last part, inside a project folder: out/v*.mp4 (task-8bd asked 5 min for it)
+                head, _, last = t.rstrip("/").rpartition("/")
+                if "*" in head or last.strip("*.") == "" or not (
+                        re.match(r"^/tmp/[\w.@%+-]+$", head)
+                        or (re.match(r"^(~|\$HOME|/data/home|/home/aiw)/workspace/[\w.@%+-]+(/[\w.@%+-]+)*$", head)
+                            and head.count("/") >= 2)):
+                    return False
+                continue
             if re.match(r"^/tmp/[\w.@%+-]", t):
                 continue
             if re.match(r"^(~|\$HOME|/data/home|/home/aiw)/workspace/[\w.@%+-]", t) and \

@@ -120,6 +120,17 @@ class SessionManager:
         return LLMRouter.from_settings(m["vision_model"], None, key, m.get("base_url") or None, None,
                                        os.environ.get("AIW_VISION_THINKING", "off"))
 
+    def _geometry_llm(self) -> Optional[LLMRouter]:
+        """Model that boxes things for exact image moves (AIW_GEOMETRY_MODEL / 设置 geometry_model), else the eyes."""
+        if self._custom_llm:
+            return None
+        m = self.model_settings()
+        name = m.get("geometry_model") or os.environ.get("AIW_GEOMETRY_MODEL")
+        if not name:
+            return None
+        key = self.secrets.get("openai_api_key") if self.secrets else None
+        return LLMRouter.from_settings(name, None, key, m.get("base_url") or None, None, "off")
+
     def _image_cfg(self) -> Optional[dict]:
         """The AI image-editing model (image_edit tool), through the same gateway and key as the other models."""
         if self._custom_llm:
@@ -344,6 +355,7 @@ class SessionManager:
                                      system_extra=system_extra.strip(),
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
+                    loop.geometry_llm = self._geometry_llm()
                     t = await loop.run()
                 status, result = t.status.value, t.result
             except Exception as e:  # noqa: BLE001

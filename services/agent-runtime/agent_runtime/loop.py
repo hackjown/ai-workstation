@@ -24,6 +24,7 @@ from tool_router.registry import SUBAGENT_TOOLS
 
 from . import cad as _cad
 from . import image_edit as _ie
+from . import image_brief as _ib
 from . import photopea as _pp
 
 # Only an explicit "go on with the earlier drawing" resumes. The bare words matched far too much: run 3ac's prompt said
@@ -311,6 +312,14 @@ class AgentLoop:
         self._last_tool: Optional[str] = None
         self._last_shown: tuple[int, int] = (0, 0)
         note: Optional[str] = None
+        if self._image_task:
+            try:
+                note = await self._image_kickoff()
+            except (StopRequested, asyncio.CancelledError):
+                raise
+            except Exception as e:  # noqa: BLE001  the agent can still do it the long way
+                await self.emit(EventType.ERROR, error=f"自动修图首轮失败，改由模型逐步处理：{type(e).__name__}: {str(e)[:160]}")
+                note = None
         while self.step < self.cfg.max_steps:
             if await self.control.checkpoint():
                 self._fresh = None
@@ -1024,6 +1033,71 @@ class AgentLoop:
                if info.get("png") else "")
         return (f"drawing saved: {json_short(short)}; sent to user: {sent or 'nothing'}; "
                 f"opened in LibreCAD: {bool(a.get('open', True))}.{tip}")
+
+    async def _image_kickoff(self) -> Optional[str]:
+        """A casual edit request ("把白色柜子加高到和左侧台面齐平") -> an explicit brief written by the vision model
+        while it looks at the photo -> the first AI edit, made here. The agent then only checks and fixes.
+        task-55a without it: 8 read_image + 8 measuring scripts, then a stretch of the doors delivered as done."""
+        if os.environ.get("AIW_IMAGE_AUTOSTART", "on").lower() in ("0", "off", "false"):
+            return None
+        paths = _ib.image_paths(self.task.prompt)
+        if len(paths) != 1 or not _ib.wants_edit(self.task.prompt):
+            return None
+        if not (self.image_cfg.get("model") and self.image_cfg.get("key")):
+            return None
+        src = paths[0]
+        instr = _ib.instruction(self.task.prompt)
+        self.step += 1
+        await self.emit(EventType.DECISION, thought="先看图，把要求翻译成明确的修图指令（改什么、哪些跟着动、哪些不动）",
+                        tool="read_image", args={"path": src, "question": "理解修图要求"})
+        f = await self.tools.run("send_file", {"path": src})
+        if not f.success or not isinstance(f.result, dict) or not f.result.get("content_b64"):
+            await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=f.error, result={})
+            return None
+        img = Image.open(io.BytesIO(base64.b64decode(f.result["content_b64"]))).convert("RGB")
+        w, h = img.size
+        g = _with_grid(img)
+        if max(g.size) > 2000:
+            k = 2000 / max(g.size)
+            g = g.resize((int(g.width * k), int(g.height * k)))
+        buf = io.BytesIO(); g.save(buf, "JPEG", quality=88)
+        eyes = self.vision_llm or self.llm
+        text = await _retry_once(lambda: asyncio.wait_for(
+            eyes.describe(_ib.BRIEF_SYSTEM, _ib.brief_user(instr, w, h), base64.b64encode(buf.getvalue()).decode(), 1500),
+            self.cfg.vision_timeout_s * 3))
+        brief = _ib.parse(text, w, h)
+        if not brief:
+            await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error="no usable edit brief", result={})
+            return None
+        await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
+                        result={"path": src, "brief": _ib.summary(brief)[:300]})
+        self.history.append(f"{self.step}. read_image {src} -> edit brief: {_ib.summary(brief)[:600]}")
+        if brief["question"]:
+            return (f"The request can be read two ways ({brief['question']}). Call ask_user with that question "
+                    f"(in Chinese) before editing. Edit brief so far: {_ib.summary(brief)}")
+        save = str(Path(src).with_name(Path(src).stem + "-修改.png"))
+        args = {"path": src, "prompt": _ib.full_prompt(brief), "save": save}
+        if brief["keep_text_boxes"]:
+            args["restore"] = brief["keep_text_boxes"]
+        self.step += 1
+        await self.emit(EventType.DECISION, thought="按修图指令让 AI 改图：" + _ib.summary(brief)[:200],
+                        tool="image_edit", args=args)
+        await self.emit(EventType.ACTION, tool="image_edit", args=args)
+        res = await self._image_edit(args)
+        self.history.append(f"{self.step}. image_edit {src} -> {res[:400]}")
+        self._last_tool = "image_edit"
+        if not res.startswith("image_edit OK"):
+            return (f"An automatic first AI edit was tried and failed: {res[:400]}\nEdit brief: {_ib.summary(brief)}\n"
+                    f"Image-model prompt used: {args['prompt']}\nFix the cause or try again; do not switch to move for this.")
+        check = brief["check"] or "目标物体是否按要求改好，跟着动的东西是否一起动了，其他地方是否保持原样"
+        return ("The user's request was turned into this edit brief and the first AI edit is ALREADY DONE (do not "
+                f"start over, do not measure with scripts).\nEdit brief: {_ib.summary(brief)}\n"
+                f"Image-model prompt used: {args['prompt']}\nResult: {res}\n"
+                f"Now: read_image paths=[{src}, {save}] compare=true question=\"{check}；有没有文字乱码、物体变形或接缝？\". "
+                f"If the check confirms the change, send_file {save} and done. If it is wrong or too weak, run "
+                f"image_edit again with path={src} (the ORIGINAL), a sharper prompt that says exactly what was wrong, "
+                f"the same save and restore boxes. Garbled text only: image_edit path={save} original={src} "
+                "restore=[[l,t,r,b]]. Never use move for furniture that has things standing on it.")
 
     async def _image_edit(self, a: dict) -> str:
         """AI image edit through the gateway's image model, then size restore + pasting original regions back."""

@@ -81,7 +81,12 @@ def test_raise_plan_moves_the_counter_and_what_stands_on_it():
     mv = ib.plan_moves(g, 29)
     assert mv[0] == {"box": [243, 693, 845, 879], "to": [243, 664, 845, 850]}      # things on the counter, not the neighbour's
     assert mv[1]["to"][1] == 850 and mv[2]["to"] == [185, 888, 845, 1188]          # counter up 29, doors stretch, base kept
-    assert ib._geometry({**g, "top_y": 2000}, 1084, 1451) is None
+    assert ib._geometry({**g, "x_right": 200}, 1084, 1451) is None                   # too narrow to be a cabinet
+    loose = ib._geometry({k: v for k, v in g.items() if k not in ("probe_x", "x_left_top")} | {"top_y": 2000}, 1084, 1451)
+    assert loose["probe_x"] == 200 and loose["x_left_top"] == 185 and loose["top_y"] < loose["front_top_y"]
+    assert ib.wants_raise("把正中白色柜子加高到和左侧柜子台面齐平")
+    assert ib.parse_geometry('好的 {"x_left": 185, "x_right": 845, "top_y": 705, "front_top_y": 887, "base_y": 1188, '
+                             '"target_y": 858}', 1084, 1451)["probe_x"] == 200
 
 
 def test_moves_join_without_ghosts_and_blend_keeps_the_move():
@@ -110,8 +115,9 @@ async def test_kickoff_measures_and_moves_for_a_raise(env, monkeypatch):  # noqa
                      config=LoopConfig(max_steps=2, timeout_s=30, make_plan=False, artifacts_dir=str(tmp / "art")),
                      image_cfg={"model": "gpt-image-1", "key": "k", "base_url": "https://gw/v1"})
     replies = [json.dumps({"target": "白柜", "reference": "左侧台面", "ai_prompt": "白柜加高", "question": "",
-                           "geometry": {"x_left": 100, "x_right": 450, "top_y": 380, "front_top_y": 425, "base_y": 650,
-                                        "target_y": 395, "probe_x": 110}}, ensure_ascii=False),
+                           "geometry": None, "keep_text_boxes": [[300, 400, 440, 500]]}, ensure_ascii=False),
+               '{"x_left": 100, "x_right": 450, "top_y": 380, "front_top_y": 425, "base_y": 650, "target_y": 395, '
+               '"probe_x": 110}',       # task-d2d: the brief left geometry out, so it is asked for on its own
                '{"front_top_y": 421, "target_y": 400}']
 
     class Eyes:
@@ -126,5 +132,8 @@ async def test_kickoff_measures_and_moves_for_a_raise(env, monkeypatch):  # noqa
     monkeypatch.setattr(ie, "edit", fake_edit)
     note = await loop._image_kickoff()
     assert "raised by 20 px exactly" in note and "只修补接缝" in seen["prompt"]
+    assert '"restore"' not in note                       # a text box over the cabinet would paste the old one back
+    r = await loop._image_edit({"path": "uploads/枫木服务区.png", "prompt": "白柜整体加高"})
+    assert r.startswith("REFUSED") and "task-d2d" in r
     out = Image.open(tmp / "uploads/枫木服务区-修改.png").convert("RGB")
     assert min(out.getpixel((300, 405))) > 238   # the white cabinet now starts 20 px higher, AI or not

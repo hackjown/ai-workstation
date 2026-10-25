@@ -722,6 +722,7 @@ const MODEL_ROLES = [
   { key: "vision_model", label: "视觉模型", hint: "可选，主模型不会看图时设置", need: "vision" },
   { key: "fallback", label: "备用模型", hint: "主模型出错时用", need: "tools" },
   { key: "subagent_model", label: "子 Agent 模型", hint: "纯文本命令行任务", need: "tools" },
+  { key: "image_model", label: "改图模型", hint: "AI 改图，如 gpt-image-1、gemini-2.5-flash-image", need: "image" },
 ];
 S.modelIds = []; S.probes = {};
 async function fetchModels(manual) {
@@ -733,7 +734,7 @@ async function fetchModels(manual) {
     const cur = sel.value || sel.dataset.cur || "";
     const ids = [...new Set([...(cur ? [cur] : []), ...S.modelIds])];
     const role = MODEL_ROLES.find((x) => x.key === sel.name);
-    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" ? "不用" : "同主模型"}</option>`
+    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" ? "不用" : role.key === "image_model" ? "不用（不能 AI 改图）" : "同主模型"}</option>`
       + ids.map((m) => `<option value="${esc(m)}" ${m === cur ? "selected" : ""}>${esc(m)}${probeTag(m)}</option>`).join("")
       + `<option value="__custom">手动输入…</option>`;
     paintProbe(sel);
@@ -749,6 +750,7 @@ function paintProbe(sel) {
   const box = sel.parentNode.querySelector(".probe"); const p = S.probes[sel.value];
   const role = MODEL_ROLES.find((x) => x.key === sel.name);
   if (!sel.value) { box.innerHTML = ""; return; }
+  if (role.need === "image") { box.innerHTML = `<span class="muted">需要网关支持图片输出，第一次改图时验证</span>`; return; }
   if (!p) { box.innerHTML = `<span class="muted">未探测</span>`; return; }
   const ok = (b, t) => `<span class="chip ${b ? "ok" : "bad"}">${b ? "✓" : "✕"} ${t}</span>`;
   let warn = "";
@@ -775,7 +777,7 @@ async function saveModels(e) {
   e.preventDefault(); const f = e.target;
   if (f.key.value) await api("PUT", "/api/secrets/openai_api_key", { value: f.key.value });
   const v = (n) => (f[n].value === "__custom" ? "" : f[n].value);
-  await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), fallback: v("fallback"), subagent_model: v("subagent_model"), base_url: f.base_url.value, thinking: f.thinking.value });
+  await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), fallback: v("fallback"), subagent_model: v("subagent_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value });
   toast("已保存，下个任务生效"); loadSettings();
 }
 async function saveVmNet(e) {

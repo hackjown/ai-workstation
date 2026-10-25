@@ -383,7 +383,8 @@ async function exportTask(tid, copy) {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
     a.download = `aiw-task-${tid.slice(0, 8)}.json`; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    // Chrome reads the blob after a save dialog closes: revoking at 2 s gave "下载错误" (task-55a)
+    setTimeout(() => URL.revokeObjectURL(a.href), 120000);
     toast(copy ? "浏览器不允许复制，已改为下载文件" : "已导出");
   } catch (e) { toast("导出失败：" + e.message); }
 }

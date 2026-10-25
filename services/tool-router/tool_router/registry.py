@@ -78,14 +78,19 @@ TOOLS: list[ToolSpec] = [
              {"path": {"type": "string", "description": "relative to ~/workspace, e.g. uploads/设计图.jpg"},
               "paths": {"type": "array", "items": {"type": "string"}, "description": "several images read at once"},
               "page": {"type": "integer", "description": "PDF page, 1-based"},
-              "compare": {"type": "boolean", "description": "with paths: read them side by side in one picture"},
+              "compare": {"type": "boolean", "description": "with paths: read them side by side in one picture "
+                                                           "(plus an enlarged view of where they differ)"},
+              "grid": {"type": "boolean", "description": "draw a labelled pixel grid so positions come back in real "
+                                                        "pixels (use before image_edit move/restore boxes)"},
               "question": {"type": "string"}}, []),
     ToolSpec("image_edit", None,
              "AI image editing: describe a change in words and an image model redraws the photo (make the cabinets "
              "taller, remove a person, change a wall colour, put the sofa elsewhere, add a sign). For changes a "
              "script cannot do. The result is scaled back to the original size. AI redraws small text and logos "
              "badly: afterwards read_image the result and paste those regions back from the original with "
-             "`restore` (aligned automatically). Exact edits (text layers, colours, crops, PSD) are photopea's job.",
+             "`restore` (aligned automatically). Exact geometry (raise/lower/widen/shift something by N px) is "
+             "`move`: no AI, the pixels of box are scaled into to; AI models do such changes only roughly. "
+             "Exact edits (text layers, colours, crops, PSD) are photopea's job.",
              {"path": {"type": "string", "description": "image to edit, relative to ~/workspace"},
               "prompt": {"type": "string", "description": "the change only, in plain words; everything else is kept"},
               "save": {"type": "string", "description": "output .png, relative to ~/workspace (default <name>-ai.png)"},
@@ -94,6 +99,10 @@ TOOLS: list[ToolSpec] = [
                                          "copied back from the original (garbled text, labels, logos, faces)"},
               "original": {"type": "string", "description": "the untouched original to restore from, when `path` "
                                                             "is already an AI result"},
+              "move": {"type": "array", "items": {"type": "object"},
+                       "description": '[{"box": [l,t,r,b], "to": [l,t,r,b]}]: copy box and scale it into to, exactly '
+                                      '(raise a cabinet 30 px: same box, to-top 30 smaller). Optional prompt then '
+                                      'only cleans seams'},
               "keep_size": {"type": "boolean", "description": "scale the result to the original size (default true)"}},
              ["path"]),
     ToolSpec("photopea", None,

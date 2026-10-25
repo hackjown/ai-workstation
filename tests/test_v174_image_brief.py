@@ -200,3 +200,13 @@ def test_video_qa_script_reads_coverage(tmp_path):
     out = subprocess.run(V.qa_command(str(f), None), shell=True, capture_output=True, text=True).stdout
     q = json.loads(out.strip().splitlines()[-1])
     assert q["channels"] == 2 and q["coverage_file"].endswith("coverage.md") and q["pages"] is None
+
+
+def test_video_model_routing_rule():
+    from agent_runtime.video import is_video_production as v
+    assert v("用 huashu-motion 把我上传的pptx文件做一个视频讲解")
+    assert v("把这个PPT制作成3分钟的讲解视频")
+    assert v("重做一下刚才的动画，第5页加长")
+    assert v("make an explainer video from this deck")
+    assert not v("这个视频说了什么？帮我总结")
+    assert not v("下载这个视频的字幕")

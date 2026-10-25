@@ -157,7 +157,8 @@ def _boxes(v, w, h, max_share):
 
 
 def _geometry(g, w, h) -> Optional[dict]:
-    keys = ("x_left", "x_right", "top_y", "front_top_y", "base_y", "target_y", "probe_x")
+    """Lenient: clamp what the vision model gave into the picture, fill the optional fields, refuse only nonsense."""
+    keys = ("x_left", "x_right", "top_y", "front_top_y", "base_y", "target_y")
     if not isinstance(g, dict):
         return None
     src = g
@@ -165,14 +166,49 @@ def _geometry(g, w, h) -> Optional[dict]:
         g = {k: int(round(float(src[k]))) for k in keys}
     except Exception:  # noqa: BLE001
         return None
-    try:
-        g["x_left_top"] = int(round(float(src.get("x_left_top"))))
-    except Exception:  # noqa: BLE001
-        g["x_left_top"] = g["x_left"]
-    if not (0 <= g["x_left"] < g["x_right"] <= w and 0 <= g["top_y"] < g["front_top_y"] < g["base_y"] <= h
-            and 0 <= g["target_y"] < h and 0 <= g["probe_x"] <= w and g["x_right"] - g["x_left"] >= 0.1 * w):
+    for k in ("x_left", "x_right"):
+        g[k] = max(0, min(w, g[k]))
+    for k in ("top_y", "front_top_y", "base_y", "target_y"):
+        g[k] = max(0, min(h, g[k]))
+    if g["x_left"] > g["x_right"]:
+        g["x_left"], g["x_right"] = g["x_right"], g["x_left"]
+    for k, default in (("probe_x", g["x_left"] + 15), ("x_left_top", g["x_left"])):
+        try:
+            g[k] = max(0, min(w, int(round(float(src.get(k))))))
+        except Exception:  # noqa: BLE001
+            g[k] = default
+    if g["top_y"] >= g["front_top_y"]:
+        g["top_y"] = max(0, g["front_top_y"] - int(0.15 * h))
+    if not (g["front_top_y"] < g["base_y"] and g["x_right"] - g["x_left"] >= 0.08 * w):
         return None
     return g
+
+
+RAISE = re.compile(r"加高|降低|抬高|升高|变高|变矮|压低|调高|调低|齐平|一样高|对齐|平齐")
+
+
+def wants_raise(instr: str) -> bool:
+    return bool(RAISE.search(instr or ""))
+
+
+def geometry_user(instr: str, brief: dict, w: int, h: int) -> str:
+    return (f"图片 {w}x{h} 像素，图上红色网格数字是原图像素坐标。用户要求：「{instr}」\n"
+            f"要改的：{brief.get('target') or '目标柜子'}；参照：{brief.get('reference') or '用户说的参照物'}。\n"
+            "按网格读出下面这些像素值，只输出 JSON，不要解释：\n"
+            '{"x_left": 目标柜体左端x, "x_right": 目标柜体右端x（被挡住的部分也算）, "top_y": 目标台面上物品的最高点y, '
+            '"front_top_y": 目标台面前沿上边y, "base_y": 目标柜门下沿或踢脚线上沿y, '
+            '"target_y": 目标台面前沿上边应到达的y（参照台面在交接处的高度）, "probe_x": 目标与参照交接处的x, '
+            '"x_left_top": 台面以上属于目标的物品从哪个x开始（相邻柜子上的东西伸过来时取它们右边，否则等于 x_left）}')
+
+
+def parse_geometry(text: str, w: int, h: int) -> Optional[dict]:
+    m = re.search(r"\{[^{}]*\}", text or "", re.S)
+    if not m:
+        return None
+    try:
+        return _geometry(json.loads(m.group(0)), w, h)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def measure_crop(img, g: dict):

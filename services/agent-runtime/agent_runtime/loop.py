@@ -1077,11 +1077,30 @@ class AgentLoop:
                     f"(in Chinese) before editing. Edit brief so far: {_ib.summary(brief)}")
         save = str(Path(src).with_name(Path(src).stem + "-修改.png"))
         args = {"path": src, "prompt": _ib.full_prompt(brief), "save": save}
-        if brief["keep_text_boxes"]:
-            args["restore"] = brief["keep_text_boxes"]
+        keep = brief["keep_text_boxes"] + brief["front_boxes"]
+        if keep:
+            args["restore"] = keep
+        how = "按修图指令让 AI 改图：" + _ib.summary(brief)[:200]
+        measured = ""
+        g = brief.get("geometry")
+        if g:  # raise/lower to a reference: image models do this only roughly, so measure and move exactly
+            dy = await self._measure_raise(img, f.result["content_b64"], brief, g)
+            if dy is not None and abs(dy) < 3:
+                return (f"Measured: the target edge is already level with the reference (y={g['front_top_y']} vs "
+                        f"{g['target_y']}, within 3 px). Tell the user it is already level, with those numbers, and "
+                        "ask whether they meant something else; do not edit.")
+            if dy is not None:
+                args = {"path": src, "save": save, "move": _ib.plan_moves(g, dy), "prompt": _ib.blend_prompt(brief, dy)}
+                if keep:
+                    args["restore"] = keep
+                measured = (f"Measured: target counter front edge y={g['front_top_y']}, reference y={g['target_y']} -> "
+                            f"{'raised' if dy > 0 else 'lowered'} by {abs(dy)} px exactly with move (counter and "
+                            "everything on it shifted, doors stretched, base kept), the AI only blended the seams.")
+                how = (f"量好了：{brief['target'] or '目标'}台面前沿 y={g['front_top_y']}，{brief['reference'] or '参照'} "
+                       f"y={g['target_y']}，{'上移' if dy > 0 else '下移'} {abs(dy)} 像素（台面和上面的东西一起动，柜门拉伸，"
+                       "踢脚线不动），AI 只修接缝")
         self.step += 1
-        await self.emit(EventType.DECISION, thought="按修图指令让 AI 改图：" + _ib.summary(brief)[:200],
-                        tool="image_edit", args=args)
+        await self.emit(EventType.DECISION, thought=how, tool="image_edit", args=args)
         await self.emit(EventType.ACTION, tool="image_edit", args=args)
         res = await self._image_edit(args)
         self.history.append(f"{self.step}. image_edit {src} -> {res[:400]}")
@@ -1090,14 +1109,47 @@ class AgentLoop:
             return (f"An automatic first AI edit was tried and failed: {res[:400]}\nEdit brief: {_ib.summary(brief)}\n"
                     f"Image-model prompt used: {args['prompt']}\nFix the cause or try again; do not switch to move for this.")
         check = brief["check"] or "目标物体是否按要求改好，跟着动的东西是否一起动了，其他地方是否保持原样"
-        return ("The user's request was turned into this edit brief and the first AI edit is ALREADY DONE (do not "
-                f"start over, do not measure with scripts).\nEdit brief: {_ib.summary(brief)}\n"
-                f"Image-model prompt used: {args['prompt']}\nResult: {res}\n"
-                f"Now: read_image paths=[{src}, {save}] compare=true question=\"{check}；有没有文字乱码、物体变形或接缝？\". "
-                f"If the check confirms the change, send_file {save} and done. If it is wrong or too weak, run "
-                f"image_edit again with path={src} (the ORIGINAL), a sharper prompt that says exactly what was wrong, "
-                f"the same save and restore boxes. Garbled text only: image_edit path={save} original={src} "
-                "restore=[[l,t,r,b]]. Never use move for furniture that has things standing on it.")
+        if measured:
+            check = "接缝处有没有错位、重复残影或断开的线条？海报和文字是否完好？"
+        head = ("The user's request was turned into this edit brief and the first edit is ALREADY DONE (do not "
+                f"start over, do not measure with scripts).\n{measured}\nEdit brief: {_ib.summary(brief)}\n"
+                f"Edit args used: {json.dumps(args, ensure_ascii=False)}\nResult: {res}\n"
+                f"Now: read_image paths=[{src}, {save}] compare=true question=\"{check}；有没有文字乱码、物体变形？\". ")
+        if measured:
+            return head + (f"The raise itself is exact, never redo it with a prompt alone. If a seam looks bad, run "
+                           f"image_edit with the SAME path, move and restore as above and a prompt naming that seam "
+                           f"(the AI is only used along the seams). If the poster or text is damaged, image_edit "
+                           f"path={save} original={src} restore=[[l,t,r,b]]. Then send_file {save} and done; in done say "
+                           "in Chinese what moved and by how many pixels.")
+        return head + (f"If the check confirms the change, send_file {save} and done (say in Chinese what changed). "
+                       f"If it is wrong or too weak, run image_edit again with path={src} (the ORIGINAL), a sharper "
+                       "prompt that says exactly what was wrong, the same save and restore boxes. Garbled text only: "
+                       f"image_edit path={save} original={src} restore=[[l,t,r,b]].")
+
+    async def _measure_raise(self, img, b64: str, brief: dict, g: dict) -> Optional[int]:
+        """dy (> 0 raise) from a zoomed crop of where the two counters meet, sharpened to the pixel row; None if the
+        measurement is unusable. Updates g in place."""
+        crop, _box = _ib.measure_crop(img, g)
+        buf = io.BytesIO(); crop.convert("RGB").save(buf, "JPEG", quality=90)
+        eyes = self.vision_llm or self.llm
+        try:
+            text = await _retry_once(lambda: asyncio.wait_for(
+                eyes.describe("你是精确读图的测量员，只输出 JSON。", _ib.measure_question(brief),
+                              base64.b64encode(buf.getvalue()).decode(), 200), self.cfg.vision_timeout_s * 2))
+            m = _ib.parse_measure(text)
+        except Exception:  # noqa: BLE001
+            m = None
+        if m:
+            ft, ty = m
+            if abs(ft - g["front_top_y"]) < 90 and abs(ty - g["target_y"]) < 90:
+                g["front_top_y"], g["target_y"] = ft, ty
+        raw = base64.b64decode(b64)
+        x0 = g["probe_x"] + 15 if g["probe_x"] < (g["x_left"] + g["x_right"]) / 2 else g["probe_x"] - 200
+        g["front_top_y"] = await asyncio.to_thread(_ie.edge_row, raw, x0, x0 + 185, g["front_top_y"])
+        dy = g["front_top_y"] - g["target_y"]
+        if abs(dy) > 0.2 * img.height or g["top_y"] - dy < 0:
+            return None
+        return dy
 
     async def _image_edit(self, a: dict) -> str:
         """AI image edit through the gateway's image model, then size restore + pasting original regions back."""
@@ -1151,6 +1203,8 @@ class AgentLoop:
             if prompt:
                 out = await _ie.edit(cfg.get("base_url") or "", cfg["key"], cfg["model"], src_bytes, _ie.prompt_for(prompt),
                                      float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")))
+                if moves:  # the AI only blends: keep the exact move, take its redraw along the seams only
+                    out = await asyncio.to_thread(_ie.blend_seams, src_bytes, out, minfo["moves"])
             png, info = await asyncio.to_thread(_ie.postprocess, orig_bytes, out, a.get("keep_size", True) is not False,
                                                 boxes, int(a.get("feather") or 6))
         except Exception as e:  # noqa: BLE001

@@ -514,7 +514,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.put("/api/settings/models", dependencies=[Depends(auth)])
     async def put_models(body: dict):
         m = {k: (str(body.get(k) or "").strip() or None)
-             for k in ("model", "vision_model", "fallback", "subagent_model", "base_url", "thinking")}
+             for k in ("model", "vision_model", "fallback", "subagent_model", "image_model", "base_url", "thinking")}
         store.kv_set("models", m)
         return m
 

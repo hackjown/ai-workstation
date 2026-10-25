@@ -96,6 +96,21 @@ class SessionManager:
         key = self.secrets.get("openai_api_key") if self.secrets else None
         return LLMRouter.from_settings(m.get("model"), m.get("fallback"), key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"))
 
+    def _task_llm(self, prompt: str) -> tuple[LLMRouter, Optional[str]]:
+        """The main model, or the video model for making/editing a video (设置 video_model / AIW_VIDEO_MODEL).
+        The reference explainer the user liked was made by Claude Opus; task-8bd on deepseek-v4-pro cut a 16-page deck
+        to 8 pages. The main model stays as the fallback, so a broken video model never stops the task."""
+        if self._custom_llm:
+            return self._custom_llm(), None
+        m = self.model_settings()
+        vm = m.get("video_model") or os.environ.get("AIW_VIDEO_MODEL")
+        from agent_runtime.video import is_video_production
+        if not vm or vm == m.get("model") or not is_video_production(prompt):
+            return self._llm(), None
+        key = self.secrets.get("openai_api_key") if self.secrets else None
+        return LLMRouter.from_settings(vm, m.get("model") or m.get("fallback"), key, m.get("base_url") or None,
+                                       self._tool_choices(), m.get("thinking")), vm
+
     def _subagent_llm(self) -> Optional[LLMRouter]:
         if self._custom_llm:
             return None
@@ -353,7 +368,10 @@ class SessionManager:
                     hold = cloud.hold(task.machine_id)
                     computer = self.computer(task.machine_id)   # a restarted agent means a fresh connection
                 async with hold:
-                    loop = AgentLoop(task, sid, computer, self._llm(), ToolExecutor(computer, confirm=confirm, audit=audit),
+                    llm, routed = self._task_llm(task.prompt)
+                    if routed:
+                        await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": f"视频任务，改用视频模型 {routed}"}))
+                    loop = AgentLoop(task, sid, computer, llm, ToolExecutor(computer, confirm=confirm, audit=audit),
                                      control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
                                      subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(), image_cfg=self._image_cfg(),
                                      system_extra=system_extra.strip(),

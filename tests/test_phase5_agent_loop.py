@@ -234,7 +234,8 @@ async def test_identical_write_is_skipped_and_unchanged_screen_not_resent(env):
                      config=LoopConfig(max_steps=6, timeout_s=20, make_plan=False))
     await loop.run()
     assert any("SKIPPED" in h for h in loop.history)
-    assert llm.requests[0].screenshot_b64 and llm.requests[0].screenshot_b64.startswith("/9j/")  # JPEG
+    # a file task opens without looking at the desktop (v1.8.1)
+    assert llm.requests[0].screenshot_b64 is None and "No screenshot" in (llm.requests[0].note or "")
     assert llm.requests[1].screenshot_b64 is None and "not re-read" in (llm.requests[1].note or "")  # file step: no screenshot
 
 

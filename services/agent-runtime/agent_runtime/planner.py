@@ -139,10 +139,11 @@ Rules:
   out garbled, run image_edit again with path=<the AI result>, original=<the original>, restore=[[l,t,r,b], ...]
   (pixel boxes of those regions in the original, no prompt). Exact finishing (text, colour, crop, PSD) in photopea.
   If image_edit says no image model is set up, tell the user where to set it instead of faking it in Photopea.
-  Raising, lowering or resizing FURNITURE (cabinets, counters, shelves, a sofa) is an AI edit with a prompt, never
-  `move`: what stands on it moves with it, the wall behind and the perspective must be redrawn. A stretch of the
-  pixels only lengthens the doors (task-55a). When the task starts, the first AI edit is usually already made from
-  an edit brief (it says so): then check it with compare=true and deliver or fix it; do not measure with scripts.
+  Raising or lowering FURNITURE to a reference ("加高到和左侧台面齐平"): image models redraw it where it was
+  (task-0d5/238). At task start the loop measures both edges and makes the exact edit itself: what stands on the
+  counter and the counter shift, the doors stretch, the base stays, the AI only blends the seams. It tells you so:
+  then only check with compare=true and deliver; never redo the raise with a prompt alone, and never stretch one box
+  over the counter (task-55a). Other changes (remove, recolour, add) are prompt edits, also started for you.
   `move` is only for flat things with nothing on or in front of them (a sign, a framed picture, a logo, a window)
   when an exact amount matters. At most 2 shell steps for measuring.
   "Make A the same as B" (height, size, colour): first measure both in the picture (read_image with a question

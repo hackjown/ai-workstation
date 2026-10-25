@@ -7,6 +7,12 @@ class Recovery:
         self.computer = computer
 
     async def recover(self, consecutive_failures: int, last_action: str | None) -> str:
+        clicky = not last_action or any(k in str(last_action) for k in ("click", "mouse", "browser", "type", "key"))
+        if not clicky:  # task-4e2: a timed-out shell got advice about clicking by x/y
+            if consecutive_failures >= 3:
+                return "Three failures in a row. Change approach, or call fail with the reason."
+            return ("The last action failed (see its error). If it was a timeout or network error, run it once more "
+                    "as is; otherwise fix the arguments or try another way.")
         if consecutive_failures == 1:
             return ("Previous action had no visible effect. If it was a click by x/y, the point was probably off: "
                     "on a web page use browser_click with the element's text; otherwise click_element with a description.")

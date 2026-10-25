@@ -64,8 +64,15 @@ def brief_user(instr: str, w: int, h: int) -> str:
             ' "keep_text_boxes": [[左,上,右,下]],\n'
             ' "ai_prompt": "给修图模型的完整中文指令",\n'
             ' "check": "改完后和原图并排对比时要确认的 2-3 点，一眼能判断成败",\n'
-            ' "question": ""\n'
+            ' "question": "",\n'
+            ' "geometry": null,\n'
+            ' "front_boxes": []\n'
             "}\n"
+            "geometry：只有当要求是把一组柜子/台面/桌子整体加高或降低（对齐到某个参照高度）时才填，否则 null。填写原图像素：\n"
+            '{"x_left": 目标柜体左端x, "x_right": 目标柜体右端x（被前面东西挡住的部分也算）, "top_y": 台面上摆的物品最高点y, '
+            '"front_top_y": 目标台面前沿上边y, "base_y": 柜体底部（踢脚线上沿或柜门下沿）y, '
+            '"target_y": 目标台面前沿上边应该到达的y（参照物在交接处的对应高度）, "probe_x": 目标与参照物交接处附近的x}\n'
+            "front_boxes：站在目标前面、不该跟着动的东西（地上的海报架、堆着的水、椅子等）的外框 [[左,上,右,下]]，没有就 []。\n"
             "keep_text_boxes：不该被改动、而且上面有文字或 logo 的区域（海报、标签、招牌、包装上的字），原图像素坐标，"
             "改完要从原图贴回去；与要改或要移动的物体重叠的区域不要列（贴回会把修改盖掉）。没有就 []。\n"
             "ai_prompt：写清改哪个物体、往哪个方向、改到什么位置（用参照物说，例如“台面前沿与左侧台面在拐角处连成一线”）、"
@@ -100,6 +107,8 @@ def parse(text: str, w: int, h: int) -> Optional[dict]:
             continue
         boxes.append([int(l), int(t), int(r), int(bt)])
     d["keep_text_boxes"] = boxes[:6]
+    d["front_boxes"] = _boxes(d.get("front_boxes"), w, h, 0.4)
+    d["geometry"] = _geometry(d.get("geometry"), w, h)
     for k in ("moves_with", "keep"):
         v = d.get(k)
         d[k] = [str(x) for x in v] if isinstance(v, list) else ([str(v)] if v else [])
@@ -131,3 +140,98 @@ def summary(d: dict) -> str:
     if d.get("keep"):
         parts.append("不动：" + "、".join(d["keep"][:6]))
     return "；".join(parts)
+
+
+def _boxes(v, w, h, max_share):
+    out = []
+    for b in v or []:
+        try:
+            l, t, r, bt = (float(x) for x in b)
+        except Exception:  # noqa: BLE001
+            continue
+        l, r = sorted((max(0.0, l), min(float(w), r)))
+        t, bt = sorted((max(0.0, t), min(float(h), bt)))
+        if r - l >= 8 and bt - t >= 8 and (r - l) * (bt - t) <= max_share * w * h:
+            out.append([int(l), int(t), int(r), int(bt)])
+    return out[:6]
+
+
+def _geometry(g, w, h) -> Optional[dict]:
+    keys = ("x_left", "x_right", "top_y", "front_top_y", "base_y", "target_y", "probe_x")
+    if not isinstance(g, dict):
+        return None
+    src = g
+    try:
+        g = {k: int(round(float(src[k]))) for k in keys}
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        g["x_left_top"] = int(round(float(src.get("x_left_top"))))
+    except Exception:  # noqa: BLE001
+        g["x_left_top"] = g["x_left"]
+    if not (0 <= g["x_left"] < g["x_right"] <= w and 0 <= g["top_y"] < g["front_top_y"] < g["base_y"] <= h
+            and 0 <= g["target_y"] < h and 0 <= g["probe_x"] <= w and g["x_right"] - g["x_left"] >= 0.1 * w):
+        return None
+    return g
+
+
+def measure_crop(img, g: dict):
+    """A 3x zoom of where the two edges meet, with a 10 px grid labelled in original pixels, and its box."""
+    from PIL import ImageDraw
+    W, H = img.size
+    y0 = max(0, min(g["front_top_y"], g["target_y"]) - 70)
+    y1 = min(H, max(g["front_top_y"], g["target_y"]) + 70)
+    x0 = max(0, g["probe_x"] - 160)
+    x1 = min(W, g["probe_x"] + 160)
+    k = 3
+    c = img.crop((x0, y0, x1, y1)).resize(((x1 - x0) * k, (y1 - y0) * k))
+    d = ImageDraw.Draw(c)
+    for y in range((y0 // 10 + 1) * 10, y1, 10):
+        Y = (y - y0) * k
+        d.line([(0, Y), (c.width if y % 50 == 0 else 24, Y)], fill=(255, 0, 0), width=1)
+        if y % 20 == 0:
+            d.text((28, Y - 6), str(y), fill=(255, 0, 0))
+    for x in range((x0 // 50 + 1) * 50, x1, 50):
+        X = (x - x0) * k
+        d.line([(X, 0), (X, 18)], fill=(0, 0, 255))
+        d.text((X + 2, 20), str(x), fill=(0, 0, 255))
+    return c, (x0, y0, x1, y1)
+
+
+def measure_question(brief: dict) -> str:
+    return ("这是原图交接处放大 3 倍的局部，左边红色数字是原图的 y 像素坐标（每格 10 像素），上方蓝色数字是 x。\n"
+            f"A = {brief['target'] or '要改的台面'} 的台面前沿上边；B = {brief['reference'] or '参照台面'} 在交接处的台面前沿上边。\n"
+            '按红色刻度读出 A 和 B 的 y，只输出 JSON：{"front_top_y": A的y, "target_y": B的y}')
+
+
+def parse_measure(text: str) -> Optional[tuple[int, int]]:
+    m = re.search(r"\{[^{}]*\}", text or "")
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(0))
+        return int(round(float(d["front_top_y"]))), int(round(float(d["target_y"])))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def plan_moves(g: dict, dy: int) -> list[dict]:
+    """Raise (dy > 0) or lower the cabinet: what stands on it and the counter shift by dy, the doors stretch or
+    shrink between the counter and the base, the base stays. Continuous at the split by construction."""
+    xl, xr, top, base = g["x_left"], g["x_right"], max(0, g["top_y"] - 12), g["base_y"]
+    xlt = min(max(g.get("x_left_top") or xl, xl), xr - 20)  # above the counter, a neighbour's things may overlap
+    ft = g["front_top_y"] - 8
+    split = min(base - 10, g["front_top_y"] + 30)   # just under the counter's front edge
+    moves = []
+    if ft - top > 4:
+        moves.append({"box": [xlt, top, xr, ft], "to": [xlt, top - dy, xr, ft - dy]})   # what stands on it
+    moves.append({"box": [xl, ft, xr, split], "to": [xl, ft - dy, xr, split - dy]})     # the counter edge
+    moves.append({"box": [xl, split, xr, base], "to": [xl, split - dy, xr, base]})      # the doors stretch
+    return moves
+
+
+def blend_prompt(brief: dict, dy: int) -> str:
+    way = f"整体上移了 {dy} 像素" if dy > 0 else f"整体下移了 {-dy} 像素"
+    return (f"这张照片里的{brief['target'] or '柜子'}刚被{way}（台面和上面的物品一起动的），接缝处可能有错位或重复。"
+            "只修补接缝：让墙面、窗框、瓷砖线条、柜子侧边在接缝处自然连续，补全露出的背景，去掉重复的残影。"
+            "柜门、台面、台面上物品的位置和大小保持完全不变。")

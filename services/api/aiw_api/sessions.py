@@ -46,6 +46,7 @@ class LiveSession:
     question: Optional[asyncio.Future] = None
     question_info: Optional[dict] = None
     cleanup: Optional[object] = None
+    loop: Optional[object] = None  # the running AgentLoop: confirmations extend its deadline
 
 
 class SessionManager:
@@ -288,11 +289,14 @@ class SessionManager:
             self.store.update_task(task.id, TaskStatus.WAITING_CONFIRM.value)
             await emit(AgentEvent(session_id=sid, type=EventType.CONFIRM_REQUIRED, data=live.confirm_info))
             await self._notify("confirm", "需要你确认", f"{decision.reason}：{tool}", task)
+            t0 = time.monotonic()
             try:
                 return await asyncio.wait_for(live.confirm, 300)
             except asyncio.TimeoutError:
                 return False
             finally:
+                if getattr(live, "loop", None) is not None:
+                    live.loop.add_wait(time.monotonic() - t0)
                 live.confirm = live.confirm_info = None
                 self.store.update_task(task.id, TaskStatus.RUNNING.value)
 
@@ -356,6 +360,7 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    live.loop = loop
                     t = await loop.run()
                 status, result = t.status.value, t.result
             except Exception as e:  # noqa: BLE001
@@ -496,7 +501,10 @@ def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str
     if cad_mode(prompt, context):
         return (max(max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400"))),
                 max(timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800"))))
-    from agent_runtime.loop import _IMAGE_TASK
+    from agent_runtime.loop import _IMAGE_TASK, _VIDEO_TASK
+    if _VIDEO_TASK.search(prompt or ""):  # task-247: a deck-to-explainer ran out at 900 s before the first frame
+        return (max(max_steps, int(os.environ.get("AIW_VIDEO_MAX_STEPS", "200"))),
+                max(timeout_s, float(os.environ.get("AIW_VIDEO_TIMEOUT", "3600"))))
     if _IMAGE_TASK.search(prompt or ""):
         # each AI edit ~70 s, each vision check ~30 s: 900 s ran out on task-4e2 and task-484 (a retry kept the
         # old 900 s because the API passes its own LoopConfig, so the loop's own image budget never applied)

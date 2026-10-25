@@ -66,7 +66,10 @@ class LinuxComputerProvider(ComputerProvider):
         last_err = None
         for attempt in range(self.retries + 1):
             try:
-                await self._ensure()
+                try:
+                    await self._ensure()
+                except asyncio.TimeoutError as e:  # connecting is safe to retry, unlike a slow command
+                    raise ConnectionError(f"connect timed out after {self.connect_timeout:.0f}s") from e
                 ws = self._ws
                 fut = asyncio.get_running_loop().create_future()
                 self._pending[cmd.id] = (ws, fut)
@@ -87,7 +90,8 @@ class LinuxComputerProvider(ComputerProvider):
                 if isinstance(e, asyncio.TimeoutError):
                     break
                 await self.close()
-                await asyncio.sleep(0.5 * (attempt + 1))
+                # a tunnel that just woke up (InstaBox) needs seconds, not half a second (task-484: 3 tries in 40 s all failed)
+                await asyncio.sleep(min(10.0, 2.0 * (attempt + 1)))
         return ActionResult(success=False, error=last_err, action=action)
 
     async def close(self):

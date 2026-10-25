@@ -137,3 +137,12 @@ async def test_kickoff_measures_and_moves_for_a_raise(env, monkeypatch):  # noqa
     assert r.startswith("REFUSED") and "task-d2d" in r
     out = Image.open(tmp / "uploads/枫木服务区-修改.png").convert("RGB")
     assert min(out.getpixel((300, 405))) > 238   # the white cabinet now starts 20 px higher, AI or not
+
+
+def test_grounding_boxes_convert_to_pixels():
+    from agent_runtime import image_brief as ib
+    t = '{"target_cabinet": [171, 611, 780, 830], "items_on_top": [175, 486, 770, 611], "reference_counter": [0, 591, 172, 600], "junction_x": 171}'
+    g = ib.parse_grounding(t, 1084, 1451)
+    assert g and abs(g["front_top_y"] - 887) <= 1 and abs(g["target_y"] - 858) <= 1
+    assert abs(g["top_y"] - 705) <= 1 and g["front_top_y"] - g["target_y"] == 29 and abs(g["probe_x"] - 185) <= 1
+    assert ib.parse_grounding("no json", 100, 100) is None

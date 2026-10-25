@@ -68,6 +68,37 @@ SENSITIVE_PATH = re.compile(r"(\.ssh/|id_rsa|\.env\b|\.aws/|credentials|\.pem$|\
 PAY_WORDS = re.compile(r"(checkout|payment|pay now|place order|立即支付|确认付款|下单|支付)", re.I)
 
 
+_RMRF = re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-r\s+-f|-f\s+-r)\s+([^;&|\n]+)")
+_PROTECTED = {"workspace", "uploads", "outputs", "home", "data", ".", "..", "~", "/"}
+
+
+def scratch_delete(cmd: str) -> bool:
+    """task-247: `rm -rf /tmp/pptx_extract` and `rm -rf huashu-film` (a folder the task made in ~/workspace) each
+    waited 5 min on a confirmation nobody saw. A recursive delete of a scratch path is routine; everything else
+    still asks. Scratch: /tmp/<name>..., ~/workspace/<name>..., or a bare relative <name>/... when the command cd's into ~/workspace
+    (the shell starts in ~, so without that cd a bare name is not known to be scratch)."""
+    hits = list(_RMRF.finditer(cmd))
+    if not hits or re.search(r"\$\(|`|\*|\.\.", cmd):
+        return False
+    cds = re.findall(r"\bcd\s+([^;&|\s]+)", cmd)
+    rel_ok = bool(cds) and all(c.rstrip("/") in ("~/workspace", "$HOME/workspace", "/data/home/workspace", "/home/aiw/workspace") for c in cds)
+    for m in hits:
+        for t in m.group(2).split():
+            t = t.strip("'\"")
+            if not t or t.startswith("-"):
+                continue
+            first = t.split("/")[0]
+            if re.match(r"^/tmp/[\w.@%+-]", t):
+                continue
+            if re.match(r"^(~|\$HOME|/data/home|/home/aiw)/workspace/[\w.@%+-]", t) and \
+                    t.rstrip("/").split("/")[-1] not in _PROTECTED and t.rstrip("/").count("/") >= 2:
+                continue
+            if rel_ok and not t.startswith(("/", "~", "$")) and first not in _PROTECTED and re.match(r"^[\w@%+-][\w.@%+-]*$", first):
+                continue
+            return False
+    return True
+
+
 class PolicyEngine:
     def __init__(self, allow_domains: Optional[list[str]] = None, extra_rules: Optional[list[Rule]] = None):
         env = os.environ.get("AIW_ALLOW_DOMAINS", "")
@@ -87,6 +118,8 @@ class PolicyEngine:
         if action != "shell.exec":
             return None
         cmd = p.get("command", "")
+        if scratch_delete(cmd):  # strip the scratch deletes, judge the rest of the command as usual
+            cmd = _RMRF.sub("true", cmd)
         for pats, lvl in ((SHELL_L4, RiskLevel.L4), (SHELL_L3, RiskLevel.L3), (SHELL_L2, RiskLevel.L2)):
             for pat, why in pats:
                 if re.search(pat, cmd):

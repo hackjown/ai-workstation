@@ -35,8 +35,10 @@ TOOLS: list[ToolSpec] = [
              {"dx": {"type": "integer"}, "dy": {"type": "integer"}, **_xy()}, ["dx", "dy"]),
     ToolSpec("open_app", "computer.open_app", "Launch an app: chrome, terminal, files, editor.", {"name": {"type": "string"}}, ["name"]),
     ToolSpec("close_app", "computer.close_app", "Close an app by name.", {"name": {"type": "string"}}, ["name"]),
-    ToolSpec("shell", "shell.exec", "Run a shell command in the VM (non-root user). Returns stdout/stderr.",
-             {"command": {"type": "string"}, "cwd": {"type": "string"}}, ["command"]),
+    ToolSpec("shell", "shell.exec", "Run a shell command in the VM (non-root user). Returns stdout/stderr. Default time "
+             "limit 60 s (installs 300 s, ffmpeg/TTS 600 s, renders 1800 s); pass timeout (seconds, up to 3600) for "
+             "anything longer instead of starting it again.",
+             {"command": {"type": "string"}, "cwd": {"type": "string"}, "timeout": {"type": "number"}}, ["command"]),
     ToolSpec("browser_open", "browser.open", "Open Chrome, optionally at a URL.", {"url": {"type": "string"}}),
     ToolSpec("browser_navigate", "browser.navigate", "Navigate the visible Chrome tab to a URL.", {"url": {"type": "string"}}, ["url"]),
     ToolSpec("browser_click", "browser.click",

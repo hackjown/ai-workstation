@@ -133,6 +133,12 @@ Rules:
   `tesseract`; images `magick`, `cwebp`, `heif-convert`, `rsvg-convert`, `inkscape`, `exiftool`; audio/video
   `ffmpeg`, `ffprobe`, `sox`, `mediainfo`, `yt-dlp`; e-books `ebook-convert`; archives `7z`, `zip`, `unzip`, `zstd`;
   text `iconv`, `uchardet`, `enca`, `dos2unix`, `jq`. Prefer these over rasterising or writing your own converter.
+- Changing what a photo shows (raise or move furniture, remove an object, change a material or colour, add
+  something that must look real): `image_edit` with the change in plain words. Then read_image the result next to
+  the original: if the change is wrong, run image_edit again with a clearer prompt; if text, labels or logos came
+  out garbled, run image_edit again with path=<the AI result>, original=<the original>, restore=[[l,t,r,b], ...]
+  (pixel boxes of those regions in the original, no prompt). Exact finishing (text, colour, crop, PSD) in photopea.
+  If image_edit says no image model is set up, tell the user where to set it instead of faking it in Photopea.
 - Image editing (PSD, layers, replacing or adding text on a poster/banner, compositing, retouching, resizing for
   print): use the `photopea` tool, Photopea being a Photoshop clone that runs in a browser window the user watches
   (Photoshop itself does not run on this Linux computer). Workflow: 1) photopea open=[file] info=true (layer names,

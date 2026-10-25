@@ -159,12 +159,25 @@ class OpenAIProvider(LLMProvider):
         return {"thinking": {"type": "disabled"}, "enable_thinking": False}
 
     async def _post(self, c: httpx.AsyncClient, body: dict) -> dict:
-        r = await c.post(self.url, json={**body, **self._extras()}, headers={"Authorization": f"Bearer {self.key}"})
-        if r.status_code == 400 and self._extras():  # gateway rejects the thinking switches: drop them for good
-            self._extras_ok = False
-            r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
-        r.raise_for_status()
-        return r.json()
+        """POST with retries on network hiccups and 429/5xx (a gateway blip used to fail the whole task)."""
+        import asyncio
+        tries = int(os.environ.get("AIW_LLM_RETRIES", "3"))
+        for i in range(tries):
+            try:
+                r = await c.post(self.url, json={**body, **self._extras()}, headers={"Authorization": f"Bearer {self.key}"})
+                if r.status_code == 400 and self._extras():  # gateway rejects the thinking switches: drop them for good
+                    self._extras_ok = False
+                    r = await c.post(self.url, json=body, headers={"Authorization": f"Bearer {self.key}"})
+                if r.status_code in (408, 409, 425, 429, 500, 502, 503, 504) and i < tries - 1:
+                    await asyncio.sleep(2 * (i + 1) ** 2)
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except (httpx.TransportError, ValueError) as e:  # connect/read errors, resets, a cut-off JSON body
+                if i >= tries - 1:
+                    raise
+                await asyncio.sleep(2 * (i + 1) ** 2)
+        raise RuntimeError("unreachable")
 
     async def describe(self, system: str, user: str, image_b64: str, max_tokens: int = 900) -> str:
         body = {"model": self.model, "max_tokens": max_tokens, "messages": [

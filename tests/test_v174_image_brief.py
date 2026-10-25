@@ -146,3 +146,30 @@ def test_grounding_boxes_convert_to_pixels():
     assert g and abs(g["front_top_y"] - 887) <= 1 and abs(g["target_y"] - 858) <= 1
     assert abs(g["top_y"] - 705) <= 1 and g["front_top_y"] - g["target_y"] == 29 and abs(g["probe_x"] - 185) <= 1
     assert ib.parse_grounding("no json", 100, 100) is None
+
+
+def test_scratch_deletes_do_not_ask_but_real_deletes_do():
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "services/tool-router"))
+    from tool_router.policy import PolicyEngine
+    e = PolicyEngine()
+    lvl = lambda c: int(e.check("shell.exec", {"command": c}).level)
+    assert lvl("rm -rf /tmp/pptx_extract && mkdir -p /tmp/pptx_extract") <= 1
+    assert lvl("cd ~/workspace && rm -rf huashu-film && mkdir -p huashu-film/materials") <= 1
+    for bad in ("rm -rf ~/workspace", "cd ~ && rm -rf workspace", "rm -rf Desktop", "rm -rf /tmp/*", "rm -rf ../x"):
+        assert lvl(bad) >= 3, bad
+
+
+def test_waiting_on_the_user_extends_the_deadline():
+    import asyncio
+    from agent_runtime.loop import AgentLoop
+    lp = AgentLoop.__new__(AgentLoop)
+    lp._waited = 0.0
+    class C: timeout_s = 0.2
+    lp.cfg = C()
+    async def _run():
+        lp.add_wait(0.3)          # the user took 0.3 s to answer
+        await asyncio.sleep(0.35)
+        return "ok"
+    lp._run = _run
+    assert asyncio.run(lp._run_with_deadline()) == "ok"

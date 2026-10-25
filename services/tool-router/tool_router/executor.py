@@ -4,6 +4,7 @@ LLM tool call -> schema check -> policy -> Computer Runtime -> audit event.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
@@ -79,19 +80,23 @@ class ToolExecutor:
                 return ToolOutcome(name, spec.action, False, decision, error=f"user declined: {decision.reason}")
 
         if spec.action in SETTLE:
-            import os
             payload.setdefault("settle", SETTLE[spec.action] * float(os.environ.get("AIW_SETTLE_SCALE", "1")))
         observe = spec.action not in ("computer.screenshot", "shell.exec") and not spec.action.startswith("files.")
-        r = await self.computer.execute(spec.action, payload, observe=observe,
-                                        timeout=float(args.get("timeout", _default_timeout(spec.action, payload))))
+        t_out = float(args.get("timeout") or _default_timeout(spec.action, payload))
+        if spec.action == "shell.exec":
+            # the VM kills the command at payload["timeout"] (60 s when absent): pip got 300 s here but died at 60 s,
+            # and task-8bd's `om render` was killed at 60 s and started 4 times
+            t_out = min(t_out, float(os.environ.get("AIW_SHELL_MAX_TIMEOUT", "3600")))
+            payload["timeout"] = t_out
+            t_out += 15
+        r = await self.computer.execute(spec.action, payload, observe=observe, timeout=t_out)
         # reads are safe to repeat: retry them here so every caller (read_image, image_edit, photopea) is covered
         for i in range(2 if spec.action in _SAFE_REPEAT else 0):
             if r.success or not _TRANSIENT.search(str(r.error or "")):
                 break
             import asyncio
             await asyncio.sleep(1.5 * (i + 1))
-            r = await self.computer.execute(spec.action, payload, observe=observe,
-                                            timeout=float(args.get("timeout", _default_timeout(spec.action, payload))))
+            r = await self.computer.execute(spec.action, payload, observe=observe, timeout=t_out)
         await self._audit({"phase": "result", "tool": name, "action": spec.action, "success": r.success,
                            "error": r.error, "duration_ms": r.duration_ms})
         return ToolOutcome(name, spec.action, r.success, decision, r.result, r.error, r.screenshot)
@@ -129,4 +134,15 @@ def _default_timeout(action: str, args: dict) -> float:
         return float(os.environ.get("AIW_SEND_FILE_TIMEOUT", "300"))
     if action != "shell.exec":
         return 30
-    return 300 if _INSTALL.search(str(args.get("command", ""))) else 60
+    cmd = str(args.get("command", ""))
+    if _RENDER.search(cmd):
+        return 1800
+    if _MEDIA.search(cmd):
+        return 600
+    return 300 if _INSTALL.search(cmd) else 60
+
+
+# renders and encodes run for minutes (task-8bd: om render killed at 60 s, restarted 4 times)
+_RENDER = _re.compile(r"\bom\s+(render|export|qa)\b|bin/om\s+(render|export|qa)\b|remotion\s+render|hyperframes\s+render", _re.I)
+_MEDIA = _re.compile(r"\bffmpeg\b|\bedge-tts\b|\bom\s+(voice|sound|samples|check)\b|bin/om\s+(voice|sound|samples|check)\b|"
+                     r"soffice\b.*--convert-to|libreoffice\b.*--convert-to|whisper", _re.I)

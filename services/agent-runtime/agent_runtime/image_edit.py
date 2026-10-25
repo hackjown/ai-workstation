@@ -137,12 +137,16 @@ async def _from_chat(c, base, key, model, png: bytes, prompt: str) -> bytes:
 async def edit(base_url: str, key: str, model: str, img_bytes: bytes, prompt: str, timeout: float = 300) -> bytes:
     base = (base_url or "https://api.openai.com/v1").rstrip("/")
     png = _png(img_bytes)
-    order = [_from_images_api, _from_chat] if IMAGES_API_HINT.search(model) else [_from_chat, _from_images_api]
+    firm = prompt + "\nReturn the edited picture itself as an image. Do not answer with text only."
+    if IMAGES_API_HINT.search(model):
+        order = [(_from_images_api, prompt), (_from_chat, firm)]
+    else:  # task-f08: qwen image models answered "done, see above" in text twice before sending a picture
+        order = [(_from_chat, prompt), (_from_chat, firm), (_from_images_api, prompt)]
     errs = []
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
-        for fn in order:
+        for fn, p in order:
             try:
-                out = await fn(c, base, key, model, png, prompt)
+                out = await fn(c, base, key, model, png, p)
                 Image.open(io.BytesIO(out)).verify()
                 return out
             except (ImageEditError, httpx.HTTPError, ValueError, OSError) as e:
@@ -218,6 +222,13 @@ def restore(orig: Image.Image, result: Image.Image, boxes: list, s: float, dx: f
     return out
 
 
+def changed_percent(orig: Image.Image, res: Image.Image) -> float:
+    """Share of the picture (in %) that clearly differs: catches a model that returns the input unchanged."""
+    a, b = _gray(orig, 320), _gray(res, 320)
+    diff = ImageChops.difference(a, b).point(lambda v: 255 if v > 40 else 0)
+    return round(100 * ImageStat.Stat(diff).mean[0] / 255, 1)
+
+
 def postprocess(orig_bytes: bytes, out_bytes: bytes, keep_size: bool = True, boxes: Optional[list] = None,
                 feather: int = 6) -> tuple[bytes, dict]:
     orig = Image.open(io.BytesIO(orig_bytes)).convert("RGB")
@@ -230,6 +241,8 @@ def postprocess(orig_bytes: bytes, out_bytes: bytes, keep_size: bool = True, box
         s, dx, dy, v = align(orig, res)
         info["align"] = {"scale": round(s, 4), "dx": round(dx, 1), "dy": round(dy, 1), "residual": round(v, 1)}
         res = restore(orig, res, boxes, s, dx, dy, feather)
+    if res.size == orig.size:
+        info["changed"] = changed_percent(orig, res)
     info["size"] = list(res.size)
     buf = io.BytesIO()
     res.save(buf, "PNG")

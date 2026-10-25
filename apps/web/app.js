@@ -723,6 +723,7 @@ const MODEL_ROLES = [
   { key: "vision_model", label: "视觉模型", hint: "可选，主模型不会看图时设置", need: "vision" },
   { key: "fallback", label: "备用模型", hint: "主模型出错时用", need: "tools" },
   { key: "subagent_model", label: "子 Agent 模型", hint: "纯文本命令行任务", need: "tools" },
+  { key: "video_model", label: "视频模型", hint: "可选，制作/修改视频的任务用它（如 claude-opus），失败回到主模型", need: "tools" },
   { key: "image_model", label: "改图模型", hint: "AI 改图，如 gpt-image-1、gemini-2.5-flash-image", need: "image" },
 ];
 S.modelIds = []; S.probes = {};
@@ -778,7 +779,7 @@ async function saveModels(e) {
   e.preventDefault(); const f = e.target;
   if (f.key.value) await api("PUT", "/api/secrets/openai_api_key", { value: f.key.value });
   const v = (n) => (f[n].value === "__custom" ? "" : f[n].value);
-  await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), fallback: v("fallback"), subagent_model: v("subagent_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value });
+  await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value });
   toast("已保存，下个任务生效"); loadSettings();
 }
 async function saveVmNet(e) {

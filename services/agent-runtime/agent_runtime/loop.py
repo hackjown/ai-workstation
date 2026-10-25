@@ -80,6 +80,11 @@ class AgentLoop:
         self._image_task = bool(_IMAGE_TASK.search(task.prompt or "")) and not self._cad_task
         if self._image_task and config is None:  # each AI edit takes ~70 s and a check ~30 s (task-4e2 ran out at 900 s)
             self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_IMAGE_TIMEOUT", "2400")))
+        self._video_task = bool(_VIDEO_TASK.search(task.prompt or "")) and not self._cad_task
+        if self._video_task and config is None:  # task-247: reading a 16-page deck alone took 15 min
+            self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_VIDEO_MAX_STEPS", "200")))
+            self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_VIDEO_TIMEOUT", "3600")))
+        self._waited = 0.0  # seconds spent waiting on the user (ask_user, confirmations): not counted toward timeout
         self._last_image: Optional[str] = None  # newest image_edit output, delivered if the task runs out of time
         self.validator = Validator()
         self._cad_keys_saved: set = set()
@@ -88,6 +93,12 @@ class AgentLoop:
         self.recovery = Recovery(computer)
         self._emit_fn = emit
         self.history: list[str] = []
+        if self._video_task and re.search(r"huashu-motion|\bom\s", task.prompt or ""):
+            self.history.append(
+                "0. (setup) huashu-motion needs Node 22+, Chrome/Chromium, FFmpeg (+ uv/Kokoro for a Chinese voice). "
+                "First run `~/.claude/skills/huashu-motion/bin/om doctor`; if anything is missing run "
+                "`bash ~/ai-workstation/deploy/vm/motion-setup.sh` (or the copy in the repo) and check again. Ask the "
+                "director's questions in ONE ask_user as soon as you know the material, not after reading everything.")
         self._images_read: dict[str, tuple] = {}  # path -> (step, description, question): history keeps only ~25 steps
         self.step = 0
         self.ask, self.remember = ask, remember
@@ -171,6 +182,30 @@ class AgentLoop:
         await self.emit(EventType.FILE, name=name, size=res.get("size"), artifact=str(p),
                         truncated=bool(res.get("size") and res["size"] > p.stat().st_size))
 
+    def add_wait(self, seconds: float) -> None:
+        """Time spent waiting on the user extends the deadline (task-247 lost 10 of its 15 min to two unanswered
+        confirmations, then timed out 6 s after asking a question)."""
+        self._waited += max(0.0, float(seconds or 0))
+
+    async def _run_with_deadline(self) -> None:
+        job = asyncio.ensure_future(self._run())
+        start = time.monotonic()
+        try:
+            while True:
+                left = self.cfg.timeout_s + self._waited - (time.monotonic() - start)
+                if left <= 0:
+                    raise asyncio.TimeoutError
+                done, _ = await asyncio.wait({job}, timeout=left)
+                if done:
+                    return job.result()
+        finally:
+            if not job.done():
+                job.cancel()
+                try:
+                    await job
+                except BaseException:  # noqa: BLE001
+                    pass
+
     # ------------------------------------------------------------------- run
     async def run(self) -> Task:
         self.task.status = TaskStatus.RUNNING
@@ -183,7 +218,7 @@ class AgentLoop:
         elif self._cad_task and not self._cad_resuming():
             await self._cad_fresh_start()
         try:
-            await asyncio.wait_for(self._run(), self.cfg.timeout_s)
+            await self._run_with_deadline()
         except asyncio.TimeoutError:
             msg = f"timeout after {self.cfg.timeout_s:.0f}s"
             if self._last_image and not getattr(self, "_sent_file", None):
@@ -637,7 +672,9 @@ class AgentLoop:
             q = a.get("question") or decision.thought or "?"
             opts = [str(o) for o in (a.get("options") or [])][:6]
             await self.emit(EventType.INPUT_REQUIRED, question=q, options=opts)
+            t0 = time.monotonic()
             reply = await self.ask(q, opts) if self.ask else None
+            self.add_wait(time.monotonic() - t0)
             await self.emit(EventType.INPUT_ANSWERED, answer=reply)
             await self.emit(EventType.ACTION_RESULT, tool=t, success=reply is not None, error=None if reply else "no answer",
                             result={"answer": reply})
@@ -1562,6 +1599,7 @@ def _with_grid(img, step: int | None = None):
     return img
 
 
+_VIDEO_TASK = re.compile(r"视频|讲解片|宣传片|发布片|动画片|动效|huashu-motion|\bvideo\b|\.mp4\b|explainer", re.I)
 _IMAGE_TASK = re.compile(r"\.(png|jpe?g|webp|heic|bmp)\b.*|图片|照片|效果图|P图|修图|改图", re.I | re.S)
 
 

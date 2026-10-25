@@ -222,6 +222,54 @@ def restore(orig: Image.Image, result: Image.Image, boxes: list, s: float, dx: f
     return out
 
 
+def move_regions(img_bytes: bytes, moves: list, feather: int = 6) -> tuple[bytes, dict]:
+    """Deterministic geometry, no AI: each move copies the pixels of `box` [l,t,r,b] and scales them into `to`
+    [l,t,r,b] (raise a cabinet = same box with a smaller top). For exact "raise / lower / widen / shift by N px"
+    jobs that image models do loosely (task-4e2: four AI tries, none level)."""
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    W, H = img.size
+    out = img.copy()
+    done = []
+    for mv in moves:
+        box = [int(round(float(v))) for v in mv["box"]]
+        to = [int(round(float(v))) for v in mv["to"]]
+        box = [max(0, min(W, box[0])), max(0, min(H, box[1])), max(0, min(W, box[2])), max(0, min(H, box[3]))]
+        to = [max(0, min(W, to[0])), max(0, min(H, to[1])), max(0, min(W, to[2])), max(0, min(H, to[3]))]
+        if box[2] - box[0] < 2 or box[3] - box[1] < 2 or to[2] - to[0] < 2 or to[3] - to[1] < 2:
+            raise ValueError(f"empty box in move {mv}")
+        piece = img.crop(tuple(box)).resize((to[2] - to[0], to[3] - to[1]), Image.LANCZOS)
+        out.paste(piece, (to[0], to[1]), _feather_mask(piece.size, feather))
+        done.append({"box": box, "to": to})
+    buf = io.BytesIO()
+    out.save(buf, "PNG")
+    return buf.getvalue(), {"moves": done}
+
+
+def _feather_mask(size, feather: int):
+    from PIL import ImageFilter
+    w, h = size
+    m = Image.new("L", size, 0)
+    f = max(0, min(feather, w // 4, h // 4))
+    m.paste(255, (f, f, w - f, h - f))
+    return m.filter(ImageFilter.GaussianBlur(f / 2)) if f else Image.new("L", size, 255)
+
+
+def changed_box(orig: Image.Image, res: Image.Image, pad: float = 0.08):
+    """Bounding box (original pixels) of where the two pictures clearly differ, padded; None if nothing or all."""
+    a, b = _gray(orig, 320), _gray(res, 320)
+    diff = ImageChops.difference(a, b).point(lambda v: 255 if v > 40 else 0)
+    bb = diff.getbbox()
+    if not bb:
+        return None
+    k = orig.width / a.width
+    l, t, r, btm = [v * k for v in bb]
+    pw, ph = (r - l) * pad + 10, (btm - t) * pad + 10
+    box = (max(0, int(l - pw)), max(0, int(t - ph)), min(orig.width, int(r + pw)), min(orig.height, int(btm + ph)))
+    if (box[2] - box[0]) * (box[3] - box[1]) > 0.7 * orig.width * orig.height:
+        return None
+    return box
+
+
 def changed_percent(orig: Image.Image, res: Image.Image) -> float:
     """Share of the picture (in %) that clearly differs: catches a model that returns the input unchanged."""
     a, b = _gray(orig, 320), _gray(res, 320)

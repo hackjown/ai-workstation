@@ -94,3 +94,34 @@ _real_sleep = asyncio.sleep
 
 async def _nosleep(*a, **k):
     await _real_sleep(0)
+
+
+# ---- V1.7.3: task-484 (retry kept 900 s, 540 s thinking step, connect timeouts not retried) ----
+
+def test_api_budget_gives_image_tasks_more_time():
+    from aiw_api.sessions import _budget
+    steps, secs = _budget("把上传图片中白色柜子加高到和左侧台面齐平\n- ~/workspace/uploads/a.png", 40, 900)
+    assert secs >= 2400 and steps == 40
+    assert _budget("帮我查一下天气", 40, 900)[1] == 900
+
+
+def test_connect_timeout_is_retried():
+    import asyncio
+    from computer_runtime.providers.linux.provider import LinuxComputerProvider
+    p = LinuxComputerProvider("ws://127.0.0.1:1", connect_timeout=0.01, retries=1)
+    calls = {"n": 0}
+
+    async def slow_ensure():
+        calls["n"] += 1
+        raise asyncio.TimeoutError()
+    p._ensure = slow_ensure
+
+    async def fast_sleep(_s):
+        return None
+    real = asyncio.sleep
+    asyncio.sleep = fast_sleep
+    try:
+        r = asyncio.run(p.execute("files.read", {"path": "x"}))
+    finally:
+        asyncio.sleep = real
+    assert not r.success and calls["n"] == 2 and "connect timed out" in r.error

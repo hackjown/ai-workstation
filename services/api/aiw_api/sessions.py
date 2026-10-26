@@ -386,6 +386,12 @@ class SessionManager:
                         extra["deploy_server"] = (sch, fn)
                 except Exception as e:  # noqa: BLE001
                     log.warning("deploy tool unavailable: %s", e)
+                try:  # hosts the user authorised for ops work (设置 › 电脑 › 运维主机)
+                    from . import remote_hosts
+                    if self.secrets and remote_hosts.hosts(self.store):
+                        extra["remote_exec"] = remote_hosts.tool(self.store, self.secrets)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("remote_exec unavailable: %s", e)
                 hold = contextlib.nullcontext()
                 cloud = getattr(self, "cloud", None)
                 if cloud and cloud.is_cloud(task.machine_id) and not cleanup:

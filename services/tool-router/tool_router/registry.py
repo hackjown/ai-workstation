@@ -68,7 +68,9 @@ TOOLS: list[ToolSpec] = [
              {"url": {"type": "string"}, "path": {"type": "string"}}, ["url"]),
     ToolSpec("send_file", "files.read",
              "Send a finished file (docx/xlsx/pdf/png/zip...) to the user's chat window as a download. "
-             "Path is relative to ~/workspace; copy or save the file there first.",
+             "Path is relative to ~/workspace; copy or save the file there first. Images (png/jpg/webp/gif) show inline in "
+             "the chat as pictures, so for screenshots or images the user wants to see or confirm, send_file EACH image "
+             "on its own (one call per image) and never zip them; zip only when the user asks for an archive.",
              {"path": {"type": "string"}}, ["path"]),
     ToolSpec("read_image", None,
              "Read an image or a PDF page in ~/workspace (an uploaded design drawing, rendering, sketch, quote-sheet "

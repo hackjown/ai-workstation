@@ -37,3 +37,13 @@ def test_brief_installs_missing_skill_from_source():
     from agent_runtime import skills
     b = skills.brief("【技能：openfilm】做个视频", [{"id": "openfilm", "path": "~/.claude/skills/openfilm", "source": "openfilm/openfilm"}])
     assert "~/.claude/skills/openfilm/SKILL.md" in b and "npx -y skills add openfilm/openfilm" in b
+
+
+def test_dev_skill_with_design_gets_mockups_first_and_a_long_budget():
+    from agent_runtime import skills
+    from aiw_api.sessions import _budget
+    p = "【技能：dev、huashu-design】做一个记账网页"
+    b = skills.brief(p)
+    assert "do NOT write app code yet" in b and "ask_user" in b and "huashu-design" in b and "SKILL.md" in b
+    assert _budget(p, 40, 900) == (300, 5400)
+    assert "~/.local/bin/officecli" in skills.brief("【技能：officecli】去掉空白页")

@@ -35,9 +35,9 @@ final class API: ObservableObject {
     func signOut() { save(server: server, token: "") }
 
     func url(_ path: String, query: [URLQueryItem] = []) -> URL? {
-        var c = URLComponents(string: server + path)
-        if !query.isEmpty { c?.queryItems = (c?.queryItems ?? []) + query }
-        return c?.url
+        guard var c = URLComponents(string: server + path) else { return nil }
+        if !query.isEmpty { let old = c.queryItems ?? []; c.queryItems = old + query }
+        return c.url
     }
     func artifactURL(_ path: String, download: Bool = true) -> URL? {
         url("/api/artifacts", query: [URLQueryItem(name: "path", value: path), URLQueryItem(name: "download", value: download ? "true" : "false"),

@@ -86,7 +86,8 @@ function modal(html) { $("modal").innerHTML = html; paintIcons($("modal")); $("m
 async function loadThreads() {
   try { S.threads = await api("GET", "/api/threads" + (S.archived ? "?archived=true" : "")); } catch (e) { return; }
   $("threadList").innerHTML = S.threads.map((t) => `<button class="${t.id === S.threadId ? "on" : ""}" onclick="openThread('${t.id}')">
-    <div class="t1">${esc(t.title)}</div><div class="t2">${t.last_status ? (STATUS_CN[t.last_status] || [t.last_status])[0] + " · " : ""}${ago(t.updated_at)}</div></button>`).join("")
+    <div class="t1">${esc(t.title)}</div><div class="t2">${t.last_status ? (STATUS_CN[t.last_status] || [t.last_status])[0] + " · " : ""}${ago(t.updated_at)}</div>
+    <span class="thdel" title="删除对话" onclick="event.stopPropagation();deleteThread('${t.id}')">×</span></button>`).join("")
     || `<div class="small pad">还没有对话</div>`;
 }
 function toggleArchived() { S.archived = !S.archived; $("archToggle").textContent = S.archived ? "返回对话" : "查看已归档"; loadThreads(); }
@@ -114,6 +115,13 @@ async function refreshThread(scroll) {
 async function renameThread() {
   if (!S.thread) return; const n = prompt("对话名称", S.thread.title); if (!n) return;
   await api("PATCH", `/api/threads/${S.thread.id}`, { title: n }); refreshThread(); loadThreads();
+}
+async function deleteThread(id) {
+  id = id || (S.thread && S.thread.id); if (!id) return;
+  const t = S.threads.find((x) => x.id === id) || S.thread || {};
+  if (!confirm(`删除对话「${t.title || ""}」？里面的任务记录会一起删除，电脑上的文件不受影响。`)) return;
+  await api("DELETE", `/api/threads/${id}`); toast("已删除");
+  if (S.threadId === id) newThread(); else loadThreads();
 }
 async function archiveThread(flag) { await api("PATCH", `/api/threads/${S.thread.id}`, { archived: flag }); toast(flag ? "已归档" : "已恢复"); newThread(); }
 
@@ -162,7 +170,8 @@ function renderChat(scroll) {
     renderQueue(); setComposerBusy(null); return;
   }
   const head = `<div class="row gap" style="justify-content:flex-end"><button class="btn sm" onclick="renameThread()">重命名</button>
-    <button class="btn sm" onclick="archiveThread(${S.thread.archived ? "false" : "true"})">${S.thread.archived ? "取消归档" : "归档"}</button></div>`;
+    <button class="btn sm" onclick="archiveThread(${S.thread.archived ? "false" : "true"})">${S.thread.archived ? "取消归档" : "归档"}</button>
+    <button class="btn sm" style="color:var(--bad)" onclick="deleteThread()">删除</button></div>`;
   box.innerHTML = head + S.thread.tasks.filter((t) => t.status !== "cancelled").map(renderTask).join("");
   paintIcons(box);
   renderQueue();

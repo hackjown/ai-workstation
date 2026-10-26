@@ -33,10 +33,9 @@ struct RootView: View {
                     withAnimation(.easeOut(duration: 0.2)) { drawer = false }
                 }, newChat: { newChat(); withAnimation { drawer = false } },
                    settings: { drawer = false; showSettings = true })
-                    .frame(width: min(UIScreen.main.bounds.width * 0.84, 340))
+                    .frame(width: max(UIScreen.main.bounds.width * 0.5, 210))
                     .background(Color(.systemBackground).ignoresSafeArea())
                     .transition(.move(edge: .leading))
-                    .gesture(DragGesture().onEnded { g in if g.translation.width < -60 { withAnimation { drawer = false } } })
             }
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
@@ -63,26 +62,31 @@ struct HistoryDrawer: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Image(systemName: "face.smiling").font(.system(size: 15, weight: .bold)).foregroundColor(.white)
-                    .frame(width: 30, height: 30).background(amber).clipShape(RoundedRectangle(cornerRadius: 8))
-                Text("Aiw").font(.title3.bold())
+                Image(systemName: "face.smiling").font(.system(size: 12, weight: .bold)).foregroundColor(.white)
+                    .frame(width: 24, height: 24).background(amber).clipShape(RoundedRectangle(cornerRadius: 6))
+                Text("Aiw").font(.headline)
                 Spacer()
-                Button(action: newChat) { Image(systemName: "square.and.pencil").font(.system(size: 18)) }
-            }.padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 10)
+                Button(action: newChat) { Image(systemName: "square.and.pencil").font(.system(size: 15)) }
+            }.padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 8)
             Picker("", selection: $tab) { Text("历史对话").tag(0); Text("归档").tag(1) }
-                .pickerStyle(.segmented).padding(.horizontal, 16)
+                .pickerStyle(.segmented).padding(.horizontal, 10)
             HStack {
                 Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-                TextField("搜索", text: $query)
-            }.padding(8).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 10))
-                .padding(.horizontal, 16).padding(.vertical, 8)
+                TextField("搜索", text: $query).font(.footnote)
+            }.font(.footnote).padding(6).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 10))
+                .padding(.horizontal, 10).padding(.vertical, 6)
             List {
                 if !err.isEmpty { Text(err).foregroundColor(.red).font(.footnote) }
                 ForEach(shown.indices, id: \.self) { i in
                     let t = shown[i]
                     Button { pick(t.s("id")) } label: { ThreadRow(t: t) }
-                        .listRowBackground(t.s("id") == current ? amber.opacity(0.12) : Color.clear)
-                        .swipeActions(edge: .trailing) {
+                        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 10))
+                        .listRowBackground(t.s("id") == current ? amber.opacity(0.12) : Color(.systemBackground))
+                        .contextMenu {
+                            Button { Task { await archive(t.s("id")) } } label: { Label(tab == 1 ? "恢复" : "归档", systemImage: "archivebox") }
+                            Button(role: .destructive) { Task { await del(t.s("id")) } } label: { Label("删除", systemImage: "trash") }
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             Button(role: .destructive) { Task { await del(t.s("id")) } } label: { Label("删除", systemImage: "trash") }
                             Button { Task { await archive(t.s("id")) } } label: { Label(tab == 1 ? "恢复" : "归档", systemImage: "archivebox") }.tint(.gray)
                         }
@@ -93,8 +97,8 @@ struct HistoryDrawer: View {
             }.listStyle(.plain).refreshable { await load() }
             Divider()
             Button(action: settings) {
-                HStack { Image(systemName: "gearshape"); Text("设置"); Spacer() }.foregroundColor(.primary)
-                    .padding(.horizontal, 16).padding(.vertical, 14)
+                HStack { Image(systemName: "gearshape"); Text("设置"); Spacer() }.font(.subheadline).foregroundColor(.primary)
+                    .padding(.horizontal, 12).padding(.vertical, 12)
             }
         }
         .task { await load() }
@@ -116,15 +120,22 @@ struct ThreadRow: View {
         let st = t.s("last_status")
         VStack(alignment: .leading, spacing: 3) {
             HStack {
-                Text(t.s("title").isEmpty ? "新对话" : t.s("title")).font(.subheadline.weight(.semibold)).lineLimit(1).foregroundColor(.primary)
-                Spacer()
-                Text(when(t.d("updated_at"))).font(.caption2).foregroundColor(.secondary)
+                Text(cleanTitle(t.s("title"))).font(.footnote.weight(.semibold)).lineLimit(1).foregroundColor(.primary)
             }
             HStack(spacing: 5) {
                 if isLive(st) { Circle().fill(st.hasPrefix("waiting") ? Color.orange : amber).frame(width: 6, height: 6) }
                 Text(isLive(st) || st == "failed" ? (statusText[st] ?? st) + " · " + t.s("last_prompt") : t.s("last_prompt"))
-                    .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    .font(.caption2).foregroundColor(.secondary).lineLimit(1)
             }
-        }.padding(.vertical, 3)
+            Text(when(t.d("updated_at"))).font(.system(size: 10)).foregroundColor(.secondary)
+        }.padding(.vertical, 2)
     }
+}
+
+/// Drop the 【技能：…】 prefix a skill pick adds, so titles show what was asked.
+func cleanTitle(_ t: String) -> String {
+    var s = t
+    if s.hasPrefix("【技能"), let r = s.range(of: "】") { s = String(s[r.upperBound...]) }
+    s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return s.isEmpty ? "新对话" : s
 }

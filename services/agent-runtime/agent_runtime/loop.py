@@ -1561,7 +1561,7 @@ class AgentLoop:
 
 
 import re as _re
-_RISKY_EXT = _re.compile(r"(send|delete|remove|pay|purchase|order|post|publish|transfer|create|update|write|cancel)", _re.I)
+_RISKY_EXT = _re.compile(r"(send|delete|remove|pay|purchase|order|post|publish|transfer|create|update|write|cancel|deploy)", _re.I)
 
 
 def _args_short(a: dict) -> dict:

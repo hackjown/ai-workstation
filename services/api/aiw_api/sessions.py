@@ -335,6 +335,13 @@ class SessionManager:
         system_extra = f"Agent name: {prof['agent_name']}." if prof.get("agent_name") else ""
         if prof.get("tone"):
             system_extra += f" Reply tone for summaries: {prof['tone']}."
+        try:
+            from agent_runtime import skills as _skills
+            sk = _skills.brief(task.prompt, self.store.kv_get("skills_custom", []) or [])
+            if sk:
+                system_extra += "\n" + sk
+        except Exception:  # noqa: BLE001 - a bad custom skill entry never blocks a task
+            pass
 
         cleanup = None
         computer = None

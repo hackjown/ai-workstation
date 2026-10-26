@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import asyncio
 import contextlib
@@ -524,6 +525,9 @@ def _title(prompt: str) -> str:
     return p[:24] + ("…" if len(p) > 24 else "")
 
 
+_OFFICE_TASK = re.compile(r"officecli|\.?docx|\.?xlsx|\.?pptx|word|excel|空白页|分页|文档|表格|幻灯片|PPT", re.I)
+
+
 def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str] = None) -> tuple[int, float]:
     """Drawing a construction set in the CAD GUI takes hundreds of steps and hours, not 40 steps / 15 min.
     A revision in a drawing thread gets the same budget (it saves, exports and sends the whole set again)."""
@@ -539,6 +543,8 @@ def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str
     if _VIDEO_TASK.search(prompt or ""):  # task-247: a deck-to-explainer ran out at 900 s before the first frame
         return (max(max_steps, int(os.environ.get("AIW_VIDEO_MAX_STEPS", "200"))),
                 max(timeout_s, float(os.environ.get("AIW_VIDEO_TIMEOUT", "3600"))))
+    if _OFFICE_TASK.search(prompt or ""):  # task-b26: render, fix, re-render does not fit in 40 steps
+        return max(max_steps, int(os.environ.get("AIW_OFFICE_MAX_STEPS", "80"))), max(timeout_s, 1800.0)
     if _IMAGE_TASK.search(prompt or ""):
         # each AI edit ~70 s, each vision check ~30 s: 900 s ran out on task-4e2 and task-484 (a retry kept the
         # old 900 s because the API passes its own LoopConfig, so the loop's own image budget never applied)

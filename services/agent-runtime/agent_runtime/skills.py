@@ -56,6 +56,24 @@ CATALOG: list[dict] = [
               "or an install.sh you wrote and tested here), then check the result (curl the page, docker ps) with "
               "another deploy_server call and report the address. If the tool is missing, tell the user to fill "
               "设置 › 电脑 › 部署服务器.")},
+    {"id": "signup", "title": "网站注册 填资料", "icon": "doc",
+     "desc": "在网站注册账号、填写资料：每一步页面要填什么先发表单给你填，再由 Agent 填入",
+     "path": "", "setup": "",
+     "auto": r"注册(?!表)|开户|sign\s*-?\s*up|create (an |a )?account|填(写)?(资料|表|信息)|申请(账号|帐号|ID)",
+     "note": ("Sign-up / form-filling flow. Use the browser on the desktop (open the official site, never a mirror). "
+              "For EACH page step: 1) screenshot and read every input on the page (labels, required marks, select "
+              "options such as country/region, birthday format, security questions, password rules); 2) ask_user with "
+              "`fields` for exactly those inputs, title like '<site> 注册 · 第 N 步', description saying what it is "
+              "for, password rules in the field hint, passwords as type password, select options copied from the page; "
+              "never fill personal data the user did not give, and do not ask for data the page does not want; "
+              "3) click each field and `type` the value (passwords: type the {{key}} placeholder), pick selects, then "
+              "screenshot to check before pressing continue/next; 4) on validation errors, ask_user again with only "
+              "the fields to fix and the page's error text as hint. Human checks: Cloudflare 'verify you are human' / "
+              "Turnstile checkbox: click the box yourself, wait 5 s, screenshot; after 2 failed tries, or for image "
+              "captchas, SMS/email codes on the user's phone, or a payment: request_takeover with exactly what to do "
+              "(an emailed or SMS code may instead be asked with ask_user fields, a single text field). Finish with "
+              "done stating the account name and what is still pending (e.g. email verification); never repeat a "
+              "password in the summary.")},
     {"id": "huashu-design", "title": "huashu-design 设计", "icon": "image",
      "desc": "出 UI 设计稿、海报、页面 mockup，并做设计评审",
      "path": "~/.claude/skills/huashu-design", "setup": ""},
@@ -102,9 +120,16 @@ def _find(name: str, custom: list[dict]) -> Optional[dict]:
     return None
 
 
+def auto(prompt: str) -> list[str]:
+    """Skills a task needs whether or not it was picked (a sign-up must ask for the data, never invent it)."""
+    text = strip(prompt or "")
+    return [s["id"] for s in CATALOG if s.get("auto") and re.search(s["auto"], text, re.I)]
+
+
 def brief(prompt: str, custom: Optional[list[dict]] = None) -> str:
     names = picked(prompt)
     names += [n for n in mentioned(prompt, custom) if n.lower() not in [x.lower() for x in names]]
+    names += [n for n in auto(prompt) if n.lower() not in [x.lower() for x in names]]
     if not names:
         return ""
     lines = ["The user picked these skills for this task; use them instead of improvising:"]

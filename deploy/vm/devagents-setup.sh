@@ -89,13 +89,16 @@ npx -y rea-agents@latest setup --client workbuddy --yes >>"$LOG" 2>&1 \
 npx -y rea-agents@latest doctor --client workbuddy --json >"$HOME/.config/aiw/rea-doctor.json" 2>>"$LOG" || true
 
 step "OfficeCLI (iOfficeAI, precise docx/xlsx/pptx read/edit/render)"
-curl -fsSL -m 60 https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.sh -o /tmp/officecli-install.sh \
-  && bash /tmp/officecli-install.sh >>"$LOG" 2>&1 || echo "WARN: OfficeCLI install failed, see $LOG"
+# own temp files: a /tmp/officecli-install.sh left by another user made curl fail with (23) on 104
+OC_TMP=$(mktemp -d)
+curl -fsSL -m 60 https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.sh -o "$OC_TMP/install.sh" \
+  && (cd "$OC_TMP" && TMPDIR="$OC_TMP" bash install.sh >>"$LOG" 2>&1) || echo "WARN: OfficeCLI install failed, see $LOG"
 hash -r
 # Make its skill visible to WorkBuddy / CodeBuddy too (its installer only knows Claude Code/Copilot/Codex/Cursor...)
-if curl -fsSL -m 30 https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/SKILL.md -o /tmp/officecli-SKILL.md; then
-  for d in "$HOME/.workbuddy/skills/officecli" "$HOME/.codebuddy/skills/officecli"; do mkdir -p "$d" && cp /tmp/officecli-SKILL.md "$d/SKILL.md"; done
+if curl -fsSL -m 30 https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/SKILL.md -o "$OC_TMP/SKILL.md"; then
+  for d in "$HOME/.workbuddy/skills/officecli" "$HOME/.codebuddy/skills/officecli"; do mkdir -p "$d" && cp "$OC_TMP/SKILL.md" "$d/SKILL.md"; done
 fi
+rm -rf "$OC_TMP"
 
 touch "$HOME/.config/aiw/devagents-ready-v1"
 echo; check

@@ -5,6 +5,7 @@ import UserNotifications
 struct AiwApp: App {
     @StateObject private var api = API.shared
     @StateObject private var hub = Hub.shared
+    @AppStorage("appearance") private var appearance = "system"
     var body: some Scene {
         WindowGroup {
             Group {
@@ -12,6 +13,7 @@ struct AiwApp: App {
             }
             .environmentObject(api).environmentObject(hub)
             .tint(amber)
+            .preferredColorScheme(appearance == "light" ? .light : appearance == "dark" ? .dark : nil)
             .onAppear {
                 UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
                 UNUserNotificationCenter.current().delegate = NotifyDelegate.shared

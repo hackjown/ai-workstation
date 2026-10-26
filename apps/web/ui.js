@@ -545,3 +545,24 @@ async function updPoll() {
   else if (got && img) updResult("warn", `已更新到 <b class="mono">${esc(short(got))}</b>，GitHub 最新镜像是 <b class="mono">${esc(short(img))}</b>${u.github.building ? "（新镜像还在构建，几分钟后再更新一次）" : ""}。`);
   else updResult("warn", `更新完成，容器版本 ${esc(short(got))}。没读到 GitHub 版本，无法对比。`);
 }
+
+/* ======================================================= AtomCode mouse effects (see ui.css) */
+(function mouseFx() {
+  if (matchMedia("(hover: none), (pointer: coarse), (prefers-reduced-motion: reduce)").matches) return;
+  const au = document.createElement("div"); au.className = "aurora"; au.setAttribute("aria-hidden", "true"); document.body.appendChild(au);
+  const SPOT = ".rows, .curcard, .bubble.result, .plusmenu, .upd-ver > div";
+  let x = -400, y = -400, raf = 0, lit = null;
+  const paint = () => {
+    raf = 0;
+    au.style.setProperty("--mx", x + "px"); au.style.setProperty("--my", y + "px");
+    const el = document.elementFromPoint(x, y); const card = el && el.closest ? el.closest(SPOT) : null;
+    if (lit && lit !== card) lit.classList.remove("lit");
+    if (card) {
+      card.classList.add("spot", "lit"); lit = card;
+      const r = card.getBoundingClientRect(); card.style.setProperty("--sx", x - r.left + "px"); card.style.setProperty("--sy", y - r.top + "px");
+    } else lit = null;
+  };
+  addEventListener("pointermove", (e) => { if (e.pointerType !== "mouse") return; x = e.clientX; y = e.clientY; au.classList.add("on"); if (!raf) raf = requestAnimationFrame(paint); }, { passive: true });
+  document.addEventListener("pointerleave", () => { au.classList.remove("on"); if (lit) lit.classList.remove("lit"); lit = null; });
+  addEventListener("blur", () => au.classList.remove("on"));
+})();

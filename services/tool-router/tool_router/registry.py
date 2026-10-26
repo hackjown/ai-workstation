@@ -165,8 +165,27 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("update_plan", None, "Mark plan steps finished (0-based indexes) and optionally add a short progress note.",
              {"done": {"type": "array", "items": {"type": "integer"}}, "note": {"type": "string"}}, ["done"]),
     ToolSpec("ask_user", None, "Ask the user a question when required information is missing (login choice, which file, "
-             "a value). Waits for the reply. Do not use it for confirmations of risky actions.",
-             {"question": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}}}, ["question"]),
+             "a value). Waits for the reply. Do not use it for confirmations of risky actions. "
+             "FORMS (sign-ups, registrations, profiles, checkout details): read the CURRENT page first, then pass `fields` "
+             "with exactly the inputs this page step shows (same order, the page's own labels translated to Chinese, "
+             "select options copied from the page, e.g. country/region list or security questions). The user gets a "
+             "card, fills it and you get the values; fields of type password (or secret:true) come back as {{key}}: "
+             "type the literal {{key}} with `type` and the real value is filled in. One form per page step: fill it, "
+             "go to the next step, then ask again for the next step's fields. Never invent personal data.",
+             {"question": {"type": "string"}, "options": {"type": "array", "items": {"type": "string"}},
+              "title": {"type": "string", "description": "form card title, e.g. 'Apple Account 注册 · 第 1 步'"},
+              "description": {"type": "string", "description": "one line: what the data is for"},
+              "fields": {"type": "array", "items": {"type": "object", "properties": {
+                  "key": {"type": "string"}, "label": {"type": "string"},
+                  "type": {"type": "string", "enum": ["text", "password", "email", "tel", "date", "number", "select", "textarea"]},
+                  "options": {"type": "array", "items": {"type": "string"}}, "required": {"type": "boolean"},
+                  "secret": {"type": "boolean"}, "placeholder": {"type": "string"}, "hint": {"type": "string"}},
+                  "required": ["key", "label"]}}}, ["question"]),
+    ToolSpec("request_takeover", None, "Ask the user to do something on the desktop themselves and wait until they are "
+             "done: a captcha/human check you could not pass after trying (Cloudflare 'verify you are human': click its "
+             "checkbox yourself first, wait 5 s, screenshot; only after 2 failed tries), an SMS/2FA step on their "
+             "phone, a payment, or a login only they can do. Say exactly what to do in `reason`.",
+             {"reason": {"type": "string"}}, ["reason"]),
     ToolSpec("remember", None, "Save a durable fact or preference about the user for future tasks "
              "(e.g. 'weekly report goes to ~/workspace/reports'). Only facts the user stated or confirmed.",
              {"text": {"type": "string"}}, ["text"]),
@@ -180,7 +199,7 @@ TOOLS: list[ToolSpec] = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "remember", "delegate", "click_element", "cad_draw", "cad_command", "read_image", "photopea", "image_edit"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "click_element", "cad_draw", "cad_command", "read_image", "photopea", "image_edit"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

@@ -31,7 +31,7 @@ const IC = {
   bell: "M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0", menu: "M4 6h16M4 12h16M4 18h16",
   clip: "M21.4 11.1l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5",
   mic: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3",
-  up: "M12 19V5M5 12l7-7 7 7", stop: "M7 7h10v10H7z", check: "M20 6 9 17l-5-5", x: "M18 6 6 18M6 6l12 12",
+  eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z", up: "M12 19V5M5 12l7-7 7 7", stop: "M7 7h10v10H7z", check: "M20 6 9 17l-5-5", x: "M18 6 6 18M6 6l12 12",
   chev: "M9 18l6-6-6-6", bulb: "M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z", file: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6",
   retry: "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5", play: "M6 4l14 8-14 8z", hand: "M18 11V6a2 2 0 0 0-4 0M14 10V4a2 2 0 0 0-4 0v2M10 10.5V6a2 2 0 0 0-4 0v8a8 8 0 0 0 16 0v-3a2 2 0 0 0-4 0",
   receipt: "M4 2v20l3-2 3 2 3-2 3 2 3-2 1 .7V2l-3 2-3-2-3 2-3-2-3 2zM8 8h8M8 12h8M8 16h5", trash: "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6",
@@ -227,7 +227,16 @@ function renderTask(t) {
       + (s.thought && s.tool !== "message" && s.tool !== "vision" ? `<p class="thinl">${esc(s.thought)}</p>` : "")
       + (s.why ? `<details class="why"><summary>${icon("chev", "chev")}思考过程</summary><pre>${esc(s.why)}</pre></details>` : "")).join("")}</div></details>`;
   }
-  if (t.pending_question && liveNow) {
+  const fq = t.pending_question && liveNow && t.pending_question.form;
+  if (fq && fq.kind === "form") {
+    S.forms[t.session_id] = fq;
+    html += `<div class="actcard"><div class="ac-ic">${icon("menu")}</div><div class="ac-b"><div class="ac-k">需要操作</div><b>${esc(fq.title)}</b>
+      ${fq.description ? `<p>${esc(fq.description)}</p>` : ""}<button class="btn primary ac-go" onclick="openForm('${t.session_id}')">继续</button></div></div>`;
+  } else if (fq && fq.kind === "takeover") {
+    html += `<div class="actcard tk"><div class="ac-ic">${icon("hand")}</div><div class="ac-b"><div class="ac-k">需要你接管</div><b>${esc(fq.title)}</b>
+      <p>接管后直接在桌面上操作，处理好点「完成，继续」，Agent 接着做。</p>
+      <div class="opts"><button class="btn primary" onclick="toggleTakeover()">${icon("hand")}接管桌面</button><button class="btn" onclick="takeoverDone('${t.session_id}')">完成，继续</button></div></div></div>`;
+  } else if (t.pending_question && liveNow) {
     const q = t.pending_question;
     html += `<div class="ask q"><div><b>${esc(S.profile.agent_name || "Agent")} 在问：</b>${esc(q.question)}</div>
       ${q.options && q.options.length ? `<div class="opts">${q.options.map((o) => `<button class="btn sm primary" onclick="answerQ('${t.session_id}', ${esc(JSON.stringify(o))})">${esc(o)}</button>`).join("")}</div>` : ""}
@@ -361,6 +370,38 @@ function speak(text) {
 /* ---------------------------------------------------------------- agent control */
 async function ctl(sid, op) { try { await api("POST", `/api/agent/${op}`, { session_id: sid }); if (op === "stop") toast("已停止，排队消息已暂停"); setTimeout(() => refreshThread(), 300); } catch (e) { toast(e.message); } }
 async function confirmAct(sid, ok) { await api("POST", "/api/agent/confirm", { session_id: sid, approve: ok }); refreshThread(); }
+S.forms = S.forms || {};
+function openForm(sid) {
+  const f = S.forms[sid]; if (!f) return;
+  const saved = JSON.parse(sessionStorage.getItem("aiw_form_" + sid) || "{}");
+  const input = (x) => {
+    const v = esc(x.secret ? "" : saved[x.key] || ""), req = x.required ? "required" : "";
+    if (x.type === "select") return `<select name="${esc(x.key)}" ${req}><option value="">请选择</option>${x.options.map((o) => `<option ${saved[x.key] === o ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
+    if (x.type === "textarea") return `<textarea name="${esc(x.key)}" rows="3" ${req} placeholder="${esc(x.placeholder)}">${v}</textarea>`;
+    const pw = x.type === "password" || x.secret;
+    return `<div class="ff-in"><input name="${esc(x.key)}" type="${pw ? "password" : x.type}" value="${v}" ${req} placeholder="${esc(x.placeholder)}" autocomplete="${pw ? "new-password" : "off"}" />${pw ? `<button type="button" class="ff-eye" onclick="const i=this.previousElementSibling;i.type=i.type==='password'?'text':'password'">${icon("eye")}</button>` : ""}</div>`;
+  };
+  modal(`<form class="ffsheet" onsubmit="submitForm(event,'${sid}')">
+    <div class="ff-h"><button type="button" class="icon ff-x" onclick="closeOverlays()">${icon("x")}</button><b>${esc(f.title)}</b>
+      <button type="button" class="icon ff-pc" title="看桌面" onclick="closeOverlays();go('computer')">${icon("monitor")}</button><button class="icon ff-ok" title="提交">${icon("check")}</button></div>
+    ${f.description ? `<p class="ff-d">${esc(f.description)}</p>` : ""}
+    ${f.fields.map((x) => `<label class="ff"><span>${esc(x.label)}${x.required ? " *" : ""}</span>${input(x)}${x.hint ? `<small>${esc(x.hint)}</small>` : ""}</label>`).join("")}
+    <p class="ff-d small">密码类字段只用于填入网页，不会显示在对话和记录里。</p>
+    <button class="btn primary ff-sub">提交，继续注册</button></form>`);
+  const first = document.querySelector(".ffsheet input,.ffsheet select"); if (first) first.focus();
+}
+async function submitForm(e, sid) {
+  e.preventDefault();
+  const f = S.forms[sid], el = e.target.elements, vals = {}, keep = {};
+  for (const x of f.fields) { const v = (el[x.key] && el[x.key].value || "").trim(); vals[x.key] = v; if (!x.secret) keep[x.key] = v; }
+  sessionStorage.setItem("aiw_form_" + sid, JSON.stringify(keep));
+  closeOverlays(); delete S.forms[sid];
+  await answerQ(sid, JSON.stringify(vals)); toast("已提交，Agent 正在填入网页");
+}
+async function takeoverDone(sid) {
+  if (S.take) await toggleTakeover();
+  await answerQ(sid, "done");
+}
 async function answerQ(sid, text) { await api("POST", "/api/agent/answer", { session_id: sid, text }); refreshThread(); }
 function answerQForm(e, sid) { e.preventDefault(); const v = e.target.a.value.trim(); if (v) answerQ(sid, v); }
 async function retry(id) { const r = await api("POST", `/api/tasks/${id}/retry`); S.threadId = r.thread_id; await refreshThread(true); }

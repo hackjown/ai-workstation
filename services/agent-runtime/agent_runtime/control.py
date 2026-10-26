@@ -26,6 +26,9 @@ class AgentControl:
         self._resume = asyncio.Event()
         self._resume.set()
         self.resumed_after_takeover = False
+        # set the moment the user presses stop: the loop cancels whatever it is awaiting (a 60 s thinking call,
+        # a long shell command) instead of noticing at the next checkpoint (task-4e6: 24 s+ after the click)
+        self.stopped = asyncio.Event()
 
     def pause(self):
         if self.state == ControlState.RUNNING:
@@ -46,6 +49,7 @@ class AgentControl:
     def stop(self):
         self.state = ControlState.STOPPED
         self._resume.set()
+        self.stopped.set()
 
     @property
     def is_active(self) -> bool:

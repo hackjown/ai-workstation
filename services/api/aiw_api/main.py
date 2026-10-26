@@ -321,6 +321,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.delete("/api/threads/{tid}", dependencies=[Depends(auth)])
     async def del_thread(tid: str):
+        for t in store.thread_tasks(tid):  # stop what is still queued or running before its records go
+            if not sessions.cancel_queued(t["id"]):
+                live = sessions.live_for_task(t["id"])
+                if live and live.runner and not live.runner.done():
+                    await sessions.control(live.id, "stop")
+        sessions.held_threads.discard(tid)
         store.delete_thread(tid)
         return {"ok": True}
 

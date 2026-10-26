@@ -75,8 +75,9 @@ def brief(prompt: str, custom: Optional[list[dict]] = None) -> str:
         if s.get("path"):
             line += f": read {s['path']}/SKILL.md first (only that file, not the skill's source) and follow it"
             line += f"; if the folder is missing, look in {SEARCH_DIRS}"
-        if s.get("setup"):
-            line += f"; if it is not installed, run `{s['setup']}` once"
+        setup = s.get("setup") or (f"npx -y skills add {s['source']} -g -a claude-code -s '*' -y --copy" if s.get("source") else "")
+        if setup:
+            line += f"; if it is not installed, run `{setup}` once"
         if s.get("note"):
             line += ". " + s["note"]
         lines.append(line + ".")
@@ -88,5 +89,6 @@ def listing(custom: Optional[list[dict]] = None) -> list[dict]:
     for s in custom or []:
         if s.get("id") and not any(x["id"] == s["id"] for x in out):
             out.append({"id": s["id"], "title": s.get("title") or s["id"], "icon": "spark",
-                        "desc": s.get("desc", ""), "path": s.get("path", ""), "setup": s.get("setup", ""), "builtin": False})
+                        "desc": s.get("desc", ""), "path": s.get("path", ""), "setup": s.get("setup", ""), "builtin": False,
+                        "source": s.get("source", ""), "machines": s.get("machines", [])})
     return out

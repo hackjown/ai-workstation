@@ -50,7 +50,12 @@ CATALOG: list[dict] = [
               "3) Implement in small steps; write automated tests next to the code and run them after every change; "
               "fix until they pass. For a web UI also run it and screenshot the real pages, checking they match the approved "
               "mockup. 4) Finish with send_file of the final screenshots (and a zip of the project if asked), then done "
-              "with: what was built, how to run it, and the test results (numbers, not 'tests pass').")},
+              "with: what was built, how to run it, and the test results (numbers, not 'tests pass'). "
+              "5) Deploy only when the user asked for it or says yes to ask_user '要部署到服务器吗？': if the deploy_server "
+              "tool is available, call it with upload=<project folder> and the install command (prefer Docker compose "
+              "or an install.sh you wrote and tested here), then check the result (curl the page, docker ps) with "
+              "another deploy_server call and report the address. If the tool is missing, tell the user to fill "
+              "设置 › 电脑 › 部署服务器.")},
     {"id": "huashu-design", "title": "huashu-design 设计", "icon": "image",
      "desc": "出 UI 设计稿、海报、页面 mockup，并做设计评审",
      "path": "~/.claude/skills/huashu-design", "setup": ""},

@@ -643,23 +643,29 @@ function mobileViewfinder() {
   }
   if (!vf) {
     chat.insertAdjacentHTML("afterbegin", `<div id="mvf"><div class="mvf-screen"></div>
-      <div class="mvf-bar"><div class="mvf-now"><small></small><span></span></div>
-      <button class="btn sm primary" onclick="toggleTakeover()">${icon("hand")}<span class="tk">接管</span></button>
-      <button class="icon soft" onclick="mvfFold()" aria-label="收起">${icon("chev")}</button></div></div>`);
+      <div class="mvf-bar" onclick="if(event.target.closest('button'))return;mvfFold()"><span class="mvf-dot"></span><div class="mvf-now"><small></small><span></span></div>
+      <button class="mvf-take" onclick="mvfTake()">${icon("hand")}<span class="tk">接管</span></button>
+      <button class="mvf-eye" onclick="mvfFold()" aria-label="显示电脑画面">${icon("monitor")}<span class="lb">画面</span></button></div></div>`);
     vf = $("mvf");
     if (frame) vf.querySelector(".mvf-screen").appendChild(frame);
     deskLoaded.small = null; loadDesktop();
   }
-  vf.classList.toggle("fold", localStorage.getItem("aiw_mvf_fold") === "1");
+  // folded (just the slim status bar) unless the user opened the screen, or is driving it
+  const fold = localStorage.getItem("aiw_mvf_fold") !== "0" && !S.take;
+  vf.classList.toggle("fold", fold);
   vf.classList.toggle("taking", !!S.take);
   vf.querySelector(".tk").textContent = S.take ? "交还" : "接管";
+  vf.querySelector(".mvf-eye .lb").textContent = fold ? "画面" : "收起";
+  vf.querySelector(".mvf-eye").setAttribute("aria-label", fold ? "显示电脑画面" : "隐藏电脑画面");
   const c = document.querySelector("#msgs .curcard .st.cur .tx");
   const lastS = document.querySelector("#msgs .work:last-of-type .steplist .s:last-child") || [...document.querySelectorAll("#msgs .steplist .s")].pop();
   const st = (S.evs[live.id] || []).find((e) => e.type === "task.started");
   vf.querySelector(".mvf-now small").textContent = (lastS ? lastS.querySelector("b").textContent + " · " : "") + (st ? mmss(Date.now() / 1000 - st.ts) : "");
   vf.querySelector(".mvf-now span").textContent = c ? c.textContent : (document.querySelector("#msgs .work .head .grow") || { textContent: "工作中…" }).textContent;
 }
-function mvfFold() { localStorage.setItem("aiw_mvf_fold", localStorage.getItem("aiw_mvf_fold") === "1" ? "0" : "1"); mobileViewfinder(); }
+// taking over needs the screen: open it first
+function mvfTake() { if (!S.take) localStorage.setItem("aiw_mvf_fold", "0"); toggleTakeover(); setTimeout(mobileViewfinder, 50); }
+function mvfFold() { localStorage.setItem("aiw_mvf_fold", localStorage.getItem("aiw_mvf_fold") === "0" ? "1" : "0"); mobileViewfinder(); }
 const _patchChatVF = patchChat;
 patchChat = function () { _patchChatVF(); mobileViewfinder(); };
 NARROW.addEventListener("change", mobileViewfinder);

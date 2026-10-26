@@ -63,6 +63,7 @@ class OpenAIProvider(LLMProvider):
         # one small decision, so thinking mostly costs time (tens of seconds per step on GLM-V).
         self.thinking = (thinking or os.environ.get("AIW_LLM_THINKING", "off")).lower()
         self._extras_ok = True
+        self._stream_ok = os.environ.get("AIW_LLM_STREAM", "1") != "0"
         self.url = (base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")) + "/chat/completions"
 
     async def decide(self, req: LLMRequest) -> LLMDecision:
@@ -96,7 +97,7 @@ class OpenAIProvider(LLMProvider):
             for attempt in range(3):
                 if attempt == 2:  # some gateways (e.g. GLM) only behave with tool_choice=auto
                     body["tool_choice"] = "auto"
-                data = await self._post(c, body)
+                data = await self._post_live(c, body, req)
                 attempts += 1
                 out_tokens += int((data.get("usage") or {}).get("completion_tokens") or 0)
                 choice = data["choices"][0]
@@ -144,7 +145,8 @@ class OpenAIProvider(LLMProvider):
                                {"reason": "model returned no tool call" + (" (output cut off by max_tokens)" if cut else "")},
                                raw=data)
         usage = {**(data.get("usage") or {}), "attempts": attempts, "out_tokens": out_tokens}
-        return LLMDecision(strip_think(msg.get("content") or ""), name, args, raw=data, usage=usage)
+        return LLMDecision(strip_think(msg.get("content") or ""), name, args, raw=data, usage=usage,
+                           reasoning=reasoning_of(msg))
 
     def _max_tokens(self) -> int:
         """Output budget per decision. A long script inside `command` gets cut (and arrives as {}) on gateways with a
@@ -157,6 +159,60 @@ class OpenAIProvider(LLMProvider):
         if self.thinking != "off" or not self._extras_ok:
             return {}
         return {"thinking": {"type": "disabled"}, "enable_thinking": False}
+
+    async def _post_live(self, c: httpx.AsyncClient, body: dict, req) -> dict:
+        """With thinking on and someone watching, stream the reply so the reasoning shows up while the model is
+        still thinking (a DeepSeek step thinks 60-70 s; the UI showed only "正在思考…"). Any trouble with the stream
+        falls back to the plain request for good."""
+        cb = getattr(req, "on_reasoning", None)
+        if not (cb and self._stream_ok and self.thinking != "off"):
+            return await self._post(c, body)
+        try:
+            return await self._stream(c, body, cb)
+        except (httpx.HTTPStatusError, ValueError, KeyError, TypeError):
+            self._stream_ok = False
+            return await self._post(c, body)
+
+    async def _stream(self, c: httpx.AsyncClient, body: dict, cb) -> dict:
+        content, reasoning, calls, finish, usage = [], [], {}, None, {}
+        payload = {**body, **self._extras(), "stream": True, "stream_options": {"include_usage": True}}
+        async with c.stream("POST", self.url, json=payload, headers={"Authorization": f"Bearer {self.key}"}) as r:
+            r.raise_for_status()
+            if "json" in (r.headers.get("content-type") or "") and "event-stream" not in r.headers.get("content-type", ""):
+                return json.loads(await r.aread())  # gateway ignored stream=true
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                ev = json.loads(chunk)
+                usage = ev.get("usage") or usage
+                for ch in ev.get("choices") or []:
+                    d = ch.get("delta") or {}
+                    finish = ch.get("finish_reason") or finish
+                    r_part = d.get("reasoning_content") or d.get("reasoning")
+                    if r_part:
+                        reasoning.append(r_part)
+                        try:
+                            await cb("".join(reasoning))
+                        except Exception:  # noqa: BLE001  the UI hook must never break the call
+                            pass
+                    if d.get("content"):
+                        content.append(d["content"])
+                    for tc in d.get("tool_calls") or []:
+                        slot = calls.setdefault(tc.get("index", 0), {"id": None, "type": "function",
+                                                                       "function": {"name": "", "arguments": ""}})
+                        slot["id"] = tc.get("id") or slot["id"]
+                        fn = tc.get("function") or {}
+                        slot["function"]["name"] += fn.get("name") or ""
+                        a = fn.get("arguments")
+                        slot["function"]["arguments"] += a if isinstance(a, str) else (json.dumps(a) if a else "")
+        msg = {"role": "assistant", "content": "".join(content) or None,
+               "reasoning_content": "".join(reasoning) or None,
+               "tool_calls": [calls[i] for i in sorted(calls)] or None}
+        return {"choices": [{"message": msg, "finish_reason": finish}], "usage": usage}
 
     async def _post(self, c: httpx.AsyncClient, body: dict) -> dict:
         """POST with retries on network hiccups and 429/5xx (a gateway blip used to fail the whole task)."""
@@ -192,6 +248,18 @@ class OpenAIProvider(LLMProvider):
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
         async with httpx.AsyncClient(timeout=90) as c:
             return strip_think((await self._post(c, body))["choices"][0]["message"].get("content") or "")
+
+
+def reasoning_of(msg: dict) -> str:
+    """The model's thinking: reasoning_content (DeepSeek, Qwen, GLM gateways), reasoning (OpenRouter), or a
+    <think> block inside content."""
+    r = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    if isinstance(r, list):
+        r = "".join(x.get("text", "") if isinstance(x, dict) else str(x) for x in r)
+    if not r:
+        m = re.search(r"<think>(.*?)(</think>|$)", msg.get("content") or "", re.S)
+        r = m.group(1) if m else ""
+    return str(r).strip()
 
 
 def strip_think(text: str) -> str:

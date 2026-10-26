@@ -1,0 +1,38 @@
+import SwiftUI
+
+struct SettingsView: View {
+    @EnvironmentObject var api: API
+    @Environment(\.dismiss) var dismiss
+    @State private var machines: [JSON] = []
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("服务器") {
+                    LabeledContent("地址", value: api.server)
+                    Button("退出登录", role: .destructive) { api.signOut(); dismiss() }
+                }
+                Section(header: Text("在哪台电脑上做"), footer: Text("新任务用这台电脑")) {
+                    if machines.isEmpty { Text(api.machine).foregroundColor(.secondary) }
+                    ForEach(machines.indices, id: \.self) { i in
+                        let mm = machines[i]
+                        Button { api.setMachine(mm.s("id")) } label: {
+                            HStack {
+                                Image(systemName: "desktopcomputer")
+                                Text(mm.s("name").isEmpty ? mm.s("id") : mm.s("name")).foregroundColor(.primary)
+                                Spacer()
+                                if api.machine == mm.s("id") { Image(systemName: "checkmark").foregroundColor(amber) }
+                            }
+                        }
+                    }
+                }
+                Section(footer: Text("模型、连接器、运维主机等完整设置在网页里")) {
+                    if let u = api.url("/") { Link(destination: u) { Label("打开网页设置", systemImage: "safari") } }
+                }
+                Section { LabeledContent("版本", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "") }
+            }
+            .navigationTitle("设置").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .task { machines = (try? await api.list("/api/machines")) ?? [] }
+        }
+    }
+}

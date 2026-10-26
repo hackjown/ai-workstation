@@ -8,8 +8,8 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>AIW</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>2.2</string>
-  <key>CFBundleVersion</key><string>5</string>
+  <key>CFBundleShortVersionString</key><string>2.3</string>
+  <key>CFBundleVersion</key><string>6</string>
   <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
   <key>MinimumOSVersion</key><string>16.0</string>
   <key>LSRequiresIPhoneOS</key><true/>
@@ -33,7 +33,7 @@
     <key>NSAllowsLocalNetworking</key><true/></dict>
   <key>NSMicrophoneUsageDescription</key><string>用语音给 Agent 下任务</string>
   <key>NSSpeechRecognitionUsageDescription</key><string>把你说的话转成文字发给 Agent</string>
-  <key>NSCameraUsageDescription</key><string>拍照作为附件发给 Agent</string>
-  <key>NSPhotoLibraryUsageDescription</key><string>选择图片作为附件发给 Agent</string>
+  <key>NSCameraUsageDescription</key><string>拍照或录像作为附件发给 Agent</string>
+  <key>NSPhotoLibraryUsageDescription</key><string>选择图片或视频作为附件发给 Agent</string>
   <key>NSLocalNetworkUsageDescription</key><string>连接局域网里的 Aiw 服务器</string>
 </dict></plist>

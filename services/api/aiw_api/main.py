@@ -699,6 +699,76 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             store._x("UPDATE notifications SET read=1")
         return {"ok": True}
 
+    # ------------------------------------------------------------- online update (SSH to the Docker host)
+    @app.get("/api/update", dependencies=[Depends(auth)])
+    async def update_info():
+        from . import updater
+        c = updater.cfg(store)
+        return {"config": c, "has_password": bool(secrets.get(updater.SECRET)), "current": os.environ.get("AIW_VERSION", "dev"),
+                "github": await updater.github_latest(), "job": store.kv_get("update_job", None)}
+
+    @app.put("/api/update/config", dependencies=[Depends(auth)])
+    async def update_config(body: dict):
+        from . import updater
+        c = updater.cfg(store)
+        for k in updater.DEFAULT:
+            if k in body:
+                c[k] = int(body[k] or 22) if k == "port" else bool(body[k]) if k == "sudo" else str(body[k]).strip()
+        store.kv_set("update_cfg", c)
+        if body.get("password"):
+            secrets.put(updater.SECRET, str(body["password"]))
+        return {"config": c, "has_password": bool(secrets.get(updater.SECRET))}
+
+    @app.post("/api/update/test", dependencies=[Depends(auth)])
+    async def update_test():
+        from . import updater
+        try:
+            return await updater.test(updater.cfg(store), secrets.get(updater.SECRET))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"连接失败：{type(e).__name__}: {str(e)[:200]}")
+
+    @app.post("/api/update/start", dependencies=[Depends(auth)])
+    async def update_start():
+        from . import updater
+        gh = await updater.github_latest()
+        try:
+            r = await updater.start(updater.cfg(store), secrets.get(updater.SECRET))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"启动更新失败：{type(e).__name__}: {str(e)[:200]}")
+        job = {"started_at": r["started_at"], "from": os.environ.get("AIW_VERSION", "dev"),
+               "target": (gh.get("image") or {}).get("sha", "")}
+        store.kv_set("update_job", job)
+        return job
+
+    @app.get("/api/update/status", dependencies=[Depends(auth)])
+    async def update_status():
+        from . import updater
+        try:
+            st = await updater.status(updater.cfg(store), secrets.get(updater.SECRET))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"读取进度失败：{type(e).__name__}: {str(e)[:200]}")
+        st["job"] = store.kv_get("update_job", None)
+        st["current"] = os.environ.get("AIW_VERSION", "dev")
+        return st
+
+    # ------------------------------------------------------------- skills (composer "+" menu)
+    @app.get("/api/skills", dependencies=[Depends(auth)])
+    async def get_skills():
+        from agent_runtime import skills as _skills
+        return _skills.listing(store.kv_get("skills_custom", []) or [])
+
+    @app.put("/api/skills/custom", dependencies=[Depends(auth)])
+    async def put_custom_skills(body: list[dict]):
+        out = []
+        for s_ in body:
+            sid = re.sub(r"[^A-Za-z0-9_.-]", "-", str(s_.get("id") or "").strip())[:60]
+            if not sid:
+                raise HTTPException(400, "each skill needs an id")
+            out.append({"id": sid, "title": str(s_.get("title") or sid)[:60], "desc": str(s_.get("desc") or "")[:200],
+                        "path": str(s_.get("path") or "")[:300], "setup": str(s_.get("setup") or "")[:300]})
+        store.kv_set("skills_custom", out)
+        return await get_skills()
+
     # ------------------------------------------------------------- integrations (HTTP / OpenAPI / MCP)
     @app.get("/api/integrations", dependencies=[Depends(auth)])
     async def get_integrations():

@@ -500,3 +500,8 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 .skm-row details{grid-column:1/-1}
 .skm-row pre{max-height:180px;overflow:auto;font-size:11.5px;white-space:pre-wrap;margin:6px 0 0;padding:8px;border-radius:8px;background:var(--panel2,rgba(127,127,127,.08))}
 .skmanual{padding:6px 18px 10px}.skmanual summary{cursor:pointer;padding:6px 0}
+.threads button{position:relative}
+.threads .thdel{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:22px;height:22px;border-radius:50%;display:none;align-items:center;justify-content:center;font-size:16px;line-height:1;color:var(--mute);background:var(--panel2)}
+.threads button:hover .thdel{display:flex}
+.threads .thdel:hover{color:var(--bad)}
+@media (hover:none){.threads .thdel{display:flex;opacity:.6}}

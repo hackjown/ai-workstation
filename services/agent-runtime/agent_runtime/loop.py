@@ -105,6 +105,9 @@ class AgentLoop:
         self.extra_tools = extra_tools or {}
         self._secrets: dict[str, str] = {}  # form values the model only sees as {{key}}
         self.subagent_llm = subagent_llm
+        # set by the API's session manager when other computers can take work: async (items, timeout_s) -> results.
+        # None (a child task, a single computer, tests) hides the dispatch tool.
+        self.dispatcher: Optional[Callable[[list, float], Awaitable[list]]] = None
         self.vision_llm = vision_llm  # optional "eyes": reads the screen for a tool model without vision
         self.image_cfg = image_cfg or {}  # {"base_url", "key", "model"}: the AI image-editing model, if set
         self._seen_hash: Optional[str] = None
@@ -444,7 +447,7 @@ class AgentLoop:
             req = LLMRequest(
                 system=self.system, task=self._task_with_plan(), history=self.history,
                 screenshot_b64=send_shot, tools=tool_schemas([t[0] for t in self.extra_tools.values()],
-                                   hide=() if _cad.script_drawing_allowed(self.task.prompt) else ("cad_draw",)),
+                                   hide=self._hidden_tools()),
                 screen=shown, note=note, screen_desc=desc,
                 # drafting sheets from cad/plan.md is transcription: with thinking on, DeepSeek spent 11-13 min per
                 # sheet reasoning about label positions in its head and often ran out of budget before any tool call
@@ -779,6 +782,8 @@ class AgentLoop:
             summary = await self._delegate(a.get("goal") or "")
             self._acted = True
             return f"helper finished: {summary[:400]}"
+        if t == "dispatch":
+            return await self._dispatch(a)
         if t in self.extra_tools:
             _schema, fn = self.extra_tools[t]
             await self.emit(EventType.TOOL_CALL, tool=t, args=a)
@@ -1616,6 +1621,65 @@ class AgentLoop:
         self._images_read[path] = (self.step, (text or "").strip(), q0)
         return f"image {path} reads:\n{(text or '').strip()[:3500]}"
 
+    def _hidden_tools(self) -> tuple:
+        hide = [] if _cad.script_drawing_allowed(self.task.prompt) else ["cad_draw"]
+        if not self.dispatcher:
+            hide.append("dispatch")
+        return tuple(hide)
+
+    async def _dispatch(self, a: dict) -> str:
+        """Run independent pieces of the request as child tasks on several computers at once and wait for them all.
+        The API's session manager does the placement, queueing, waking and stopping; this side checks the arguments,
+        keeps the parent's own deadline from running out while it waits, and turns the results into a history note."""
+        items = a.get("tasks") if isinstance(a.get("tasks"), list) else a.get("items")
+        clean = []
+        for it in items or []:
+            if isinstance(it, str):
+                it = {"goal": it}
+            if not isinstance(it, dict):
+                continue
+            goal = str(it.get("goal") or it.get("task") or "").strip()
+            if goal:
+                clean.append({"machine": str(it.get("machine") or it.get("machine_id") or "auto").strip() or "auto",
+                              "goal": goal[:4000]})
+        if not self.dispatcher:
+            await self.emit(EventType.ACTION_RESULT, tool="dispatch", success=False, error="no other computers", result={})
+            return ("FAILED: dispatch is not available here (only one computer, or this is already a child task). "
+                    "Do the pieces yourself one after another.")
+        if not clean:
+            await self.emit(EventType.ACTION_RESULT, tool="dispatch", success=False, error="missing args ['tasks']", result={})
+            return ("FAILED: dispatch needs `tasks`: a list of {machine: id or \"auto\", goal: complete instruction}. "
+                    "Call it again with the pieces filled in.")
+        clean = clean[:int(os.environ.get("AIW_DISPATCH_MAX", "8"))]
+        try:
+            mins = float(a.get("timeout_min") or 0)
+        except (TypeError, ValueError):
+            mins = 0
+        timeout_s = min(max(mins * 60 if mins > 0 else float(os.environ.get("AIW_DISPATCH_TIMEOUT", "3600")), 60.0),
+                        float(os.environ.get("AIW_DISPATCH_MAX_TIMEOUT", "10800")))
+        t0 = time.monotonic()
+        try:
+            results = await self.dispatcher(clean, timeout_s)
+        finally:
+            # waiting on the children is not this task's own work: it must not eat the parent's deadline
+            self.add_wait(time.monotonic() - t0)
+        self._acted = True
+        ok = sum(1 for r in results if r.get("status") == "succeeded")
+        await self.emit(EventType.ACTION_RESULT, tool="dispatch", success=ok > 0, error=None if ok else "no child task succeeded",
+                        result={"children": [{k: r.get(k) for k in ("machine", "machine_name", "status", "task_id")} for r in results]})
+        lines = [f"dispatch finished: {ok}/{len(results)} child tasks succeeded."]
+        for i, r in enumerate(results, 1):
+            files = r.get("local_files") or []
+            lines.append(f"[{i}] {r.get('machine_name') or r.get('machine')} ({r.get('machine')}) {r.get('status')}"
+                         f"{' (ran after the others: computer was busy)' if r.get('queued') else ''}: "
+                         f"goal={_clip(r.get('goal') or '', 160)!r}\n    summary: {_clip(r.get('summary') or '', 900)}"
+                         + (f"\n    files (on your computer): {', '.join(files)}" if files else
+                            f"\n    files (in the child's chat only): {', '.join(r.get('files') or [])}" if r.get("files") else ""))
+        lines.append("Now combine these results into ONE answer for the user: merge the files if a single file was asked "
+                     "for and send_file it, then done with a summary that names what each computer did. Re-dispatch or do "
+                     "yourself only the pieces that failed.")
+        return "\n".join(lines)
+
     async def _delegate(self, goal: str) -> str:
         """Text-only helper: shell/file tools, no screenshots, its own short history."""
         llm = self.subagent_llm or self.llm
@@ -1805,8 +1869,8 @@ def _side_by_side(imgs: list, height: int = 900, zoom: tuple | None = None) -> b
     return buf.getvalue()
 
 
-_NO_SCREEN_TOOLS = {"read_image", "image_edit", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate"}
-_NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "open_app"}
+_NO_SCREEN_TOOLS = {"read_image", "image_edit", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch"}
+_NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "dispatch", "open_app"}
 
 
 def _thumb(b64: str):

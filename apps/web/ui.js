@@ -110,6 +110,7 @@ loadSettings = async function () {
   const [prof, mems, models, notify, integ, secs, vmnet, machines] = await Promise.all([api("GET", "/api/profile"), api("GET", "/api/memories"), api("GET", "/api/settings/models"),
     api("GET", "/api/settings/notify"), api("GET", "/api/integrations"), api("GET", "/api/secrets"), api("GET", "/api/settings/vm").catch(() => ({})), api("GET", "/api/machines").catch(() => [])]);
   S.profile = prof;
+  const dep = await api("GET", "/api/deploy/config").catch(() => ({ config: {} }));
   const [skillList, upd, skJob] = await Promise.all([api("GET", "/api/skills").catch(() => []), api("GET", "/api/update").catch(() => null),
     api("GET", "/api/skills/install").catch(() => null)]);
   S.skillList = skillList; S.skillJob = skJob && Date.now() / 1000 - (skJob.finished || skJob.started || 0) < 1800 ? skJob : null;
@@ -172,6 +173,15 @@ loadSettings = async function () {
         ${row("名称 / 机器", "自动装好 LibreCAD、中文字体和 vm-agent", `<div class="inl"><input name="name" value="instabox" placeholder="instabox" /><select name="remote_id" style="flex:1;min-width:140px"><option value="">新建一台</option></select></div>`)}
         <div class="savebar"><span class="note" id="cloudNote"></span><button type="button" class="btn sm" onclick="cloudLookup()">读取已有机器</button><button class="btn sm primary">添加</button></div>
       </details>
+    </form>
+    <form class="rows" id="sDeploy" onsubmit="depSave(event)">
+      <div class="rw head"><div class="k">部署服务器 · 开发好的程序装到这里</div><div>${dep.config.host ? '<span class="chip ok">已设置</span>' : '<span class="chip">未设置</span>'}</div></div>
+      ${row("服务器地址", "随时可以换", `<div class="inl"><input name="host" value="${esc(dep.config.host || "")}" placeholder="192.168.50.120 或域名" /><input name="port" value="${esc(dep.config.port || 22)}" style="flex:0 0 80px;min-width:0" aria-label="端口" /></div>`)}
+      ${row("用户名", "", `<input name="user" value="${esc(dep.config.user || "root")}" autocomplete="off" />`)}
+      ${row("密码", "加密保存在 AIW 服务端，不会发给虚拟机", `<input name="password" type="password" autocomplete="new-password" placeholder="${dep.has_password ? "已保存，留空不修改" : "SSH 密码"}" />`, dep.has_password ? '<span class="chip ok">已保存</span>' : '<span class="chip">未设置</span>')}
+      ${row("部署目录", "每个程序一个子文件夹", `<input name="dir" value="${esc(dep.config.dir || "~/apps")}" />`)}
+      ${row("用 sudo", "需要 root 权限安装时打开", "", `<input type="checkbox" name="sudo" ${dep.config.sudo ? "checked" : ""} aria-label="sudo" />`, "sw")}
+      <div class="savebar"><span class="note" id="depNote">每次部署前都会弹卡片请你允许</span><button type="button" class="btn sm" onclick="depTest()">测试连接</button><button class="btn sm primary">保存</button></div>
     </form>
   </section>
 
@@ -541,6 +551,13 @@ function updSection(u) {
       ${row("用 sudo", "用户不在 docker 组时打开", "", `<input type="checkbox" name="sudo" ${c.sudo ? "checked" : ""} aria-label="sudo" />`, "sw")}
       <div class="savebar"><span class="note" id="updNote"></span><button type="button" class="btn sm" onclick="updTest()">测试连接</button><button class="btn sm primary">保存</button></div>
     </div></form>`;
+}
+function depForm() { const e = $("sDeploy").elements; return { host: e.host.value, port: e.port.value, user: e.user.value, dir: e.dir.value, sudo: e.sudo.checked, password: e.password.value }; }
+async function depSave(e) { if (e) e.preventDefault(); const r = await api("PUT", "/api/deploy/config", depForm()); $("sDeploy").elements.password.value = ""; toast("已保存"); return r; }
+async function depTest() {
+  $("depNote").textContent = "连接中…";
+  try { await depSave(); const r = await api("POST", "/api/deploy/test"); $("depNote").textContent = `连接成功 · ${r.dir} · ${r.system} · ${r.docker}`; }
+  catch (err) { $("depNote").textContent = err.message; }
 }
 function updForm() { const e = $("g-upd").elements; return { host: e.host.value, port: e.port.value, user: e.user.value, dir: e.dir.value, container: e.container.value, sudo: e.sudo.checked, password: e.password.value }; }
 async function updSave(e) { if (e) e.preventDefault(); const r = await api("PUT", "/api/update/config", updForm()); $("g-upd").elements.password.value = ""; toast("已保存"); return r; }

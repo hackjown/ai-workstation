@@ -47,3 +47,12 @@ def test_dev_skill_with_design_gets_mockups_first_and_a_long_budget():
     assert "do NOT write app code yet" in b and "ask_user" in b and "huashu-design" in b and "SKILL.md" in b
     assert _budget(p, 40, 900) == (300, 5400)
     assert "~/.local/bin/officecli" in skills.brief("【技能：officecli】去掉空白页")
+
+
+def test_skill_named_in_words_gets_its_brief_and_office_budget():
+    from agent_runtime import skills
+    from aiw_api.sessions import _budget
+    b = skills.brief("你用officecli去修改，去掉空白页面")
+    assert "~/.local/bin/officecli" in b and "overflow" in b
+    assert _budget("你用officecli去修改，去掉空白页面", 40, 900) == (80, 1800.0)
+    assert skills.mentioned("develop a page") == []

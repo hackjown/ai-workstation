@@ -5,6 +5,7 @@ LLM tool call -> schema check -> policy -> Computer Runtime -> audit event.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
@@ -73,7 +74,11 @@ class ToolExecutor:
                            "level": int(decision.level), "reason": decision.reason})
 
         if decision.forbidden:
-            return ToolOutcome(name, spec.action, False, decision, error=f"forbidden by policy: {decision.reason}")
+            hint = ""
+            if spec.action == "shell.exec" and re.search(r"Proxmox|root shell", decision.reason):
+                hint = ("。这台电脑的 shell 不能直接操作 Proxmox/远程 root；用户在 设置 › 电脑 › 运维主机 授权过的主机请用 "
+                        "remote_exec 工具执行；没有授权就用 ask_user 请用户去那里添加主机（不要让用户在聊天里发密码）")
+            return ToolOutcome(name, spec.action, False, decision, error=f"forbidden by policy: {decision.reason}{hint}")
         if decision.needs_confirm:
             ok = await self.confirm(name, payload, decision) if self.confirm else False
             if not ok:

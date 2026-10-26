@@ -24,7 +24,15 @@ CATALOG: list[dict] = [
      "note": ("OfficeCLI is a command-line program plus this skill guide. Call the program by its full path "
               "~/.local/bin/officecli (older computers do not have ~/.local/bin on PATH); if that file is missing, run "
               "the setup. Prefer it over GUI clicking for any .docx/.xlsx/.pptx edit, and after an edit render to PDF "
-              "(soffice --headless --convert-to pdf) to check the pages.")},
+              "(soffice --headless --convert-to pdf) to check the pages. "
+              "Blank or extra pages: do not study the XML first. Render to PDF, count pages (pdfinfo) and characters per "
+              "page (pdftotext -f N -l N), and look at the page images; a page with a few characters (a footer like "
+              "'第1页') is overflow from the page before, not a page to delete. In a PDF-converted .docx every page is a "
+              "section with exact line heights, so fix overflow by shrinking that section's spacing: the empty paragraph "
+              "at the section start, the empty section-break paragraph, huge exact line heights (lineSpacing) or "
+              "spaceBefore/After on the footer — `officecli set f.docx /body/p[N] --prop lineSpacing=1pt --prop "
+              "lineRule=exact --prop spaceBefore=0pt --prop spaceAfter=0pt` — then render again until the page count "
+              "matches the source. Save as a new file (…_去空白页.docx), keep the original, and send_file it.")},
     {"id": "reverse-engineer-anything", "title": "REA 逆向分析", "icon": "search",
      "desc": "拆解 Electron、JS、网页应用：看结构、找接口、抓协议",
      "path": "~/.workbuddy/skills/reverse-engineer-anything", "setup": "bash ~/ai-workstation/deploy/vm/devagents-setup.sh"},
@@ -65,6 +73,18 @@ def picked(prompt: str) -> list[str]:
     return out
 
 
+def mentioned(prompt: str, custom: Optional[list[dict]] = None) -> list[str]:
+    """A skill named in plain words ("你用officecli去修改") counts as picked too: task-b26 typed the name
+    instead of ticking it, got no brief, and spent 40 steps reading XML."""
+    low = (prompt or "").lower()
+    out = []
+    for sk in list(custom or []) + CATALOG:
+        sid = (sk.get("id") or "").lower()
+        if len(sid) >= 6 and re.search(rf"(?<![a-z0-9-]){re.escape(sid)}(?![a-z0-9-])", low) and sid not in out:
+            out.append(sid)
+    return out
+
+
 def strip(prompt: str) -> str:
     return MARK.sub("", prompt or "").strip()
 
@@ -79,6 +99,7 @@ def _find(name: str, custom: list[dict]) -> Optional[dict]:
 
 def brief(prompt: str, custom: Optional[list[dict]] = None) -> str:
     names = picked(prompt)
+    names += [n for n in mentioned(prompt, custom) if n.lower() not in [x.lower() for x in names]]
     if not names:
         return ""
     lines = ["The user picked these skills for this task; use them instead of improvising:"]

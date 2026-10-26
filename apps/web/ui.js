@@ -566,3 +566,53 @@ async function updPoll() {
   document.addEventListener("pointerleave", () => { au.classList.remove("on"); if (lit) lit.classList.remove("lit"); lit = null; });
   addEventListener("blur", () => au.classList.remove("on"));
 })();
+
+/* ---------- mobile: viewfinder (direction A) — the live computer on top of the chat while a task runs */
+const NARROW = window.matchMedia("(max-width:760px)");
+function mobileViewfinder() {
+  const chat = $("v-chat"); if (!chat) return;
+  let vf = $("mvf");
+  const live = liveTask();
+  const want = NARROW.matches && S.view === "chat" && !!live;
+  const frame = document.querySelector("#deskPane .deskframe, #mvf .deskframe");
+  if (!want) {
+    if (vf) { if (frame && frame.parentNode !== $("deskPane")) { $("deskPane").appendChild(frame); deskLoaded.small = null; if (S.view === "chat") loadDesktop(); } vf.remove(); }
+    return;
+  }
+  if (!vf) {
+    chat.insertAdjacentHTML("afterbegin", `<div id="mvf"><div class="mvf-screen"></div>
+      <div class="mvf-bar"><div class="mvf-now"><small></small><span></span></div>
+      <button class="btn sm primary" onclick="toggleTakeover()">${icon("hand")}<span class="tk">接管</span></button>
+      <button class="icon soft" onclick="mvfFold()" aria-label="收起">${icon("chev")}</button></div></div>`);
+    vf = $("mvf");
+    if (frame) vf.querySelector(".mvf-screen").appendChild(frame);
+    deskLoaded.small = null; loadDesktop();
+  }
+  vf.classList.toggle("fold", localStorage.getItem("aiw_mvf_fold") === "1");
+  vf.classList.toggle("taking", !!S.take);
+  vf.querySelector(".tk").textContent = S.take ? "交还" : "接管";
+  const c = document.querySelector("#msgs .curcard .st.cur .tx");
+  const lastS = document.querySelector("#msgs .work:last-of-type .steplist .s:last-child") || [...document.querySelectorAll("#msgs .steplist .s")].pop();
+  const st = (S.evs[live.id] || []).find((e) => e.type === "task.started");
+  vf.querySelector(".mvf-now small").textContent = (lastS ? lastS.querySelector("b").textContent + " · " : "") + (st ? mmss(Date.now() / 1000 - st.ts) : "");
+  vf.querySelector(".mvf-now span").textContent = c ? c.textContent : (document.querySelector("#msgs .work .head .grow") || { textContent: "工作中…" }).textContent;
+}
+function mvfFold() { localStorage.setItem("aiw_mvf_fold", localStorage.getItem("aiw_mvf_fold") === "1" ? "0" : "1"); mobileViewfinder(); }
+const _patchChatVF = patchChat;
+patchChat = function () { _patchChatVF(); mobileViewfinder(); };
+NARROW.addEventListener("change", mobileViewfinder);
+const _goVF = go;
+go = function (v) { const r = _goVF.apply(this, arguments); setTimeout(mobileViewfinder, 0); return r; };
+setInterval(() => { if ($("mvf")) mobileViewfinder(); }, 1000);
+
+/* ---------- composer: round amber start / stop button (direction A), pause beside the hint */
+const _setBusyA = setComposerBusy;
+setComposerBusy = function (t) {
+  _setBusyA(t);
+  const h = $("composerHint");
+  if (t && LIVE.includes(t.status) && t.session_id) {
+    const paused = t.status === "paused" || t.status === "takeover";
+    h.innerHTML = `<span>${paused ? "已暂停 · 新消息会排队" : "工作中 · 新消息会排队"}</span><button class="btn xs" onclick="ctl('${t.session_id}','${paused ? "resume" : "pause"}')">${paused ? "继续" : "暂停"}</button>`;
+  }
+  mobileViewfinder();
+};

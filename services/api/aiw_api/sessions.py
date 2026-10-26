@@ -9,6 +9,8 @@
 * recovery: tasks left running when the API restarted are marked interrupted and,
   if enabled, re-queued automatically
 * optional isolated runs on a throw-away PVE clone
+* dispatch: one request split into child tasks that run on several computers at once (each child is a task in
+  its own child thread); the parent waits for them, gets their summaries and files, and combines the result
 """
 from __future__ import annotations
 
@@ -16,6 +18,7 @@ import os
 import re
 
 import asyncio
+import base64
 import contextlib
 import logging
 import time
@@ -62,6 +65,7 @@ class SessionManager:
         self.held_threads: set[str] = set()   # queue paused because the user pressed stop
         self._drain_lock = asyncio.Lock()
         self.cloud = None  # CloudManager, set by the API
+        self._health: dict[str, tuple[float, bool]] = {}   # machine -> (checked at, vm-agent answered)
 
     # ------------------------------------------------------------------ factories
     def _default_computer(self, machine: dict) -> Computer:
@@ -208,14 +212,16 @@ class SessionManager:
         t = self.store.task(task.id)
         return {"task": t, "session_id": t.get("session_id"), "queued": queued, "thread_id": thread_id}
 
-    async def _start_task_row(self, row: dict) -> LiveSession:
+    async def _start_task_row(self, row: dict, allow_busy: bool = False) -> LiveSession:
         ctx = self.build_context(row.get("thread_id"), exclude_task=row["id"])
+        if row.get("parent_id"):
+            ctx = _child_note(self.store.task(row["parent_id"]) or {}) + ("\n\n" + ctx if ctx else "")
         steps, secs = _budget(row["prompt"], row.get("max_steps") or 40,
                               row.get("timeout_s") or float(os.environ.get("AIW_TASK_TIMEOUT", "900")), ctx)
         task = Task(id=row["id"], prompt=row["prompt"], machine_id=row["machine_id"], thread_id=row.get("thread_id"),
                     source=row.get("source") or "chat", max_steps=steps, timeout_s=secs)
         task.context = ctx
-        return await self.start(task)
+        return await self.start(task, allow_busy=allow_busy)
 
     async def drain(self, machine_id: str):
         async with self._drain_lock:
@@ -256,18 +262,25 @@ class SessionManager:
             self.store.update_task(t["id"], "interrupted", (t.get("result") or "") + " [API restarted]")
             if t.get("session_id"):
                 self.store.end_session(t["session_id"], "interrupted")
+            if t.get("parent_id"):
+                continue   # a child is re-dispatched by its parent's resume, never on its own
             if requeue and time.time() - (t.get("updated_at") or 0) < 1800:   # only recent work; stale runs just get marked
                 res = await self.submit(f"（继续之前被中断的任务）{t['prompt']}", t["machine_id"], t.get("thread_id"),
                                         source="resume")
                 out.append(res["task"]["id"])
+        for t in self.store.tasks_by_status(("queued",)):
+            if t.get("parent_id"):   # its parent died with the restart: nobody waits for this piece any more
+                self.store.update_task(t["id"], "cancelled", "parent task interrupted")
         for m in {t["machine_id"] for t in self.store.tasks_by_status(("queued",))}:
             await self.drain(m)
         return out
 
     # ------------------------------------------------------------------ run
-    async def start(self, task: Task) -> LiveSession:
-        if self.busy_session(task.machine_id):
+    async def start(self, task: Task, allow_busy: bool = False) -> LiveSession:
+        # allow_busy: a dispatched child on its parent's own computer (the parent only waits while it runs)
+        if self.busy_session(task.machine_id) and not allow_busy:
             raise RuntimeError(f"machine {task.machine_id} already has a running session")
+        parent_id = (self.store.task(task.id) or {}).get("parent_id")
         sid = self.store.create_session(task.machine_id, task.id)
         self.store.set_task_session(task.id, sid)
         self.store.update_task(task.id, TaskStatus.RUNNING.value)
@@ -399,6 +412,13 @@ class SessionManager:
                     await cloud.wake(task.machine_id)
                     hold = cloud.hold(task.machine_id)
                     computer = self.computer(task.machine_id)   # a restarted agent means a fresh connection
+                sx = system_extra
+                can_dispatch = not parent_id and not cleanup and len(self.store.machines()) > 1
+                if can_dispatch:
+                    try:
+                        sx += "\n" + roster_text(await self.roster(probe_timeout=3), task.machine_id)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("roster unavailable: %s", e)
                 async with hold:
                     llm, routed = self._task_llm(task.prompt)
                     if routed:
@@ -406,10 +426,14 @@ class SessionManager:
                     loop = AgentLoop(task, sid, computer, llm, ToolExecutor(computer, confirm=confirm, audit=audit),
                                      control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
                                      subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(), image_cfg=self._image_cfg(),
-                                     system_extra=system_extra.strip(),
+                                     system_extra=sx.strip(),
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    if can_dispatch:
+                        async def _dispatcher(items, timeout_s, _live=live, _emit=emit):
+                            return await self.dispatch(_live, items, timeout_s, _emit)
+                        loop.dispatcher = _dispatcher
                     live.loop = loop
                     t = await loop.run()
                 status, result = t.status.value, t.result
@@ -417,6 +441,11 @@ class SessionManager:
                 status, result = "failed", f"{type(e).__name__}: {e}"
             self.store.update_task(task.id, status, result)
             self.store.end_session(sid, status)
+            if not parent_id:   # a parent that ended (failed, timed out, stopped) leaves no child running
+                try:
+                    await self.stop_children(task.id)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("stop children: %s", e)
             if cleanup:
                 try:
                     await cleanup()
@@ -494,6 +523,200 @@ class SessionManager:
         for ws in dead:
             live.subscribers.discard(ws)
 
+    # ------------------------------------------------------------------ dispatch (several computers at once)
+    async def _probe(self, mid: str, timeout: float = 5.0) -> bool:
+        c = self._health.get(mid)
+        if c and time.time() - c[0] < 30:
+            return c[1]
+        try:
+            h = await asyncio.wait_for(self.computer(mid).health(), timeout)
+            ok = bool(h.success and ((h.result or {}).get("ok", True) if isinstance(h.result, dict) else True))
+        except Exception:  # noqa: BLE001
+            ok = False
+        self._health[mid] = (time.time(), ok)
+        return ok
+
+    async def roster(self, probe_timeout: float = 5.0) -> list[dict]:
+        """Every computer with what dispatch needs: online/asleep/offline and busy. A paused cloud computer counts as
+        available: the child task's start wakes it the way every task does (cloud.wake)."""
+        cloud = getattr(self, "cloud", None)
+
+        async def one(m: dict) -> dict:
+            mid = m["id"]
+            busy = self.busy_session(mid)
+            info = {"id": mid, "name": m.get("name") or mid, "kind": "local", "available": False, "asleep": False,
+                    "state": "unknown", "busy_task": busy.task.id if busy else None}
+            if cloud and cloud.is_cloud(mid):
+                info["kind"] = "cloud"
+                e = cloud.entry(mid) or {}
+                if e.get("status") != "ready":
+                    info["state"] = e.get("status") or "not set up"
+                    return info
+                try:
+                    st = await asyncio.wait_for(cloud.state(mid), probe_timeout + 3)
+                except Exception:  # noqa: BLE001
+                    st = {"state": "unknown"}
+                info["state"] = st.get("state") or "unknown"
+                from .cloud import _cooldown_left
+                if _cooldown_left(st.get("cooldown_until")) > 0:
+                    info["state"] = "cooldown"
+                    return info
+                info["available"] = info["state"] not in ("error", "deleted", "failed")
+                info["asleep"] = info["state"] != "running"
+                return info
+            if busy:
+                info.update(state="online", available=True)
+            else:
+                ok = await self._probe(mid, probe_timeout)
+                info.update(state="online" if ok else "offline", available=ok)
+            return info
+        return list(await asyncio.gather(*(one(m) for m in self.store.machines())))
+
+    def children_view(self, task_id: str) -> list[dict]:
+        out = []
+        for r in self.store.children(task_id):
+            m = self.store.machine(r["machine_id"]) or {}
+            out.append({"task_id": r["id"], "thread_id": r.get("thread_id"), "machine": r["machine_id"],
+                        "machine_name": m.get("name") or r["machine_id"], "goal": (r.get("prompt") or "")[:300],
+                        "status": r["status"], "result": (r.get("result") or "")[:500], "session_id": r.get("session_id")})
+        return out
+
+    async def stop_children(self, task_id: str) -> int:
+        """Stop on a parent stops every child it dispatched: running ones are stopped, queued ones dropped."""
+        n = 0
+        for r in self.store.children(task_id):
+            if r["status"] == "queued":
+                n += self.cancel_queued(r["id"])
+                continue
+            live = self.live_for_task(r["id"])
+            if live and live.runner and not live.runner.done() and live.control.state.value != "stopped":
+                await self.control(live.id, "stop")
+                n += 1
+        return n
+
+    async def dispatch(self, parent: LiveSession, items: list[dict], timeout_s: float, emit) -> list[dict]:
+        """Run `items` ({machine, goal}) as child tasks, one child thread each, on several computers at once; wait for
+        all of them (overall `timeout_s`) and return each one's status, summary and files. The files are copied into
+        ~/workspace/dispatch/ on the parent's computer so the parent can merge them.
+        Placement: a named idle computer takes its item; "auto" (or an offline/unknown name) takes an idle online one,
+        the parent's own computer last; a busy computer's item moves to an idle one if there is one, else waits in that
+        computer's queue. Items on the parent's own computer run one after another while the parent waits, which is
+        also the fallback when it is the only computer."""
+        ptask = parent.task
+        own = ptask.machine_id
+        roster = await self.roster()
+        plan = _place(items, roster, own)
+        names = {m["id"]: m["name"] for m in roster}
+        kids: list[dict] = []
+        for it, mid, queued in plan:
+            th = self.store.create_thread("↳ " + _title(it["goal"]), parent_task_id=ptask.id, parent_thread_id=ptask.thread_id)
+            steps, secs = _budget(it["goal"], 40, max(float(os.environ.get("AIW_TASK_TIMEOUT", "900")), timeout_s))
+            t = Task(prompt=it["goal"], machine_id=mid, thread_id=th["id"], source="dispatch", max_steps=steps, timeout_s=secs)
+            row = t.model_dump()
+            row.update(status="queued", parent_id=ptask.id)
+            self.store.create_task(row)
+            kids.append({"task_id": t.id, "thread_id": th["id"], "machine": mid, "machine_name": names.get(mid, mid),
+                         "goal": it["goal"], "status": "queued", "queued": queued})
+
+        async def say(phase: str):
+            step = getattr(getattr(parent, "loop", None), "step", None)
+            await emit(AgentEvent(session_id=parent.id, type=EventType.DISPATCH, step=step, data={
+                "phase": phase, "children": [{k: c.get(k) for k in ("task_id", "thread_id", "machine", "machine_name",
+                                                                    "goal", "status", "queued")} for c in kids]}))
+
+        await say("start")
+        for c in kids:   # the other computers start now (or queue behind what they are doing)
+            if c["machine"] == own:
+                continue
+            if self.busy_session(c["machine"]):
+                c["queued"] = True
+                continue
+            try:
+                await self._start_task_row(self.store.task(c["task_id"]))
+            except Exception as e:  # noqa: BLE001  (busy by now: it stays queued and drain starts it)
+                if not self.busy_session(c["machine"]):
+                    self.store.update_task(c["task_id"], "failed", f"could not start: {e}")
+                else:
+                    c["queued"] = True
+
+        async def run_own():
+            for c in kids:
+                if c["machine"] != own:
+                    continue
+                row = self.store.task(c["task_id"]) or {}
+                if row.get("status") != "queued":   # stopped / cancelled meanwhile
+                    continue
+                try:
+                    lv = await self._start_task_row(row, allow_busy=True)
+                except Exception as e:  # noqa: BLE001
+                    self.store.update_task(c["task_id"], "failed", f"could not start: {e}")
+                    continue
+                await asyncio.wait({lv.runner})   # wait, never cancel the child from here
+
+        own_job = asyncio.ensure_future(run_own())
+        poll = float(os.environ.get("AIW_DISPATCH_POLL", "1.0"))
+        deadline = time.monotonic() + timeout_s
+        timed_out = False
+        last = None
+        try:
+            while True:
+                for c in kids:
+                    c["status"] = (self.store.task(c["task_id"]) or {}).get("status", "failed")
+                sig = tuple(c["status"] for c in kids)
+                if sig != last:
+                    last = sig
+                    if any(st != "queued" for st in sig):
+                        await say("update")
+                if all(st in FINAL_STATES for st in sig) and own_job.done():
+                    break
+                if parent.control.state.value == "stopped":
+                    await self.stop_children(ptask.id)
+                    break
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    await self.stop_children(ptask.id)
+                    end = time.monotonic() + 15
+                    while time.monotonic() < end and not all(
+                            (self.store.task(c["task_id"]) or {}).get("status") in FINAL_STATES for c in kids):
+                        await asyncio.sleep(0.2)
+                    break
+                await asyncio.sleep(poll)
+        except asyncio.CancelledError:   # the parent was stopped mid-wait
+            await self.stop_children(ptask.id)
+            raise
+        finally:
+            if not own_job.done():
+                own_job.cancel()
+
+        comp = getattr(getattr(parent, "loop", None), "computer", None) or self.computer(own)
+        out = []
+        for i, c in enumerate(kids, 1):
+            row = self.store.task(c["task_id"]) or {}
+            c["status"] = row.get("status", "failed")
+            sid = row.get("session_id")
+            arts = [a for a in self.store.artifacts(sid) if a["kind"] == "file"] if sid else []
+            local = []
+            for a in arts:
+                path = a["path"]
+                try:
+                    if os.path.getsize(path) > 40 * 1024 * 1024:
+                        continue
+                    with open(path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    dest = f"dispatch/{i}-{_slug(c['machine'])}/{os.path.basename(path)}"
+                    r = await comp.execute("files.upload", {"path": dest, "content_b64": b64}, observe=False, timeout=120)
+                    if r.success:
+                        local.append("~/workspace/" + dest)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("dispatch: copy %s: %s", path, e)
+            summary = row.get("result") or ""
+            if timed_out and c["status"] in ("stopped", "cancelled"):
+                summary = f"[stopped: dispatch time limit {int(timeout_s // 60)} min reached] " + summary
+            out.append({**c, "summary": summary, "files": [os.path.basename(a["path"]) for a in arts],
+                        "local_files": local})
+        await say("done")
+        return out
+
     def get(self, sid: str) -> LiveSession:
         if sid not in self.live:
             raise KeyError(sid)
@@ -509,6 +732,8 @@ class SessionManager:
                     fut.set_result(False if fut is live.confirm else None)
             if live.task.thread_id:
                 self.held_threads.add(live.task.thread_id)
+        if op == "stop":
+            await self.stop_children(live.task.id)
         status = {"pause": "paused", "takeover": "takeover", "resume": "running", "stop": "stopped"}[op]
         self.store.update_task(live.task.id, status)
         etype = {"pause": EventType.PAUSED, "takeover": EventType.TAKEOVER, "resume": EventType.RESUMED,
@@ -537,6 +762,77 @@ class SessionManager:
             if s.task.id == task_id:
                 return s
         return None
+
+
+def _slug(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", s or "pc").strip("-")[:40] or "pc"
+
+
+def _child_note(parent: dict) -> str:
+    return ("CHILD TASK: you are doing ONE piece of a larger request that a parent agent split across several computers "
+            "to run at the same time. Do only your piece (the CURRENT REQUEST). Save what you produce under ~/workspace "
+            "and send_file each deliverable (the parent collects your files), then done with a factual summary: what "
+            "you produced, file names, key facts or numbers. Do not ask the user unless truly blocked.\n"
+            f"The user's whole request (for context only): {(parent.get('prompt') or '')[:800]}")
+
+
+def _place(items: list[dict], roster: list[dict], own: str) -> list[tuple[dict, str, bool]]:
+    """Pick a computer for each item. Returns (item, machine id, will queue)."""
+    by_id = {m["id"]: m for m in roster}
+    by_name = {str(m.get("name") or "").lower(): m["id"] for m in roster}
+    avail = {m["id"] for m in roster if m.get("available")} | {own}
+    asleep = {m["id"] for m in roster if m.get("asleep")}
+    busy_other = {m["id"] for m in roster if m.get("busy_task") and m["id"] != own}
+    used: set = set()
+    load: dict = {}
+    out: list = [None] * len(items)
+
+    def idle() -> Optional[str]:
+        c = sorted((mid for mid in avail if mid not in used and mid not in busy_other and mid != own),
+                   key=lambda mid: (mid in asleep, mid))
+        if c:
+            return c[0]
+        return own if own not in used else None
+
+    def least() -> str:   # every computer has an item: share out, own computer first on a tie (no foreign queue)
+        return min(avail, key=lambda mid: (mid in busy_other, load.get(mid, 0), mid != own, mid))
+
+    def put(i: int, mid: str):
+        used.add(mid)
+        load[mid] = load.get(mid, 0) + 1
+        out[i] = (items[i], mid, mid in busy_other or load[mid] > 1)
+
+    for i, it in enumerate(items):   # named computers first, so "auto" does not take them
+        want = str(it.get("machine") or "auto").strip()
+        mid = want if want in by_id else by_name.get(want.lower())
+        if not mid or want.lower() == "auto" or mid not in avail:
+            continue
+        if mid in busy_other:
+            mid = idle() or mid
+        put(i, mid)
+    for i, it in enumerate(items):
+        if out[i] is None:
+            put(i, idle() or least())
+    return out
+
+
+def roster_text(roster: list[dict], own: str) -> str:
+    lines = []
+    for m in roster:
+        st = ("this task's computer" if m["id"] == own else
+              "busy with another task (work sent there waits in its queue)" if m.get("busy_task") else
+              "asleep, woken automatically when given work" if m.get("asleep") and m.get("available") else
+              "online, idle" if m.get("available") else f"{m.get('state') or 'offline'}, not usable now")
+        lines.append(f"- {m['id']} 「{m['name']}」 {m['kind']} · {st}")
+    usable = sum(1 for m in roster if m.get("available") or m["id"] == own)
+    return ("COMPUTERS (this task runs on " + own + "; hand work to them with `dispatch`):\n" + "\n".join(lines) + "\n"
+            "When the request has independent pieces that can run at the same time (several topics, sites, files, "
+            "clients, tests or machines) or the user asks for parallel work (同时 / 并行 / 分头 / 多台电脑 / 每台电脑), "
+            "call `dispatch` once with one item per piece instead of doing them one by one, then combine what comes back "
+            "into one answer (merge files if one file was asked for). Keep dependent steps, quick answers and small "
+            "single jobs to yourself."
+            + ("" if usable > 1 else " Only this computer is usable right now: dispatch would run the pieces one "
+               "after another here, so do the work yourself unless the pieces are big and separate."))
 
 
 def _title(prompt: str) -> str:

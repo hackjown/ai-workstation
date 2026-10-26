@@ -1,5 +1,5 @@
 """Background scheduler: routines (scheduled agent tasks) and page watches
-(change / text appears / price below a threshold), with de-duplicated alerts
+(change / text appears / price below a threshold; 京东/淘宝 price watches in shopwatch.py), with de-duplicated alerts
 and exponential back-off on fetch failures."""
 from __future__ import annotations
 
@@ -61,6 +61,11 @@ class Scheduler:
     def __init__(self, store, sessions, notifier, tick: float = 20.0):
         self.store, self.sessions, self.notifier, self.tick = store, sessions, notifier, tick
         self._task: asyncio.Task | None = None
+        try:  # 京东/淘宝 watches keep their own columns on the watches table
+            from . import shopwatch
+            shopwatch.ensure_columns(store)
+        except Exception as e:  # noqa: BLE001
+            log.warning("shop watch columns: %s", e)
 
     def start(self):
         self._task = asyncio.create_task(self._loop())
@@ -98,6 +103,9 @@ class Scheduler:
 
     async def check_watch(self, w: dict, now: float | None = None) -> dict:
         now = now or time.time()
+        if (w.get("mode") or "") == "shop":   # 京东/淘宝/天猫: read on an AIW computer's logged-in Chrome
+            from . import shopwatch
+            return await shopwatch.check(self, w, now)
         interval = max(5, int(w.get("interval_min") or 60)) * 60
         try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent": UA}) as c:

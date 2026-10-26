@@ -224,7 +224,39 @@ try:
     _ctx = RenderContext(doc)
     _lp = LayoutProperties.from_layout(msp)
     _lp.set_colors("#FFFFFF")
-    Frontend(_ctx, MatplotlibBackend(_ax)).draw_layout(msp, finalize=True, layout_properties=_lp)
+    # ezdxf >= 1.1 fills text with detect_holes=True, which guesses holes from contour nesting and renders
+    # CJK glyphs with overlapping strokes (单 骨 撑 要 …) hollow. Glyph contours already carry TrueType winding,
+    # so text is filled with detect_holes=False (nonzero rule); hatches keep ezdxf's hole detection.
+    class _TextSafeBackend(MatplotlibBackend):
+        _in_text = 0
+        def draw_filled_paths(self, *args, **kw):
+            if not self._in_text or len(args) != 2:      # ezdxf 1.0 passes (paths, holes, properties): unaffected
+                return super().draw_filled_paths(*args, **kw)
+            paths, properties = args
+            try:
+                from ezdxf.addons.drawing import matplotlib as _mm
+                from matplotlib.patches import PathPatch as _PP
+                self.ax.add_patch(_PP(_mm.to_matplotlib_path(paths, detect_holes=False), color=properties.color,
+                                      linewidth=0, fill=True, zorder=self._get_z()))
+            except Exception:
+                return super().draw_filled_paths(*args, **kw)
+
+    class _TextSafeFrontend(Frontend):
+        def _as_text(self, fn, *a):
+            self.__dict__["_bk"]._in_text += 1
+            try:
+                return fn(*a)
+            finally:
+                self.__dict__["_bk"]._in_text -= 1
+        def draw_text_entity(self, *a):
+            return self._as_text(super().draw_text_entity, *a)
+        def draw_mtext_entity(self, *a):
+            return self._as_text(super().draw_mtext_entity, *a)
+
+    _bk = _TextSafeBackend(_ax)
+    _fe = _TextSafeFrontend(_ctx, _bk)
+    _fe.__dict__["_bk"] = _bk
+    _fe.draw_layout(msp, finalize=True, layout_properties=_lp)
     for _l in doc.layers:
         _l.dxf.color = _saved.get(_l.dxf.name, 7)
     _fig.set_size_inches(_w, _h)

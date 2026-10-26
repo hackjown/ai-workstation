@@ -138,7 +138,7 @@ async function refreshThread(scroll) {
     if (!t.live || !S.sock[t.session_id]) {
       try { const s = await api("GET", `/api/sessions/${t.session_id}`); S.evs[t.id] = s.events; S.evSt[t.id] = t.status; t.pending_confirm = s.pending_confirm; t.pending_question = s.pending_question; } catch (e) {}
     }
-    if (t.live) subscribe(t);
+    if (t.live) { subscribe(t); keepPending(t); }
   }));
   renderChat(scroll);
 }
@@ -156,6 +156,17 @@ async function deleteThread(id) {
 async function archiveThread(flag) { await api("PATCH", `/api/threads/${S.thread.id}`, { archived: flag }); toast(flag ? "已归档" : "已恢复"); newThread(); }
 
 /* ---------------------------------------------------------------- live session sockets */
+// The socket outlives refreshThread, which swaps in fresh task objects. Live events must land on the task object
+// that is rendered now (not the one captured when the socket opened), or confirm/ask cards only show after a reload.
+S.pend = S.pend || {};
+function curTask(t) { return ((S.thread && S.thread.tasks) || []).find((x) => x.id === t.id) || t; }
+function keepPending(t) {
+  const p = S.pend[t.id]; if (!p) return;
+  if (!t.pending_confirm && p.confirm) t.pending_confirm = p.confirm;
+  if (!t.pending_question && p.question) t.pending_question = p.question;
+  if (t.pending_confirm && t.status === "running") t.status = "waiting_confirm";
+  if (t.pending_question && t.status === "running") t.status = "waiting_input";
+}
 function subscribe(t) {
   if (S.sock[t.session_id]) return;
   const ws = new WebSocket(wsUrl(`/ws/session/${t.session_id}`));
@@ -163,24 +174,25 @@ function subscribe(t) {
   ws.onmessage = (m) => {
     const e = JSON.parse(m.data); if (e.kind !== "event") return;
     // reasoning streamed while the model thinks: kept aside (replaced each time), not appended to the event list
-    if (e.type === "agent.thinking" && (e.data || {}).live) { S.think[t.id] = e.data; onLiveEvent(t, e); return; }
+    if (e.type === "agent.thinking" && (e.data || {}).live) { S.think[t.id] = e.data; onLiveEvent(curTask(t), e); return; }
     if (e.type === "agent.thinking" || e.type === "agent.decision") delete S.think[t.id];
-    (S.evs[t.id] = S.evs[t.id] || []).push(e); onLiveEvent(t, e);
+    (S.evs[t.id] = S.evs[t.id] || []).push(e); onLiveEvent(curTask(t), e);
   };
   ws.onclose = () => { delete S.sock[t.session_id]; };
 }
 let rerenderQ = null;
 function onLiveEvent(t, e) {
   const d = e.data || {};
-  if (e.type === "agent.confirm_required") t.pending_confirm = d;
-  if (e.type === "agent.input_required") t.pending_question = d;
-  if (e.type === "agent.input_answered") t.pending_question = null;
-  if (e.type === "agent.action_result" && t.pending_confirm) t.pending_confirm = null;
+  const pend = (S.pend[t.id] = S.pend[t.id] || {});
+  if (e.type === "agent.confirm_required") { t.pending_confirm = pend.confirm = d; t.status = "waiting_confirm"; }
+  if (e.type === "agent.input_required") { t.pending_question = pend.question = d; t.status = "waiting_input"; }
+  if (e.type === "agent.input_answered") { t.pending_question = pend.question = null; if (t.status === "waiting_input") t.status = "running"; }
+  if (e.type === "agent.action_result" && (t.pending_confirm || pend.confirm)) { t.pending_confirm = pend.confirm = null; if (t.status === "waiting_confirm") t.status = "running"; }
   if (e.type === "agent.takeover") { t.status = "takeover"; setTake(true, true); }
   if (e.type === "agent.resumed") { t.status = "running"; setTake(false, true); }
   if (e.type === "agent.paused") t.status = "paused";
   if (e.type === "task.finished" || e.type === "task.failed") {
-    t.status = d.status || (e.type === "task.finished" ? "succeeded" : "failed"); t.result = d.result; t.live = false;
+    t.status = d.status || (e.type === "task.finished" ? "succeeded" : "failed"); t.result = d.result; t.live = false; delete S.pend[t.id];
     if (e.type === "task.finished" && localStorage.getItem("aiw_tts") === "1") speak(d.result);
     setTimeout(() => refreshThread(), 400);
   }
@@ -405,7 +417,10 @@ function speak(text) {
 
 /* ---------------------------------------------------------------- agent control */
 async function ctl(sid, op) { try { await api("POST", `/api/agent/${op}`, { session_id: sid }); if (op === "stop") toast("已停止，排队消息已暂停"); setTimeout(() => refreshThread(), 300); } catch (e) { toast(e.message); } }
-async function confirmAct(sid, ok) { await api("POST", "/api/agent/confirm", { session_id: sid, approve: ok }); refreshThread(); }
+function clearPend(sid, key) {
+  for (const t of ((S.thread && S.thread.tasks) || [])) if (t.session_id === sid) { if (S.pend[t.id]) S.pend[t.id][key] = null; t["pending_" + key] = null; }
+}
+async function confirmAct(sid, ok) { clearPend(sid, "confirm"); renderChat(); await api("POST", "/api/agent/confirm", { session_id: sid, approve: ok }); refreshThread(); }
 S.forms = S.forms || {};
 function openForm(sid) {
   const f = S.forms[sid]; if (!f) return;
@@ -438,7 +453,7 @@ async function takeoverDone(sid) {
   if (S.take) await toggleTakeover();
   await answerQ(sid, "done");
 }
-async function answerQ(sid, text) { await api("POST", "/api/agent/answer", { session_id: sid, text }); refreshThread(); }
+async function answerQ(sid, text) { clearPend(sid, "question"); await api("POST", "/api/agent/answer", { session_id: sid, text }); refreshThread(); }
 function answerQForm(e, sid) { e.preventDefault(); const v = e.target.a.value.trim(); if (v) answerQ(sid, v); }
 async function retry(id) { const r = await api("POST", `/api/tasks/${id}/retry`); S.threadId = r.thread_id; await refreshThread(true); }
 async function cancelQueued(id) { await api("DELETE", `/api/tasks/${id}`); refreshThread(); }

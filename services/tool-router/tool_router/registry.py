@@ -194,6 +194,20 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("delegate", None, "Hand a self-contained terminal/file sub-task to a text-only helper agent (no screen). "
              "Faster and cheaper for shell work: scripts, file conversion, data processing. Returns its summary.",
              {"goal": {"type": "string"}}, ["goal"]),
+    ToolSpec("dispatch", None, "Split the request into independent pieces and run them AT THE SAME TIME on several "
+             "computers (see COMPUTERS in the system prompt). Each item becomes its own child task with its own chat on "
+             "that computer; the call waits until all of them finish (or `timeout_min` runs out) and returns each one's "
+             "status, summary and output files, copied into ~/workspace/dispatch/ on YOUR computer so you can combine "
+             "them, send_file the result and finish. machine: a computer id from COMPUTERS, or \"auto\" (an idle online "
+             "one; paused cloud computers are woken). Your own computer may take one item. Each goal must be complete "
+             "and self-contained (the child does not see this conversation): say what to produce, where to save it under "
+             "~/workspace and to send_file it. Do not use it for steps that depend on each other or for one small job.",
+             {"tasks": {"type": "array", "items": {"type": "object", "properties": {
+                 "machine": {"type": "string", "description": "computer id from COMPUTERS, or \"auto\""},
+                 "goal": {"type": "string", "description": "the complete, self-contained instruction for that computer"}},
+                 "required": ["goal"]}},
+              "timeout_min": {"type": "integer", "description": "overall limit for all items, minutes (default 60)"}},
+             ["tasks"]),
     ToolSpec("done", None, "Finish: the task is complete. Give a short summary.", {"summary": {"type": "string"}}, ["summary"]),
     ToolSpec("fail", None, "Give up: the task cannot be completed. Explain why.", {"reason": {"type": "string"}}, ["reason"]),
 ]
@@ -201,7 +215,7 @@ TOOLS: list[ToolSpec] = [
 BY_NAME = {t.name: t for t in TOOLS}
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "click_element", "cad_draw", "cad_command", "read_image", "photopea", "image_edit"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "read_image", "photopea", "image_edit"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

@@ -2,6 +2,7 @@ import SwiftUI
 import PhotosUI
 import QuickLook
 import UniformTypeIdentifiers
+import AVFoundation
 
 let toolCN: [String: String] = [
     "screenshot": "截图", "click": "点击", "double_click": "双击", "right_click": "右键", "move": "移动鼠标", "drag": "拖动",
@@ -216,11 +217,11 @@ struct ChatView: View {
             if tid == m.threadId && (e.s("kind") == "task" || e.s("type").hasPrefix("task.")) { Task { await m.load() } }
         }
         .onChange(of: photo) { item in Task { await upload(item) } }
-        .photosPicker(isPresented: $showPhotos, selection: $photo, matching: .images)
+        .photosPicker(isPresented: $showPhotos, selection: $photo, matching: .any(of: [.images, .videos]))
         .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { r in
             if case .success(let urls) = r { Task { for u in urls { await uploadFile(u) } } }
         }
-        .sheet(isPresented: $showCamera) { CameraPicker { img in Task { await uploadImage(img) } }.ignoresSafeArea() }
+        .sheet(isPresented: $showCamera) { CameraPicker(done: { img in Task { await uploadImage(img) } }, video: { u in Task { await uploadFile(u) } }).ignoresSafeArea() }
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .onChange(of: m.threadId) { id in if let id = id { onThread(id) } }
         .sheet(item: $preview) { p in QuickLookView(url: p.url).ignoresSafeArea() }
@@ -256,9 +257,9 @@ struct ChatView: View {
             HStack(alignment: .bottom, spacing: 8) {
                 Menu {
                     Section("添加文件") {
-                        Button { showPhotos = true } label: { Label("照片", systemImage: "photo.on.rectangle") }
+                        Button { showPhotos = true } label: { Label("照片或视频", systemImage: "photo.on.rectangle") }
                         if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                            Button { showCamera = true } label: { Label("拍照", systemImage: "camera") }
+                            Button { showCamera = true } label: { Label("拍照或录像", systemImage: "camera") }
                         }
                         Button { showFiles = true } label: { Label("文件", systemImage: "folder") }
                     }
@@ -305,16 +306,46 @@ struct ChatView: View {
 
     func send(name: String, data: Data) async {
         uploading = true; defer { uploading = false }
-        if data.count > 40 * 1024 * 1024 { m.err = "\(name) 超过 40MB"; return }
+        if data.count > 40 * 1024 * 1024 { m.err = "\(name) 超过 40MB，请先剪短或压缩"; return }
         do {
             let r = try await API.shared.obj("POST", "/api/uploads", ["name": name, "content_b64": data.base64EncodedString(), "machine_id": API.shared.machine])
             attach.append(r)
         } catch { m.err = "上传失败：" + error.localizedDescription }
     }
     func upload(_ item: PhotosPickerItem?) async {
-        guard let item = item, let data = try? await item.loadTransferable(type: Data.self) else { return }
+        guard let item = item else { return }
         photo = nil
-        if let img = UIImage(data: data) { await uploadImage(img) } else { await send(name: "photo-\(Int(Date().timeIntervalSince1970)).jpg", data: data) }
+        let stamp = Int(Date().timeIntervalSince1970)
+        if let t = item.supportedContentTypes.first(where: { $0.conforms(to: .movie) || $0.conforms(to: .video) }) {
+            uploading = true
+            if let mv = try? await item.loadTransferable(type: PickedMovie.self) {
+                defer { try? FileManager.default.removeItem(at: mv.url) }
+                var src = mv.url
+                let size = (try? FileManager.default.attributesOfItem(atPath: src.path)[.size] as? Int) ?? 0
+                if size > 38 * 1024 * 1024, let small = await shrinkVideo(src) { src = small }
+                defer { if src != mv.url { try? FileManager.default.removeItem(at: src) } }
+                guard let d = try? Data(contentsOf: src, options: .mappedIfSafe) else { uploading = false; m.err = "读不了这个视频"; return }
+                let ext = src != mv.url ? "mp4" : mv.url.pathExtension.isEmpty ? (t.preferredFilenameExtension ?? "mov") : mv.url.pathExtension
+                await send(name: "video-\(stamp).\(ext.lowercased())", data: d)
+            } else { uploading = false; m.err = "读不了这个视频（可能还在 iCloud 里没下载）" }
+            return
+        }
+        guard let data = try? await item.loadTransferable(type: Data.self) else { m.err = "读不了这张图片"; return }
+        if let img = UIImage(data: data) { await uploadImage(img) } else { await send(name: "file-\(stamp)", data: data) }
+    }
+    /// Re-encode a video that is over the 40 MB upload limit: 720p, then 540p if still too big.
+    func shrinkVideo(_ u: URL) async -> URL? {
+        for preset in [AVAssetExportPreset1280x720, AVAssetExportPreset960x540, AVAssetExportPresetMediumQuality] {
+            let out = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mp4")
+            guard let ex = AVAssetExportSession(asset: AVURLAsset(url: u), presetName: preset) else { continue }
+            ex.outputURL = out; ex.outputFileType = .mp4; ex.shouldOptimizeForNetworkUse = true
+            await ex.export()
+            guard ex.status == .completed else { continue }
+            let n = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? Int) ?? 0
+            if n <= 39 * 1024 * 1024 { return out }
+            try? FileManager.default.removeItem(at: out)
+        }
+        return nil
     }
     func uploadImage(_ img: UIImage) async {
         guard let jpg = img.jpegData(compressionQuality: 0.85) else { return }
@@ -535,9 +566,11 @@ struct QuickLookView: UIViewControllerRepresentable {
 
 struct CameraPicker: UIViewControllerRepresentable {
     let done: (UIImage) -> Void
+    var video: (URL) -> Void = { _ in }
     @Environment(\.dismiss) var dismiss
     func makeUIViewController(context: Context) -> UIImagePickerController {
-        let p = UIImagePickerController(); p.sourceType = .camera; p.delegate = context.coordinator; return p
+        let p = UIImagePickerController(); p.sourceType = .camera; p.delegate = context.coordinator
+        p.mediaTypes = ["public.image", "public.movie"]; p.videoQuality = .typeMedium; return p
     }
     func updateUIViewController(_ vc: UIImagePickerController, context: Context) {}
     func makeCoordinator() -> Coord { Coord(self) }
@@ -545,9 +578,23 @@ struct CameraPicker: UIViewControllerRepresentable {
         let parent: CameraPicker
         init(_ p: CameraPicker) { parent = p }
         func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
-            if let img = info[.originalImage] as? UIImage { parent.done(img) }
+            if let u = info[.mediaURL] as? URL { parent.video(u) }
+            else if let img = info[.originalImage] as? UIImage { parent.done(img) }
             parent.dismiss()
         }
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) { parent.dismiss() }
+    }
+}
+
+
+/// A video from the photo library, copied to a temp file (videos are too big to load as Data first).
+struct PickedMovie: Transferable {
+    let url: URL
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { m in SentTransferredFile(m.url) } importing: { f in
+            let dst = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + (f.file.pathExtension.isEmpty ? "mov" : f.file.pathExtension))
+            try FileManager.default.copyItem(at: f.file, to: dst)
+            return PickedMovie(url: dst)
+        }
     }
 }

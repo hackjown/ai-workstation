@@ -28,6 +28,8 @@ final class TaskLive: ObservableObject {
     @Published var steps: [Step] = []
     @Published var status = ""
     @Published var activity = ""
+    @Published var thinking = ""     // reasoning streamed while the model thinks
+    @Published var thought = ""      // the latest step's stated thought
     @Published var result = ""
     @Published var confirm: JSON? = nil
     @Published var question: JSON? = nil
@@ -46,7 +48,8 @@ final class TaskLive: ObservableObject {
         case "agent.plan_update":
             planDone = Set((d["done"] as? [Int]) ?? Array(planDone))
         case "agent.thinking":
-            activity = d.s("phase") == "vision" ? "正在看屏幕…" : "正在思考…"
+            activity = d.s("phase") == "vision" ? "视觉模型在看屏幕…" : "正在思考…"
+            if d.b("live") { thinking = d.s("text") } else { thinking = "" }
         case "agent.observation":
             activity = "正在看屏幕…"
         case "agent.decision":
@@ -56,6 +59,7 @@ final class TaskLive: ObservableObject {
             if txt.isEmpty, let x = a["x"] { txt = "(\(x), \(a.s("y")))" }
             let th = d.s("thought")
             if !th.isEmpty && tool != "done" { steps.append(Step(tool: "message", text: String(th.prefix(400)))) }
+            thinking = ""; if !th.isEmpty { thought = th }
             if !["done", "fail", "update_plan"].contains(tool) { steps.append(Step(tool: tool, text: String(txt.prefix(200)))) }
             activity = "正在\(toolName(tool))…"
         case "agent.message":
@@ -78,7 +82,7 @@ final class TaskLive: ObservableObject {
         case "agent.file": files.append(d)
         case "task.finished", "task.failed":
             status = d.s("status").isEmpty ? (type == "task.finished" ? "succeeded" : "failed") : d.s("status")
-            result = d.s("result"); activity = ""; confirm = nil; question = nil
+            result = d.s("result"); activity = ""; confirm = nil; question = nil; thinking = ""
         default: break
         }
     }
@@ -373,7 +377,35 @@ struct TaskBlock: View {
                         }
                     }
                 }
-                if running && !live.activity.isEmpty { Text(live.activity).font(.caption).foregroundColor(.secondary) }
+                if running && !live.activity.isEmpty {
+                    HStack(spacing: 6) { ProgressView().controlSize(.mini); Text(live.activity).font(.caption).foregroundColor(.secondary) }
+                }
+                if running && (!live.thinking.isEmpty || !live.thought.isEmpty) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "lightbulb"); Text("思考过程")
+                            if !live.thinking.isEmpty { Text("\(live.thinking.count) 字").foregroundColor(.secondary) }
+                        }.font(.caption.weight(.semibold)).foregroundColor(amber)
+                        ScrollViewReader { sp in
+                            ScrollView {
+                                Text(live.thinking.isEmpty ? live.thought : live.thinking)
+                                    .font(.caption).foregroundColor(.secondary).frame(maxWidth: .infinity, alignment: .leading).id("end")
+                            }.frame(maxHeight: 110)
+                            .onChange(of: live.thinking) { _ in sp.scrollTo("end", anchor: .bottom) }
+                        }
+                    }.padding(8).background(amber.opacity(0.07)).clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                if running, !live.steps.isEmpty && !showSteps {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(live.steps.filter { $0.tool != "message" }.suffix(3)) { s in
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: s.ok == false ? "xmark.circle" : s.ok == true ? "checkmark.circle" : "circle.dotted")
+                                    .foregroundColor(s.ok == false ? .red : amber).font(.caption2)
+                                Text("\(toolName(s.tool)) \(s.text)").font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                            }
+                        }
+                    }
+                }
 
                 if let c = live.confirm { confirmCard(c) }
                 if let q = live.question { questionCard(q) }

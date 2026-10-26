@@ -4,6 +4,7 @@ struct SettingsView: View {
     @EnvironmentObject var api: API
     @Environment(\.dismiss) var dismiss
     @State private var machines: [JSON] = []
+    @AppStorage("appearance") private var appearance = "system"
     var body: some View {
         NavigationStack {
             Form {
@@ -24,6 +25,11 @@ struct SettingsView: View {
                             }
                         }
                     }
+                }
+                Section(header: Text("外观"), footer: Text("跟随系统时，白天浅色、晚上深色，随 iPhone 的设置自动切换")) {
+                    Picker("外观", selection: $appearance) {
+                        Text("跟随系统").tag("system"); Text("浅色").tag("light"); Text("深色").tag("dark")
+                    }.pickerStyle(.segmented)
                 }
                 Section(footer: Text("模型、连接器、运维主机等完整设置在网页里")) {
                     if let u = api.url("/") { Link(destination: u) { Label("打开网页设置", systemImage: "safari") } }

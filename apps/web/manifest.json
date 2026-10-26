@@ -1,10 +1,10 @@
 {
-  "name": "AI Workstation",
-  "short_name": "AIW",
+  "name": "Aiw",
+  "short_name": "Aiw",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#FCFCFC",
-  "theme_color": "#FCFCFC",
+  "background_color": "#F6F3EC",
+  "theme_color": "#F6F3EC",
   "icons": [
     {"src": "icon-180.png", "sizes": "180x180", "type": "image/png"},
     {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"}

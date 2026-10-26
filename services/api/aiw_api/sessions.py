@@ -325,7 +325,9 @@ class SessionManager:
             await self._notify("confirm", "需要你确认", f"{decision.reason}：{tool}", task)
             t0 = time.monotonic()
             try:
-                return await asyncio.wait_for(live.confirm, 300)
+                # a price-watch order waits up to 30 min for the user (payload confirm_timeout_s); everything else 5 min
+                wait = float(payload.get("confirm_timeout_s") or 300) if isinstance(payload, dict) else 300.0
+                return await asyncio.wait_for(live.confirm, wait)
             except asyncio.TimeoutError:
                 return False
             finally:
@@ -419,6 +421,11 @@ class SessionManager:
                         sx += "\n" + roster_text(await self.roster(probe_timeout=3), task.machine_id)
                     except Exception as e:  # noqa: BLE001
                         log.warning("roster unavailable: %s", e)
+                try:  # 京东/淘宝 price watches: price_watch (create from chat); order_confirm for a watch's order task
+                    from . import shopwatch
+                    extra.update(shopwatch.task_tools(self.store, self.notifier, task, computer, confirm))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("price watch tools unavailable: %s", e)
                 async with hold:
                     llm, routed = self._task_llm(task.prompt)
                     if routed:
@@ -430,6 +437,9 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    from . import shopwatch
+                    if shopwatch.is_order_task(task):   # no 提交订单/支付 click before the user confirms
+                        shopwatch.guard(loop.tools, shopwatch.ensure_state(task.id), computer)
                     if can_dispatch:
                         async def _dispatcher(items, timeout_s, _live=live, _emit=emit):
                             return await self.dispatch(_live, items, timeout_s, _emit)

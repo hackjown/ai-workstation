@@ -782,9 +782,10 @@ class AgentLoop:
         if t in self.extra_tools:
             _schema, fn = self.extra_tools[t]
             await self.emit(EventType.TOOL_CALL, tool=t, args=a)
-            if _RISKY_EXT.search(t) and self.tools.confirm:
+            _need = getattr(fn, "needs_confirm", None)   # a tool may judge its own calls (remote_exec: by host + command)
+            if (_need(a) if callable(_need) else _RISKY_EXT.search(t)) and self.tools.confirm:
                 from tool_router import Decision, RiskLevel
-                ok = await self.tools.confirm(t, a, Decision(RiskLevel.L3, "external tool can act outside the VM"))
+                ok = await self.tools.confirm(t, a, Decision(RiskLevel.L3, getattr(fn, "confirm_reason", None) or "external tool can act outside the VM"))
                 if not ok:
                     await self.emit(EventType.ACTION_RESULT, tool=t, success=False, error="user declined", result={})
                     return "user declined this external action; choose another approach or ask_user"
@@ -795,7 +796,7 @@ class AgentLoop:
                 res, ok, err = {}, False, f"{type(e).__name__}: {e}"
             self._acted = self._acted or ok
             await self.emit(EventType.ACTION_RESULT, tool=t, success=ok, error=err, result=_short(res if isinstance(res, dict) else {"result": res}))
-            text = str(res)[:600] if ok else f"FAILED ({err})"
+            text = str(res)[:int(getattr(fn, "max_result", 600))] if ok else f"FAILED ({err})"
             return text
         return None
 

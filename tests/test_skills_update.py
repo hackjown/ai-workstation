@@ -45,3 +45,26 @@ def test_update_endpoints(tmp_path, monkeypatch):
         assert any(s["id"] == "officecli" for s in r.json())
         r = cl.put("/api/skills/custom", json=[{"id": "pdf tools", "path": "~/x"}], headers=h)
         assert any(s["id"] == "pdf-tools" for s in r.json())
+
+
+def test_delete_thread_removes_its_tasks(tmp_path):
+    from fastapi.testclient import TestClient
+    from aiw_api.config import Settings
+    from aiw_api.main import build_app
+    s = Settings(api_token="t", agent_token="a", db_path=str(tmp_path / "a.db"), artifacts_dir=str(tmp_path / "art"))
+    s.scheduler_enabled = False
+    app = build_app(s)
+    with TestClient(app) as cl:
+        h = {"Authorization": "Bearer t"}
+        th = cl.post("/api/threads", json={"title": "x"}, headers=h).json()
+        st = app.state.store if hasattr(app.state, "store") else None
+        if st is None:
+            import aiw_api.store as S
+            st = S.Store(s.db_path)
+        st.insert("tasks", {"id": "task-1", "prompt": "p", "status": "failed", "thread_id": th["id"]})
+        st._x("INSERT INTO sessions (id, task_id, status) VALUES ('sess-1', 'task-1', 'done')")
+        st._x("INSERT INTO agent_events (id, session_id, type, step, data, ts) VALUES ('ev-1', 'sess-1', 'x', 1, '{}', 0)")
+        cl.patch(f"/api/threads/{th['id']}", json={"archived": True}, headers=h)
+        assert cl.delete(f"/api/threads/{th['id']}", headers=h).status_code == 200
+        assert cl.get("/api/threads?archived=true", headers=h).json() == []
+        assert st.task("task-1") is None and st._x("SELECT * FROM agent_events") == []

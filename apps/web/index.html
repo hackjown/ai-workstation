@@ -11,7 +11,8 @@
 <script>(function(){var m=localStorage.getItem("aiw_theme")||"system";var t=m==="system"?(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"):m;document.documentElement.dataset.theme=t;})();</script>
 <link rel="manifest" href="manifest.json" />
 <link rel="apple-touch-icon" href="icon-180.png" />
-<title>AI Workstation</title>
+<title>Aiw</title>
+<link rel="icon" type="image/svg+xml" href="logo.svg" />
 <link rel="stylesheet" href="app.css" />
 <link rel="stylesheet" href="ui.css" />
 </head>
@@ -20,8 +21,9 @@
   <!-- sidebar (desktop) -->
   <nav id="side">
     <div class="brand">
-      <button class="avatar" id="sideAvatar" onclick="go('settings')" title="设置"></button>
-      <div><div class="heading" id="agentName">AI Workstation</div><div class="small" id="agentStatus">空闲</div></div>
+      <img class="logo" src="logo.svg" alt="Aiw" />
+      <div class="grow"><div class="heading">Aiw</div><div class="small"><span class="sdot" id="agentDot"></span><span id="agentName">小秘</span> · <span id="agentStatus">空闲</span></div></div>
+      <span id="sideAvatar" hidden></span>
     </div>
     <button class="btn primary wide" onclick="newThread()"><i data-i="plus"></i>新对话</button>
     <div class="navs">
@@ -41,6 +43,7 @@
   <section id="main">
     <header id="top">
       <button class="icon only-mobile" onclick="openDrawer()" aria-label="对话列表"><i data-i="menu"></i></button>
+      <img class="logo sm only-mobile" src="logo.svg" alt="Aiw" />
       <div class="ttl"><div class="heading" id="viewTitle">对话</div><div class="small" id="viewSub"></div></div>
       <span class="chip" id="pillAgent">Agent …</span>
       <button class="icon" id="bell" onclick="toggleNotes()" aria-label="通知"><i data-i="bell"></i><span class="dot" id="bellDot"></span></button>

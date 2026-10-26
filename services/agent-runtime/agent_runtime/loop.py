@@ -103,6 +103,7 @@ class AgentLoop:
         self.step = 0
         self.ask, self.remember = ask, remember
         self.extra_tools = extra_tools or {}
+        self._secrets: dict[str, str] = {}  # form values the model only sees as {{key}}
         self.subagent_llm = subagent_llm
         self.vision_llm = vision_llm  # optional "eyes": reads the screen for a tool model without vision
         self.image_cfg = image_cfg or {}  # {"base_url", "key", "model"}: the AI image-editing model, if set
@@ -604,7 +605,7 @@ class AgentLoop:
 
             outcome = None
             for attempt in range(self.cfg.action_retries + 1):
-                outcome = await self.tools.run(decision.tool, decision.args, intent=decision.thought)
+                outcome = await self.tools.run(decision.tool, self._fill_secrets(decision.tool, decision.args), intent=decision.thought)
                 await self.emit(EventType.POLICY, level=int(outcome.decision.level), reason=outcome.decision.reason)
                 retryable = (not outcome.success and outcome.decision.allowed and outcome.control is None
                              and _transient(outcome.error))
@@ -724,6 +725,10 @@ class AgentLoop:
             await self.emit(EventType.PLAN_UPDATE, done=sorted(self.plan_done), note=a.get("note"))
             await self.emit(EventType.ACTION_RESULT, tool=t, success=True, error=None, result={})
             return f"plan updated, done={sorted(self.plan_done)}"
+        if t == "ask_user" and a.get("fields"):
+            return await self._ask_form(a, decision.thought)
+        if t == "request_takeover":
+            return await self._request_takeover(a, decision.thought)
         if t == "ask_user":
             q = a.get("question") or decision.thought or "?"
             opts = [str(o) for o in (a.get("options") or [])][:6]
@@ -793,6 +798,88 @@ class AgentLoop:
             text = str(res)[:600] if ok else f"FAILED ({err})"
             return text
         return None
+
+    # ------------------------------------------------- forms the user fills (sign-ups, profiles)
+    async def _ask(self, q: str, opts: list, extra: Optional[dict] = None):
+        if not self.ask:
+            return None
+        if extra is None:
+            return await self.ask(q, opts)
+        try:
+            return await self.ask(q, opts, extra)
+        except TypeError:  # an older ask() without the extra argument
+            return await self.ask(q, opts)
+
+    async def _ask_form(self, a: dict, intent: str) -> str:
+        """ask_user with `fields`: the user gets a card, opens it, fills the fields. Passwords and other secret
+        fields never enter the history or the events: the model sees {{key}} and `type` swaps the value in."""
+        fields = []
+        for f in a.get("fields") or []:
+            if not isinstance(f, dict):
+                continue
+            key = _re.sub(r"[^a-zA-Z0-9_]", "_", str(f.get("key") or f.get("label") or ""))[:40].strip("_")
+            if not key:
+                continue
+            typ = str(f.get("type") or "text").lower()
+            typ = typ if typ in ("text", "password", "email", "tel", "date", "number", "select", "textarea") else "text"
+            fields.append({"key": key, "label": str(f.get("label") or key)[:80], "type": typ,
+                           "required": f.get("required", True) is not False,
+                           "secret": bool(f.get("secret")) or typ == "password",
+                           "options": [str(o) for o in (f.get("options") or [])][:40],
+                           "placeholder": str(f.get("placeholder") or "")[:80], "hint": str(f.get("hint") or "")[:160]})
+        if not fields:
+            return "FAILED: fields needs at least one {key,label,type}"
+        title = str(a.get("title") or a.get("question") or "需要填写资料")[:80]
+        form = {"kind": "form", "title": title, "description": str(a.get("description") or "")[:300], "fields": fields}
+        await self.emit(EventType.INPUT_REQUIRED, question=title, options=[], form=form)
+        t0 = time.monotonic()
+        reply = await self._ask(title, [], form)
+        self.add_wait(time.monotonic() - t0)
+        vals = {}
+        if reply:
+            try:
+                vals = json.loads(reply) if isinstance(reply, str) else dict(reply)
+            except (ValueError, TypeError):
+                vals = {}
+        if not isinstance(vals, dict) or not vals:
+            await self.emit(EventType.INPUT_ANSWERED, answer=None)
+            await self.emit(EventType.ACTION_RESULT, tool="ask_user", success=False, error="no answer", result={})
+            return "user did not fill the form" + (f" and wrote: {reply!r}" if reply else "") + "; ask again or stop"
+        shown, safe = [], {}
+        for f in fields:
+            v = str(vals.get(f["key"]) or "").strip()
+            if f["secret"] and v:
+                self._secrets[f["key"]] = v
+                shown.append(f"{f['label']} ({f['key']}): use {{{{{f['key']}}}}} in `type`, it is filled in for you")
+                safe[f["key"]] = "••••"
+            else:
+                shown.append(f"{f['label']} ({f['key']}): {v!r}")
+                safe[f["key"]] = v
+        await self.emit(EventType.INPUT_ANSWERED, answer=json.dumps(safe, ensure_ascii=False))
+        await self.emit(EventType.ACTION_RESULT, tool="ask_user", success=True, error=None, result={"fields": list(safe)})
+        self._acted = True
+        return "user filled the form: " + "; ".join(shown) + ". Type each value into its own field of the page now."
+
+    def _fill_secrets(self, tool: str, args: dict) -> dict:
+        if tool != "type" or not self._secrets or "{{" not in str(args.get("text") or ""):
+            return args
+        text = str(args["text"])
+        for k, v in self._secrets.items():
+            text = text.replace("{{" + k + "}}", v)
+        return {**args, "text": text, "secret": True}
+
+    async def _request_takeover(self, a: dict, intent: str) -> str:
+        reason = str(a.get("reason") or intent or "需要你在桌面上处理一下")[:200]
+        info = {"kind": "takeover", "title": reason}
+        await self.emit(EventType.INPUT_REQUIRED, question=reason, options=[], form=info)
+        t0 = time.monotonic()
+        reply = await self._ask(reason, [], info)
+        self.add_wait(time.monotonic() - t0)
+        await self.emit(EventType.INPUT_ANSWERED, answer=reply)
+        await self.emit(EventType.ACTION_RESULT, tool="request_takeover", success=reply is not None, error=None, result={})
+        if reply is None:
+            return "the user did not take over in time; try once more yourself, or fail with the reason"
+        return f"the user handled it on the desktop (said: {reply!r}). Take a screenshot and continue from what is shown now."
 
     async def _click_element(self, a: dict, intent: str) -> str:
         """Locate a described element with the vision model (whole screen, then a zoomed crop) and click it."""

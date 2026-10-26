@@ -7,26 +7,33 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+  issues: write
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain (clang + lld + ldid + iPhoneOS SDK)
+      - name: Tools (ldid + Pillow)
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q clang lld libplist-dev libssl-dev python3-pil zip
-          git clone -q --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
-          make -C /tmp/ldid -j"$(nproc)"
-          git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
-          git -C /tmp/sdks sparse-checkout set iPhoneOS16.5.sdk
-      - name: Build (fakesigned, for TrollStore)
+          brew install ldid >/dev/null
+          python3 -m pip install --quiet --break-system-packages pillow || python3 -m pip install --quiet pillow
+          xcrun --sdk iphoneos --show-sdk-version; swift --version
+      - name: Build native SwiftUI app (fakesigned, for TrollStore)
         run: |
           set -o pipefail
-          SDK=/tmp/sdks/iPhoneOS16.5.sdk LDID=/tmp/ldid/ldid bash -x apps/ios/build-ipa.sh 2>&1 | tee /tmp/build.log
+          bash apps/ios/build-ipa.sh 2>&1 | tee /tmp/build.log
       - name: Report build error
         if: failure()
-        run: echo "::error title=build-ipa::$(tail -n 25 /tmp/build.log | sed 's/%/%25/g' | awk '{printf "%s%%0A",$0}')"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo "Build failed at ${GITHUB_SHA::7}"; echo '```'; grep -E "error:|warning: .*(deprecated|unused)" -A3 /tmp/build.log | head -150; echo '---'; tail -n 40 /tmp/build.log; echo '```'; } > /tmp/body.md
+          gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body-file /tmp/body.md
+      - name: Report success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body "Build OK at ${GITHUB_SHA::7} ($(du -h apps/ios/AIWorkstation.ipa | cut -f1))"
       - uses: actions/upload-artifact@v4
         with:
           name: AIWorkstation-ipa
@@ -35,6 +42,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ipa-latest
-          name: AIWorkstation IPA (latest)
+          name: Aiw iOS (native, latest)
           prerelease: true
           files: apps/ios/AIWorkstation.ipa

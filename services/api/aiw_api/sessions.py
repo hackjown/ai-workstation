@@ -426,6 +426,14 @@ class SessionManager:
                     extra.update(shopwatch.task_tools(self.store, self.notifier, task, computer, confirm))
                 except Exception as e:  # noqa: BLE001
                     log.warning("price watch tools unavailable: %s", e)
+                xhs_task = False
+                try:  # 小红书运营: caps, the approval queue and the warning pause live in xhs.py
+                    from . import xhs
+                    xhs_task = xhs.is_xhs_task(task)
+                    if xhs_task:
+                        extra.update(xhs.task_tools(self.store, self.notifier, task, computer, confirm, self))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("xhs tools unavailable: %s", e)
                 async with hold:
                     llm, routed = self._task_llm(task.prompt)
                     if routed:
@@ -440,6 +448,9 @@ class SessionManager:
                     from . import shopwatch
                     if shopwatch.is_order_task(task):   # no 提交订单/支付 click before the user confirms
                         shopwatch.guard(loop.tools, shopwatch.ensure_state(task.id), computer)
+                    if xhs_task:   # nothing goes out on 小红书 unless the user approved it
+                        from . import xhs
+                        xhs.guard(loop.tools, self.store, xhs.task_state(task.id), self.notifier, computer, self, task.id)
                     if can_dispatch:
                         async def _dispatcher(items, timeout_s, _live=live, _emit=emit):
                             return await self.dispatch(_live, items, timeout_s, _emit)

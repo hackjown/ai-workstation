@@ -298,6 +298,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             t["live"] = bool(live and live.runner and not live.runner.done())
             t["pending_confirm"] = live.confirm_info if live else None
             t["pending_question"] = live.question_info if live else None
+            kids = sessions.children_view(t["id"])
+            if kids:   # pieces this task dispatched to other computers (each with its own thread)
+                t["children"] = kids
+        if th.get("parent_thread_id"):
+            pt = store.thread(th["parent_thread_id"]) or {}
+            th["parent_title"] = pt.get("title")
         return {**th, "tasks": tasks, "queue_held": tid in sessions.held_threads}
 
     @app.get("/api/threads", dependencies=[Depends(auth)])
@@ -326,6 +332,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                 live = sessions.live_for_task(t["id"])
                 if live and live.runner and not live.runner.done():
                     await sessions.control(live.id, "stop")
+        for t in store.thread_tasks(tid):   # child threads of dispatched pieces go with their parent
+            await sessions.stop_children(t["id"])
+            for c in store.children(t["id"]):
+                if c.get("thread_id"):
+                    sessions.held_threads.discard(c["thread_id"])
+                    store.delete_thread(c["thread_id"])
         sessions.held_threads.discard(tid)
         store.delete_thread(tid)
         return {"ok": True}

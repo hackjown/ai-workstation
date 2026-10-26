@@ -360,6 +360,7 @@ function skillSection(list) {
 function skillJobHtml(job) {
   if (!job || !job.machines) return "";
   const ms = Object.entries(job.machines);
+  if (job.done && ms.every(([, m]) => m.state === "ok")) return "";  // the skill's own row already shows each computer
   return `<div class="skjob ${job.done ? "done" : ""}"><div class="small">${job.done ? "安装完成" : "正在安装"} · <span class="mono">${esc(job.source)}</span></div>
     ${ms.map(([id, m]) => `<div class="skm-row"><b>${esc(m.name)}</b><span class="chip ${m.state === "ok" ? "ok" : m.state === "failed" ? "bad" : ""}">${SK_ST[m.state] || m.state}</span>
       <span class="small">${m.state === "ok" ? esc((m.skills || []).join("、")) : esc(m.error || "")}</span>

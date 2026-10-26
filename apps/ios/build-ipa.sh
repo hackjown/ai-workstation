@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Build an unsigned (fakesigned) IPA for TrollStore on Linux or macOS.
-# Needs: clang + lld, an iPhoneOS SDK (github.com/theos/sdks), ldid (ProcursusTeam), python3-pil.
-#   SDK=/path/iPhoneOS16.5.sdk LDID=/path/ldid ./build-ipa.sh
+# Build the native SwiftUI app as a fakesigned IPA for TrollStore. Runs on macOS (Xcode command line tools + ldid):
+#   ./build-ipa.sh            -> apps/ios/AIWorkstation.ipa
 set -euo pipefail
 cd "$(dirname "$0")"
-SDK=${SDK:?set SDK=/path/to/iPhoneOS*.sdk}; LDID=${LDID:-ldid}
+LDID=${LDID:-ldid}
+SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 OUT=build; APP=$OUT/Payload/AIW.app
-[ "$(uname)" = Linux ] && LDFLAG=-fuse-ld=lld
-rm -rf $OUT && mkdir -p $APP
-clang -target arm64-apple-ios14.0 -isysroot "$SDK" -fobjc-arc -O2 ${LDFLAG:-} \
-  main.m -framework UIKit -framework WebKit -framework Foundation -framework Speech -framework AVFoundation -framework UserNotifications -o $APP/AIW
+rm -rf $OUT AIWorkstation.ipa && mkdir -p $APP
+xcrun --sdk iphoneos swiftc -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -module-name Aiw \
+  Sources/*.swift -o $APP/AIW
 cp Info.plist $APP/
 python3 - "$APP" <<'PY'
 import sys; from PIL import Image

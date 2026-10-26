@@ -10,7 +10,7 @@ from __future__ import annotations
 import abc
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 
 @dataclass
@@ -24,6 +24,7 @@ class LLMRequest:
     note: Optional[str] = None  # e.g. "user took over and returned control"
     screen_desc: Optional[str] = None  # set when a separate vision model read the screenshot
     thinking: Optional[str] = None  # per-step override of the provider's thinking setting ("off" while drafting CAD)
+    on_reasoning: Optional[Callable[[str], Awaitable[None]]] = None  # live reasoning text so far (streamed providers)
 
 
 @dataclass
@@ -33,6 +34,7 @@ class LLMDecision:
     args: dict = field(default_factory=dict)
     raw: Optional[dict] = None
     usage: dict = field(default_factory=dict)
+    reasoning: str = ""  # the model's thinking (reasoning_content / <think>), shown in the UI
 
 
 class LLMProvider(abc.ABC):
@@ -80,7 +82,8 @@ def user_text(req: LLMRequest) -> str:
     parts = [f"TASK: {req.task}", screen, f"PREVIOUS STEPS:\n{hist}"]
     if req.note:
         parts.append(f"NOTE: {req.note}")
-    parts.append("Decide the single next tool call. Briefly state your reasoning first.")
+    parts.append("Decide the single next tool call. Briefly state your reasoning first. Think and write your reasoning "
+                 "in the language of the TASK (a Chinese task: 用中文思考和说明).")
     return "\n\n".join(parts)
 
 

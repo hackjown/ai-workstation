@@ -1,6 +1,7 @@
 import SwiftUI
 import PhotosUI
 import QuickLook
+import UniformTypeIdentifiers
 
 let toolCN: [String: String] = [
     "screenshot": "截图", "click": "点击", "double_click": "双击", "right_click": "右键", "move": "移动鼠标", "drag": "拖动",
@@ -156,14 +157,27 @@ final class ChatModel: ObservableObject {
 struct ChatView: View {
     @EnvironmentObject var hub: Hub
     @StateObject private var m: ChatModel
+    let onThread: (String) -> Void
     @State private var text = ""
     @State private var attach: [JSON] = []
     @State private var photo: PhotosPickerItem?
+    @State private var showPhotos = false
+    @State private var showFiles = false
+    @State private var showCamera = false
+    @State private var skills: [JSON] = []
+    @State private var picked: [String] = []
+    @State private var uploading = false
     @State private var sending = false
     @State private var preview: Preview?
     @FocusState private var focused: Bool
 
-    init(threadId: String?) { _m = StateObject(wrappedValue: ChatModel(threadId)) }
+    init(threadId: String?, onThread: @escaping (String) -> Void = { _ in }) {
+        _m = StateObject(wrappedValue: ChatModel(threadId)); self.onThread = onThread
+    }
+    var liveSession: String? {
+        guard let t = m.tasks.last(where: { isLive($0.s("status")) }), !t.s("session_id").isEmpty else { return nil }
+        return t.s("session_id")
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -173,6 +187,7 @@ struct ChatView: View {
                         VStack(spacing: 10) {
                             Image(systemName: "face.smiling").font(.system(size: 36)).foregroundColor(amber)
                             Text("让 Aiw 在电脑上替你做事").foregroundColor(.secondary)
+                            Text("点 + 上传文件或选技能").font(.caption).foregroundColor(.secondary)
                         }.frame(maxWidth: .infinity).padding(.top, 80)
                     }
                     ForEach(m.tasks.indices, id: \.self) { i in
@@ -185,8 +200,9 @@ struct ChatView: View {
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: m.tasks.count) { _ in withAnimation { proxy.scrollTo("end") } }
             .safeAreaInset(edge: .bottom) { composer }
+            .safeAreaInset(edge: .top, spacing: 0) { DesktopPane(liveSession: liveSession, onChange: { await m.load() }) }
         }
-        .navigationTitle(m.title)
+        .navigationTitle(m.threadId == nil ? "新对话" : m.title)
         .navigationBarTitleDisplayMode(.inline)
         .task { await m.load() }
         .refreshable { await m.load() }
@@ -196,11 +212,31 @@ struct ChatView: View {
             if tid == m.threadId && (e.s("kind") == "task" || e.s("type").hasPrefix("task.")) { Task { await m.load() } }
         }
         .onChange(of: photo) { item in Task { await upload(item) } }
+        .photosPicker(isPresented: $showPhotos, selection: $photo, matching: .images)
+        .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { r in
+            if case .success(let urls) = r { Task { for u in urls { await uploadFile(u) } } }
+        }
+        .sheet(isPresented: $showCamera) { CameraPicker { img in Task { await uploadImage(img) } }.ignoresSafeArea() }
+        .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
+        .onChange(of: m.threadId) { id in if let id = id { onThread(id) } }
         .sheet(item: $preview) { p in QuickLookView(url: p.url).ignoresSafeArea() }
     }
 
     var composer: some View {
         VStack(spacing: 6) {
+            if !picked.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack {
+                        ForEach(picked, id: \.self) { id in
+                            HStack(spacing: 4) {
+                                Image(systemName: "sparkles"); Text(skillTitle(id)).lineLimit(1)
+                                Button { picked.removeAll { $0 == id } } label: { Image(systemName: "xmark.circle.fill") }
+                            }.font(.caption.weight(.medium)).foregroundColor(amber)
+                            .padding(.horizontal, 8).padding(.vertical, 5).background(amber.opacity(0.12)).clipShape(Capsule())
+                        }
+                    }
+                }
+            }
             if !attach.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack {
@@ -214,8 +250,27 @@ struct ChatView: View {
                 }
             }
             HStack(alignment: .bottom, spacing: 8) {
-                PhotosPicker(selection: $photo, matching: .images) {
-                    Image(systemName: "plus").font(.system(size: 18, weight: .semibold)).frame(width: 36, height: 36)
+                Menu {
+                    Section("添加文件") {
+                        Button { showPhotos = true } label: { Label("照片", systemImage: "photo.on.rectangle") }
+                        if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                            Button { showCamera = true } label: { Label("拍照", systemImage: "camera") }
+                        }
+                        Button { showFiles = true } label: { Label("文件", systemImage: "folder") }
+                    }
+                    Section("技能") {
+                        ForEach(skills.indices, id: \.self) { i in
+                            let id = skills[i].s("id")
+                            Button { toggleSkill(id) } label: {
+                                if picked.contains(id) { Label(skills[i].s("title"), systemImage: "checkmark") }
+                                else { Text(skills[i].s("title")) }
+                            }
+                        }
+                        if skills.isEmpty { Text("没有可用技能") }
+                    }
+                } label: {
+                    Group { if uploading { ProgressView() } else { Image(systemName: "plus").font(.system(size: 18, weight: .semibold)) } }
+                        .frame(width: 36, height: 36)
                         .background(Color(.secondarySystemBackground)).clipShape(Circle())
                 }
                 TextField("给 Aiw 一个任务…", text: $text, axis: .vertical)
@@ -234,21 +289,38 @@ struct ChatView: View {
 
     func send() async {
         var p = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !picked.isEmpty { p = "【技能：\(picked.joined(separator: "、"))】\n" + p }
         if !attach.isEmpty { p += "\n\n附件（已放到电脑上）：\n" + attach.map { "- " + $0.s("vm_path") }.joined(separator: "\n") }
         sending = true
-        if await m.send(p) { text = ""; attach = []; focused = false }
+        if await m.send(p) { text = ""; attach = []; picked = []; focused = false }
         sending = false
     }
 
-    func upload(_ item: PhotosPickerItem?) async {
-        guard let item = item, let data = try? await item.loadTransferable(type: Data.self) else { return }
-        let jpg = UIImage(data: data)?.jpegData(compressionQuality: 0.85) ?? data
-        let name = "photo-\(Int(Date().timeIntervalSince1970)).jpg"
+    func skillTitle(_ id: String) -> String { skills.first { $0.s("id") == id }?.s("title") ?? id }
+    func toggleSkill(_ id: String) { if picked.contains(id) { picked.removeAll { $0 == id } } else { picked.append(id) } }
+
+    func send(name: String, data: Data) async {
+        uploading = true; defer { uploading = false }
+        if data.count > 40 * 1024 * 1024 { m.err = "\(name) 超过 40MB"; return }
         do {
-            let r = try await API.shared.obj("POST", "/api/uploads", ["name": name, "content_b64": jpg.base64EncodedString(), "machine_id": API.shared.machine])
+            let r = try await API.shared.obj("POST", "/api/uploads", ["name": name, "content_b64": data.base64EncodedString(), "machine_id": API.shared.machine])
             attach.append(r)
         } catch { m.err = "上传失败：" + error.localizedDescription }
+    }
+    func upload(_ item: PhotosPickerItem?) async {
+        guard let item = item, let data = try? await item.loadTransferable(type: Data.self) else { return }
         photo = nil
+        if let img = UIImage(data: data) { await uploadImage(img) } else { await send(name: "photo-\(Int(Date().timeIntervalSince1970)).jpg", data: data) }
+    }
+    func uploadImage(_ img: UIImage) async {
+        guard let jpg = img.jpegData(compressionQuality: 0.85) else { return }
+        await send(name: "photo-\(Int(Date().timeIntervalSince1970)).jpg", data: jpg)
+    }
+    func uploadFile(_ u: URL) async {
+        let ok = u.startAccessingSecurityScopedResource()
+        defer { if ok { u.stopAccessingSecurityScopedResource() } }
+        guard let d = try? Data(contentsOf: u) else { m.err = "读不了 \(u.lastPathComponent)"; return }
+        await send(name: u.lastPathComponent, data: d)
     }
 }
 
@@ -425,5 +497,25 @@ struct QuickLookView: UIViewControllerRepresentable {
         init(_ u: URL) { url = u }
         func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
         func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem { url as NSURL }
+    }
+}
+
+
+struct CameraPicker: UIViewControllerRepresentable {
+    let done: (UIImage) -> Void
+    @Environment(\.dismiss) var dismiss
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let p = UIImagePickerController(); p.sourceType = .camera; p.delegate = context.coordinator; return p
+    }
+    func updateUIViewController(_ vc: UIImagePickerController, context: Context) {}
+    func makeCoordinator() -> Coord { Coord(self) }
+    final class Coord: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let parent: CameraPicker
+        init(_ p: CameraPicker) { parent = p }
+        func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            if let img = info[.originalImage] as? UIImage { parent.done(img) }
+            parent.dismiss()
+        }
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) { parent.dismiss() }
     }
 }

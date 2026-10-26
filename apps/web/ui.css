@@ -405,3 +405,35 @@ html[data-theme=light] .spot.lit{--spotA:.12}
 .plusmenu button:hover .pi,.conn:hover .lg{transform:translateY(-1px);transition:transform .2s}
 .btn,.link,.set-index a,.connfilter button{transition:color .2s,background-color .2s,border-color .2s,filter .2s}
 @media (hover:none),(pointer:coarse),(prefers-reduced-motion:reduce){.aurora{display:none}.spot.lit{--spotA:0}}
+
+/* ======================================================= hover / press / selected: boxes take the accent (AtomCode stat-card) */
+/* stand-alone cards: lift, amber border, stronger glow */
+.curcard,.filecard,.upd-ver > div,.plusmenu,.card,.sugs > *,.cloudrow{transition:border-color .25s,transform .3s,box-shadow .3s,background-color .25s}
+.filecard:hover,.card:hover,.sugs > *:hover,.cloudrow:hover{border-color:var(--acc)!important;transform:translateY(-3px);box-shadow:0 14px 34px var(--shadow)}
+.filecard,.card,.sugs > *,.cloudrow{position:relative}
+.spot.lit{--spotA:.14}
+html[data-theme=light] .spot.lit{--spotA:.20}
+.rows.spot.lit{border-color:var(--accLine)}
+.upd-ver > div:hover{background-color:var(--panel3)}
+/* rows inside a group: tint + amber edge on the left */
+.rw,.conn,.mcp{transition:background-color .2s,box-shadow .2s}
+.rw:not(.head):hover,.conn:hover{background-color:var(--accBg);box-shadow:inset 2px 0 0 var(--acc)}
+.conn.open{background-color:var(--accBg);box-shadow:inset 2px 0 0 var(--acc)}
+/* sidebar: hover tint, selected thread / nav gets an amber bar */
+.navs button,.threads button{position:relative;transition:background-color .2s,color .2s}
+.navs button:hover,.threads button:hover{background:var(--accBg)}
+.navs button.on,.threads button.on{background:var(--accBg);color:var(--text);box-shadow:inset 2px 0 0 var(--acc)}
+.navs button.on svg{color:var(--acc)}
+/* inputs and buttons */
+input:not([type=checkbox]):not([type=radio]):hover,select:hover,textarea:hover{border-color:var(--accLine)}
+input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{border-color:var(--acc)}
+.composer:hover{border-color:var(--accLine)}
+.composer:focus-within{border-color:var(--acc);box-shadow:0 0 0 3px var(--accBg)}
+.btn:not(.primary):not(.danger):hover{border-color:var(--acc);color:var(--acc)}
+.btn:active,.send:active,.icon:active,.navs button:active,.threads button:active,.conn .link:active,.plusmenu button:active{transform:scale(.97)}
+.icon:hover{color:var(--acc)}
+.plusmenu button:hover{background:var(--accBg)}
+.plusmenu button.on{background:var(--accBg);box-shadow:inset 2px 0 0 var(--acc)}
+.chip:not(.ok):not(.bad):not(.live):hover{border-color:var(--accLine)}
+.segsw label:hover,.seg button:hover{color:var(--acc)}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}

@@ -207,6 +207,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     def ws_token(ws: WebSocket) -> Optional[str]:
         return ws.query_params.get("token") or ws.cookies.get("aiw_token")
 
+    from . import xhs   # 小红书运营: settings, approval queue, pause (/api/xhs/*)
+    xhs.mount(app, store, sessions, notifier, auth)
+
     # ------------------------------------------------------------- tasks
 
     @app.post("/api/tasks", dependencies=[Depends(auth)])

@@ -21,10 +21,28 @@ CATALOG: list[dict] = [
     {"id": "officecli", "title": "OfficeCLI 文档", "icon": "doc",
      "desc": "精确读写 Word、Excel、PPT：改格式、填表、批量替换、出 PDF",
      "path": "~/.workbuddy/skills/officecli", "setup": "bash ~/ai-workstation/deploy/vm/devagents-setup.sh",
-     "note": "The CLI is ~/.local/bin/officecli; prefer it over GUI clicking for any .docx/.xlsx/.pptx edit."},
+     "note": ("OfficeCLI is a command-line program plus this skill guide. Call the program by its full path "
+              "~/.local/bin/officecli (older computers do not have ~/.local/bin on PATH); if that file is missing, run "
+              "the setup. Prefer it over GUI clicking for any .docx/.xlsx/.pptx edit, and after an edit render to PDF "
+              "(soffice --headless --convert-to pdf) to check the pages.")},
     {"id": "reverse-engineer-anything", "title": "REA 逆向分析", "icon": "search",
      "desc": "拆解 Electron、JS、网页应用：看结构、找接口、抓协议",
      "path": "~/.workbuddy/skills/reverse-engineer-anything", "setup": "bash ~/ai-workstation/deploy/vm/devagents-setup.sh"},
+    {"id": "dev", "title": "开发 程序", "icon": "code",
+     "desc": "在电脑上写程序并测试；有界面的先出页面截图给你选，确认后再开发",
+     "path": "", "setup": "",
+     "note": ("Work as a careful software engineer in ~/workspace/<project> (git init, commit each milestone). "
+              "1) Restate the goal and write PLAN.md (features, stack, how it will be tested). "
+              "2) If the program has ANY user interface (web page, app screen, desktop window), do NOT write app code yet: "
+              "build a static clickable prototype (plain HTML/CSS, realistic content, no lorem ipsum) — two or three distinct "
+              "directions when the user gave no style — and if huashu-design was also picked, design it by that skill. "
+              "Screenshot every key screen with headless Chrome (`chromium --headless=new --hide-scrollbars --screenshot=a.png "
+              "--window-size=1440,900 file://…`, and 390,844 for mobile when it matters), send_file each PNG, then ask_user "
+              "which direction / what to change. Iterate until the user confirms; only then implement. "
+              "3) Implement in small steps; write automated tests next to the code and run them after every change; "
+              "fix until they pass. For a web UI also run it and screenshot the real pages, checking they match the approved "
+              "mockup. 4) Finish with send_file of the final screenshots (and a zip of the project if asked), then done "
+              "with: what was built, how to run it, and the test results (numbers, not 'tests pass').")},
     {"id": "huashu-design", "title": "huashu-design 设计", "icon": "image",
      "desc": "出 UI 设计稿、海报、页面 mockup，并做设计评审",
      "path": "~/.claude/skills/huashu-design", "setup": ""},

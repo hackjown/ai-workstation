@@ -81,12 +81,17 @@ class RoutineIn(BaseModel):
     enabled: bool = True
 
 class WatchIn(BaseModel):
-    name: str
+    name: str = ""
     url: str
-    mode: str = "change"          # change | contains | price_below
-    value: str = ""
+    mode: str = "change"          # change | contains | price_below | shop (京东/淘宝/天猫, see shopwatch.py)
+    value: str = ""               # shop: target price
     interval_min: int = 60
     enabled: bool = True
+    quantity: int = 1             # shop only from here on
+    sku: str = ""
+    address_note: str = ""
+    auto_order: bool = False
+    machine_id: Optional[str] = None
 
 class MemoryIn(BaseModel):
     text: str
@@ -456,6 +461,18 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         return store.all("watches", order="created_at ASC")
 
     def _watch_fields(body: WatchIn) -> dict:
+        from . import shopwatch
+        if body.mode == shopwatch.MODE or (body.mode == "price_below" and shopwatch.is_shop_url(body.url)):
+            shopwatch.ensure_columns(store)
+            try:
+                f = shopwatch.watch_fields(body.model_dump(), default_machine=settings.machines[0].id if settings.machines else None)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            if f.get("machine_id") and not store.machine(f["machine_id"]):
+                raise HTTPException(400, f"unknown machine {f['machine_id']}")
+            return f
+        if not body.name:
+            raise HTTPException(400, "name is required")
         if body.mode not in ("change", "contains", "price_below"):
             raise HTTPException(400, "mode must be change, contains or price_below")
         if not body.url.startswith(("http://", "https://")):
@@ -477,7 +494,10 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     async def put_watch(wid: str, body: WatchIn):
         if not store.get("watches", wid):
             raise HTTPException(404)
-        store.update("watches", wid, **_watch_fields(body), next_check=None)
+        f = _watch_fields(body)
+        if f.get("mode") == "shop":  # a changed target or link starts a fresh transition, never a stale order
+            f.update(below=0, fail_count=0)
+        store.update("watches", wid, **f, next_check=None)
         return store.get("watches", wid)
 
     @app.delete("/api/watches/{wid}", dependencies=[Depends(auth)])

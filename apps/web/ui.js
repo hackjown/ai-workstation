@@ -233,7 +233,7 @@ loadSettings = async function () {
       ${row("语气", "", `<input name="tone" value="${esc(prof.tone || "")}" placeholder="例如 简洁、用中文" />`)}
       ${row("关于你", "工作、常用网站、文件放哪", `<textarea name="about" rows="2">${esc(prof.about || "")}</textarea>`, "", "top")}
       ${row("完成时朗读结果", "", "", `<input type="checkbox" ${localStorage.getItem("aiw_tts") === "1" ? "checked" : ""} onchange="localStorage.setItem('aiw_tts', this.checked?'1':'')" aria-label="朗读" />`, "sw")}
-      <input type="hidden" name="avatar" value="${esc(prof.avatar || "sky")}" />
+      <input type="hidden" name="avatar" value="${esc(prof.avatar || "amber")}" />
       <div class="savebar"><button class="btn sm primary">保存</button></div>
     </form>
     <div class="rows">

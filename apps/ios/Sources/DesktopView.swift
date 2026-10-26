@@ -11,6 +11,7 @@ struct DesktopPane: View {
     @State private var note = ""
     @State private var taking = false
     @State private var busy = false
+    @State private var machines: [JSON] = []
     @Environment(\.scenePhase) var phase
     private let timer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
@@ -18,7 +19,22 @@ struct DesktopPane: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Circle().fill(liveSession != nil ? amber : Color.secondary.opacity(0.5)).frame(width: 7, height: 7)
-                Text(liveSession != nil ? "Agent 正在操作电脑" : "Agent 电脑").font(.caption.weight(.semibold))
+                Menu {
+                    ForEach(machines.indices, id: \.self) { i in
+                        let mm = machines[i]
+                        Button { pick(mm.s("id")) } label: {
+                            if mm.s("id") == api.machine { Label(label(mm), systemImage: "checkmark") } else { Text(label(mm)) }
+                        }
+                    }
+                    if machines.isEmpty { Text("没有电脑") }
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: current.s("provider") == "instabox" ? "cloud" : "desktopcomputer").font(.caption2)
+                        Text(current.isEmpty ? api.machine : label(current)).font(.caption.weight(.semibold)).lineLimit(1)
+                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .bold))
+                    }.foregroundColor(.primary)
+                }.disabled(liveSession != nil)
+                if liveSession != nil { Text("执行中").font(.caption2).foregroundColor(amber) }
                 if !note.isEmpty { Text(note).font(.caption2).foregroundColor(.secondary).lineLimit(1) }
                 Spacer()
                 Button { Task { await takeover() } } label: {
@@ -42,6 +58,7 @@ struct DesktopPane: View {
         .background(.bar)
         .overlay(Divider(), alignment: .bottom)
         .onAppear { if liveSession != nil { open = true } }
+        .task { machines = (try? await api.list("/api/machines")) ?? [] }
         .onChange(of: liveSession) { s in if s != nil { withAnimation { open = true } } }
         .onReceive(timer) { _ in if open && phase == .active && !taking { Task { await grab() } } }
         .fullScreenCover(isPresented: $taking) {
@@ -49,6 +66,15 @@ struct DesktopPane: View {
         }
     }
 
+    var current: JSON { machines.first { $0.s("id") == api.machine } ?? [:] }
+    func label(_ m: JSON) -> String {
+        let n = m.s("name").isEmpty ? m.s("id") : m.s("name")
+        return m.s("provider") == "instabox" ? n + "（云电脑）" : n + "（本地）"
+    }
+    func pick(_ id: String) {
+        api.setMachine(id); image = nil; note = ""
+        if open { Task { await grab() } }
+    }
     func grab() async {
         guard let u = api.url("/api/machines/\(api.machine)/screenshot") else { return }
         var r = URLRequest(url: u, timeoutInterval: 12)

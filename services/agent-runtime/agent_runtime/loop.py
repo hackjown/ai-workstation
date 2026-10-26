@@ -200,22 +200,41 @@ class AgentLoop:
 
     async def _run_with_deadline(self) -> None:
         job = asyncio.ensure_future(self._run())
+        stop = getattr(getattr(self, "control", None), "stopped", None)
+        stop_w = asyncio.ensure_future(stop.wait()) if stop is not None else None
         start = time.monotonic()
+        stopped = False
         try:
             while True:
                 left = self.cfg.timeout_s + self._waited - (time.monotonic() - start)
                 if left <= 0:
                     raise asyncio.TimeoutError
-                done, _ = await asyncio.wait({job}, timeout=left)
-                if done:
+                done, _ = await asyncio.wait({job, stop_w} - {None}, timeout=left, return_when=asyncio.FIRST_COMPLETED)
+                if job in done:
                     return job.result()
+                if stop_w is not None and stop_w in done:
+                    stopped = True  # cancel the model call / command in flight right now
+                    raise StopRequested()
         finally:
+            if stop_w is not None and not stop_w.done():
+                stop_w.cancel()
             if not job.done():
                 job.cancel()
                 try:
-                    await job
+                    await asyncio.wait_for(job, 5)
                 except BaseException:  # noqa: BLE001
                     pass
+            if stopped:
+                await self._kill_commands()
+
+    async def _kill_commands(self) -> None:
+        """Stop also ends the shell commands this task left running on the computer (soffice, ffmpeg...)."""
+        try:
+            ex = getattr(self.computer, "execute", None)
+            if ex:
+                await asyncio.wait_for(ex("shell.kill", {}, observe=False, timeout=8), 10)
+        except BaseException:  # noqa: BLE001  an older vm-agent has no shell.kill
+            pass
 
     # ------------------------------------------------------------------- run
     async def run(self) -> Task:
@@ -412,6 +431,15 @@ class AgentLoop:
                     self._last_sent_thumb = tiny
             await self.emit(EventType.THINKING)
             t_llm = time.time()
+            live_think = {"at": 0.0, "n": 0}
+
+            async def on_reasoning(text: str, _lt=live_think):
+                # shown live under "正在思考…"; broadcast only (not stored), at most once a second
+                now = time.monotonic()
+                if now - _lt["at"] < 1.0 or len(text) == _lt["n"]:
+                    return
+                _lt["at"], _lt["n"] = now, len(text)
+                await self.emit(EventType.THINKING, live=True, text=text[-1500:], chars=len(text))
             req = LLMRequest(
                 system=self.system, task=self._task_with_plan(), history=self.history,
                 screenshot_b64=send_shot, tools=tool_schemas([t[0] for t in self.extra_tools.values()],
@@ -426,7 +454,8 @@ class AgentLoop:
                            else os.environ.get("AIW_CAD_PLAN_THINKING", "off")) if self._cad_task
                           # an image edit is measure -> move/edit -> compare -> send; task-484 thought 50-70 s per
                           # step and then 540 s on one step (900 s budget gone with the result already made at 175 s)
-                          else os.environ.get("AIW_IMAGE_THINKING", "off") if self._image_task else None))
+                          else os.environ.get("AIW_IMAGE_THINKING", "off") if self._image_task else None),
+                on_reasoning=on_reasoning)
             decision = None
             tries = int(os.environ.get("AIW_DECIDE_RETRIES", "4"))
             for attempt in range(tries):
@@ -537,7 +566,8 @@ class AgentLoop:
                 self._since_edit = getattr(self, "_since_edit", 0) + 1
             u = decision.usage or {}
             await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args, llm_ms=llm_ms,
-                            out_tokens=u.get("out_tokens") or u.get("completion_tokens"), attempts=u.get("attempts"))
+                            out_tokens=u.get("out_tokens") or u.get("completion_tokens"), attempts=u.get("attempts"),
+                            reasoning=(getattr(decision, "reasoning", "") or "")[-4000:] or None)
             sig = (decision.tool, repr(sorted(decision.args.items())))
             if decision.tool not in ("screenshot", "wait", "done", "fail"):
                 self._rep = self._rep + 1 if sig == self._prev_sig else 0

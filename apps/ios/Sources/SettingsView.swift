@@ -26,6 +26,9 @@ struct SettingsView: View {
                         }
                     }
                 }
+                Section(footer: Text("降价提醒，可自动下单到付款前，等你确认")) {
+                    NavigationLink { ShopWatchView() } label: { Label("京东/淘宝价格监控", systemImage: "tag") }
+                }
                 Section(header: Text("外观"), footer: Text("跟随系统时，白天浅色、晚上深色，随 iPhone 的设置自动切换")) {
                     Picker("外观", selection: $appearance) {
                         Text("跟随系统").tag("system"); Text("浅色").tag("light"); Text("深色").tag("dark")

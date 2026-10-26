@@ -541,3 +541,29 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 .sdot{width:7px;height:7px;border-radius:50%;background:var(--dim);display:inline-block;margin-right:2px}
 .sdot.on{background:#3BA55D;box-shadow:0 0 0 3px rgba(59,165,93,.18)}
 #top .logo.sm{width:30px;height:30px;border-radius:8px}
+
+/* ---------- send / stop: glyph dead-centre (iOS Safari adds button padding) */
+.send{padding:0;line-height:0;display:grid;place-items:center}
+.send svg,.send.stop svg{display:block;margin:0}
+.send svg{width:18px;height:18px}
+.send.stop svg{width:14px;height:14px;stroke-width:0}
+
+/* ---------- mobile viewfinder: a slim status bar by default, the screen only when asked for */
+@media (max-width:760px){
+  #mvf{margin:8px 12px 2px;border:1px solid var(--line2);border-radius:12px;background:var(--panel);box-shadow:0 1px 0 var(--line3)}
+  #mvf .mvf-screen{aspect-ratio:16/9;background:#0b0b0b;border-bottom:1px solid var(--line)}
+  #mvf .mvf-screen .vfchip{font-size:10px;padding:2px 7px;top:6px;right:6px}
+  #mvf .mvf-bar{gap:10px;padding:7px 7px 7px 12px;border-top:0;background:transparent;cursor:pointer;min-height:48px}
+  #mvf .mvf-dot{width:8px;height:8px;border-radius:50%;background:var(--acc);flex:none;animation:mvfPulse 1.6s ease-in-out infinite}
+  #mvf.taking .mvf-dot{background:#3BA55D}
+  #mvf .mvf-now small{font-size:11px}
+  #mvf .mvf-now span{font-size:13.5px}
+  #mvf .mvf-take,#mvf .mvf-eye{all:unset;box-sizing:border-box;display:inline-flex;align-items:center;gap:4px;height:32px;padding:0 10px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;flex:none}
+  #mvf .mvf-take{color:var(--acc);background:var(--accBg)}
+  #mvf.taking .mvf-take{color:#fff;background:var(--acc)}
+  #mvf .mvf-eye{color:var(--text);border:1px solid var(--line2)}
+  #mvf .mvf-take svg,#mvf .mvf-eye svg{width:15px;height:15px}
+  #mvf.fold .mvf-screen{display:none}
+}
+@keyframes mvfPulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){#mvf .mvf-dot{animation:none}}

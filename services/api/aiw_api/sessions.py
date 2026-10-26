@@ -532,6 +532,10 @@ def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str
         return (max(max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400"))),
                 max(timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800"))))
     from agent_runtime.loop import _IMAGE_TASK, _VIDEO_TASK
+    from agent_runtime import skills as _sk
+    if "dev" in _sk.picked(prompt):  # writing and testing a program, with mockup rounds the user confirms
+        return (max(max_steps, int(os.environ.get("AIW_DEV_MAX_STEPS", "300"))),
+                max(timeout_s, float(os.environ.get("AIW_DEV_TIMEOUT", "5400"))))
     if _VIDEO_TASK.search(prompt or ""):  # task-247: a deck-to-explainer ran out at 900 s before the first frame
         return (max(max_steps, int(os.environ.get("AIW_VIDEO_MAX_STEPS", "200"))),
                 max(timeout_s, float(os.environ.get("AIW_VIDEO_TIMEOUT", "3600"))))

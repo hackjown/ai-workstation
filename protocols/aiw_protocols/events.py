@@ -35,6 +35,7 @@ class EventType(str, Enum):
     SUBAGENT = "agent.subagent"
     MEMORY = "agent.memory"
     TOOL_CALL = "agent.tool_call"
+    DISPATCH = "agent.dispatch"        # child tasks on other computers: {phase, children:[{task_id, machine, status...}]}
 
 
 class AgentEvent(BaseModel):

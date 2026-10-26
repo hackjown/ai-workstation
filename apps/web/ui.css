@@ -505,3 +505,8 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 .threads button:hover .thdel{display:flex}
 .threads .thdel:hover{color:var(--bad)}
 @media (hover:none){.threads .thdel{display:flex;opacity:.6}}
+.steplist .thinl{margin:-2px 0 0;padding:0 0 8px 78px;font-size:12.5px;line-height:1.5;color:var(--mute);white-space:pre-wrap;word-break:break-word;border-bottom:1px solid var(--line3)}
+.steplist .thinl+details.why{border-top:0}
+.imgprev{display:block;margin:8px 0 4px;max-width:min(560px,100%);border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;background:var(--panel)}
+.imgprev img{display:block;width:100%;height:auto}
+@media (max-width:760px){.steplist .thinl{padding-left:0}}

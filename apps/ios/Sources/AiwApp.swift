@@ -8,7 +8,7 @@ struct AiwApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                if api.configured { ThreadsView() } else { ConnectView() }
+                if api.configured { RootView() } else { ConnectView() }
             }
             .environmentObject(api).environmentObject(hub)
             .tint(amber)

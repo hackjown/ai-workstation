@@ -276,6 +276,11 @@ class SessionManager:
 
         async def emit(ev: AgentEvent):
             d = ev.model_dump(mode="json")
+            if ev.type == EventType.THINKING and ev.data.get("live"):
+                # the reasoning text while the model is still thinking: shown live, never stored (the final
+                # reasoning is kept on agent.decision)
+                await self._broadcast(live, {"kind": "event", "task_id": task.id, "thread_id": task.thread_id, **d})
+                return
             self.store.add_event(d)
             if ev.type == EventType.OBSERVATION and ev.data.get("artifact"):
                 self.store.add_artifact(sid, "screenshot", ev.data["artifact"])

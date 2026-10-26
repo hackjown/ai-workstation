@@ -389,3 +389,19 @@ body{font-family:var(--sans)}
 .grp-h{flex-wrap:wrap;row-gap:6px}
 .grp-h h2{white-space:nowrap}
 @media (max-width:760px){.set-index{padding-top:8px}.grp-h .sub{flex-basis:100%;order:3}}
+
+/* ======================================================= AtomCode mouse effects
+   1) aurora: a soft amber glow that follows the pointer over the whole app (screen blend on ink, multiply on paper)
+   2) spotlight: cards light up under the pointer (--sx/--sy are set per card) */
+.aurora{position:fixed;inset:0;z-index:9000;pointer-events:none;opacity:0;transition:opacity .35s;
+  background:radial-gradient(circle 360px at var(--mx,-400px) var(--my,-400px),rgba(232,160,80,.18) 0%,rgba(232,160,80,.06) 30%,rgba(232,160,80,0) 60%);mix-blend-mode:screen}
+html[data-theme=light] .aurora{mix-blend-mode:multiply;background:radial-gradient(circle 360px at var(--mx,-400px) var(--my,-400px),rgba(232,160,80,.30) 0%,rgba(232,160,80,.10) 30%,rgba(232,160,80,0) 60%)}
+.aurora.on{opacity:1}
+.spot{background-image:radial-gradient(circle 220px at var(--sx,50%) var(--sy,50%),rgba(232,160,80,var(--spotA,0)),transparent 60%);transition:border-color .25s,box-shadow .25s}
+.spot.lit{--spotA:.10}
+html[data-theme=light] .spot.lit{--spotA:.12}
+.rows.spot.lit,.conn-wrap.lit{border-color:var(--line2)}
+.curcard.spot.lit{border-color:var(--acc)}
+.plusmenu button:hover .pi,.conn:hover .lg{transform:translateY(-1px);transition:transform .2s}
+.btn,.link,.set-index a,.connfilter button{transition:color .2s,background-color .2s,border-color .2s,filter .2s}
+@media (hover:none),(pointer:coarse),(prefers-reduced-motion:reduce){.aurora{display:none}.spot.lit{--spotA:0}}

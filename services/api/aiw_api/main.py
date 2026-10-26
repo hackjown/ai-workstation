@@ -731,6 +731,44 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         except Exception as e:  # noqa: BLE001
             raise HTTPException(400, f"连接失败：{type(e).__name__}: {str(e)[:200]}")
 
+    @app.get("/api/remote-hosts", dependencies=[Depends(auth)])
+    async def remote_hosts_list():
+        from . import remote_hosts
+        return remote_hosts.public(store, secrets)
+
+    @app.post("/api/remote-hosts", dependencies=[Depends(auth)])
+    async def remote_hosts_add(body: dict):
+        from . import remote_hosts
+        try:
+            return remote_hosts.save(store, secrets, body)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.put("/api/remote-hosts/{hid}", dependencies=[Depends(auth)])
+    async def remote_hosts_edit(hid: str, body: dict):
+        from . import remote_hosts
+        try:
+            return remote_hosts.save(store, secrets, body, hid)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.delete("/api/remote-hosts/{hid}", dependencies=[Depends(auth)])
+    async def remote_hosts_del(hid: str):
+        from . import remote_hosts
+        remote_hosts.remove(store, secrets, hid)
+        return {"ok": True}
+
+    @app.post("/api/remote-hosts/{hid}/test", dependencies=[Depends(auth)])
+    async def remote_hosts_test(hid: str):
+        from . import remote_hosts
+        h = remote_hosts.find(store, hid)
+        if not h:
+            raise HTTPException(404)
+        try:
+            return await remote_hosts.test(h, secrets.get(f"remote_host_{h['id']}"))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"连接失败：{type(e).__name__}: {str(e)[:200]}")
+
     @app.put("/api/update/config", dependencies=[Depends(auth)])
     async def update_config(body: dict):
         from . import updater

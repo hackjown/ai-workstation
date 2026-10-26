@@ -437,3 +437,56 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 .chip:not(.ok):not(.bad):not(.live):hover{border-color:var(--accLine)}
 .segsw label:hover,.seg button:hover{color:var(--acc)}
 :focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+
+/* ======================================================= live reasoning + per-step thoughts */
+.thinklive{margin:10px 0 4px;border:1px solid var(--accLine);background:var(--accBg);border-radius:var(--r,10px);padding:10px 12px}
+.thinklive .tl{display:flex;align-items:center;gap:6px;font:600 12px var(--sans);color:var(--acc)}
+.thinklive .tl .i{width:14px;height:14px}
+.thinklive .tl em{font:400 11px var(--mono);color:var(--mute);margin-left:auto;font-style:normal}
+.thinklive .tt{max-height:8.4em;overflow:hidden;display:flex;flex-direction:column-reverse;margin-top:6px;
+  -webkit-mask-image:linear-gradient(to bottom,transparent 0,#000 2.2em);mask-image:linear-gradient(to bottom,transparent 0,#000 2.2em)}
+.thinklive .tt div{white-space:pre-wrap;font-size:12.5px;line-height:1.4;color:var(--text2,var(--mute))}
+.steplist details.why{border-bottom:1px solid var(--line3);padding:0 0 6px 78px;margin-top:-1px}
+.steplist details.why summary{list-style:none;cursor:pointer;font:500 11.5px var(--sans);color:var(--mute);display:inline-flex;align-items:center;gap:4px}
+.steplist details.why summary::-webkit-details-marker{display:none}
+.steplist details.why summary .chev{width:11px;height:11px;transition:transform .2s}
+.steplist details.why[open] summary .chev{transform:rotate(90deg)}
+.steplist details.why summary:hover{color:var(--acc)}
+.steplist details.why .th{margin:6px 0 2px;font-size:12.5px;color:var(--text)}
+.steplist details.why pre{margin:6px 0 0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 var(--sans);color:var(--mute);max-height:22em;overflow:auto;
+  border-left:2px solid var(--accLine);padding-left:10px}
+@media (max-width:760px){.steplist details.why{padding-left:0}}
+
+/* ======================================================= send / stop: round amber button (direction A) */
+.send{width:40px;height:40px;border-radius:50%;background:var(--acc);color:#141414;transition:transform .15s,box-shadow .25s,background-color .2s}
+.send svg{stroke:#141414}
+.send:hover{box-shadow:0 0 0 4px var(--accBg)}
+.send.stop{background:var(--acc);color:#141414;animation:sendPulse 1.8s ease-out infinite}
+.send.stop svg{fill:#141414;stroke:#141414;width:15px;height:15px}
+@keyframes sendPulse{0%{box-shadow:0 0 0 0 rgba(232,160,80,.55)}70%{box-shadow:0 0 0 9px rgba(232,160,80,0)}100%{box-shadow:0 0 0 0 rgba(232,160,80,0)}}
+@media (prefers-reduced-motion:reduce){.send.stop{animation:none;box-shadow:0 0 0 3px var(--accLine)}}
+#composerHint{display:flex;align-items:center;justify-content:center;gap:10px}
+#composerHint:empty{display:none}
+.btn.xs{padding:2px 10px;font-size:11.5px;border-radius:999px;min-height:0;line-height:18px}
+
+/* ======================================================= mobile viewfinder */
+#mvf{display:none}
+@media (max-width:760px){
+  #v-chat{display:flex;flex-direction:column}
+  #mvf{display:block;flex:none;margin:6px 10px 4px;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#000;position:relative}
+  #mvf.taking{border-color:var(--acc);box-shadow:0 0 0 2px var(--accBg)}
+  #mvf .mvf-screen{aspect-ratio:16/10;position:relative;background:#050505}
+  #mvf .mvf-screen .deskframe{position:absolute;inset:0;height:100%;border:0;border-radius:0;margin:0}
+  #mvf .mvf-screen iframe{width:100%;height:100%;border:0;display:block}
+  #mvf .mvf-screen .vfchip{top:8px;right:8px}
+  #mvf .mvf-bar{display:flex;align-items:center;gap:8px;padding:8px 8px 8px 12px;background:var(--panel);border-top:1px solid var(--line)}
+  #mvf .mvf-now{flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.25}
+  #mvf .mvf-now small{font:500 11px var(--mono);color:var(--acc);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #mvf .mvf-now span{font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #mvf .icon .chev{transform:rotate(-90deg);transition:transform .2s}
+  #mvf.fold .mvf-screen{display:none}
+  #mvf.fold .icon .chev{transform:rotate(90deg)}
+  #mvf ~ #msgs{flex:1;min-height:0}
+  #mvf .vfnow,#mvf .deskempty .row{display:none}
+}
+@media (max-width:760px){#mvf ~ #msgs .curcard .ctl .btn.primary{display:none}}

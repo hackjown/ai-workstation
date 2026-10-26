@@ -83,7 +83,7 @@ const TOOL_CN = { screenshot: "截图", click: "点击", double_click: "双击",
   keypress: "按键", scroll: "滚动", open_app: "打开应用", close_app: "关闭应用", shell: "执行命令", browser_open: "打开浏览器",
   browser_navigate: "打开网址", browser_back: "后退", browser_forward: "前进", files_list: "列文件", files_read: "读文件", files_write: "写文件",
   files_download: "下载", send_file: "发送文件", done: "完成", fail: "放弃", update_plan: "更新计划", ask_user: "提问", remember: "记住",
-  delegate: "交给助手" };
+  delegate: "交给助手", dispatch: "分派到多台电脑" };
 const STATUS_CN = { queued: ["排队中", "warn"], running: ["进行中", "live"], paused: ["已暂停", "warn"], takeover: ["你在操作", "warn"],
   waiting_confirm: ["等你确认", "warn"], waiting_input: ["等你回答", "warn"], succeeded: ["完成", "ok"], failed: ["失败", "bad"],
   stopped: ["已停止", "bad"], interrupted: ["被中断", "bad"], cancelled: ["已取消", ""], pending: ["等待", ""] };
@@ -211,10 +211,11 @@ function renderChat(scroll) {
       <div class="sugs">${SUGS.map((s) => `<button onclick="usePrompt(this.textContent)">${esc(s)}</button>`).join("")}</div></div>`;
     renderQueue(); setComposerBusy(null); return;
   }
+  const from = S.thread.parent_thread_id ? `<button class="fromp" onclick="openThread('${S.thread.parent_thread_id}')"><span>↖ 来自主任务</span><b>${esc(S.thread.parent_title || "")}</b></button>` : "";
   const head = `<div class="row gap" style="justify-content:flex-end"><button class="btn sm" onclick="renameThread()">重命名</button>
     <button class="btn sm" onclick="archiveThread(${S.thread.archived ? "false" : "true"})">${S.thread.archived ? "取消归档" : "归档"}</button>
     <button class="btn sm" style="color:var(--bad)" onclick="deleteThread()">删除</button></div>`;
-  box.innerHTML = head + S.thread.tasks.filter((t) => t.status !== "cancelled").map(renderTask).join("");
+  box.innerHTML = head + from + S.thread.tasks.filter((t) => t.status !== "cancelled").map(renderTask).join("");
   paintIcons(box);
   renderQueue();
   const live = S.thread.tasks.find((t) => LIVE.includes(t.status) || t.live);
@@ -224,7 +225,7 @@ function renderChat(scroll) {
 }
 function renderTask(t) {
   const evs = S.evs[t.id] || [];
-  const user = `<div class="u"><div><div class="bubble">${esc(t.prompt)}</div><div class="meta">${when(t.created_at)}${t.source && t.source !== "chat" ? " · " + ({ routine: "例程", retry: "重试", resume: "自动恢复" }[t.source] || t.source) : ""}</div></div></div>`;
+  const user = `<div class="u"><div><div class="bubble">${esc(t.prompt)}</div><div class="meta">${when(t.created_at)}${t.source && t.source !== "chat" ? " · " + ({ routine: "例程", retry: "重试", resume: "自动恢复", dispatch: "主任务分派" }[t.source] || t.source) : ""}</div></div></div>`;
   if (t.status === "sending") return user + `<div class="a"><div class="small" style="margin-left:8px">正在发送…</div></div>`;
   if (t.status === "queued") return user + `<div class="a"><div class="small" style="margin-left:8px">排队中，前面的任务完成后自动开始</div></div>`;
   let plan = t.plan && t.plan.steps && t.plan.steps.length ? t.plan : null;
@@ -262,6 +263,7 @@ function renderTask(t) {
     const done = new Set(plan.done || []); const firstOpen = plan.steps.findIndex((_, i) => !done.has(i));
     html += `<div class="plan">${plan.steps.map((s, i) => `<div class="st ${done.has(i) ? "done" : i === firstOpen && liveNow ? "cur" : ""}"><span class="ck">${done.has(i) ? icon("check") : ""}</span><span class="tx">${esc(s)}</span></div>`).join("")}</div>`;
   }
+  html += renderKids(t, evs);
   if (steps.length) {
     html += `<details class="steps" ${liveNow ? "open" : ""}><summary>${icon("chev", "chev")}${steps.length} 个操作</summary><div class="steplist">${steps.slice(-40).map((s) =>
       `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${s.ms ? `<em class="ms">${(s.ms / 1000).toFixed(1)}s${s.tok ? ` · ${s.tok} tok` : ""}${s.tries > 1 ? ` · 重试${s.tries - 1}` : ""}</em>` : ""}</span></div>`
@@ -308,9 +310,21 @@ function renderTask(t) {
   html += `</div></div></div>`;
   return user + html;
 }
+// pieces this task dispatched to other computers: machine, live status, a way into each child's own chat
+function renderKids(t, evs) {
+  let kids = null;
+  for (const e of evs) if (e.type === "agent.dispatch" && (e.data || {}).children) kids = e.data.children;
+  const known = {}; for (const c of t.children || []) known[c.task_id] = c;
+  kids = (kids || t.children || []).map((c) => ({ ...known[c.task_id], ...c, thread_id: c.thread_id || (known[c.task_id] || {}).thread_id }));
+  if (!kids.length) return "";
+  const done = kids.filter((c) => ["succeeded", "failed", "stopped", "cancelled", "interrupted"].includes(c.status)).length;
+  return `<div class="kids"><div class="kh">${icon("monitor")}分派到 ${new Set(kids.map((c) => c.machine)).size} 台电脑 · ${done}/${kids.length} 完成</div>${kids.map((c) =>
+    `<button class="kid" ${c.thread_id ? `onclick="openThread('${c.thread_id}')"` : "disabled"}><span class="km">${esc(c.machine_name || c.machine)}</span><span class="kg">${esc(c.goal || "")}</span>${chip(c.status)}<span class="kgo">${icon("chev")}</span></button>`).join("")}</div>`;
+}
 function stepText(s) {
   if (s.tool === "message" || s.tool === "vision") return s.thought || "";
   const a = s.args || {};
+  if (s.tool === "dispatch" && Array.isArray(a.tasks)) return a.tasks.map((x) => `${x.machine || "auto"}: ${x.goal || ""}`).join(" ｜ ").slice(0, 200);
   let t = a.command || a.url || a.text || a.key || a.name || a.path || a.goal || a.question || (a.x != null ? `(${a.x}, ${a.y})` : "");
   if (!t && s.args) t = JSON.stringify(s.args);
   if (s.ok === false && s.err) t += " — " + s.err;

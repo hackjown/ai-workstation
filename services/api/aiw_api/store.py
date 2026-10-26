@@ -47,9 +47,15 @@ class Store:
             self.db.executescript(SCHEMA)
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
             for col, typ in (("thread_id", "TEXT"), ("source", "TEXT"), ("plan", "TEXT"), ("session_id", "TEXT"),
-                             ("max_steps", "INTEGER"), ("timeout_s", "REAL")):
+                             ("max_steps", "INTEGER"), ("timeout_s", "REAL"), ("parent_id", "TEXT")):
                 if col not in cols:
                     self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typ}")
+            # a child thread holds one piece of a request the agent split across computers (dispatch)
+            tcols = {r[1] for r in self.db.execute("PRAGMA table_info(threads)")}
+            for col in ("parent_task_id", "parent_thread_id"):
+                if col not in tcols:
+                    self.db.execute(f"ALTER TABLE threads ADD COLUMN {col} TEXT")
+            self.db.execute("CREATE INDEX IF NOT EXISTS ix_tasks_parent ON tasks(parent_id)")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_tasks_thread ON tasks(thread_id, created_at)")
             self.db.commit()
 
@@ -81,9 +87,10 @@ class Store:
     def create_task(self, t: dict):
         now = time.time()
         self._x("""INSERT INTO tasks (id, user_id, prompt, machine_id, status, result, created_at, updated_at,
-                   thread_id, source, max_steps, timeout_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   thread_id, source, max_steps, timeout_s, parent_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (t["id"], t.get("user_id"), t["prompt"], t["machine_id"], t["status"], None, now, now,
-                 t.get("thread_id"), t.get("source", "chat"), t.get("max_steps", 40), t.get("timeout_s", 600)))
+                 t.get("thread_id"), t.get("source", "chat"), t.get("max_steps", 40), t.get("timeout_s", 600),
+                 t.get("parent_id")))
         if t.get("thread_id"):
             self.touch_thread(t["thread_id"])
 
@@ -103,15 +110,21 @@ class Store:
             r["plan"] = json.loads(r["plan"]) if r.get("plan") else None
         return rows
 
+    def children(self, task_id: str) -> list[dict]:
+        """Child tasks a parent task dispatched to other computers, oldest first."""
+        return self._x("SELECT * FROM tasks WHERE parent_id=? ORDER BY created_at", (task_id,))
+
     def recent_tasks(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
         if status:
             return self._x("SELECT * FROM tasks WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, limit))
         return self._x("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,))
 
     # ---------------------------------------------------------------- threads
-    def create_thread(self, title: str = "") -> dict:
+    def create_thread(self, title: str = "", parent_task_id: Optional[str] = None,
+                      parent_thread_id: Optional[str] = None) -> dict:
         tid, now = f"thr-{uuid.uuid4().hex[:10]}", time.time()
-        self._x("INSERT INTO threads VALUES (?,?,?,?,?)", (tid, title or "新对话", 0, now, now))
+        self._x("INSERT INTO threads (id, title, archived, created_at, updated_at, parent_task_id, parent_thread_id) "
+                "VALUES (?,?,?,?,?,?,?)", (tid, title or "新对话", 0, now, now, parent_task_id, parent_thread_id))
         return self.thread(tid)
 
     def thread(self, tid: str) -> Optional[dict]:
@@ -122,7 +135,8 @@ class Store:
         return self._x("""SELECT t.*, (SELECT prompt FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_prompt,
                           (SELECT status FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_status,
                           (SELECT COUNT(*) FROM tasks WHERE thread_id=t.id) AS task_count
-                          FROM threads t WHERE archived=? ORDER BY updated_at DESC LIMIT ?""", (1 if archived else 0, limit))
+                          FROM threads t WHERE archived=? AND t.parent_task_id IS NULL
+                          ORDER BY updated_at DESC LIMIT ?""", (1 if archived else 0, limit))
 
     def update_thread(self, tid: str, title: Optional[str] = None, archived: Optional[bool] = None):
         if title is not None:

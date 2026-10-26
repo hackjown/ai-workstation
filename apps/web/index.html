@@ -7,11 +7,13 @@
 <meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="default" />
 <meta name="apple-mobile-web-app-title" content="AIW" />
-<meta name="theme-color" content="#FCFCFC" />
+<meta name="theme-color" content="#0a0a0a" />
+<script>(function(){var m=localStorage.getItem("aiw_theme")||"system";var t=m==="system"?(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"):m;document.documentElement.dataset.theme=t;})();</script>
 <link rel="manifest" href="manifest.json" />
 <link rel="apple-touch-icon" href="icon-180.png" />
 <title>AI Workstation</title>
 <link rel="stylesheet" href="app.css" />
+<link rel="stylesheet" href="ui.css" />
 </head>
 <body>
 <div id="app">
@@ -165,5 +167,6 @@
 <div id="modal" class="sheet"></div>
 <div id="toast"></div>
 <script src="app.js"></script>
+<script src="ui.js"></script>
 </body>
 </html>

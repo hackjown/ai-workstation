@@ -321,13 +321,19 @@ class SessionManager:
                 live.confirm = live.confirm_info = None
                 self.store.update_task(task.id, TaskStatus.RUNNING.value)
 
-        async def ask(question: str, options: list) -> Optional[str]:
+        async def ask(question: str, options: list, extra: Optional[dict] = None) -> Optional[str]:
             live.question = asyncio.get_running_loop().create_future()
             live.question_info = {"question": question, "options": options}
+            if extra:  # a form card to fill, or a takeover request
+                live.question_info["form"] = extra
             self.store.update_task(task.id, TaskStatus.WAITING_INPUT.value)
-            await self._notify("input", "Agent 在问你", question, task)
+            kind = (extra or {}).get("kind")
+            await self._notify("input", "需要你填写资料" if kind == "form" else "需要你接管桌面" if kind == "takeover"
+                               else "Agent 在问你", question, task)
             try:
-                return await asyncio.wait_for(live.question, float(self.settings.ask_timeout_s))
+                # filling a form or passing a captcha takes longer than answering a question
+                wait = float(self.settings.ask_timeout_s) * (3 if extra else 1)
+                return await asyncio.wait_for(live.question, wait)
             except asyncio.TimeoutError:
                 return None
             finally:

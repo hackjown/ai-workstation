@@ -42,6 +42,7 @@ class Router:
             A.CURSOR: self._cursor,
             A.SCREEN_SIZE: self._size,
             A.SHELL_EXEC: lambda p: executor.run(p["command"], p.get("cwd"), p.get("timeout", 60)),
+            A.SHELL_KILL: lambda p: executor.kill_all(),
             A.BROWSER_OPEN: lambda p: self.browser.open(p.get("url")),
             A.BROWSER_NAVIGATE: lambda p: self.browser.navigate(p["url"]),
             A.BROWSER_BACK: lambda p: self.browser.back(),

@@ -95,7 +95,14 @@ CATALOG: list[dict] = [
               "(--quality for jpg/webp; never overwrite the original; .psd/.pcraft keep layers). Many images: "
               "`photocraft-cli batch --help`. Look at the result (read the image) before sending, then send_file it. "
               "Use the GUI (`photocraft`, on the desktop display) only when the user wants to watch or take over; it has no "
-              "GPU here so it is slow. Do not use image_edit (AI) for this skill unless the user asks for an AI change.")},
+              "GPU here so it is slow. Do not use image_edit (AI) for this skill unless the user asks for an AI change. "
+              "Recipe, raise a cabinet/counter by D px so it lines up with another (measure both top edges in pixels first "
+              "with python/PIL column profiles near the junction): one run with --cmd select.lasso {points: polygon around the "
+              "counter top plus everything standing on it, top edge on a plain band of wall, side edge along the junction} → "
+              "layer.new.layerViaCopy → layer.translate {dy:-D} → layer.selectBottom → select.rect {the door band just under "
+              "the counter} → layer.new.layerViaCopy → edit.transform {rect:[x0,y0,x1,y1], quad: same box with its top moved "
+              "up by D} → layer.flattenImage --out. Keep posters/objects in front outside both regions, then crop-compare "
+              "before/after at the junction and send both.")},
     {"id": "photopea", "title": "Photopea 修图", "icon": "image",
      "desc": "AI 改图后用 Photopea 精修文字、图层，导出 PSD / PNG",
      "path": "", "setup": "", "note": "Use the image_edit tool for the AI edit and the photopea tool for exact finishing."},

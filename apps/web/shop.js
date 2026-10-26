@@ -24,7 +24,7 @@ function shopCard() {
       <input name="address_note" placeholder="收货地址（可空 = 默认地址）" />
       <select name="interval_min"><option value="10">每 10 分钟</option><option value="15">每 15 分钟</option><option value="30" selected>每 30 分钟</option><option value="60">每小时</option><option value="120">每 2 小时</option><option value="360">每 6 小时</option></select>
       <select name="machine_id" id="shopMachine"></select>
-      <label class="small" style="display:flex;align-items:center;gap:6px"><input type="checkbox" name="auto_order" style="width:auto" />降价后自动下单（付款前要你确认）</label>
+      <label class="small" style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" name="auto_order" /><span>降价后自动下单（付款前要你确认）</span></label>
       <input name="name" placeholder="名称（可空）" />
       <button class="btn primary"><i data-i="plus"></i>添加价格监控</button>
     </form>

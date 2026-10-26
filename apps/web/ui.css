@@ -510,3 +510,27 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 .imgprev{display:block;margin:8px 0 4px;max-width:min(560px,100%);border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;background:var(--panel)}
 .imgprev img{display:block;width:100%;height:auto}
 @media (max-width:760px){.steplist .thinl{padding-left:0}}
+/* form / takeover action cards (sign-ups: the agent asks for each page step's data) */
+.actcard{display:flex;flex-direction:column;margin:10px 0;max-width:460px;border:1px solid var(--line2);border-radius:22px;overflow:hidden;background:var(--panel)}
+.actcard .ac-ic{display:flex;align-items:center;justify-content:center;height:96px;background:var(--line3)}
+.actcard .ac-ic svg{width:34px;height:34px;padding:14px;box-sizing:content-box;background:var(--panel);border-radius:16px}
+.actcard .ac-b{padding:14px 16px 16px}
+.actcard .ac-k{color:#D9922B;font-size:13px;font-weight:600;margin-bottom:2px}
+.actcard b{display:block;font-size:16px}
+.actcard p{margin:4px 0 12px;color:var(--mute);font-size:13px}
+.actcard .ac-go{width:100%;justify-content:center;border-radius:999px;padding:11px}
+.actcard.tk .ac-k{color:var(--bad)}
+.actcard .opts{display:flex;gap:8px;flex-wrap:wrap}
+.ffsheet{display:flex;flex-direction:column;gap:14px}
+.ffsheet .ff-h{display:flex;align-items:center;gap:10px;position:sticky;top:-20px;background:var(--panel);padding:4px 0 8px;z-index:1}
+.ffsheet .ff-h b{flex:1;font-size:17px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ffsheet .ff-h .icon{width:40px;height:40px;border-radius:50%;background:var(--line3);display:inline-flex;align-items:center;justify-content:center}
+.ffsheet .ff-h .ff-ok{background:var(--acc);color:#fff}
+.ffsheet .ff-d{margin:0;color:var(--mute)}
+.ffsheet .ff{display:flex;flex-direction:column;gap:6px}
+.ffsheet .ff>span{color:var(--mute);font-size:13px}
+.ffsheet .ff small{color:var(--mute)}
+.ffsheet input,.ffsheet select,.ffsheet textarea{width:100%;box-sizing:border-box;border:1px solid var(--line);background:var(--canvas);border-radius:16px;padding:12px 14px;font:inherit;color:var(--text)}
+.ffsheet .ff-in{position:relative}
+.ffsheet .ff-eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:0;background:none;color:var(--mute);cursor:pointer}
+.ffsheet .ff-sub{justify-content:center;border-radius:999px;padding:12px}

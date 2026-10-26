@@ -32,7 +32,7 @@ const IC = {
   clip: "M21.4 11.1l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5",
   mic: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3",
   up: "M12 19V5M5 12l7-7 7 7", stop: "M7 7h10v10H7z", check: "M20 6 9 17l-5-5", x: "M18 6 6 18M6 6l12 12",
-  chev: "M9 18l6-6-6-6", file: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6",
+  chev: "M9 18l6-6-6-6", bulb: "M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z", file: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6",
   retry: "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5", play: "M6 4l14 8-14 8z", hand: "M18 11V6a2 2 0 0 0-4 0M14 10V4a2 2 0 0 0-4 0v2M10 10.5V6a2 2 0 0 0-4 0v8a8 8 0 0 0 16 0v-3a2 2 0 0 0-4 0",
   receipt: "M4 2v20l3-2 3 2 3-2 3 2 3-2 1 .7V2l-3 2-3-2-3 2-3-2-3 2zM8 8h8M8 12h8M8 16h5", trash: "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6",
   bolt: "M13 2 3 14h9l-1 8 10-12h-9z", brain: "M12 5a3 3 0 0 0-5.9.8A3 3 0 0 0 4 11a3 3 0 0 0 2 5.2A3 3 0 0 0 12 18zM12 5a3 3 0 0 1 5.9.8A3 3 0 0 1 20 11a3 3 0 0 1-2 5.2A3 3 0 0 1 12 18z",
@@ -48,7 +48,7 @@ function avatarSVG() {
 
 /* ---------------------------------------------------------------- state */
 const S = { view: "chat", threadId: localStorage.getItem("aiw_thread") || null, thread: null, threads: [], archived: false,
-  evs: {}, evSt: {}, sock: {}, profile: {}, notes: [], attach: [], take: false, agentFails: 0, actFilter: "all", tasks: [] };
+  evs: {}, evSt: {}, sock: {}, think: {}, profile: {}, notes: [], attach: [], take: false, agentFails: 0, actFilter: "all", tasks: [] };
 const TOOL_CN = { screenshot: "截图", click: "点击", double_click: "双击", right_click: "右键", move: "移动鼠标", drag: "拖动", type: "输入文字",
   keypress: "按键", scroll: "滚动", open_app: "打开应用", close_app: "关闭应用", shell: "执行命令", browser_open: "打开浏览器",
   browser_navigate: "打开网址", browser_back: "后退", browser_forward: "前进", files_list: "列文件", files_read: "读文件", files_write: "写文件",
@@ -122,7 +122,13 @@ function subscribe(t) {
   if (S.sock[t.session_id]) return;
   const ws = new WebSocket(wsUrl(`/ws/session/${t.session_id}`));
   S.sock[t.session_id] = ws; S.evs[t.id] = [];
-  ws.onmessage = (m) => { const e = JSON.parse(m.data); if (e.kind !== "event") return; (S.evs[t.id] = S.evs[t.id] || []).push(e); onLiveEvent(t, e); };
+  ws.onmessage = (m) => {
+    const e = JSON.parse(m.data); if (e.kind !== "event") return;
+    // reasoning streamed while the model thinks: kept aside (replaced each time), not appended to the event list
+    if (e.type === "agent.thinking" && (e.data || {}).live) { S.think[t.id] = e.data; onLiveEvent(t, e); return; }
+    if (e.type === "agent.thinking" || e.type === "agent.decision") delete S.think[t.id];
+    (S.evs[t.id] = S.evs[t.id] || []).push(e); onLiveEvent(t, e);
+  };
   ws.onclose = () => { delete S.sock[t.session_id]; };
 }
 let rerenderQ = null;
@@ -178,7 +184,7 @@ function renderTask(t) {
     if (e.type === "task.started") startTs = e.ts;
     if (e.type === "agent.plan") plan = { steps: d.plan || [], done: d.done || [] };
     if (e.type === "agent.plan_update" && plan) plan = { ...plan, done: d.done || [] };
-    if (e.type === "agent.decision") cur = { tool: d.tool, args: d.args, thought: d.thought, ok: null, ms: d.llm_ms, tok: d.out_tokens, tries: d.attempts };
+    if (e.type === "agent.decision") cur = { tool: d.tool, args: d.args, thought: d.thought, why: d.reasoning, ok: null, ms: d.llm_ms, tok: d.out_tokens, tries: d.attempts };
     if (e.type === "agent.action_result" && cur && cur.tool === d.tool) { cur.ok = d.success; cur.err = d.error; if (cur.tool !== "screenshot") steps.push(cur); cur = null; }
     if (e.type === "agent.subagent" && d.phase === "step") steps.push({ tool: d.tool, args: d.args, sub: true, ok: true });
     if (e.type === "agent.file") files.push(d);
@@ -199,13 +205,16 @@ function renderTask(t) {
     <div class="head">${liveNow && t.status === "running" ? '<span class="spin"></span>' : chip(t.status)}
       <div class="grow">${esc(status || (dur != null ? `用时 ${dur}s · ${steps.length} 步` : ""))}</div>
       ${liveNow ? `<button class="btn sm" onclick="ctl('${t.session_id}','${t.status === "paused" || t.status === "takeover" ? "resume" : "pause"}')">${t.status === "paused" || t.status === "takeover" ? "继续" : "暂停"}</button>` : ""}</div>`;
+  const th = liveNow && last && last.type === "agent.thinking" ? S.think[t.id] : null;
+  if (th && th.text) html += `<div class="thinklive"><div class="tl">${icon("bulb")}思考过程<em>${th.chars || th.text.length} 字</em></div><div class="tt"><div>${esc(th.text)}</div></div></div>`;
   if (plan) {
     const done = new Set(plan.done || []); const firstOpen = plan.steps.findIndex((_, i) => !done.has(i));
     html += `<div class="plan">${plan.steps.map((s, i) => `<div class="st ${done.has(i) ? "done" : i === firstOpen && liveNow ? "cur" : ""}"><span class="ck">${done.has(i) ? icon("check") : ""}</span><span class="tx">${esc(s)}</span></div>`).join("")}</div>`;
   }
   if (steps.length) {
     html += `<details class="steps" ${liveNow ? "open" : ""}><summary>${icon("chev", "chev")}${steps.length} 个操作</summary><div class="steplist">${steps.slice(-40).map((s) =>
-      `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${s.ms ? `<em class="ms">${(s.ms / 1000).toFixed(1)}s${s.tok ? ` · ${s.tok} tok` : ""}${s.tries > 1 ? ` · 重试${s.tries - 1}` : ""}</em>` : ""}</span></div>`).join("")}</div></details>`;
+      `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${s.ms ? `<em class="ms">${(s.ms / 1000).toFixed(1)}s${s.tok ? ` · ${s.tok} tok` : ""}${s.tries > 1 ? ` · 重试${s.tries - 1}` : ""}</em>` : ""}</span></div>`
+      + ((s.why || (s.thought && s.tool !== "message" && s.tool !== "vision")) ? `<details class="why"><summary>${icon("chev", "chev")}${s.why ? "思考过程" : "想法"}</summary>${s.thought && s.tool !== "message" && s.tool !== "vision" ? `<p class="th">${esc(s.thought)}</p>` : ""}${s.why ? `<pre>${esc(s.why)}</pre>` : ""}</details>` : "")).join("")}</div></details>`;
   }
   if (t.pending_question && liveNow) {
     const q = t.pending_question;

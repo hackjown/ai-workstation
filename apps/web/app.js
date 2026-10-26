@@ -41,7 +41,8 @@ const IC = {
 };
 const icon = (n, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24"><path d="${IC[n] || ""}"/></svg>`;
 function paintIcons(root = document) { root.querySelectorAll("i[data-i]").forEach((el) => { el.outerHTML = icon(el.dataset.i); }); }
-const AVATAR_BG = { sky: "#EDF7FD", sand: "#FAF0DF", lilac: "#F1ECF9" };
+// warm backgrounds that sit with the amber Aiw logo (old keys kept so saved profiles still map)
+const AVATAR_BG = { amber: "#C87618", cream: "#F3E6D0", peach: "#F6C99A", sky: "#C87618", sand: "#F3E6D0", lilac: "#F6C99A" };
 function avatarSVG() {
   return `<svg viewBox="0 0 48 48"><circle cx="24" cy="26" r="15" fill="#fff" stroke="#11191C" stroke-width="2"/><circle cx="18.5" cy="25" r="2.2" fill="#11191C"/><circle cx="29.5" cy="25" r="2.2" fill="#11191C"/><path d="M19 31.5c3 2.4 7 2.4 10 0" stroke="#11191C" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M24 11V6" stroke="#11191C" stroke-width="2" stroke-linecap="round"/><circle cx="24" cy="5" r="2.4" fill="#1473C8"/></svg>`;
 }
@@ -163,7 +164,7 @@ function renderChat(scroll) {
   const box = $("msgs");
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
   if (!S.thread || !S.thread.tasks.length) {
-    box.innerHTML = `<div class="welcome"><div class="avatar" style="background:${AVATAR_BG[S.profile.avatar] || AVATAR_BG.sky}">${avatarSVG()}</div>
+    box.innerHTML = `<div class="welcome"><div class="avatar" style="background:${AVATAR_BG[S.profile.avatar] || AVATAR_BG.amber}">${avatarSVG()}</div>
       <div class="title">${esc(S.profile.name ? "你好，" + S.profile.name : "想让我做什么？")}</div>
       <div class="muted">我在自己的 Linux 电脑上替你操作浏览器、终端和文件，做完把结果和文件交给你。</div>
       <div class="sugs">${SUGS.map((s) => `<button onclick="usePrompt(this.textContent)">${esc(s)}</button>`).join("")}</div></div>`;
@@ -288,6 +289,7 @@ function setComposerBusy(t) {
   b.setAttribute("aria-label", t ? "停止" : "发送");
   $("composerHint").textContent = t ? "Agent 正在工作 · 现在发送的消息会排队，按顺序执行" : "";
   $("agentStatus").textContent = t ? (STATUS_CN[t.status] || [t.status])[0] : "空闲";
+  $("agentDot").className = "sdot" + (t ? " on" : "");
 }
 function autoGrow(el) { el.style.height = "auto"; el.style.height = Math.min(el.scrollHeight, 180) + "px"; }
 function promptKey(e) { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && window.innerWidth > 760) { e.preventDefault(); submitPrompt(e); } }
@@ -691,7 +693,7 @@ async function loadSettings() {
   const [prof, mems, models, notify, integ, secs, vmnet] = await Promise.all([api("GET", "/api/profile"), api("GET", "/api/memories"), api("GET", "/api/settings/models"),
     api("GET", "/api/settings/notify"), api("GET", "/api/integrations"), api("GET", "/api/secrets"), api("GET", "/api/settings/vm").catch(() => ({}))]);
   S.profile = prof;
-  const av = (k) => `<button type="button" class="avatar" style="background:${AVATAR_BG[k]};${(prof.avatar || "sky") === k ? "outline:2px solid var(--blueDark)" : ""}" onclick="this.form.avatar.value='${k}';[...this.parentNode.children].forEach(b=>b.style.outline='');this.style.outline='2px solid var(--blueDark)'">${avatarSVG()}</button>`;
+  const av = (k) => `<button type="button" class="avatar" style="background:${AVATAR_BG[k]};${(prof.avatar || "amber") === k || ({sky:"amber",sand:"cream",lilac:"peach"})[prof.avatar] === k ? "outline:2px solid var(--blueDark)" : ""}" onclick="this.form.avatar.value='${k}';[...this.parentNode.children].forEach(b=>b.style.outline='');this.style.outline='2px solid var(--blueDark)'">${avatarSVG()}</button>`;
   $("settingsPage").innerHTML = `
   <div class="apps">
     <button style="background:var(--lavender)" onclick="go('routines')">${icon("clock")}例程</button>
@@ -705,7 +707,7 @@ async function loadSettings() {
     <span class="muted">Agent 名字</span><input name="agent_name" value="${esc(prof.agent_name || "")}" placeholder="例如 小A" />
     <span class="muted">语气</span><input name="tone" value="${esc(prof.tone || "")}" placeholder="例如 简洁、用中文" />
     <span class="muted">关于你</span><textarea name="about" rows="2" placeholder="工作、常用网站、文件放哪…">${esc(prof.about || "")}</textarea>
-    <span class="muted">头像底色</span><div class="row gap">${av("sky")}${av("sand")}${av("lilac")}</div></div>
+    <span class="muted">头像底色</span><div class="row gap">${av("amber")}${av("cream")}${av("peach")}</div></div>
     <input type="hidden" name="avatar" value="${esc(prof.avatar || "sky")}" />
     <label class="toggle"><input type="checkbox" ${localStorage.getItem("aiw_tts") === "1" ? "checked" : ""} onchange="localStorage.setItem('aiw_tts', this.checked?'1':'')" /> 任务完成时朗读结果</label>
     <div><button class="btn primary">保存</button></div></form>
@@ -774,8 +776,8 @@ async function loadSettings() {
   fetchModels(false);
 }
 function applyProfile() {
-  $("agentName").textContent = S.profile.agent_name || "AI Workstation";
-  $("sideAvatar").innerHTML = avatarSVG(); $("sideAvatar").style.background = AVATAR_BG[S.profile.avatar] || AVATAR_BG.sky;
+  $("agentName").textContent = S.profile.agent_name || "Agent";
+  $("sideAvatar").innerHTML = avatarSVG(); $("sideAvatar").style.background = AVATAR_BG[S.profile.avatar] || AVATAR_BG.amber;
 }
 async function saveProfile(e) { e.preventDefault(); const f = e.target; S.profile = await api("PUT", "/api/profile", { name: f.name.value, agent_name: f.agent_name.value, tone: f.tone.value, about: f.about.value, avatar: f.avatar.value }); applyProfile(); toast("已保存"); }
 async function addMem(e) { e.preventDefault(); const v = e.target.t.value.trim(); if (!v) return; await api("POST", "/api/memories", { text: v }); loadSettings(); }

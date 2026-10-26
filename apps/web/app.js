@@ -15,6 +15,35 @@ async function api(m, p, b) {
   if (!r.ok) { let t = await r.text(); try { t = JSON.parse(t).detail || t; } catch (e) {} throw new Error(typeof t === "string" ? t : JSON.stringify(t)); }
   return r.json();
 }
+function gallery(list) {
+  const one = list.length === 1;
+  return `<div class="gallery${one ? " one" : ""}">${list.map((p, i) => `<figure onclick="lightbox(this)" data-i="${i}" data-src="${esc(p.src)}" data-dl="${esc(p.dl)}" data-name="${esc(p.name)}">
+    <img src="${esc(p.src)}" alt="${esc(p.name)}" loading="lazy" /><figcaption>${esc(p.name.split("/").pop().replace(/\.(png|jpe?g|webp|gif)$/i, ""))}</figcaption></figure>`).join("")}</div>`;
+}
+// a zip that holds screenshots: show the pictures inside it
+const zipSeen = {};
+function fillZipGalleries() {
+  document.querySelectorAll(".zipgal:not(.done)").forEach(async (el) => {
+    el.classList.add("done");
+    const p = el.dataset.art;
+    try {
+      const list = zipSeen[p] || (zipSeen[p] = await fetch(artUrl(p) + "&images=1").then((r) => (r.ok ? r.json() : [])));
+      if (list.length) el.outerHTML = gallery(list.map((m) => ({ src: artUrl(p) + "&member=" + encodeURIComponent(m.name), dl: artUrl(p, true) + "&member=" + encodeURIComponent(m.name), name: m.name })));
+    } catch (e) { /* the zip still downloads */ }
+  });
+}
+setInterval(fillZipGalleries, 800);
+function lightbox(fig) {
+  const figs = [...fig.parentNode.querySelectorAll("figure")]; let i = figs.indexOf(fig);
+  let lb = document.getElementById("lightbox");
+  if (!lb) { document.body.insertAdjacentHTML("beforeend", `<div id="lightbox" onclick="if(event.target===this||event.target.classList.contains('lb-x'))this.remove()"><button class="lb-x" aria-label="关闭">×</button><img /><div class="lb-bar"><span class="lb-n"></span><a class="lb-dl" download>下载</a></div><button class="lb-p" aria-label="上一张">‹</button><button class="lb-nx" aria-label="下一张">›</button></div>`); lb = document.getElementById("lightbox"); }
+  const show = () => { const f = figs[i]; lb.querySelector("img").src = f.dataset.src; lb.querySelector(".lb-n").textContent = `${f.dataset.name.split("/").pop()}${figs.length > 1 ? `  ${i + 1} / ${figs.length}` : ""}`; const a = lb.querySelector(".lb-dl"); a.href = f.dataset.dl; a.setAttribute("download", f.dataset.name.split("/").pop()); lb.classList.toggle("multi", figs.length > 1); };
+  lb.querySelector(".lb-p").onclick = (e) => { e.stopPropagation(); i = (i - 1 + figs.length) % figs.length; show(); };
+  lb.querySelector(".lb-nx").onclick = (e) => { e.stopPropagation(); i = (i + 1) % figs.length; show(); };
+  let x0 = null; lb.ontouchstart = (e) => { x0 = e.touches[0].clientX; };
+  lb.ontouchend = (e) => { if (x0 == null) return; const dx = e.changedTouches[0].clientX - x0; x0 = null; if (Math.abs(dx) > 50 && figs.length > 1) { i = (i + (dx < 0 ? 1 : -1) + figs.length) % figs.length; show(); } };
+  show();
+}
 const artUrl = (path, dl) => `/api/artifacts?${dl ? "download=1&" : ""}path=${encodeURIComponent(path)}${TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""}`;
 const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${p}${TOKEN ? (p.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(TOKEN) : ""}`;
 function toast(t) { const el = $("toast"); el.textContent = t; el.classList.add("on"); clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove("on"), 2600); }
@@ -249,9 +278,14 @@ function renderTask(t) {
       <div class="opts"><button class="btn sm primary" onclick="confirmAct('${t.session_id}',true)">允许</button><button class="btn sm" onclick="confirmAct('${t.session_id}',false)">拒绝</button></div></div>`;
   }
   const allFiles = files.length ? files : (t.files || []).map((f) => ({ name: f.path.split("/").pop(), artifact: f.path }));
+  // pictures show as pictures (a grid when there are several); everything else is a download card
+  const pics = allFiles.filter((f) => /\.(png|jpe?g|webp|gif)$/i.test(f.name));
+  if (pics.length) html += gallery(pics.map((f) => ({ src: artUrl(f.artifact), dl: artUrl(f.artifact, true), name: f.name })));
   for (const f of allFiles) {
-    if (/\.(png|jpe?g|webp|gif)$/i.test(f.name)) html += `<a class="imgprev" href="${artUrl(f.artifact)}" target="_blank" title="${esc(f.name)}"><img src="${artUrl(f.artifact)}" alt="${esc(f.name)}" loading="lazy" /></a>`;
+    if (pics.includes(f)) continue;
+    const zip = /\.zip$/i.test(f.name);
     html += `<a class="filecard" href="${artUrl(f.artifact, true)}" download="${esc(f.name)}"><span class="iconbox">${icon("file")}</span><span class="grow"><b>${esc(f.name)}</b><div class="small">${size(f.size)}${f.truncated ? " · 超过 40MB 已截断" : ""} · 点击下载</div></span></a>`;
+    if (zip) html += `<div class="zipgal" data-art="${esc(f.artifact)}"></div>`;
   }
   if (t.result && !liveNow) html += `<div class="bubble result" style="max-width:100%;background:${t.status === "succeeded" ? "var(--sky)" : "var(--dangerBg)"}">${esc(t.result)}</div>`;
   html += `<div class="foot">`;

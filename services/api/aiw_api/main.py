@@ -1118,10 +1118,29 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     # ------------------------------------------------------------- artifacts + web console
     @app.get("/api/artifacts", dependencies=[Depends(auth)])
-    async def artifact(path: str, download: bool = False):
+    async def artifact(path: str, download: bool = False, member: str = "", images: bool = False):
         real = os.path.realpath(path)
         if not real.startswith(os.path.realpath(settings.artifacts_dir) + os.sep) or not os.path.exists(real):
             raise HTTPException(404)
+        if (images or member) and real.lower().endswith(".zip"):
+            # a zip of screenshots is unreadable on a phone: list its pictures, and serve one so the chat can show it
+            import mimetypes
+            import zipfile
+            from fastapi.responses import Response
+            try:
+                with zipfile.ZipFile(real) as z:
+                    pics = [i for i in z.infolist() if not i.is_dir() and "__MACOSX" not in i.filename
+                            and re.search(r"\.(png|jpe?g|webp|gif)$", i.filename, re.I) and i.file_size <= 20 * 1024 * 1024][:24]
+                    if images:
+                        return [{"name": i.filename, "size": i.file_size} for i in pics]
+                    hit = next((i for i in pics if i.filename == member), None)
+                    if not hit:
+                        raise HTTPException(404)
+                    disp = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(os.path.basename(member))}"} if download else {}
+                    return Response(z.read(hit), media_type=mimetypes.guess_type(member)[0] or "image/png",
+                                    headers={"Cache-Control": "private, max-age=86400", **disp})
+            except zipfile.BadZipFile:
+                return [] if images else Response(status_code=404)
         return FileResponse(real, filename=os.path.basename(real) if download else None)
 
     @app.websocket("/ws/events")

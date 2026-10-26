@@ -111,6 +111,7 @@ loadSettings = async function () {
     api("GET", "/api/settings/notify"), api("GET", "/api/integrations"), api("GET", "/api/secrets"), api("GET", "/api/settings/vm").catch(() => ({})), api("GET", "/api/machines").catch(() => [])]);
   S.profile = prof;
   const dep = await api("GET", "/api/deploy/config").catch(() => ({ config: {} }));
+  const rhosts = await api("GET", "/api/remote-hosts").catch(() => []);
   const [skillList, upd, skJob] = await Promise.all([api("GET", "/api/skills").catch(() => []), api("GET", "/api/update").catch(() => null),
     api("GET", "/api/skills/install").catch(() => null)]);
   S.skillList = skillList; S.skillJob = skJob && Date.now() / 1000 - (skJob.finished || skJob.started || 0) < 1800 ? skJob : null;
@@ -182,6 +183,20 @@ loadSettings = async function () {
       ${row("部署目录", "每个程序一个子文件夹", `<input name="dir" value="${esc(dep.config.dir || "~/apps")}" />`)}
       ${row("用 sudo", "需要 root 权限安装时打开", "", `<input type="checkbox" name="sudo" ${dep.config.sudo ? "checked" : ""} aria-label="sudo" />`, "sw")}
       <div class="savebar"><span class="note" id="depNote">每次部署前都会弹卡片请你允许</span><button type="button" class="btn sm" onclick="depTest()">测试连接</button><button class="btn sm primary">保存</button></div>
+    </form>
+    <form class="rows" id="sRemote" onsubmit="rhAdd(event)">
+      <div class="rw head"><div class="k">运维主机 · 授权 Agent 远程执行命令</div><div>${rhosts.length ? `<span class="chip ok">${rhosts.length} 台已授权</span>` : '<span class="chip">未授权</span>'}</div></div>
+      ${rhosts.map((h) => `<div class="rw"><div class="k"><div class="mach"><span class="ic">${icon("monitor")}</span><div><b>${esc(h.name)}</b><span class="mono">${esc(h.user || "root")}@${esc(h.host)}:${esc(h.port || 22)}</span></div></div></div>
+        <div class="v"><div class="segsw"><label><input type="radio" name="m_${h.id}" ${h.mode !== "auto" ? "checked" : ""} onchange="rhMode('${h.id}','confirm')">每条都确认</label><label><input type="radio" name="m_${h.id}" ${h.mode === "auto" ? "checked" : ""} onchange="rhMode('${h.id}','auto')">只读免确认</label></div><span class="small" id="rhT_${h.id}">${h.has_password ? "密码已加密保存" : "未保存密码"}</span></div>
+        <div class="t"><button type="button" class="btn sm" onclick="rhTest('${h.id}')">测试</button><button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="rhDel('${h.id}')">移除</button></div></div>`).join("")}
+      <details class="more" ${rhosts.length ? "" : "open"}><summary>${icon("chev")}添加主机<span class="cnt">PVE、LXC、NAS、服务器</span></summary>
+        ${row("名称", "聊天里这样称呼它", `<input name="name" placeholder="如 PVE、LXC102" />`)}
+        ${row("地址", "", `<div class="inl"><input name="host" placeholder="192.168.50.200" required /><input name="port" value="22" style="flex:0 0 80px;min-width:0" aria-label="端口" /></div>`)}
+        ${row("用户名", "", `<input name="user" value="root" autocomplete="off" />`)}
+        ${row("密码", "加密保存在 AIW 服务端，模型和虚拟机都看不到", `<input name="password" type="password" autocomplete="new-password" placeholder="SSH 密码" />`)}
+        ${row("执行方式", "改动主机和危险命令（删除、关机、销毁虚拟机）始终要你允许", `<div class="segsw"><label><input type="radio" name="mode" value="confirm" checked>每条都确认</label><label><input type="radio" name="mode" value="auto">只读免确认</label></div>`)}
+        <div class="savebar"><span class="note" id="rhNote">Agent 用 remote_exec 工具在这些主机上执行，每次执行都记入收据</span><button class="btn sm primary">授权并测试</button></div>
+      </details>
     </form>
   </section>
 
@@ -684,3 +699,21 @@ setComposerBusy = function (t) {
   }
   mobileViewfinder();
 };
+
+/* ---------- 运维主机 */
+async function rhAdd(e) {
+  e.preventDefault(); const f = e.target.elements;
+  const body = { name: f.name.value, host: f.host.value, port: f.port.value, user: f.user.value, password: f.password.value, mode: f.mode.value };
+  $("rhNote").textContent = "保存中…";
+  try { const h = await api("POST", "/api/remote-hosts", body); $("rhNote").textContent = "已授权，连接测试中…";
+    try { const r = await api("POST", `/api/remote-hosts/${h.id}/test`); toast("连接成功：" + (r.output || "").split("\n")[0]); } catch (err) { toast(err.message); }
+    loadSettings(); }
+  catch (err) { $("rhNote").textContent = err.message; }
+}
+async function rhTest(id) {
+  const el = $("rhT_" + id); if (el) el.textContent = "连接中…";
+  try { const r = await api("POST", `/api/remote-hosts/${id}/test`); if (el) el.textContent = "连接成功 · " + (r.output || "").split("\n").slice(0, 3).join(" · "); }
+  catch (err) { if (el) el.textContent = err.message; }
+}
+async function rhMode(id, mode) { try { await api("PUT", `/api/remote-hosts/${id}`, { mode }); toast(mode === "auto" ? "只读命令不再询问" : "每条命令都会请你确认"); } catch (err) { toast(err.message); } }
+async function rhDel(id) { if (!confirm("移除这台主机的授权？保存的密码会一起删除。")) return; await api("DELETE", `/api/remote-hosts/${id}`); toast("已移除"); loadSettings(); }

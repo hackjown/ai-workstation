@@ -10,7 +10,7 @@ let toolCN: [String: String] = [
     "browser_open": "打开浏览器", "browser_navigate": "打开网址", "browser_back": "后退", "browser_forward": "前进", "files_list": "列文件",
     "files_read": "读文件", "files_write": "写文件", "files_download": "下载", "send_file": "发送文件", "done": "完成", "fail": "放弃",
     "update_plan": "更新计划", "ask_user": "提问", "remember": "记住", "delegate": "交给助手", "remote_exec": "远程执行",
-    "deploy_server": "部署", "message": "说明"]
+    "deploy_server": "部署", "dispatch": "分派到多台电脑", "message": "说明"]
 func toolName(_ t: String) -> String {
     if let n = toolCN[t] { return n }
     if t.hasPrefix("mcp_") { return "MCP · " + t.dropFirst(4) }
@@ -37,6 +37,7 @@ final class TaskLive: ObservableObject {
     @Published var files: [JSON] = []
     @Published var plan: [String] = []
     @Published var planDone: Set<Int> = []
+    @Published var children: [JSON] = []   // pieces dispatched to other computers (agent.dispatch / thread view)
     var sock: Socket?
     var loaded = false
 
@@ -81,10 +82,22 @@ final class TaskLive: ObservableObject {
         case "agent.resumed": status = "running"
         case "agent.takeover": status = "takeover"
         case "agent.file": files.append(d)
+        case "agent.dispatch": mergeChildren(d.a("children"))
         case "task.finished", "task.failed":
             status = d.s("status").isEmpty ? (type == "task.finished" ? "succeeded" : "failed") : d.s("status")
             result = d.s("result"); activity = ""; confirm = nil; question = nil; thinking = ""
         default: break
+        }
+    }
+    /// Live status from the parent's stream, the thread id from the thread view: keep both.
+    func mergeChildren(_ list: [JSON]) {
+        guard !list.isEmpty else { return }
+        var known: [String: JSON] = [:]
+        for c in children { known[c.s("task_id")] = c }
+        children = list.map { c in
+            var m = known[c.s("task_id")] ?? [:]
+            for (k, v) in c where !(v is NSNull) { m[k] = v }
+            return m
         }
     }
     func follow(_ sid: String) {
@@ -113,6 +126,8 @@ final class ChatModel: ObservableObject {
     @Published var title = "新对话"
     @Published var tasks: [JSON] = []
     @Published var err = ""
+    @Published var parentThread: String?   // a child thread: the conversation whose task dispatched it
+    @Published var parentTitle = ""
     var lives: [String: TaskLive] = [:]
     init(_ id: String?) { threadId = id }
 
@@ -130,6 +145,7 @@ final class ChatModel: ObservableObject {
         if let p = t["plan"] as? JSON, let done = p["done"] as? [Int] { l.planDone = Set(done) }
         if let c = t["pending_confirm"] as? JSON { l.confirm = c }
         if let q = t["pending_question"] as? JSON { l.question = q }
+        if !t.a("children").isEmpty { l.mergeChildren(t.a("children")) }
         if l.files.isEmpty { l.files = t.a("files").map { ["name": ($0.s("path") as NSString).lastPathComponent, "artifact": $0.s("path")] } }
         if isLive(t.s("status")) { l.follow(t.s("session_id")) }
     }
@@ -139,6 +155,9 @@ final class ChatModel: ObservableObject {
         do {
             let th = try await API.shared.obj("GET", "/api/threads/\(id)")
             title = th.s("title").isEmpty ? "对话" : th.s("title")
+            let pt = th.s("parent_thread_id")
+            parentThread = pt.isEmpty || pt == "<null>" ? nil : pt
+            parentTitle = th.s("parent_title")
             let ts = th.a("tasks")
             for t in ts { sync(t) }
             tasks = ts
@@ -163,6 +182,8 @@ struct ChatView: View {
     @EnvironmentObject var hub: Hub
     @StateObject private var m: ChatModel
     let onThread: (String) -> Void
+    let fromParent: Bool
+    @Environment(\.dismiss) private var dismiss
     @State private var text = ""
     @State private var attach: [JSON] = []
     @State private var photo: PhotosPickerItem?
@@ -176,8 +197,8 @@ struct ChatView: View {
     @State private var preview: Preview?
     @FocusState private var focused: Bool
 
-    init(threadId: String?, onThread: @escaping (String) -> Void = { _ in }) {
-        _m = StateObject(wrappedValue: ChatModel(threadId)); self.onThread = onThread
+    init(threadId: String?, fromParent: Bool = false, onThread: @escaping (String) -> Void = { _ in }) {
+        _m = StateObject(wrappedValue: ChatModel(threadId)); self.onThread = onThread; self.fromParent = fromParent
     }
     var liveSession: String? {
         guard let t = m.tasks.last(where: { isLive($0.s("status")) }), !t.s("session_id").isEmpty else { return nil }
@@ -188,6 +209,7 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
+                    if let p = m.parentThread { parentBanner(p) }
                     if m.tasks.isEmpty {
                         VStack(spacing: 10) {
                             Image(systemName: "face.smiling").font(.system(size: 36)).foregroundColor(amber)
@@ -225,6 +247,21 @@ struct ChatView: View {
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .onChange(of: m.threadId) { id in if let id = id { onThread(id) } }
         .sheet(item: $preview) { p in QuickLookView(url: p.url).ignoresSafeArea() }
+    }
+
+    /// A child thread (one dispatched piece) says where it came from and leads back to it.
+    @ViewBuilder func parentBanner(_ p: String) -> some View {
+        let label = HStack(spacing: 6) {
+            Image(systemName: "arrow.turn.left.up").foregroundColor(amber)
+            Text("来自主任务").font(.caption.bold()).foregroundColor(amber)
+            Text(m.parentTitle).font(.caption).lineLimit(1).foregroundColor(.primary)
+            Spacer(minLength: 0)
+        }.padding(.horizontal, 10).padding(.vertical, 8).background(amber.opacity(0.1)).clipShape(RoundedRectangle(cornerRadius: 10))
+        if fromParent {
+            Button { dismiss() } label: { label }.buttonStyle(.plain)
+        } else {
+            NavigationLink { ChatView(threadId: p) } label: { label }.buttonStyle(.plain)
+        }
     }
 
     var composer: some View {
@@ -408,6 +445,7 @@ struct TaskBlock: View {
                         }
                     }
                 }
+                if !live.children.isEmpty { childList }
                 if running && !live.activity.isEmpty {
                     HStack(spacing: 6) { ProgressView().controlSize(.mini); Text(live.activity).font(.caption).foregroundColor(.secondary) }
                 }
@@ -464,6 +502,34 @@ struct TaskBlock: View {
             }
             .padding(12).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 16))
         }
+    }
+
+    /// The pieces this task dispatched: machine, live status, tap to open that piece's own conversation.
+    var childList: some View {
+        let finals = ["succeeded", "failed", "stopped", "cancelled", "interrupted"]
+        let done = live.children.filter { finals.contains($0.s("status")) }.count
+        let machines = Set(live.children.map { $0.s("machine") }).count
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 5) {
+                Image(systemName: "desktopcomputer"); Text("分派到 \(machines) 台电脑 · \(done)/\(live.children.count) 完成")
+            }.font(.caption2.weight(.medium)).foregroundColor(.secondary).padding(.horizontal, 10).padding(.vertical, 7)
+            ForEach(live.children.indices, id: \.self) { i in
+                let c = live.children[i]
+                Divider()
+                NavigationLink { ChatView(threadId: c.s("thread_id"), fromParent: true) } label: {
+                    HStack(spacing: 8) {
+                        Text(c.s("machine_name").isEmpty ? c.s("machine") : c.s("machine_name"))
+                            .font(.caption.weight(.semibold)).foregroundColor(amber).lineLimit(1)
+                        Text(c.s("goal")).font(.caption).foregroundColor(.primary).lineLimit(1)
+                        Spacer(minLength: 4)
+                        if c.s("status") == "running" { ProgressView().controlSize(.mini) }
+                        Text(statusText[c.s("status")] ?? (c.s("status") == "cancelled" ? "已取消" : c.s("status")))
+                            .font(.caption2.bold()).foregroundColor(c.s("status") == "failed" ? .red : isLive(c.s("status")) ? amber : .secondary)
+                        Image(systemName: "chevron.right").font(.caption2).foregroundColor(.secondary)
+                    }.padding(.horizontal, 10).padding(.vertical, 8).contentShape(Rectangle())
+                }.buttonStyle(.plain).disabled(c.s("thread_id").isEmpty)
+            }
+        }.background(Color(.systemBackground)).clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     func confirmCard(_ c: JSON) -> some View {

@@ -765,9 +765,67 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             if not sid:
                 raise HTTPException(400, "each skill needs an id")
             out.append({"id": sid, "title": str(s_.get("title") or sid)[:60], "desc": str(s_.get("desc") or "")[:200],
-                        "path": str(s_.get("path") or "")[:300], "setup": str(s_.get("setup") or "")[:300]})
+                        "path": str(s_.get("path") or f"~/.claude/skills/{sid}")[:300], "setup": str(s_.get("setup") or "")[:300],
+                        "source": str(s_.get("source") or "")[:200], "machines": list(s_.get("machines") or [])[:20]})
         store.kv_set("skills_custom", out)
         return await get_skills()
+
+    async def _skill_shell(mid: str, cmd: str, timeout: float) -> dict:
+        import shlex
+        r = await sessions.computer(mid).shell("bash -c " + shlex.quote(cmd), timeout=timeout)
+        if not r.success and not r.result:
+            raise RuntimeError(r.error or "shell failed")
+        return r.result or {}
+
+    async def _skill_wake(mid: str):
+        if cloud.is_cloud(mid):
+            await cloud.wake(mid)
+
+    @app.post("/api/skills/install", dependencies=[Depends(auth)])
+    async def install_skill(body: dict):
+        """Install a skill package on every computer (npx skills add … into ~/.claude/skills)."""
+        from . import skillsync
+        try:
+            pkg = skillsync.parse_source(body.get("source", ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        job = store.kv_get("skills_install_job", None) or {}
+        if job and not job.get("done") and time.time() - job.get("started", 0) < 900:
+            raise HTTPException(409, "上一个技能还在安装")
+        ms = [m for m in store.machines() if not body.get("machines") or m["id"] in body["machines"]]
+        if not ms:
+            raise HTTPException(400, "还没有电脑")
+        asyncio.create_task(skillsync.install_all(pkg, ms, _skill_shell, _skill_wake, store.kv_get, store.kv_set))
+        await asyncio.sleep(0.05)
+        return store.kv_get("skills_install_job", None)
+
+    @app.get("/api/skills/install", dependencies=[Depends(auth)])
+    async def install_skill_status():
+        return store.kv_get("skills_install_job", None)
+
+    @app.get("/api/skills/check", dependencies=[Depends(auth)])
+    async def check_skills():
+        """Which custom skills each running computer has (paused cloud computers are not woken)."""
+        from . import skillsync
+        ids = [s["id"] for s in store.kv_get("skills_custom", []) or []]
+        out = {}
+
+        async def one(m):
+            mid = m["id"]
+            if cloud.is_cloud(mid):
+                try:
+                    if (await cloud.state(mid)).get("state") != "running":
+                        out[mid] = {"name": m.get("name") or mid, "offline": True}; return
+                except Exception:  # noqa: BLE001
+                    out[mid] = {"name": m.get("name") or mid, "offline": True}; return
+            try:
+                r = await asyncio.wait_for(_skill_shell(mid, skillsync.check_script(ids), 20), 25)
+                has = [l[8:].strip() for l in (r.get("stdout") or "").splitlines() if l.startswith("AIW_HAS ")]
+                out[mid] = {"name": m.get("name") or mid, "has": has}
+            except Exception as e:  # noqa: BLE001
+                out[mid] = {"name": m.get("name") or mid, "offline": True, "error": str(e)[:120]}
+        await asyncio.gather(*(one(m) for m in store.machines()))
+        return out
 
     # ------------------------------------------------------------- integrations (HTTP / OpenAPI / MCP)
     @app.get("/api/integrations", dependencies=[Depends(auth)])

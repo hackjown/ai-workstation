@@ -223,7 +223,9 @@ function renderTask(t) {
   if (steps.length) {
     html += `<details class="steps" ${liveNow ? "open" : ""}><summary>${icon("chev", "chev")}${steps.length} 个操作</summary><div class="steplist">${steps.slice(-40).map((s) =>
       `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${s.ms ? `<em class="ms">${(s.ms / 1000).toFixed(1)}s${s.tok ? ` · ${s.tok} tok` : ""}${s.tries > 1 ? ` · 重试${s.tries - 1}` : ""}</em>` : ""}</span></div>`
-      + ((s.why || (s.thought && s.tool !== "message" && s.tool !== "vision")) ? `<details class="why"><summary>${icon("chev", "chev")}${s.why ? "思考过程" : "想法"}</summary>${s.thought && s.tool !== "message" && s.tool !== "vision" ? `<p class="th">${esc(s.thought)}</p>` : ""}${s.why ? `<pre>${esc(s.why)}</pre>` : ""}</details>` : "")).join("")}</div></details>`;
+      // the step's thought shows inline; only the long reasoning stays folded
+      + (s.thought && s.tool !== "message" && s.tool !== "vision" ? `<p class="thinl">${esc(s.thought)}</p>` : "")
+      + (s.why ? `<details class="why"><summary>${icon("chev", "chev")}思考过程</summary><pre>${esc(s.why)}</pre></details>` : "")).join("")}</div></details>`;
   }
   if (t.pending_question && liveNow) {
     const q = t.pending_question;
@@ -238,6 +240,7 @@ function renderTask(t) {
   }
   const allFiles = files.length ? files : (t.files || []).map((f) => ({ name: f.path.split("/").pop(), artifact: f.path }));
   for (const f of allFiles) {
+    if (/\.(png|jpe?g|webp|gif)$/i.test(f.name)) html += `<a class="imgprev" href="${artUrl(f.artifact)}" target="_blank" title="${esc(f.name)}"><img src="${artUrl(f.artifact)}" alt="${esc(f.name)}" loading="lazy" /></a>`;
     html += `<a class="filecard" href="${artUrl(f.artifact, true)}" download="${esc(f.name)}"><span class="iconbox">${icon("file")}</span><span class="grow"><b>${esc(f.name)}</b><div class="small">${size(f.size)}${f.truncated ? " · 超过 40MB 已截断" : ""} · 点击下载</div></span></a>`;
   }
   if (t.result && !liveNow) html += `<div class="bubble result" style="max-width:100%;background:${t.status === "succeeded" ? "var(--sky)" : "var(--dangerBg)"}">${esc(t.result)}</div>`;

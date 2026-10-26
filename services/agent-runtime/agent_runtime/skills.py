@@ -81,6 +81,21 @@ CATALOG: list[dict] = [
      "desc": "按设计图和报价单画施工图，导出 DXF / PDF",
      "path": "", "setup": "bash ~/ai-workstation/deploy/vm/librecad-setup.sh",
      "note": "Use the built-in cad_draw / cad tools for the drawing; LibreCAD is only for viewing."},
+    {"id": "photocraft", "title": "PhotoCraft 修图", "icon": "image",
+     "desc": "不用 AI 的精确修图：裁剪、改尺寸、调色、曲线、锐化、模糊、文字、PSD，可批量",
+     "path": "", "auto": r"photocraft",
+     "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/photocraft-setup.sh "
+               "-o /tmp/pcs.sh && bash /tmp/pcs.sh"),
+     "note": ("PhotoCraft is a Photoshop-like editor with a headless CLI; every edit is a plain algorithm (no AI model, no "
+              "network). Check `photocraft-cli --version`; if missing, run the setup (needs sudo). Prefer the CLI over the GUI: "
+              "`photocraft-cli info in.png` (size, layers as JSON); find a command and its JSON params with "
+              "`photocraft-cli commands --json --filter <word>` (e.g. imageSize, crop, curves, levels, hueSaturation, "
+              "brightnessContrast, unsharpMask, gaussianBlur, canvasSize, rotate, type); then "
+              "`photocraft-cli run in.png --cmd <id> --params '<json>' [--cmd … --params …] --out out.png` "
+              "(--quality for jpg/webp; never overwrite the original; .psd/.pcraft keep layers). Many images: "
+              "`photocraft-cli batch --help`. Look at the result (read the image) before sending, then send_file it. "
+              "Use the GUI (`photocraft`, on the desktop display) only when the user wants to watch or take over; it has no "
+              "GPU here so it is slow. Do not use image_edit (AI) for this skill unless the user asks for an AI change.")},
     {"id": "photopea", "title": "Photopea 修图", "icon": "image",
      "desc": "AI 改图后用 Photopea 精修文字、图层，导出 PSD / PNG",
      "path": "", "setup": "", "note": "Use the image_edit tool for the AI edit and the photopea tool for exact finishing."},

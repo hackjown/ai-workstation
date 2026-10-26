@@ -567,3 +567,19 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 }
 @keyframes mvfPulse{0%,100%{opacity:1}50%{opacity:.35}}
 @media (prefers-reduced-motion:reduce){#mvf .mvf-dot{animation:none}}
+
+/* ---------- pictures the agent sends: shown, not zipped behind a download */
+.gallery{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:8px 0 6px;max-width:600px}
+.gallery.one{grid-template-columns:1fr;max-width:min(560px,100%)}
+.gallery figure{margin:0;border:1px solid var(--line2);border-radius:12px;overflow:hidden;background:var(--panel);cursor:zoom-in;box-shadow:0 1px 0 var(--line3)}
+.gallery figure img{display:block;width:100%;aspect-ratio:4/3;object-fit:cover;object-position:top;background:var(--panel2)}
+.gallery.one figure img{aspect-ratio:auto;max-height:520px;object-fit:contain}
+.gallery figcaption{font-size:12.5px;color:var(--dim);padding:6px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#lightbox{position:fixed;inset:0;z-index:999;background:rgba(8,8,8,.94);display:flex;align-items:center;justify-content:center;padding:calc(48px + var(--safe-t,0px)) 10px calc(64px + var(--safe-b,0px))}
+#lightbox img{max-width:100%;max-height:100%;object-fit:contain;border-radius:6px}
+#lightbox .lb-x{position:absolute;top:calc(8px + var(--safe-t,0px));right:10px;width:40px;height:40px;border:0;border-radius:50%;background:rgba(255,255,255,.12);color:#fff;font-size:26px;line-height:40px;padding:0}
+#lightbox .lb-bar{position:absolute;left:0;right:0;bottom:calc(14px + var(--safe-b,0px));display:flex;justify-content:center;align-items:center;gap:14px;color:#ddd;font-size:13px}
+#lightbox .lb-dl{color:#141414;background:var(--acc);border-radius:8px;padding:6px 14px;font-weight:600;text-decoration:none}
+#lightbox .lb-p,#lightbox .lb-nx{display:none;position:absolute;top:50%;transform:translateY(-50%);width:40px;height:56px;border:0;border-radius:10px;background:rgba(255,255,255,.1);color:#fff;font-size:30px;padding:0}
+#lightbox.multi .lb-p,#lightbox.multi .lb-nx{display:block}
+#lightbox .lb-p{left:6px} #lightbox .lb-nx{right:6px}

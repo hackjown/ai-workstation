@@ -538,6 +538,7 @@ struct TaskBlock: View {
         return VStack(alignment: .leading, spacing: 8) {
             Label("需要你确认", systemImage: "exclamationmark.shield.fill").font(.subheadline.bold()).foregroundColor(.orange)
             Text("\(c.s("reason"))：\(toolName(c.s("tool")))").font(.subheadline)
+            if c.s("tool") == "xhs_review" { XhsReviewList(payload: p) }
             if !detail.isEmpty { Text(detail).font(.system(.caption, design: .monospaced)).lineLimit(8).padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading).background(Color(.systemBackground)).clipShape(RoundedRectangle(cornerRadius: 8)) }
             HStack {

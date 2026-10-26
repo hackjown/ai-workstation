@@ -88,6 +88,11 @@ class Scheduler:
             await self.fire_routine(r, now)
         for w in self.store.all("watches", "enabled=1 AND (next_check IS NULL OR next_check<=?)", (now,), "created_at ASC"):
             await self.check_watch(w, now)
+        try:  # 小红书运营 sessions at random times inside the active window
+            from . import xhs
+            await xhs.tick(self, now)
+        except Exception as e:  # noqa: BLE001
+            log.warning("xhs tick failed: %s", e)
 
     async def fire_routine(self, r: dict, now: float | None = None) -> dict:
         now = now or time.time()

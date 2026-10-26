@@ -373,6 +373,13 @@ class SessionManager:
                 except Exception as e:  # noqa: BLE001
                     log.warning("integrations unavailable: %s", e)
                     extra = {}
+                try:  # the 开发 skill's way onto the user's deploy server (only when one is set up)
+                    from . import deployer
+                    if self.secrets and deployer.cfg(self.store).get("host"):
+                        sch, fn = deployer.tool(self.store, self.secrets, computer)
+                        extra["deploy_server"] = (sch, fn)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("deploy tool unavailable: %s", e)
                 hold = contextlib.nullcontext()
                 cloud = getattr(self, "cloud", None)
                 if cloud and cloud.is_cloud(task.machine_id) and not cleanup:

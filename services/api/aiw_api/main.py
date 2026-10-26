@@ -713,6 +713,24 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         return {"config": c, "has_password": bool(secrets.get(updater.SECRET)), "current": os.environ.get("AIW_VERSION", "dev"),
                 "github": await updater.github_latest(), "job": store.kv_get("update_job", None)}
 
+    @app.get("/api/deploy/config", dependencies=[Depends(auth)])
+    async def deploy_config():
+        from . import deployer
+        return {"config": deployer.cfg(store), "has_password": bool(secrets.get(deployer.SECRET))}
+
+    @app.put("/api/deploy/config", dependencies=[Depends(auth)])
+    async def deploy_save(body: dict):
+        from . import deployer
+        return deployer.save(store, secrets, body)
+
+    @app.post("/api/deploy/test", dependencies=[Depends(auth)])
+    async def deploy_test():
+        from . import deployer
+        try:
+            return await deployer.test(deployer.cfg(store), secrets.get(deployer.SECRET))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"连接失败：{type(e).__name__}: {str(e)[:200]}")
+
     @app.put("/api/update/config", dependencies=[Depends(auth)])
     async def update_config(body: dict):
         from . import updater

@@ -30,6 +30,7 @@ class ActionType(str, Enum):
     SCREEN_SIZE = "computer.screen_size"
     # shell.*
     SHELL_EXEC = "shell.exec"
+    SHELL_KILL = "shell.kill"
     # browser.*
     BROWSER_OPEN = "browser.open"
     BROWSER_NAVIGATE = "browser.navigate"
@@ -63,6 +64,7 @@ PAYLOAD_SCHEMA: dict[str, list[str]] = {
     ActionType.OPEN_APP.value: ["name"],
     ActionType.CLOSE_APP.value: ["name"],
     ActionType.SHELL_EXEC.value: ["command"],
+    ActionType.SHELL_KILL.value: [],
     ActionType.BROWSER_OPEN.value: [],
     ActionType.BROWSER_NAVIGATE.value: ["url"],
     ActionType.BROWSER_CLICK.value: ["text"],

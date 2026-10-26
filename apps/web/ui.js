@@ -110,8 +110,9 @@ loadSettings = async function () {
   const [prof, mems, models, notify, integ, secs, vmnet, machines] = await Promise.all([api("GET", "/api/profile"), api("GET", "/api/memories"), api("GET", "/api/settings/models"),
     api("GET", "/api/settings/notify"), api("GET", "/api/integrations"), api("GET", "/api/secrets"), api("GET", "/api/settings/vm").catch(() => ({})), api("GET", "/api/machines").catch(() => [])]);
   S.profile = prof;
-  const [skillList, upd] = await Promise.all([api("GET", "/api/skills").catch(() => []), api("GET", "/api/update").catch(() => null)]);
-  S.skillList = skillList;
+  const [skillList, upd, skJob] = await Promise.all([api("GET", "/api/skills").catch(() => []), api("GET", "/api/update").catch(() => null),
+    api("GET", "/api/skills/install").catch(() => null)]);
+  S.skillList = skillList; S.skillJob = skJob && Date.now() / 1000 - (skJob.finished || skJob.started || 0) < 1800 ? skJob : null;
   const localM = machines.find((m) => m.provider !== "instabox");
   let localUp = null;
   if (localM) { try { const m = await api("GET", `/api/machines/${localM.id}`); localUp = !!(m.agent && m.agent.ok); } catch (e) { localUp = false; } }
@@ -254,6 +255,8 @@ loadSettings = async function () {
   fetchModels(false);
   connFilter(S.connCat || "全部");
   updResume();
+  checkSkillMachines();
+  if (S.skillJob && !S.skillJob.done) pollSkillJob();
 };
 
 /* ======================================================= theme: 跟随系统 / 深色 / 浅色 */
@@ -337,25 +340,66 @@ function skillBadges(root) {
 const _renderChat2 = renderChat;
 renderChat = function (scroll) { _renderChat2(scroll); const b = $("msgs"); if (b) skillBadges(b); };
 
-/* settings › 技能: built-in list + your own */
+/* settings › 技能: built-in list + your own; 安装 runs `npx skills add` on every computer */
+const SK_ST = { waiting: "排队", waking: "唤醒中", installing: "安装中", ok: "已装好", failed: "失败" };
 function skillSection(list) {
-  const mine = (list || []).filter((s) => !s.builtin);
+  const job = S.skillJob;
   return `<section class="grp" id="g-skill">
     <div class="grp-h"><h2>${secNo("g-skill")}技能</h2><span class="chip ok">${(list || []).length} 个可用</span></div>
-    <div class="grp-d">在对话框点「+」选技能，Agent 会先读电脑上这个技能的 SKILL.md 再动手；没装的会先自动安装。</div>
+    <div class="grp-d">在对话框点「+」选技能，Agent 会先读电脑上这个技能的 SKILL.md 再动手。新技能填一行就会装到所有电脑的 ~/.claude/skills/。</div>
     <div class="rows">
-      ${(list || []).map((s) => `<div class="rw"><div class="k">${esc(s.title)}<small>${esc(s.id)}</small></div><div class="v"><span class="small">${esc(s.desc || "")}</span>${s.path ? `<span class="mono">${esc(s.path)}</span>` : ""}</div>
-        <div class="t">${s.builtin ? '<span class="tag">内置</span>' : `<button class="btn sm ghost" style="color:var(--bad)" onclick="delSkill('${esc(s.id)}')">删除</button>`}</div></div>`).join("")}
-      <form onsubmit="addSkill(event)">${row("添加技能", "装在电脑上的技能文件夹", `<div class="inl"><input name="id" placeholder="名字，如 pdf-tools" required style="flex:.6" /><input name="path" placeholder="~/.claude/skills/pdf-tools" /></div><input name="desc" placeholder="一句话说明它能做什么" />`, `<button class="btn sm primary">添加</button>`, "top")}</form>
+      <form onsubmit="installSkill(event)">${row("安装技能", "装到所有电脑", `<div class="inl"><input name="src" placeholder="npx skills add openfilm/openfilm，或 owner/repo、GitHub 链接" required ${job && !job.done ? "disabled" : ""} /></div>`,
+        `<button class="btn sm primary" ${job && !job.done ? "disabled" : ""}>${job && !job.done ? "安装中…" : "安装"}</button>`, "top")}</form>
+      <div id="skJob">${skillJobHtml(job)}</div>
+      ${(list || []).map((s) => `<div class="rw"><div class="k">${esc(s.title)}<small>${esc(s.id)}</small></div><div class="v"><span class="small">${esc(s.desc || "")}</span>${s.path ? `<span class="mono">${esc(s.path)}</span>` : ""}${s.builtin ? "" : `<span class="skm" data-sk="${esc(s.id)}"><span class="small">正在检查各电脑…</span></span>`}</div>
+        <div class="t">${s.builtin ? '<span class="tag">内置</span>' : `${s.source ? `<button class="btn sm ghost" onclick="syncSkill('${esc(s.source)}')" title="${esc(s.source)}">同步</button>` : ""}<button class="btn sm ghost" style="color:var(--bad)" onclick="delSkill('${esc(s.id)}')">删除</button>`}</div></div>`).join("")}
+      <details class="skmanual"><summary class="small">已经手动装好了？只登记文件夹</summary>
+      <form onsubmit="addSkill(event)">${row("登记技能", "默认 ~/.claude/skills/名字", `<div class="inl"><input name="id" placeholder="名字，如 pdf-tools" required style="flex:.6" /><input name="path" placeholder="留空 = ~/.claude/skills/名字" /></div><input name="desc" placeholder="一句话说明它能做什么（可选）" />`, `<button class="btn sm">登记</button>`, "top")}</form></details>
     </div></section>`;
+}
+function skillJobHtml(job) {
+  if (!job || !job.machines) return "";
+  const ms = Object.entries(job.machines);
+  return `<div class="skjob ${job.done ? "done" : ""}"><div class="small">${job.done ? "安装完成" : "正在安装"} · <span class="mono">${esc(job.source)}</span></div>
+    ${ms.map(([id, m]) => `<div class="skm-row"><b>${esc(m.name)}</b><span class="chip ${m.state === "ok" ? "ok" : m.state === "failed" ? "bad" : ""}">${SK_ST[m.state] || m.state}</span>
+      <span class="small">${m.state === "ok" ? esc((m.skills || []).join("、")) : esc(m.error || "")}</span>
+      ${m.log ? `<details><summary class="small">日志</summary><pre class="mono">${esc(m.log)}</pre></details>` : ""}</div>`).join("")}</div>`;
+}
+async function installSkill(e) {
+  e.preventDefault();
+  try { S.skillJob = await api("POST", "/api/skills/install", { source: e.target.elements.src.value.trim() }); loadSettings().then(() => { const g = $("g-skill"); g && g.scrollIntoView(); }); pollSkillJob(); }
+  catch (err) { toast("安装失败：" + err.message); }
+}
+async function syncSkill(src) {
+  try { S.skillJob = await api("POST", "/api/skills/install", { source: src }); toast("开始同步到所有电脑"); loadSettings(); pollSkillJob(); } catch (err) { toast(err.message); }
+}
+let skPoll = null;
+function pollSkillJob() {
+  clearTimeout(skPoll);
+  skPoll = setTimeout(async () => {
+    try { S.skillJob = await api("GET", "/api/skills/install"); } catch (e) { return; }
+    const box = $("skJob"); if (box) box.innerHTML = skillJobHtml(S.skillJob);
+    if (S.skillJob && !S.skillJob.done) pollSkillJob(); else if (S.view === "settings") loadSettings();
+  }, 2000);
+}
+async function checkSkillMachines() {
+  if (!document.querySelector(".skm[data-sk]")) return;
+  let r = {}; try { r = await api("GET", "/api/skills/check"); } catch (e) { return; }
+  document.querySelectorAll(".skm[data-sk]").forEach((el) => {
+    const id = el.dataset.sk;
+    el.innerHTML = Object.values(r).map((m) => m.offline ? `<span class="chip">${esc(m.name)} · 未开机</span>`
+      : (m.has || []).includes(id) ? `<span class="chip ok">${esc(m.name)} ✓</span>` : `<span class="chip bad">${esc(m.name)} 未装</span>`).join("") || "";
+  });
 }
 async function addSkill(e) {
   e.preventDefault(); const f = e.target.elements;
   const mine = (S.skillList || []).filter((s) => !s.builtin);
-  mine.push({ id: f.id.value.trim(), title: f.id.value.trim(), path: f.path.value.trim(), desc: f.desc.value.trim() });
-  try { S.skillList = await api("PUT", "/api/skills/custom", mine); toast("已添加技能"); loadSettings(); } catch (err) { toast("添加失败：" + err.message); }
+  const id = f.id.value.trim();
+  mine.push({ id, title: id, path: f.path.value.trim() || `~/.claude/skills/${id}`, desc: f.desc.value.trim() });
+  try { S.skillList = await api("PUT", "/api/skills/custom", mine); toast("已登记"); loadSettings(); } catch (err) { toast("登记失败：" + err.message); }
 }
 async function delSkill(id) {
+  if (!confirm("从列表删除 " + id + "？（电脑上的文件夹不会删）")) return;
   const mine = (S.skillList || []).filter((s) => !s.builtin && s.id !== id);
   S.skillList = await api("PUT", "/api/skills/custom", mine); loadSettings();
 }

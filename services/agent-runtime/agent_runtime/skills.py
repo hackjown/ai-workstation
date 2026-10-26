@@ -106,6 +106,27 @@ CATALOG: list[dict] = [
     {"id": "photopea", "title": "Photopea 修图", "icon": "image",
      "desc": "AI 改图后用 Photopea 精修文字、图层，导出 PSD / PNG",
      "path": "", "setup": "", "note": "Use the image_edit tool for the AI edit and the photopea tool for exact finishing."},
+    {"id": "xhs", "title": "小红书运营", "icon": "spark",
+     "desc": "在已登录的浏览器里点赞、回复我笔记下的评论、给兴趣相近的笔记写评论、发布笔记；发出前都要你确认",
+     "path": "", "setup": "",
+     "auto": r"小红书\s*(运营|养号|互动|点赞|涨粉)|xhs\s*运营",
+     "note": ("Work in the visible Chrome of THIS computer, which keeps the user's xiaohongshu.com login (the local VM on "
+              "the home network is preferred over the cloud box: a datacenter IP is more likely to be flagged). Always start "
+              "with xhs_status. Not logged in -> request_takeover asking the user to scan the QR code once with the 小红书 app. "
+              "Behave like a person, never like a script: wait a random 3-20 s between actions, open a post and scroll/read it "
+              "(images, text, a few comments) for 10-60 s before deciding anything, skip most posts, mix browsing, search "
+              "(browser_navigate to https://www.xiaohongshu.com/search_result?keyword=<one of the user's keywords>) and the "
+              "home feed, never act on many posts in a row, end the session when its time is up. Likes: only on posts you "
+              "actually read and that fit the persona; call xhs_like first, then click the heart once. Comments on other "
+              "people's posts and replies on the user's own posts (通知 › 评论和@ or the user's own notes): write each one fresh "
+              "from that post's real content and the persona/tone, short and specific, as the user would say it; never a "
+              "template, never the same sentence twice, no links, no ads, no 互关/私信/引流, no hashtags in comments. Save each "
+              "with xhs_draft (target_url, target_title, target_excerpt = what you read), then send the batch with xhs_review "
+              "and wait. Send only approved drafts: xhs_begin -> type the returned text exactly -> pause -> click 发送 -> "
+              "xhs_sent. Posts go through https://creator.xiaohongshu.com/publish/publish (upload the media files with the "
+              "file dialog, ctrl+L for the path, title <= 20 chars), only after approval, same xhs_begin/xhs_sent steps. "
+              "If ANY captcha, slider, verification, 操作频繁 or account warning appears: call xhs_warning at once, do not "
+              "touch it, and finish with done. Never solve a captcha. Respect the caps the tools report.")},
 ]
 
 

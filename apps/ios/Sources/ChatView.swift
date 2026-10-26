@@ -160,7 +160,7 @@ struct ChatView: View {
     @State private var attach: [JSON] = []
     @State private var photo: PhotosPickerItem?
     @State private var sending = false
-    @State private var preview: URL?
+    @State private var preview: Preview?
     @FocusState private var focused: Bool
 
     init(threadId: String?) { _m = StateObject(wrappedValue: ChatModel(threadId)) }
@@ -196,7 +196,7 @@ struct ChatView: View {
             if tid == m.threadId && (e.s("kind") == "task" || e.s("type").hasPrefix("task.")) { Task { await m.load() } }
         }
         .onChange(of: photo) { item in Task { await upload(item) } }
-        .sheet(item: $preview) { url in QuickLookView(url: url).ignoresSafeArea() }
+        .sheet(item: $preview) { p in QuickLookView(url: p.url).ignoresSafeArea() }
     }
 
     var composer: some View {
@@ -252,12 +252,12 @@ struct ChatView: View {
     }
 }
 
-extension URL: Identifiable { public var id: String { absoluteString } }
+struct Preview: Identifiable { let url: URL; var id: String { url.absoluteString } }
 
 struct TaskBlock: View {
     let t: JSON
     @ObservedObject var live: TaskLive
-    @Binding var preview: URL?
+    @Binding var preview: Preview?
     let reload: () async -> Void
     @State private var showSteps = false
     @State private var answer = ""
@@ -395,7 +395,7 @@ struct TaskBlock: View {
         let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: dest)
         try? FileManager.default.moveItem(at: tmp, to: dest)
-        preview = dest
+        preview = Preview(url: dest)
     }
 }
 
@@ -424,6 +424,6 @@ struct QuickLookView: UIViewControllerRepresentable {
         let url: URL
         init(_ u: URL) { url = u }
         func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
-        func previewItem(at index: Int, for controller: QLPreviewController) -> QLPreviewItem { url as NSURL }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem { url as NSURL }
     }
 }

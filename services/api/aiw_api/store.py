@@ -134,8 +134,19 @@ class Store:
         self._x("UPDATE threads SET updated_at=? WHERE id=?", (time.time(), tid))
 
     def delete_thread(self, tid: str):
+        """Delete a conversation and everything recorded for its tasks (events, actions, files list).
+        Files on the computers are left alone."""
+        tids = [r["id"] for r in self._x("SELECT id FROM tasks WHERE thread_id=?", (tid,))]
+        for t in tids:
+            sids = [r["id"] for r in self._x("SELECT id FROM sessions WHERE task_id=?", (t,))]
+            for sid in sids:
+                for tbl in ("agent_events", "machine_actions", "artifacts", "workspace_files"):
+                    self._x(f"DELETE FROM {tbl} WHERE session_id=?", (sid,))
+            self._x("DELETE FROM sessions WHERE task_id=?", (t,))
+            self._x("DELETE FROM notifications WHERE task_id=?", (t,))
+        self._x("DELETE FROM tasks WHERE thread_id=?", (tid,))
+        self._x("UPDATE routines SET thread_id=NULL WHERE thread_id=?", (tid,))
         self._x("DELETE FROM threads WHERE id=?", (tid,))
-        self._x("UPDATE tasks SET thread_id=NULL WHERE thread_id=?", (tid,))
 
     # ---------------------------------------------------------------- generic rows
     def insert(self, table: str, row: dict) -> dict:

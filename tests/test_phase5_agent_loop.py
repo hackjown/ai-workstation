@@ -272,3 +272,20 @@ _real_sleep = asyncio.sleep
 
 async def _fast_sleep(t, *a, **k):
     return await _real_sleep(min(t, 0.01), *a, **k)
+
+
+async def test_stop_cancels_a_slow_model_call(env):
+    """Stop lands while the model is still thinking (task-4e6 waited for a 60 s call to end)."""
+    backend, comp, tmp = env
+    control = AgentControl()
+    loop, llm = make_loop(comp, [("move", {"x": 5, "y": 5})] * 5, tmp, control=control)
+
+    async def slow_decide(req):
+        await asyncio.sleep(30)
+    llm.decide = slow_decide
+    run = asyncio.create_task(loop.run())
+    await asyncio.sleep(0.3)
+    t0 = asyncio.get_running_loop().time()
+    control.stop()
+    assert (await asyncio.wait_for(run, 5)).status == TaskStatus.STOPPED
+    assert asyncio.get_running_loop().time() - t0 < 2

@@ -114,6 +114,8 @@ _TRANSIENT = _re0.compile(r"timeout|timed out|connection|reset by peer|broken pi
 
 def _redact(p: dict) -> dict:
     out = dict(p)
+    if out.get("secret") and "text" in out:
+        out["text"] = "••••"
     if "content_b64" in out:
         out["content_b64"] = f"<{len(out['content_b64'])} b64 chars>"
     if "content" in out and isinstance(out["content"], str) and len(out["content"]) > 200:

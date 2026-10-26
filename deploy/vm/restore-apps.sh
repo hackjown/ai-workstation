@@ -36,6 +36,6 @@ say "LibreCAD"; command -v librecad >/dev/null || $SUDO apt-get install -y -q li
 say "WorkBuddy / CodeBuddy / REA / OfficeCLI"; bash "$V/devagents-setup.sh"
 say "视频工具（huashu-motion）"; bash "$V/motion-setup.sh" || echo "   视频工具没装全，之后可单独重跑 motion-setup.sh"
 icons
-say "重启 vm-agent（用上新代码）"; $SUDO systemctl restart vm-agent 2>/dev/null || echo "   vm-agent 不是 systemd 服务，跳过"
+say "重启 vm-agent（用上新代码）"; systemctl --user restart vm-agent 2>/dev/null || $SUDO systemctl restart vm-agent 2>/dev/null || echo "   没找到 vm-agent 服务，跳过"
 say "检查"; bash "$V/devagents-setup.sh" check
 echo; echo "完成。WorkBuddy 和 codebuddy 第一次打开需要你自己登录一次（快照恢复后登录状态也一起回退了）。"

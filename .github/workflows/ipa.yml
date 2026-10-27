@@ -2,7 +2,7 @@ name: ipa
 on:
   push:
     branches: [main]
-    paths: ["apps/ios/**", "apps/web/icon-512.png", "apps/web/mate.html", "apps/web/mate-map.js", "apps/web/vendor/moodmates/**", ".github/workflows/ipa.yml"]
+    paths: ["apps/ios/**", "apps/web/icon-512.png", "apps/web/mate.html", "apps/web/mate-map.js", "apps/web/vendor/emotionball/**", ".github/workflows/ipa.yml"]
     tags: ["v*"]
   workflow_dispatch:
 permissions:

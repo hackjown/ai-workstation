@@ -1,13 +1,14 @@
 import SwiftUI
 import WebKit
 
-// 云宝 expression assistant in the chat header. The character is the Mood Mates 云宝 (github.com/sam70361/aora-bot,
-// non-commercial licence, see apps/web/vendor/moodmates/LICENSE) running in a small transparent WKWebView that loads
+// 球球 expression assistant in the chat header. The character is the Emotion Ball 球球 in its 暗黑 look
+// (github.com/sam70361/aora-bot emotion-ball/; visuals for personal learning/research only, no commercial use, see
+// apps/web/vendor/emotionball/LICENSE + NOTICE.md) running in a small transparent WKWebView that loads
 // the bundled mate/mate.html (copied from apps/web by build-ipa.sh; the server's /mate.html is the fallback).
 // The mapping task event -> emotion id lives in mate-map.js, shared with the web app; Swift only forwards the raw
 // live events of the shown thread (MateBus) and the shown task's stored status. Off switch: 设置 › 表情助手.
 
-/// Forwards live session events of the thread on screen to the visible 云宝.
+/// Forwards live session events of the thread on screen to the visible 球球.
 final class MateBus {
     static let shared = MateBus()
     private weak var web: WKWebView?
@@ -31,7 +32,7 @@ final class MateBus {
             if self.ready { w.evaluateJavaScript(s, completionHandler: nil) } else { self.pending.append(s) }
         }
     }
-    /// A live event from a session socket (any thread): only the thread on screen moves the header 云宝.
+    /// A live event from a session socket (any thread): only the thread on screen moves the header 球球.
     func event(_ e: JSON) {
         let tid = e.s("thread_id")
         guard !tid.isEmpty, tid == thread else { return }
@@ -43,7 +44,7 @@ final class MateBus {
     }
 }
 
-/// The inline navigation title with the 云宝 beside it.
+/// The inline navigation title with the 球球 beside it.
 struct MateTitle: View {
     let title: String
     let status: String
@@ -51,7 +52,7 @@ struct MateTitle: View {
     @AppStorage("mate") private var on = true
     var body: some View {
         HStack(spacing: 6) {
-            if on { MateView(status: status, threadId: threadId).frame(width: 30, height: 30).accessibilityLabel("云宝") }
+            if on { MateView(status: status, threadId: threadId).frame(width: 30, height: 30).accessibilityLabel("球球") }
             Text(title).font(.headline).lineLimit(1)
         }
     }

@@ -48,6 +48,8 @@ SHELL_L4 = [
     (r"\b(shutdown|poweroff|halt|reboot)\b", "power control belongs to VM Runtime"),
     (r":\(\)\s*\{\s*:\|:&\s*\};:", "fork bomb"),
     (r"\b(iptables|nft|ufw)\b", "firewall change"),
+    # BrowserOS's DevTools (9110) and MCP (9210, /mcp) ports: the bos_* tools reach them through the element gates
+    (r"\b(9110|9210)\b|/mcp(?![\w.-])", "BrowserOS internals (use the bos_* tools)"),
 ]
 SHELL_L3 = [
     (r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b", "recursive force delete"),

@@ -12,6 +12,7 @@ REST (see README "API" for the full list)
   POST /api/sessions                   {task_id}
   GET  /api/sessions/{id}              session + events + artifacts
   GET  /api/machines | /api/machines/{id}
+  PUT  /api/machines/{id}/name          -> rename (display name shared by web + iOS; "" = default 云电脑 N)
   POST /api/machines/{id}/start|stop|restart|snapshot|restore
   GET  /api/machines/{id}/desktop      -> noVNC URL (proxied through this API)
   GET  /api/machines/{id}/screenshot   -> PNG
@@ -650,7 +651,13 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     # ------------------------------------------------------------- cloud computers (InstaBox)
     @app.get("/api/cloud", dependencies=[Depends(auth)])
     async def cloud_list():
-        return cloud.list()
+        names = {m["id"]: m for m in store.machines()}
+        out = []
+        for c in cloud.list():   # the display name (云电脑 N or the user's own) wins over the name typed when adding
+            m = names.get(c["id"]) or {}
+            out.append({**c, "raw_name": c.get("name"), "name": m.get("name") or c.get("name"),
+                        "default_name": m.get("default_name"), "custom_name": m.get("custom_name"), "order": m.get("order")})
+        return out
 
     @app.post("/api/cloud/instabox/machines", dependencies=[Depends(auth)])
     async def cloud_remote_machines(body: dict):
@@ -1012,6 +1019,22 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.get("/api/machines", dependencies=[Depends(auth)])
     async def machines():
         return store.machines()
+
+    @app.put("/api/machines/{mid}/name", dependencies=[Depends(auth)])
+    async def rename_machine(mid: str, body: dict):
+        """Rename a computer for web and iOS alike. An empty name goes back to the default (云电脑 N / configured name)."""
+        raw = (body or {}).get("name")
+        if raw is not None and not isinstance(raw, str):
+            raise HTTPException(400, "name must be a string")
+        name = " ".join((raw or "").split())
+        if len(name) > 32:
+            raise HTTPException(400, "名称最多 32 个字")
+        if any(ord(ch) < 32 for ch in (raw or "") if ch not in " \t\n"):
+            raise HTTPException(400, "名称里有不能用的字符")
+        m = store.rename_machine(mid, name)
+        if not m:
+            raise HTTPException(404, "no such computer")
+        return m
 
     @app.get("/api/machines/{mid}", dependencies=[Depends(auth)])
     async def machine(mid: str):

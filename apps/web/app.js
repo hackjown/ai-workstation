@@ -645,7 +645,8 @@ async function loadMachines() {
   let ms = [];
   try { ms = await api("GET", "/api/machines"); } catch (e) { return; }
   if (!ms.some((m) => m.id === MID) && ms.length) { MID = ms[0].id; localStorage.setItem("aiw_machine", MID); }
-  const opts = ms.map((m) => `<option value="${esc(m.id)}" ${m.id === MID ? "selected" : ""}>${esc(m.name || m.id)}${m.provider === "instabox" ? "（云）" : ""}</option>`).join("");
+  S.machines = ms;   // display names (云电脑 N or the user's own) for toasts and cards
+  const opts = ms.map((m) => `<option value="${esc(m.id)}" ${m.id === MID ? "selected" : ""}>${esc(m.name || m.id)}${m.provider === "instabox" && !/云/.test(m.name || "") ? "（云）" : ""}</option>`).join("");
   // one picker on the 电脑 page and one on the chat's desktop pane, always shown so it is easy to find
   for (const [id, anchor] of [["machineSel", "pcTitle"], ["machineSel2", "deskTitle"]]) {
     let sel = $(id); const a = $(anchor);
@@ -662,7 +663,7 @@ function pickMachine(id) {
   MID = id; localStorage.setItem("aiw_machine", id);
   deskLoaded = { small: null, big: null }; S.agentFails = 0;
   for (const sid of ["machineSel", "machineSel2"]) { const s = $(sid); if (s) s.value = id; }
-  loadDesktop(); refreshMachine(); toast("已切换到 " + id);
+  loadDesktop(); refreshMachine(); toast("已切换到 " + (((S.machines || []).find((m) => m.id === id) || {}).name || id));
 }
 
 /* ---------------------------------------------------------------- cloud computers */

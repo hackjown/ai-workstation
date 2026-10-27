@@ -34,6 +34,9 @@ final class TaskLive: ObservableObject {
     @Published var result = ""
     @Published var confirm: JSON? = nil
     @Published var question: JSON? = nil
+    @Published var approvals: [JSON] = []   // past confirmations / takeovers with the user's decision (Approval.swift)
+    var lastTakeover: JSON? = nil
+    var sessionId = ""
     @Published var files: [JSON] = []
     @Published var plan: [String] = []
     @Published var planDone: Set<Int> = []
@@ -74,10 +77,21 @@ final class TaskLive: ObservableObject {
             if confirm != nil { confirm = nil; if status == "waiting_confirm" { status = "running" } }
         case "agent.confirm_required":
             confirm = d; status = "waiting_confirm"
+        case "agent.confirm_answered":
+            approvals.append(d)
+            if confirm != nil { confirm = nil; if status == "waiting_confirm" { status = "running" } }
         case "agent.input_required":
             question = d; status = "waiting_input"
+            let f = d.o("form")
+            if f.s("kind") == "takeover" { lastTakeover = f }
         case "agent.input_answered":
             question = nil; if status == "waiting_input" { status = "running" }
+            if d.b("takeover"), let f = lastTakeover {
+                approvals.append(["kind": "takeover", "title": d.s("title").isEmpty ? f.s("title") : d.s("title"),
+                                  "cancelled": d.b("cancelled"), "timeout": d["answer"] == nil || d["answer"] is NSNull])
+                lastTakeover = nil
+            }
+            if !sessionId.isEmpty { TakeoverBus.shared.clear(sessionId) }
         case "agent.paused": status = "paused"
         case "agent.resumed": status = "running"
         case "agent.takeover": status = "takeover"
@@ -102,7 +116,7 @@ final class TaskLive: ObservableObject {
     }
     func follow(_ sid: String) {
         guard sock == nil, !sid.isEmpty, let u = API.shared.wsURL("/ws/session/\(sid)") else { return }
-        steps = []; files = []; loaded = true
+        steps = []; files = []; approvals = []; loaded = true; sessionId = sid
         let s = Socket(u)
         s.onMessage = { [weak self] m in if m.s("kind") == "event" { self?.apply(m); MateBus.shared.event(m) } }
         s.start(); sock = s
@@ -113,7 +127,7 @@ final class TaskLive: ObservableObject {
         guard let s = try? await API.shared.obj("GET", "/api/sessions/\(sid)") else { return }
         await MainActor.run {
             let keep = (status, result)
-            steps = []
+            steps = []; approvals = []
             for e in s.a("events") { apply(e) }
             status = keep.0; if !keep.1.isEmpty { result = keep.1 }
         }
@@ -577,8 +591,14 @@ struct TaskBlock: View {
                     }
                 }
 
-                if let c = live.confirm { confirmCard(c) }
-                if let q = live.question { questionCard(q) }
+                if let c = live.confirm, running {
+                    ApprovalCard(c: c) { ok, all in await decide(ok, scope: all ? "task" : nil) }
+                }
+                if let q = live.question {
+                    if q.o("form").s("kind") == "takeover" { TakeoverCard(form: q.o("form"), session: t.s("session_id")) }
+                    else { questionCard(q) }
+                }
+                if !live.approvals.isEmpty && (running || showSteps) { ApprovalLog(items: live.approvals) }
 
                 if !live.result.isEmpty && !running {
                     Text(.init(live.result)).textSelection(.enabled).font(.body)
@@ -633,21 +653,6 @@ struct TaskBlock: View {
         }.background(Color(.systemBackground)).clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
-    func confirmCard(_ c: JSON) -> some View {
-        let p = c.o("payload")
-        let detail = ["command", "url", "text", "host", "name", "path"].lazy.map { p.s($0) }.first { !$0.isEmpty } ?? ""
-        return VStack(alignment: .leading, spacing: 8) {
-            Label("需要你确认", systemImage: "exclamationmark.shield.fill").font(.subheadline.bold()).foregroundColor(.orange)
-            Text("\(c.s("reason"))：\(toolName(c.s("tool")))").font(.subheadline)
-            if c.s("tool") == "xhs_review" { XhsReviewList(payload: p) }
-            if !detail.isEmpty { Text(detail).font(.system(.caption, design: .monospaced)).lineLimit(8).padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading).background(Color(.systemBackground)).clipShape(RoundedRectangle(cornerRadius: 8)) }
-            HStack {
-                Button("拒绝") { Task { await decide(false) } }.buttonStyle(.bordered)
-                Button("允许") { Task { await decide(true) } }.buttonStyle(.borderedProminent)
-            }
-        }.padding(10).background(Color.orange.opacity(0.1)).clipShape(RoundedRectangle(cornerRadius: 12))
-    }
 
     func questionCard(_ q: JSON) -> some View {
         let opts = (q["options"] as? [String]) ?? []
@@ -681,8 +686,10 @@ struct TaskBlock: View {
         }
     }
 
-    func decide(_ ok: Bool) async {
-        _ = try? await API.shared.call("POST", "/api/agent/confirm", ["session_id": t.s("session_id"), "approve": ok])
+    func decide(_ ok: Bool, scope: String? = nil) async {
+        var body: JSON = ["session_id": t.s("session_id"), "approve": ok]
+        if let s = scope { body["scope"] = s }
+        _ = try? await API.shared.call("POST", "/api/agent/confirm", body)
         await MainActor.run { live.confirm = nil; live.status = "running" }
     }
     func reply(_ text: String) async {

@@ -186,8 +186,16 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("request_takeover", None, "Ask the user to do something on the desktop themselves and wait until they are "
              "done: a captcha/human check you could not pass after trying (Cloudflare 'verify you are human': click its "
              "checkbox yourself first, wait 5 s, screenshot; only after 2 failed tries), an SMS/2FA step on their "
-             "phone, a payment, or a login only they can do. Say exactly what to do in `reason`.",
-             {"reason": {"type": "string"}}, ["reason"]),
+             "phone, a payment, or a login only they can do. Fill the structured fields so the user sees a clear card: "
+             "`action` (what kind of step), `site` (the site/app in Chinese, e.g. 京东), `what_to_do` (one short Chinese "
+             "instruction for the user, e.g. 在登录页输入手机收到的短信验证码，然后点登录) and `reason` (a one-line Chinese "
+             "title of what you need, e.g. 在京东登录页输入短信验证码). Never ask for passwords or codes in chat.",
+             {"reason": {"type": "string", "description": "one-line Chinese title: 在京东登录页输入短信验证码"},
+              "action": {"type": "string", "enum": ["login", "sms_code", "captcha", "slider", "qr_scan", "payment", "2fa",
+                                                    "confirm", "other"]},
+              "site": {"type": "string", "description": "site or app name, e.g. 京东 / 小红书 / 微信"},
+              "what_to_do": {"type": "string", "description": "short Chinese instruction for the user, e.g. 拖动滑块完成验证后点“我已完成”"},
+              "url": {"type": "string", "description": "the page's url, if known"}}, ["reason"]),
     ToolSpec("remember", None, "Save a durable fact or preference about the user for future tasks "
              "(e.g. 'weekly report goes to ~/workspace/reports'). Only facts the user stated or confirmed.",
              {"text": {"type": "string"}}, ["text"]),

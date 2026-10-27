@@ -67,6 +67,12 @@ struct DesktopPane: View {
         .onReceive(NotificationCenter.default.publisher(for: .aiwMachinesChanged)) { _ in
             Task { machines = (try? await api.list("/api/machines")) ?? [] }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .aiwOpenTakeover)) { n in
+            // a takeover card's 打开桌面接管: go to the computer the agent is on, then the real desktop
+            let mid = (n.userInfo?["machine"] as? String) ?? ""
+            if !mid.isEmpty && mid != api.machine { pick(mid) }
+            Task { await takeover() }
+        }
         .onChange(of: liveSession) { s in if s != nil { withAnimation { open = true } } }
         .onReceive(timer) { _ in if open && phase == .active && !taking { Task { await grab() } } }
         .fullScreenCover(isPresented: $taking) {
@@ -101,6 +107,10 @@ struct DesktopPane: View {
     func handBack() async {
         taking = false
         if let s = liveSession { _ = try? await api.call("POST", "/api/agent/resume", ["session_id": s]) }
+        // the agent asked for this takeover: handing back also answers it (完成，交还给 Aiw)
+        if let p = TakeoverBus.shared.pending, !p.s("session_id").isEmpty, p.s("session_id") == liveSession {
+            await TakeoverBus.shared.answer(p.s("session_id"), cancel: false)
+        }
         await onChange()
     }
 }
@@ -112,13 +122,20 @@ struct TakeoverView: View {
     let done: () -> Void
     @State private var url: URL?
     @State private var err = ""
+    @ObservedObject private var bus = TakeoverBus.shared
+    var asked: JSON? { (bus.pending?.s("session_id") ?? "") == (liveSession ?? "-") ? bus.pending : nil }
     var body: some View {
         VStack(spacing: 0) {
             HStack {
                 Circle().fill(Color.red).frame(width: 8, height: 8)
-                Text(liveSession != nil ? "你在操作桌面，Agent 已暂停" : "你在操作桌面").font(.subheadline.weight(.semibold))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(liveSession != nil ? "你在操作桌面，Aiw 已暂停" : "你在操作桌面").font(.subheadline.weight(.semibold))
+                    if let a = asked {   // what the agent asked for, so the user knows what to do here
+                        Text(a.s("steps").isEmpty ? a.s("title") : a.s("steps")).font(.caption).foregroundColor(.secondary).lineLimit(2)
+                    }
+                }
                 Spacer()
-                Button(liveSession != nil ? "交还给 Agent" : "结束操作") { done() }.buttonStyle(.borderedProminent)
+                Button(asked != nil ? "完成，交还给 Aiw" : liveSession != nil ? "交还给 Aiw" : "结束操作") { done() }.buttonStyle(.borderedProminent)
             }.padding(.horizontal, 14).padding(.vertical, 10).background(.bar)
             ZStack {
                 Color.black

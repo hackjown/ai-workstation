@@ -23,6 +23,7 @@ struct RootView: View {
     @State private var fresh = UUID()
     @State private var sheet: HomeSheet?
     @State private var showSettings = false
+    @ObservedObject private var inbox = ImportCenter.shared
 
     var body: some View {
         NavigationStack {
@@ -37,7 +38,11 @@ struct RootView: View {
                     ToolbarItem(placement: .navigationBarTrailing) { homeMenu }
                 }
         }
+        .id(fresh)   // also pops a pushed child thread when the home is reset
         .sheet(isPresented: $showSettings) { SettingsView() }
+        // a file from another app (Open In / share sheet): go to the new-chat home, whose composer picks it up
+        .onChange(of: inbox.tick) { _ in toHomeForImport() }
+        .onAppear { toHomeForImport() }
         .sheet(item: $sheet) { s in
             sheetView(s)
                 .presentationDetents([.large])
@@ -72,6 +77,11 @@ struct RootView: View {
 
     func openThread(_ id: String) { current = id; fresh = UUID(); sheet = nil }
     func newChat() { current = nil; fresh = UUID() }
+    func toHomeForImport() {
+        guard inbox.hasPending else { return }
+        sheet = nil; showSettings = false
+        if current != nil { newChat() }
+    }
 }
 
 /// Sheet chrome: × at the top-left, a bold centred title, an optional action on the right.

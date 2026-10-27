@@ -70,7 +70,7 @@ CATALOG: list[dict] = [
               "screenshot to check before pressing continue/next; 4) on validation errors, ask_user again with only "
               "the fields to fix and the page's error text as hint. Human checks: Cloudflare 'verify you are human' / "
               "Turnstile checkbox: click the box yourself, wait 5 s, screenshot; after 2 failed tries, or for image "
-              "captchas, SMS/email codes on the user's phone, or a payment: request_takeover with exactly what to do "
+              "captchas, SMS/email codes on the user's phone, or a payment: request_takeover with action/site/what_to_do filled "
               "(an emailed or SMS code may instead be asked with ask_user fields, a single text field). Finish with "
               "done stating the account name and what is still pending (e.g. email verification); never repeat a "
               "password in the summary.")},

@@ -68,6 +68,8 @@ struct MateView: UIViewRepresentable {
     var bus = true
     var emotion: String? = nil
     var ring = "amber"
+    /// For a standalone picture (`bus: false`): keep it moving (an online computer, the card of a working task).
+    var animate = false
     @Environment(\.scenePhase) private var phase
     @Environment(\.accessibilityReduceMotion) private var still
 
@@ -87,13 +89,14 @@ struct MateView: UIViewRepresentable {
         w.isUserInteractionEnabled = false
         w.navigationDelegate = bus ? context.coordinator : nil
         if bus { MateBus.shared.attach(w, thread: threadId) }
-        var q = "?static=\(still || !bus ? 1 : 0)&ring=\(ring)"
+        let frozen = still || (!bus && !animate)
+        var q = "?static=\(frozen ? 1 : 0)&ring=\(ring)"
         if let e = emotion { q += "&e=\(e.filter { $0.isNumber })" }
         if !bus { q += "&lite=1" }
         if let u = Bundle.main.url(forResource: "mate", withExtension: "html", subdirectory: "mate"),
            let full = URL(string: u.absoluteString + q) {
             w.loadFileURL(full, allowingReadAccessTo: u.deletingLastPathComponent())
-        } else if let u = API.shared.url("/mate.html", query: [URLQueryItem(name: "static", value: still || !bus ? "1" : "0"),
+        } else if let u = API.shared.url("/mate.html", query: [URLQueryItem(name: "static", value: frozen ? "1" : "0"),
                                                               URLQueryItem(name: "ring", value: ring), URLQueryItem(name: "e", value: emotion ?? "02")]) {
             w.load(URLRequest(url: u))
         }

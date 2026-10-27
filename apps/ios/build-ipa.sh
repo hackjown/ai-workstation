@@ -10,6 +10,8 @@ rm -rf $OUT AIWorkstation.ipa && mkdir -p $APP
 xcrun --sdk iphoneos swiftc -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -module-name Aiw \
   Sources/*.swift -o $APP/AIW
 cp Info.plist $APP/
+# 云宝 page for the chat header (MateView.swift): same files the web app serves
+mkdir -p $APP/mate/vendor/moodmates && cp ../web/mate.html ../web/mate-map.js $APP/mate/ && cp ../web/vendor/moodmates/*.js ../web/vendor/moodmates/LICENSE $APP/mate/vendor/moodmates/
 python3 - "$APP" <<'PY'
 import sys; from PIL import Image
 app=sys.argv[1]; src=Image.open('../web/icon-512.png').convert('RGB')

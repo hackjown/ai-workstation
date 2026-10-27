@@ -60,6 +60,8 @@ python3 -m venv ~/.aiw-venv
 ~/.aiw-venv/bin/pip install fonttools
 bash "$REPO/deploy/vm/librecad-setup.sh" || true
 bash "$REPO/deploy/vm/toolbox-setup.sh" install || true   # office/PDF/OCR/image/audio-video/e-book/archive tools
+# optional: BrowserOS neo (element-level web tools for the agent; amd64 only). AIW_BROWSEROS=1 bash setup-vm.sh
+[ "${AIW_BROWSEROS:-0}" = 1 ] && { bash "$REPO/deploy/vm/browseros-setup.sh" install || true; }
 mkdir -p ~/workspace/downloads
 
 # VNC password file (x11vnc refuses unauthenticated clients)

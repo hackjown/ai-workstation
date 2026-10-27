@@ -74,7 +74,7 @@ func inlineMD(_ s: String, leadBold: Bool = false) -> AttributedString {
     var t = shortPaths(s)
     // "瘦脸：在脸部…" -> "**瘦脸**：在脸部…" for list items whose short lead-in names the point
     if leadBold, !t.hasPrefix("**"), let r = t.range(of: "：") ?? t.range(of: ": "),
-       t.distance(from: t.startIndex, to: r.lowerBound) in 1...10, !t[..<r.lowerBound].contains("`") {
+       (1...10).contains(t.distance(from: t.startIndex, to: r.lowerBound)), !t[..<r.lowerBound].contains("`") {
         t = "**" + String(t[..<r.lowerBound]) + "**" + String(t[r.lowerBound...])
     }
     let opt = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)

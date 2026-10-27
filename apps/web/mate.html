@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>云宝</title>
+<!-- 云宝 (Mood Mates, github.com/sam70361/aora-bot, non-commercial licence: vendor/moodmates/LICENSE).
+     Embedded by the iOS app (WKWebView, bundled copy) in the chat header. The app drives it with evaluateJavaScript:
+       aiwMate.event({type, data})  a task/session event (mapped by mate-map.js)
+       aiwMate.status("running")    a task's stored status
+       aiwMate.set("33", true)      an emotion id directly (+ burst)
+       aiwMate.active(false)        stop the animation loop (app in background)
+     ?static=1 renders single frames only (Reduce Motion). -->
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; -webkit-user-select: none; user-select: none; }
+  #m { position: absolute; inset: 0; }
+</style>
+</head>
+<body>
+<div id="m" role="img" aria-label="云宝"></div>
+<script src="vendor/moodmates/geometry.js"></script>
+<script src="vendor/moodmates/render.js"></script>
+<script src="vendor/moodmates/features.js"></script>
+<script src="vendor/moodmates/fx.js"></script>
+<script src="vendor/moodmates/emotions.js"></script>
+<script src="vendor/moodmates/engine.js"></script>
+<script src="vendor/moodmates/nimbo.js"></script>
+<script src="mate-map.js"></script>
+<script>
+(function () {
+  "use strict";
+  var q = new URLSearchParams(location.search);
+  var still = q.get("static") === "1" || (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
+  var M = AiwMood, ID = M.ID, cur = q.get("e") || ID.IDLE, settleT = 0, live = !still;
+  var eng = MoodMates.create(document.getElementById("m"), { character: "nimbo", emotion: cur, eyeScale: +(q.get("eye") || 1.7), lite: q.get("lite") === "1", autostart: live });
+  if (!live) eng.renderStatic();
+  function post(o) { try { window.webkit.messageHandlers.mate.postMessage(o); } catch (e) { /* not in the app */ } }
+  var HOLD = { "31": 1400, "39": 1400, "36": 700, "40": 700, "38": 900 }, holdUntil = 0, holdT = 0, queuedSettle = false;
+  function set(id, burst, settle) {
+    var now = Date.now();
+    if (holdUntil > now && id !== cur) {
+      if (queuedSettle && !settle) return;   // a queued 完成/出错 wins over a later status refresh
+      queuedSettle = !!settle; clearTimeout(holdT);
+      holdT = setTimeout(function () { queuedSettle = false; set(id, burst, settle); }, holdUntil - now); return;
+    }
+    queuedSettle = false; clearTimeout(holdT);
+    if (id !== cur) holdUntil = now + (HOLD[id] || 0);
+    clearTimeout(settleT); settleT = 0;
+    if (settle) settleT = setTimeout(function () { settleT = 0; set(ID.IDLE); }, settle);
+    if (id !== cur) { cur = id; eng.setEmotion(id); }
+    if (!live) eng.renderStatic(); else if (burst) eng.burst(24);
+    document.getElementById("m").setAttribute("aria-label", "云宝 · " + (M.NAMES[id] || id));
+    post({ mood: id });
+  }
+  window.aiwMate = {
+    set: function (id, burst) { set(String(id), !!burst); },
+    event: function (e) { if (typeof e === "string") e = JSON.parse(e); var r = M.fromEvent(e); if (r) set(r.id, r.burst, r.settle); },
+    // a finished task's stored status must not cut the 完成/出错 moment short: it settles to idle by itself
+    status: function (s) { if (!M.isLive(s) && settleT) return; set(M.fromStatus(s)); },
+    active: function (a) { live = !!a && !still; eng.setActive(live); if (!live) eng.renderStatic(); },
+    still: function (s) { still = !!s; this.active(!still); },
+    get: function () { return cur; }
+  };
+  document.addEventListener("visibilitychange", function () { window.aiwMate.active(!document.hidden); });
+  post({ ready: true, mood: cur });
+})();
+</script>
+</body>
+</html>

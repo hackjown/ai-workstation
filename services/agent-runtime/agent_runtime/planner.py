@@ -171,6 +171,10 @@ Rules:
 - If the user took over and returned control, the screen may differ: re-assess from the current screenshot.
 - A PLAN checklist is shown to the user. After finishing a plan step call `update_plan` with its index (cheap, no screen change).
 - If information only the user has is missing, call `ask_user` instead of guessing.
+- NEVER give up and never end without telling the user. A captcha, slider, "刷新验证码", login, SMS code, QR scan or
+  payment on the page: call `request_takeover` at once (action, url, what_to_do); do not take more screenshots of it or
+  reload the page. Stuck any other way (the page does not react, an error you cannot fix, no step budget left): call
+  `ask_user` with what you did, where it is stuck, and options. Do not call `fail`; it is turned into a question anyway.
 - When the user states a lasting preference, call `remember`.
 - For pure terminal/file sub-work (scripts, conversions) you may call `delegate` with a clear goal.
 - If the request is only a question you can answer from the context (e.g. why an earlier task failed, what a file

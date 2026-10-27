@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
+from . import browseros as bos
 from .policy import Decision, PolicyEngine, RiskLevel
 from .registry import BY_NAME
 
@@ -43,6 +44,10 @@ class ToolExecutor:
         self.confirm = confirm
         self.audit = audit
         self.scale = 1.0  # screen px / screenshot px, set by the loop when it downsizes
+        # BrowserOS: one MCP connection (= one tab group) per task; the session manager sets these
+        self.bos_key = "default"
+        self.bos_title: Optional[str] = None
+        self.bos_category: Optional[str] = None
 
     async def run(self, name: str, args: dict, intent: str = "") -> ToolOutcome:
         spec = BY_NAME.get(name)
@@ -58,6 +63,9 @@ class ToolExecutor:
             return ToolOutcome(name, spec.action, False, Decision(RiskLevel.L0, "schema"), error=f"missing args {missing}")
         if spec.action is None:
             return ToolOutcome(name, None, True, Decision(RiskLevel.L0, "control"), result=args, control=name)
+
+        if spec.action == "browseros.call":
+            return await self._bos(name, args, intent)
 
         payload = dict(args)
         if name == "send_file":
@@ -105,6 +113,54 @@ class ToolExecutor:
         await self._audit({"phase": "result", "tool": name, "action": spec.action, "success": r.success,
                            "error": r.error, "duration_ms": r.duration_ms})
         return ToolOutcome(name, spec.action, r.success, decision, r.result, r.error, r.screenshot)
+
+    async def _bos(self, name: str, args: dict, intent: str = "") -> ToolOutcome:
+        """A BrowserOS tool: policy judged on the classic call it amounts to (a 下单/支付 element click asks, a
+        private-network url asks), then one MCP call through the vm-agent. No screenshot: bos_act returns a diff."""
+        args = await bos.annotate(self, name, args)
+        tool, margs = bos.mcp_call(name, args)          # internal _labels/_label stripped here
+        if args.get("secret") and name == "bos_act":
+            margs["sensitive"] = True
+        decision = Decision(RiskLevel.L1 if name not in bos.READ_ONLY else RiskLevel.L0, "browseros")
+        for cname, cargs in bos.classic(name, args):
+            cs = BY_NAME.get(cname)
+            if cs and cs.action:
+                d = self.policy.check(cs.action, cargs)
+                if d.level > decision.level:
+                    decision = d
+        if PolicyEngine.payment_hint(intent) and decision.level < RiskLevel.L3 and name == "bos_act":
+            decision = Decision(RiskLevel.L3, "payment intent")
+        shown = {k: v for k, v in args.items() if not str(k).startswith("_") and k != "secret"}
+        if args.get("secret"):
+            shown = {k: ("••••" if k in ("value", "text") else v) for k, v in shown.items()}
+            if shown.get("fields"):
+                shown["fields"] = [{**f, "value": "••••"} for f in shown["fields"] if isinstance(f, dict)]
+        await self._audit({"phase": "policy", "tool": name, "action": "browseros.call", "payload": shown,
+                           "level": int(decision.level), "reason": decision.reason})
+        if decision.forbidden:
+            return ToolOutcome(name, "browseros.call", False, decision, error=f"forbidden by policy: {decision.reason}")
+        if decision.needs_confirm:
+            label = args.get("_label")
+            ok = await self.confirm(name, {**shown, **({"element": label} if label else {})}, decision) if self.confirm else False
+            if not ok:
+                return ToolOutcome(name, "browseros.call", False, decision, error=f"user declined: {decision.reason}")
+        payload = {"tool": tool, "args": margs, "key": self.bos_key or "default"}
+        if self.bos_title:
+            payload["title"] = self.bos_title
+        if self.bos_category:
+            payload["category"] = self.bos_category
+        t_out = float(os.environ.get("AIW_BOS_TIMEOUT", "120"))
+        try:
+            r = await self.computer.execute("browseros.call", payload, observe=False, timeout=t_out)
+        except Exception as e:  # noqa: BLE001
+            return ToolOutcome(name, "browseros.call", False, decision, error=f"BrowserOS: {type(e).__name__}: {e}")
+        result = dict(r.result or {}) if isinstance(r.result, dict) else {}
+        result.pop("images", None)
+        if args.get("_label"):
+            result["element"] = args["_label"]
+        await self._audit({"phase": "result", "tool": name, "action": "browseros.call", "success": r.success,
+                           "error": r.error, "duration_ms": r.duration_ms})
+        return ToolOutcome(name, "browseros.call", r.success, decision, result, r.error, None)
 
     async def _audit(self, rec: dict):
         if self.audit:

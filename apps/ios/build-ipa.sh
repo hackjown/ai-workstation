@@ -21,6 +21,22 @@ for name,px in [('AppIcon60x60@2x.png',120),('AppIcon60x60@3x.png',180),('AppIco
     src.resize((px,px),Image.LANCZOS).save(f'{app}/{name}')
 PY
 printf 'APPL????' > $APP/PkgInfo
+# AiwShare share extension (Share/): embedded in PlugIns, bundle id com.hackjown.aiworkstation.share (child of the app's),
+# same App Group as the app. If it fails to build, the IPA still ships without it (AIW_SHARE=0 skips it on purpose).
+EXT=$APP/PlugIns/AiwShare.appex
+build_share() {
+  mkdir -p $EXT || return 1
+  xcrun --sdk iphoneos swiftc -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -application-extension \
+    -module-name AiwShare Share/*.swift -o $EXT/AiwShare -Xlinker -e -Xlinker _NSExtensionMain || return 1
+  cp Share/Info.plist $EXT/ || return 1
+  for k in CFBundleShortVersionString CFBundleVersion; do
+    /usr/libexec/PlistBuddy -c "Set :$k $(/usr/libexec/PlistBuddy -c "Print :$k" Info.plist)" $EXT/Info.plist || return 1
+  done
+  "$LDID" -SShare/entitlements.plist $EXT/AiwShare || return 1
+}
+if [ "${AIW_SHARE:-1}" = "1" ]; then
+  if build_share; then echo "AiwShare.appex embedded"; else echo "::warning::AiwShare extension failed to build; the IPA ships without it"; rm -rf $APP/PlugIns; fi
+fi
 "$LDID" -Sentitlements.plist $APP/AIW
 (cd $OUT && zip -qry ../AIWorkstation.ipa Payload)
 echo "OK -> $(pwd)/AIWorkstation.ipa"

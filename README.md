@@ -117,5 +117,8 @@ deploy/                    PVE 建机、Token、VM 初始化与 systemd 服务
 docs/                      github-analysis.md、协议说明
 ```
 
+## 表情助手 · 球球（第三方，非商用）
+对话标题旁和电脑卡片上的「球球」表情小球来自 [sam70361/aora-bot](https://github.com/sam70361/aora-bot) 的 `emotion-ball/`（暗黑主题），原样放在 `apps/web/vendor/emotionball/`，附原作者 `LICENSE` / `NOTICE.md`。**其角色视觉形象仅供个人学习与研究，禁止任何商业用途**；引擎与表情数据非商业免费、商用须向原作者取得授权。商业用途请删除该目录并在 设置 › 关于 › 表情助手 关闭，或换成自有形象。
+
 ## V1 之后
 Windows VM（参考 Dexbox 的 Desktop 接口做 `WindowsComputerProvider`）→ 剪映 / PS / PR → Video Agent；实时桌面升级 WebRTC。新后端只加 Provider，不改 Agent Runtime。

@@ -19,4 +19,13 @@ def health(backend_name: str) -> dict:
         "load": load,
         "disk_free_gb": round(disk.free / 1e9, 1),
         "display": os.environ.get("DISPLAY"),
+        "browseros": _browseros(),
     }
+
+
+def _browseros() -> dict:
+    try:
+        from ..browser.browseros import status
+        return status()
+    except Exception as e:  # noqa: BLE001 - health must always answer
+        return {"installed": False, "error": str(e)[:200]}

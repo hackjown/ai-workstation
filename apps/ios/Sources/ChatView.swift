@@ -251,7 +251,11 @@ struct ChatView: View {
         .sheet(isPresented: $showCamera) { CameraPicker(done: { img in Task { await uploadImage(img) } }, video: { u in Task { await uploadFile(u) } }).ignoresSafeArea() }
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .onChange(of: m.threadId) { id in if let id = id { onThread(id) } }
-        .sheet(item: $preview) { p in QuickLookView(url: p.url).ignoresSafeArea() }
+        .sheet(item: $preview) { p in
+            // .md / .json / text: rendered in-app (MarkdownPreview.swift); everything else in QuickLook
+            if !textPreviewKind(p.url).isEmpty, textPreviewPage() != nil { FilePreviewView(url: p.url, kind: textPreviewKind(p.url)) }
+            else { QuickLookView(url: p.url).ignoresSafeArea() }
+        }
     }
 
     /// A child thread (one dispatched piece) says where it came from and leads back to it.

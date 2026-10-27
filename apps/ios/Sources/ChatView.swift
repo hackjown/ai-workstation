@@ -195,6 +195,11 @@ struct ChatView: View {
     @State private var uploading = false
     @State private var sending = false
     @State private var preview: Preview?
+    @State private var upName = ""
+    @State private var upProgress: Double = 0
+    @State private var toast = ""
+    @State private var importing = false
+    @ObservedObject private var inbox = ImportCenter.shared
     @FocusState private var focused: Bool
 
     init(threadId: String?, fromParent: Bool = false, onThread: @escaping (String) -> Void = { _ in }) {
@@ -244,6 +249,20 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showCamera) { CameraPicker(done: { img in Task { await uploadImage(img) } }, video: { u in Task { await uploadFile(u) } }).ignoresSafeArea() }
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
+        // files sent here from WeChat「用其他应用打开」or the share sheet (Import.swift); only the new-chat home takes them
+        .task { await takeImports() }
+        .onChange(of: inbox.tick) { _ in Task { await takeImports() } }
+        .overlay(alignment: .top) {
+            if !toast.isEmpty {
+                Text(toast).font(.footnote.weight(.medium)).lineLimit(2).multilineTextAlignment(.center)
+                    .padding(.horizontal, 14).padding(.vertical, 9)
+                    .background(.regularMaterial).clipShape(Capsule())
+                    .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
+                    .padding(.top, 8).padding(.horizontal, 20)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .onTapGesture { toast = "" }
+            }
+        }
         .onChange(of: m.threadId) { id in if let id = id { onThread(id) } }
         .sheet(item: $preview) { p in
             // .md / .json / text: rendered in-app (MarkdownPreview.swift); everything else in QuickLook
@@ -281,6 +300,12 @@ struct ChatView: View {
                         }
                     }
                 }
+            }
+            if uploading && !upName.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView(value: upProgress).tint(amber)
+                    Text("上传 \(upName) \(Int(upProgress * 100))%").font(.caption).foregroundColor(.secondary).lineLimit(1)
+                }.padding(.horizontal, 4)
             }
             if !attach.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -344,13 +369,63 @@ struct ChatView: View {
     func skillTitle(_ id: String) -> String { skills.first { $0.s("id") == id }?.s("title") ?? id }
     func toggleSkill(_ id: String) { if picked.contains(id) { picked.removeAll { $0 == id } } else { picked.append(id) } }
 
-    func send(name: String, data: Data) async {
-        uploading = true; defer { uploading = false }
-        if data.count > 40 * 1024 * 1024 { m.err = "\(name) 超过 40MB，请先剪短或压缩"; return }
+    @discardableResult
+    func send(name: String, data: Data) async -> Bool {
+        uploading = true; upName = name; upProgress = 0
+        defer { uploading = false; upName = "" }
+        if data.count > 40 * 1024 * 1024 { m.err = "\(name) 超过 40MB，请先剪短或压缩"; return false }
         do {
-            let r = try await API.shared.obj("POST", "/api/uploads", ["name": name, "content_b64": data.base64EncodedString(), "machine_id": API.shared.machine])
+            let r = try await API.shared.postWithProgress("/api/uploads", ["name": name, "content_b64": data.base64EncodedString(), "machine_id": API.shared.machine]) { f in
+                upProgress = f
+            }
             attach.append(r)
-        } catch { m.err = "上传失败：" + error.localizedDescription }
+            return true
+        } catch { m.err = "\(name) 上传失败：" + error.localizedDescription; return false }
+    }
+
+    /// Take what other apps handed to Aiw and add it to this (new) conversation's composer, one upload at a time.
+    func takeImports() async {
+        guard m.threadId == nil, inbox.hasPending, !importing else { return }
+        importing = true
+        let got = inbox.take()
+        if !got.texts.isEmpty {
+            let t = got.texts.joined(separator: "\n")
+            text = text.isEmpty ? t : text + "\n" + t
+        }
+        var added: [String] = []
+        var refused: [String] = []
+        for f in got.files {
+            defer { inbox.discard(f) }
+            let name = f.lastPathComponent
+            var src = f
+            let size = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? Int) ?? 0
+            let isVideo = UTType(filenameExtension: f.pathExtension)?.conforms(to: .movie) ?? false
+            if isVideo && size > 38 * 1024 * 1024 {
+                uploading = true; upName = "正在压缩 \(name)"; upProgress = 0
+                let small = await shrinkVideo(f)
+                uploading = false; upName = ""
+                guard let s2 = small else { refused.append(name); continue }
+                src = s2
+            } else if size > 40 * 1024 * 1024 {
+                refused.append(name); continue
+            }
+            defer { if src != f { try? FileManager.default.removeItem(at: src) } }
+            guard let d = try? Data(contentsOf: src, options: .mappedIfSafe) else { refused.append(name); continue }
+            let upload = src == f ? name : (name as NSString).deletingPathExtension + ".mp4"
+            if await send(name: upload, data: d) { added.append(upload) }
+        }
+        var msg: [String] = []
+        if !added.isEmpty { msg.append("已添加附件：" + added.joined(separator: "、")) }
+        if !refused.isEmpty { msg.append(refused.joined(separator: "、") + " 超过 40MB 或读取失败，没有添加") }
+        if added.isEmpty && refused.isEmpty && !got.texts.isEmpty { msg.append("已填入分享的内容") }
+        if !msg.isEmpty { showToast(msg.joined(separator: "\n")) }
+        importing = false
+        if inbox.hasPending { await takeImports() }   // more arrived while uploading
+    }
+    func showToast(_ t: String) {
+        withAnimation { toast = t }
+        let shown = t
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { if toast == shown { withAnimation { toast = "" } } }
     }
     func upload(_ item: PhotosPickerItem?) async {
         guard let item = item else { return }

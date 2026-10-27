@@ -163,7 +163,7 @@ class BrowserOS:
 
     async def call(self, key: str, tool: str, args: Optional[dict] = None, title: Optional[str] = None,
                    category: Optional[str] = None) -> dict:
-        if tool not in ALLOWED and tool != "front":
+        if tool not in ALLOWED and tool not in ("front", "page_shot"):
             raise PermissionError(f"BrowserOS tool '{tool}' is not available through AIW")
         await self.ensure_running()
         self._gc()
@@ -172,6 +172,8 @@ class BrowserOS:
         async with lock:   # one task's calls in order: refs from one snapshot belong to the next act
             if tool == "front":
                 return await self._front(key, (args or {}).get("page"))
+            if tool == "page_shot":
+                return await self._page_shot(key, (args or {}).get("page"))
             return await self._call(key, tool, _clean_args(tool, args or {}), title, category)
 
     async def _call(self, key: str, tool: str, args: dict, title: Optional[str], category: Optional[str]) -> dict:
@@ -200,8 +202,8 @@ class BrowserOS:
                                        "params": {"name": tool, "arguments": args}}, c["sid"])
         return r or {}
 
-    async def _front(self, key: str, page) -> dict:
-        """Bring a task's page to the front of the BrowserOS window, so the screenshot/xdotool fallback can see it."""
+    async def _target(self, key: str, page) -> tuple[Optional[dict], str]:
+        """(DevTools target of a task's page, error text). The page number is BrowserOS's, from its tab list."""
         listing = (await self._call(key, "tabs", {"action": "list"}, None, None)).get("text", "")
         url = None
         for m in re.finditer(r"^\[(\d+)\]\s+(\S+)", listing, re.M):
@@ -210,23 +212,101 @@ class BrowserOS:
                 if page is not None:
                     break
         if not url:
-            return {"ok": False, "is_error": True, "text": f"page {page} not found in:\n{listing[:1500]}"}
+            return None, f"page {page} not found in:\n{listing[:1500]}"
         _, cdp = ports()
-        async with httpx.AsyncClient(timeout=5) as cl:
+        async with httpx.AsyncClient(timeout=5, trust_env=False) as cl:
             tabs = (await cl.get(f"http://127.0.0.1:{cdp}/json/list")).json()
-            t = next((t for t in tabs if t.get("type") == "page" and t.get("url") == url), None)
-            if not t:
-                t = next((t for t in tabs if t.get("type") == "page" and url.rstrip("/") in (t.get("url") or "")), None)
-            if not t:
-                return {"ok": False, "is_error": True, "text": f"no DevTools target for {url}"}
-            await cl.get(f"http://127.0.0.1:{cdp}/json/activate/{t['id']}")
-        # raise the window itself (another app may be on top)
+        t = next((t for t in tabs if t.get("type") == "page" and t.get("url") == url), None)
+        if not t:
+            t = next((t for t in tabs if t.get("type") == "page" and url.rstrip("/") in (t.get("url") or "")), None)
+        if not t:
+            return None, f"no DevTools target for {url}"
+        t["_cdp"] = cdp
+        return t, ""
+
+    async def _sh(self, cmd: str) -> str:
         proc = await asyncio.create_subprocess_shell(
-            "xdotool search --onlyvisible --class 'browserclaw|chromium-browser|BrowserOS' windowactivate 2>/dev/null; "
-            "wmctrl -x -a browserclaw 2>/dev/null; true", env={**self.env, "DISPLAY": self.env.get("DISPLAY") or ":0"})
-        await proc.wait()
-        return {"ok": True, "is_error": False, "text": f"page {page} ({url}) is now the visible tab of the BrowserOS window; "
-                "screenshot / click by coordinates now act on it."}
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            env={**self.env, "DISPLAY": self.env.get("DISPLAY") or ":0"})
+        out, _ = await asyncio.wait_for(proc.communicate(), 10)
+        return (out or b"").decode(errors="ignore")
+
+    async def _front(self, key: str, page) -> dict:
+        """Bring a task's page to the front: its tab in its window, and THAT window on top of the desktop.
+
+        BrowserOS keeps each AIW task's tabs in a tab group of their own window. The old code raised whichever
+        BrowserOS window xdotool found first, which was often the user's window with the session-replay page
+        (task-d76ffb0bd1: 13 screenshots of the replay page while the captcha sat in the task's window). Now the
+        window is found by the tab's title and the result says whether the desktop really shows the page."""
+        t, err = await self._target(key, page)
+        if not t:
+            return {"ok": False, "is_error": True, "text": err}
+        async with httpx.AsyncClient(timeout=5, trust_env=False) as cl:
+            await cl.get(f"http://127.0.0.1:{t['_cdp']}/json/activate/{t['id']}")
+        await asyncio.sleep(0.3)
+        title = (t.get("title") or "").strip()
+        verified, active = False, ""
+        try:
+            if title:
+                pat = re.escape(title[:60]).replace("'", ".")
+                ids = (await self._sh(f"xdotool search --name '{pat}' 2>/dev/null")).split()
+                for wid in ids[:6]:
+                    await self._sh(f"xdotool windowmap {wid} 2>/dev/null; xdotool windowactivate --sync {wid} 2>/dev/null; "
+                                   f"xdotool windowraise {wid} 2>/dev/null; true")
+                    active = (await self._sh("xdotool getactivewindow getwindowname 2>/dev/null")).strip()
+                    if title[:30] in active:
+                        verified = True
+                        break
+            if not verified:   # no window title to go by: the old way, then check again
+                await self._sh("xdotool search --onlyvisible --class 'browserclaw|chromium-browser|BrowserOS' "
+                               "windowactivate 2>/dev/null; wmctrl -x -a browserclaw 2>/dev/null; true")
+                active = (await self._sh("xdotool getactivewindow getwindowname 2>/dev/null")).strip()
+                verified = bool(title) and title[:30] in active
+        except Exception:  # noqa: BLE001  no xdotool / no X: the page itself is still activated
+            pass
+        url = t.get("url") or ""
+        if verified:
+            text = (f"page {page} ({url}) is now the visible tab and its window is on top of the desktop; "
+                    "screenshot / click by coordinates now act on it.")
+        else:
+            text = (f"page {page} ({url}) is the active tab of its BrowserOS window, but the desktop shows another "
+                    f"window ({active or 'unknown'}). Desktop screenshots will NOT show this page; the agent uses a "
+                    "picture of the page itself instead.")
+        return {"ok": True, "is_error": False, "text": text, "verified": verified, "window": active, "url": url,
+                "title": title}
+
+    async def _page_shot(self, key: str, page) -> dict:
+        """A picture of the page itself over DevTools (Page.captureScreenshot), whatever window is on the desktop.
+        Its pixels are viewport CSS pixels, the x,y that bos_act click_at / type_at take."""
+        t, err = await self._target(key, page)
+        if not t or not t.get("webSocketDebuggerUrl"):
+            return {"ok": False, "is_error": True, "text": err or "page has no DevTools socket"}
+        import websockets
+        ws_url = t["webSocketDebuggerUrl"]
+        async with websockets.connect(ws_url, max_size=None, open_timeout=5) as ws:
+            n = 0
+
+            async def cmd(method, params=None):
+                nonlocal n
+                n += 1
+                await ws.send(json.dumps({"id": n, "method": method, "params": params or {}}))
+                while True:
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), 15))
+                    if msg.get("id") == n:
+                        if "error" in msg:
+                            raise RuntimeError(f"{method}: {msg['error'].get('message')}")
+                        return msg.get("result") or {}
+            await cmd("Page.bringToFront")
+            m = await cmd("Runtime.evaluate", {"expression": "[innerWidth, innerHeight, devicePixelRatio]",
+                                               "returnByValue": True})
+            w, h, dpr = ((m.get("result") or {}).get("value") or [0, 0, 1])
+            params = {"format": "jpeg", "quality": 75}
+            if w and h and dpr and abs(float(dpr) - 1) > 0.01:
+                params["clip"] = {"x": 0, "y": 0, "width": w, "height": h, "scale": 1 / float(dpr)}
+            shot = await cmd("Page.captureScreenshot", params)
+        return {"ok": True, "is_error": False, "text": f"picture of page {page} ({t.get('url')}), {w}x{h} viewport px",
+                "images": [{"mime": "image/jpeg", "data": shot.get("data") or ""}], "width": w, "height": h,
+                "url": t.get("url"), "title": t.get("title")}
 
     async def close(self, key: str) -> dict:
         c = self.conns.pop(key, None)

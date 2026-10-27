@@ -1,16 +1,16 @@
-/* 云宝 expression assistant (loaded after app.js/ui.js). A small Mood Mates 云宝 in the chat header shows what the
-   current task is doing, and a mini one sits on each computer card (设置 › 电脑, 电脑 page) showing that machine.
+/* 球球 expression assistant (loaded after app.js/ui.js). A small Emotion Ball 球球 (dark theme) in the chat header shows
+   what the current task is doing, and a mini one sits on each computer card (设置 › 电脑, 电脑 page) showing that machine.
    Driven only by the task event stream the app already receives (no model output). Mapping: mate-map.js.
-   Off switch: 设置 › 关于 › 表情助手 (localStorage aiw_mate = "0"). Vendored engine: vendor/moodmates (non-commercial
-   licence, see its README). This file only wraps app.js functions and adds DOM; it never changes their behaviour. */
+   Off switch: 设置 › 关于 › 表情助手 (localStorage aiw_mate = "0"). Vendored engine: vendor/emotionball (visuals for
+   personal learning/research only, no commercial use: see its README, LICENSE, NOTICE.md). This file only wraps app.js functions and adds DOM; it never changes their behaviour. */
 "use strict";
 (function () {
-  if (!window.MoodMates || !window.AiwMood) return;
+  if (!window.EmotionBall || !EmotionBall.create || !window.AiwMood) return;
   const MAP = window.AiwMood, ID = MAP.ID;
   const RM = window.matchMedia ? matchMedia("(prefers-reduced-motion: reduce)") : { matches: false, addEventListener() {} };
   const on = () => localStorage.getItem("aiw_mate") !== "0";
 
-  /* ---------- one 云宝 instance in a host element */
+  /* ---------- one 球球 instance in a host element */
   const mates = new Set();
   function Mate(host, opts) {
     this.host = host; this.id = null; this.opts = opts || {}; this.eng = null; this.settleT = 0;
@@ -19,8 +19,10 @@
   Mate.prototype.ensure = function () {
     if (this.eng || !this.host.isConnected) return this.eng;
     const still = RM.matches;
-    this.eng = MoodMates.create(this.host, { character: "nimbo", emotion: this.id || ID.IDLE, eyeScale: this.opts.eyeScale || 1.6,
-      lite: !!this.opts.lite, autostart: !still && !document.hidden && this.vis !== false });
+    // 球球 = the default blob body (#F3F0EA, dark eyes); the 暗黑 backdrop comes from mate.css. No idle timer:
+    // AIW drives standby/sleep itself from the machine state.
+    this.eng = EmotionBall.create(this.host, { emotion: this.id || ID.IDLE, idle: false, shape: "blob", eyeScale: this.opts.eyeScale || 1.6,
+      lite: !!this.opts.lite, autostart: !still && !document.hidden && this.vis !== false, label: "球球" });
     if (still) this.eng.renderStatic();
     return this.eng;
   };
@@ -39,9 +41,9 @@
     const changed = id !== this.id;
     this.id = id;
     this.host.dataset.mood = id;
-    this.host.title = "云宝 · " + (MAP.NAMES[id] || id);
+    this.host.title = "球球 · " + (MAP.NAMES[id] || id);
     const eng = this.ensure(); if (!eng) return;
-    if (changed) eng.setEmotion(id);
+    if (changed) eng.handleAIMessage({ emotionId: id });
     if (RM.matches || document.hidden) eng.renderStatic();
     else if (o.burst) { try { eng.burst(24); } catch (e) { /* ignore */ } }
   };
@@ -195,7 +197,7 @@
     const about = document.querySelector("#g-about .rows");
     if (!about || document.getElementById("mateToggle")) return;
     const rw = document.createElement("div"); rw.className = "rw sw";
-    rw.innerHTML = `<div class="k">表情助手<small>云宝随任务状态变表情，电脑卡片上也有一只</small></div><div class="v"></div>
+    rw.innerHTML = `<div class="k">表情助手<small>球球随任务状态变表情，电脑卡片上也有一只（仅供个人学习研究，非商用）</small></div><div class="v"></div>
       <div class="t"><input type="checkbox" id="mateToggle" aria-label="表情助手" ${on() ? "checked" : ""} /></div>`;
     const first = about.querySelector(".rw");
     about.insertBefore(rw, first ? first.nextSibling : null);

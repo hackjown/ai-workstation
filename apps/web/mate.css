@@ -1,0 +1,13 @@
+/* 云宝 expression assistant (mate.js). Engine: vendor/moodmates (SVG, sized by its host). */
+.mate { display: inline-block; flex: none; position: relative; line-height: 0; pointer-events: auto; }
+.mate > svg { width: 100% !important; height: 100% !important; overflow: visible; display: block; }
+.mate-head { width: 36px; height: 36px; margin: -4px 2px -4px 0; cursor: default; }
+body:not(.mate-chat) .mate-head, body.mate-off .mate { display: none; }
+@media (max-width: 760px) { .mate-head { width: 30px; height: 30px; margin: -2px 0; } }
+/* mini mate replaces the monitor icon of a computer card */
+.has-mate { position: relative; }
+.iconbox.has-mate > :not(.mate), .mach .ic.has-mate > :not(.mate) { visibility: hidden; }
+.mate-mini { position: absolute; inset: -3px; width: auto; height: auto; }
+.mate-mini.inline { position: static; width: 22px; height: 22px; vertical-align: -6px; margin-left: 6px; }
+.iconbox.has-mate, .mach .ic.has-mate { background: color-mix(in srgb, #B4C6EE 22%, transparent); overflow: visible; }
+.mate-slot { position: relative; width: 34px; height: 34px; flex: none; margin-left: 8px; border-radius: 10px; background: color-mix(in srgb, #B4C6EE 22%, transparent); }

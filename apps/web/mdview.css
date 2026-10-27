@@ -1,0 +1,82 @@
+/* AIW file preview (.mdv): rendered Markdown, pretty JSON, plain text. Shared by the web modal and the iOS WKWebView.
+   Light by default; dark with html[data-theme=dark] (web) or the system dark scheme when no theme is forced (iOS). */
+:root{
+  --mdv-bg:#f6f3ec; --mdv-fg:#1a1712; --mdv-mut:rgba(0,0,0,.58); --mdv-bd:rgba(0,0,0,.12); --mdv-bd2:rgba(0,0,0,.07);
+  --mdv-code:#efeadf; --mdv-codeh:#e6dfd0; --mdv-inline:rgba(200,118,24,.10); --mdv-acc:#b4690f; --mdv-th:#ebe5d8; --mdv-zebra:rgba(0,0,0,.025);
+  --mdv-quote:rgba(200,118,24,.07); --mdv-btn:#fff; --mdv-ok:#1d8048;
+  --mdv-font:Inter,-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans SC","Noto Sans CJK SC",sans-serif;
+  --mdv-mono:"JetBrains Mono",ui-monospace,Menlo,Monaco,Consolas,"Noto Sans Mono CJK SC",monospace;
+  --mdv-size:15px;
+}
+html[data-theme=dark]{
+  --mdv-bg:#0f0f0f; --mdv-fg:#ececec; --mdv-mut:rgba(255,255,255,.62); --mdv-bd:rgba(255,255,255,.13); --mdv-bd2:rgba(255,255,255,.07);
+  --mdv-code:#161616; --mdv-codeh:#1e1e1e; --mdv-inline:rgba(232,160,80,.14); --mdv-acc:#e8a050; --mdv-th:#1c1c1c; --mdv-zebra:rgba(255,255,255,.025);
+  --mdv-quote:rgba(232,160,80,.08); --mdv-btn:#232323; --mdv-ok:#69d28a;
+}
+@media (prefers-color-scheme: dark){
+  html:not([data-theme]){
+    --mdv-bg:#0f0f0f; --mdv-fg:#ececec; --mdv-mut:rgba(255,255,255,.62); --mdv-bd:rgba(255,255,255,.13); --mdv-bd2:rgba(255,255,255,.07);
+    --mdv-code:#161616; --mdv-codeh:#1e1e1e; --mdv-inline:rgba(232,160,80,.14); --mdv-acc:#e8a050; --mdv-th:#1c1c1c; --mdv-zebra:rgba(255,255,255,.025);
+    --mdv-quote:rgba(232,160,80,.08); --mdv-btn:#232323; --mdv-ok:#69d28a;
+  }
+}
+.mdv{color:var(--mdv-fg);font:var(--mdv-size)/1.7 var(--mdv-font);word-wrap:break-word;overflow-wrap:anywhere;-webkit-text-size-adjust:100%}
+.mdv>*:first-child{margin-top:0}
+.mdv h1,.mdv h2,.mdv h3,.mdv h4,.mdv h5,.mdv h6{line-height:1.35;margin:1.5em 0 .6em;font-weight:650}
+.mdv h1{font-size:1.6em;padding-bottom:.35em;border-bottom:1px solid var(--mdv-bd)}
+.mdv h2{font-size:1.3em;padding-bottom:.3em;border-bottom:1px solid var(--mdv-bd2)}
+.mdv h3{font-size:1.1em}
+.mdv h4,.mdv h5,.mdv h6{font-size:1em;color:var(--mdv-mut)}
+.mdv p{margin:.7em 0}
+.mdv a{color:var(--mdv-acc);text-decoration:none;border-bottom:1px solid currentColor}
+.mdv strong{font-weight:650}
+.mdv ul,.mdv ol{margin:.6em 0;padding-left:1.6em}
+.mdv li{margin:.25em 0}
+.mdv li>p{margin:.3em 0}
+.mdv blockquote{margin:1em 0;padding:.6em 1em;border-left:3px solid var(--mdv-acc);background:var(--mdv-quote);color:var(--mdv-mut);border-radius:0 6px 6px 0}
+.mdv blockquote p{margin:.2em 0}
+.mdv hr{border:0;border-top:1px solid var(--mdv-bd);margin:1.6em 0}
+.mdv img{max-width:100%;border-radius:6px}
+.mdv code{font-family:var(--mdv-mono);font-size:.88em;background:var(--mdv-inline);padding:.12em .38em;border-radius:4px}
+/* tables: own horizontal scroll so long rows never stretch the page */
+.mdv .mdv-tw{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:1em 0;border:1px solid var(--mdv-bd);border-radius:8px}
+.mdv table{border-collapse:collapse;min-width:100%;font-size:.92em}
+.mdv th,.mdv td{padding:.5em .75em;border-bottom:1px solid var(--mdv-bd2);border-right:1px solid var(--mdv-bd2);text-align:left;vertical-align:top;min-width:4.5em}
+.mdv th:last-child,.mdv td:last-child{border-right:0}
+.mdv tr:last-child td{border-bottom:0}
+.mdv th{background:var(--mdv-th);font-weight:600;white-space:nowrap}
+.mdv tbody tr:nth-child(even){background:var(--mdv-zebra)}
+.mdv td{overflow-wrap:normal;word-break:normal}
+.mdv .mdv-nw{white-space:nowrap}
+.mdv .mdv-long{min-width:14em;max-width:30em}
+/* fenced code with a header and copy button */
+.mdv .mdv-code{margin:1em 0;border:1px solid var(--mdv-bd);border-radius:8px;overflow:hidden;background:var(--mdv-code)}
+.mdv .mdv-code-h{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 6px 4px 12px;background:var(--mdv-codeh);border-bottom:1px solid var(--mdv-bd2);font:12px/1.4 var(--mdv-mono);color:var(--mdv-mut)}
+.mdv .mdv-copy{font:600 12px/1 var(--mdv-font);color:var(--mdv-fg);background:var(--mdv-btn);border:1px solid var(--mdv-bd);border-radius:6px;padding:6px 12px;cursor:pointer;min-height:28px}
+.mdv .mdv-copy:hover{border-color:var(--mdv-acc);color:var(--mdv-acc)}
+.mdv .mdv-copy.ok{color:var(--mdv-ok);border-color:var(--mdv-ok)}
+.mdv pre{margin:0;padding:12px 14px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.mdv pre code{background:none;padding:0;border-radius:0;font-size:.86em;line-height:1.65;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+.mdv.mdv-mono .mdv-raw pre code{line-height:1.5;white-space:pre;word-break:normal;overflow-wrap:normal}
+.mdv .mdv-plain{margin:0;font:.86em/1.65 var(--mdv-mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.mdv.mdv-mono .mdv-code{margin:0}
+
+/* web modal (mdpreview.js) */
+.mdm{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;padding:24px}
+.mdm-box{background:var(--mdv-bg);color:var(--mdv-fg);width:min(920px,100%);max-height:100%;display:flex;flex-direction:column;border-radius:12px;border:1px solid var(--mdv-bd);box-shadow:0 20px 60px rgba(0,0,0,.35);overflow:hidden}
+.mdm-h{display:flex;align-items:center;gap:8px;padding:10px 12px 10px 18px;border-bottom:1px solid var(--mdv-bd)}
+.mdm-h b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:600 14px/1.4 var(--mdv-font)}
+.mdm-h .mdm-k{font:11px/1 var(--mdv-mono);color:var(--mdv-mut);border:1px solid var(--mdv-bd);border-radius:4px;padding:3px 5px}
+.mdm-h button,.mdm-h a{font:600 13px/1 var(--mdv-font);color:var(--mdv-fg);background:var(--mdv-btn);border:1px solid var(--mdv-bd);border-radius:6px;padding:7px 12px;cursor:pointer;text-decoration:none;white-space:nowrap}
+.mdm-h button:hover,.mdm-h a:hover{border-color:var(--mdv-acc);color:var(--mdv-acc)}
+.mdm-h .mdm-x{font-size:18px;padding:4px 10px;line-height:1}
+.mdm-b{overflow:auto;padding:22px 26px 40px;-webkit-overflow-scrolling:touch}
+.mdm-b.mdv-mono{padding:14px}
+.mdm-load{color:var(--mdv-mut);font:14px var(--mdv-font)}
+@media (max-width:760px){
+  .mdm{padding:0}
+  .mdm-box{width:100%;height:100%;border-radius:0;border:0}
+  .mdm-b{padding:16px 16px 40px}
+  .mdm-h{padding:8px 8px 8px 14px;padding-top:max(8px,env(safe-area-inset-top))}
+  .mdm-h .mdm-k{display:none}
+}

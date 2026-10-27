@@ -4,7 +4,7 @@
 .mate {
   display: inline-block; flex: none; position: relative; line-height: 0; pointer-events: auto; box-sizing: border-box;
   border-radius: 50%; color-scheme: dark;
-  background: radial-gradient(circle at 50% 42%, rgba(145, 109, 255, 0.30), rgba(145, 109, 255, 0.08) 48%, transparent 70%), #09090b;
+  background: var(--mate-glow, radial-gradient(circle at 50% 42%, rgba(145, 109, 255, 0.30), rgba(145, 109, 255, 0.08) 48%, transparent 70%)), var(--mate-disc, #09090b);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 1px 3px rgba(0, 0, 0, 0.25);
   --sketch-ink: rgba(226, 232, 248, 0.82);
 }
@@ -21,3 +21,6 @@ body:not(.mate-chat) .mate-head, body.mate-off .mate { display: none; }
 .mate-mini.inline { width: 22px; height: 22px; vertical-align: -6px; margin-left: 6px; position: relative; display: inline-block; border-radius: 50%; --mate-pad: 6%; }
 .iconbox.has-mate, .mach .ic.has-mate { background: #09090b; overflow: hidden; }
 .mate-slot { position: relative; width: 34px; height: 34px; flex: none; margin-left: 8px; border-radius: 10px; background: #09090b; overflow: hidden; }
+/* amber disc (the app accent), same as mate.html?ring=amber: add class "amber" or set --mate-disc / --mate-glow */
+.mate.amber { --mate-disc: #c87618; --mate-glow: radial-gradient(circle at 50% 36%, rgba(255, 214, 150, 0.38), rgba(255, 190, 110, 0.10) 50%, transparent 72%);
+  --sketch-ink: rgba(255, 246, 232, 0.92); }

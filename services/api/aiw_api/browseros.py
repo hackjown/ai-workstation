@@ -11,11 +11,21 @@ When BrowserOS is on for a computer:
 
 Routes: GET /api/browseros, PUT /api/browseros/{mid} {"enabled": bool}, POST /api/browseros/{mid}/install
 (runs deploy/vm/browseros-setup.sh on the computer through the vm-agent's shell, amd64 only).
+
+Detection: a vm-agent from before the BrowserOS release sends no "browseros" in system.health; then refresh() asks
+the computer's shell (`browseros-setup.sh status`), so 重新检测 still tells installed / running, and the row says the
+agent is old (`agent_old`) because the bos_* tools need the newer agent.
+Install errors: the script ends a failure with `ERROR: <step>: <reason>`; summarize() turns stdout/stderr into that
+line plus the few lines before it (curl's progress meter and apt chatter dropped). A sudo that needs a password comes
+back as need_sudo with the one-line command to paste into the computer's terminal (no password goes through Aiw).
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,6 +36,10 @@ _STORE = None          # set by mount(); the probes look up the switch by machin
 KV, SEEN = "browseros", "browseros_seen"
 SETUP = Path(__file__).resolve().parents[3] / "deploy" / "vm" / "browseros-setup.sh"
 SETUP_URL = "https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/browseros-setup.sh"
+AGENT_URL = "https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/update-agent.sh"
+# what the user pastes into the computer's own terminal (接管桌面 › 终端, or ssh) when sudo there needs a password;
+# the second half updates the vm-agent so it reports BrowserOS and can drive it
+MANUAL_CMD = f"curl -fsSL {SETUP_URL} | bash && curl -fsSL {AGENT_URL} | bash"
 
 
 def bind(store) -> None:
@@ -54,8 +68,9 @@ def enabled(store, mid: Optional[str]) -> bool:
     if not store or not mid:
         return False
     s = setting(store, mid)
-    inst = bool(seen(store, mid).get("installed"))
-    return inst and (s is None or s)
+    sn = seen(store, mid)
+    # an old agent cannot proxy bos_* calls: installed but not usable until the agent is updated
+    return bool(sn.get("installed")) and not sn.get("agent_old") and (s is None or s)
 
 
 def set_enabled(store, mid: str, on: bool) -> dict:
@@ -65,18 +80,100 @@ def set_enabled(store, mid: str, on: bool) -> dict:
     return d[mid]
 
 
-def note_health(store, mid: str, health: Optional[dict]) -> None:
-    """Record what the vm-agent's system.health said about BrowserOS (older agents send nothing: leave it)."""
-    if not store or not mid or not isinstance(health, dict) or "browseros" not in health:
-        return
-    b = health.get("browseros") or {}
+def _record(store, mid: str, b: dict, **extra) -> dict:
     d = _kv(store, SEEN)
-    d[mid] = {"installed": bool(b.get("installed")), "running": bool(b.get("running")), "version": b.get("version"),
-              "mcp_port": b.get("mcp_port") or 9210, "cdp_port": b.get("cdp_port") or 9110, "at": time.time()}
+    d[mid] = {"installed": bool(b.get("installed")), "running": bool(b.get("running")), "version": b.get("version") or None,
+              "mcp_port": b.get("mcp_port") or 9210, "cdp_port": b.get("cdp_port") or 9110, "at": time.time(),
+              **{k: v for k, v in extra.items() if v is not None}}
     try:
         store.kv_set(SEEN, d)
     except Exception as e:  # noqa: BLE001
         log.debug("browseros seen: %s", e)
+    return d[mid]
+
+
+def note_health(store, mid: str, health: Optional[dict]) -> None:
+    """Record what the vm-agent's system.health said about BrowserOS (older agents send nothing: leave it)."""
+    if not store or not mid or not isinstance(health, dict) or "browseros" not in health:
+        return
+    _record(store, mid, health.get("browseros") or {}, arch=health.get("arch"), agent_old=False)
+
+
+def _script_cmd(sub: str) -> str:
+    """Run this image's browseros-setup.sh on the computer (shipped inline; the raw GitHub copy as a fallback)."""
+    if SETUP.exists():
+        b64 = base64.b64encode(SETUP.read_bytes()).decode()
+        return (f"f=$(mktemp) && echo '{b64}' | base64 -d > \"$f\" && bash \"$f\" {sub}; rc=$?; rm -f \"$f\"; exit $rc")
+    return f"curl -fsSL {SETUP_URL} | bash -s {sub}"
+
+
+def parse_status(stdout: str) -> Optional[dict]:
+    """The JSON line of `browseros-setup.sh status` (or None)."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{") and '"installed"' in line:
+            try:
+                return json.loads(line)
+            except ValueError:
+                return None
+    return None
+
+
+async def shell_status(comp, timeout: float = 20) -> Optional[dict]:
+    """Ask the computer's shell what is installed: works with any vm-agent version."""
+    try:
+        r = await asyncio.wait_for(comp.execute("shell.exec", {"command": _script_cmd("status"), "timeout": 15},
+                                                timeout=timeout), timeout + 2)
+    except Exception as e:  # noqa: BLE001
+        log.debug("browseros shell status: %s", e)
+        return None
+    return parse_status((getattr(r, "result", None) or {}).get("stdout") or "")
+
+
+# ----------------------------------------------------------------------------- install output -> what to show
+_PROGRESS = re.compile(r"(%\s*Total|%\s*Received|Dload\s+Upload|Total\s+Spent)|^[\s\d.:kKMGB%#-]+$")
+_APT_NOISE = re.compile(r"^(Reading|Building|Get:|Hit:|Ign:|Fetched|Selecting|Preparing|Unpacking|Setting up|Processing|"
+                        r"\(Reading database|WARNING: apt does not have a stable CLI)")
+_SUDO_PW = re.compile(r"NEED_SUDO_PASSWORD|sudo: (a password is required|需要密码|a terminal is required)|"
+                      r"sudo:.*(password|密码)", re.I)
+_ERRLIKE = re.compile(r"^(E: |dpkg: |dpkg-deb: |curl: \(|sudo: |ERROR|Error|error:|FAILED|Traceback)")
+
+
+def meaningful_lines(text: str) -> list[str]:
+    """Output lines without curl's progress meter (\r-redrawn), apt chatter or blank lines."""
+    out = []
+    for raw in (text or "").replace("\r", "\n").split("\n"):
+        line = raw.strip()
+        if not line or _PROGRESS.search(line) or _APT_NOISE.match(line):
+            continue
+        out.append(line)
+    return out
+
+
+def summarize(stdout: str, stderr: str, exit_code) -> dict:
+    """{"error": one line for the UI or None, "detail": [up to 4 lines], "need_sudo": bool, "step": str|None}."""
+    so, se = meaningful_lines(stdout), meaningful_lines(stderr)
+    allv = so + se
+    need_sudo = exit_code == 10 or any(_SUDO_PW.search(l) for l in allv)
+    if exit_code in (0, None) and not need_sudo:
+        return {"error": None, "detail": [], "need_sudo": False, "step": None}
+    if need_sudo:
+        return {"error": "需要这台电脑的 sudo 密码", "detail": [], "need_sudo": True, "step": "sudo"}
+    err = next((l for l in reversed(so) if l.startswith("ERROR:")), None)
+    if err:
+        m = re.match(r"ERROR:\s*([\w-]+):\s*(.*)", err)
+        i = so.index(err)
+        detail = [l.lstrip("| ").strip() for l in so[max(0, i - 4):i] if l.startswith("|")]
+        if not detail:
+            detail = [l for l in se if _ERRLIKE.match(l)][-3:]
+        return {"error": err[len("ERROR:"):].strip(), "detail": detail[-4:], "need_sudo": False,
+                "step": m.group(1) if m else None}
+    if exit_code == 124:
+        return {"error": "安装超时（15 分钟）", "detail": allv[-3:], "need_sudo": False, "step": "timeout"}
+    errs = [l for l in allv if _ERRLIKE.match(l)]
+    detail = (errs or allv)[-3:]
+    return {"error": detail[-1] if detail else f"安装脚本退出码 {exit_code}", "detail": detail, "need_sudo": False,
+            "step": None}
 
 
 def cdp_port(store, mid: Optional[str]) -> Optional[int]:
@@ -96,11 +193,17 @@ def browser_name(store, mid: Optional[str]) -> str:
 
 
 async def refresh(store, computer, mid: str, timeout: float = 6) -> dict:
-    """Ask the computer now (system.health) and record it."""
+    """Ask the computer now (system.health) and record it. An agent too old to report BrowserOS gets asked through
+    its shell instead, so the row shows installed / running and says the agent needs an update."""
     try:
         h = await asyncio.wait_for(computer.health(), timeout)
         if getattr(h, "success", False) and isinstance(h.result, dict):
-            note_health(store, mid, h.result)
+            if "browseros" in h.result:
+                note_health(store, mid, h.result)
+            else:
+                b = await shell_status(computer, max(timeout, 10))
+                if b is not None:
+                    _record(store, mid, b, arch=b.get("arch") or h.result.get("arch"), agent_old=True)
     except Exception as e:  # noqa: BLE001
         log.debug("browseros refresh %s: %s", mid, e)
     return seen(store, mid)
@@ -139,7 +242,8 @@ def mount(app, store, sessions, auth) -> None:
     def row(m: dict) -> dict:
         mid = m["id"]
         return {"id": mid, "name": m.get("name") or mid, "cloud": (m.get("provider") or "") == "instabox",
-                "setting": setting(store, mid), "enabled": enabled(store, mid), "seen": seen(store, mid)}
+                "setting": setting(store, mid), "enabled": enabled(store, mid), "seen": seen(store, mid),
+                "command": MANUAL_CMD if seen(store, mid).get("agent_old") else None}
 
     @app.get("/api/browseros", dependencies=dep)
     async def bos_list(refresh_now: bool = False):
@@ -171,17 +275,21 @@ def mount(app, store, sessions, auth) -> None:
         if cloud and cloud.is_cloud(mid):
             await cloud.wake(mid)
         comp = sessions.computer(mid)
-        script = SETUP.read_text() if SETUP.exists() else None
-        if script:
-            import base64
-            cmd = ("f=$(mktemp) && echo '" + base64.b64encode(script.encode()).decode() + "' | base64 -d > \"$f\" && "
-                   "bash \"$f\" install; rc=$?; rm -f \"$f\"; exit $rc")
-        else:
-            cmd = f"curl -fsSL {SETUP_URL} | bash -s install"
-        r = await comp.execute("shell.exec", {"command": cmd, "timeout": 900}, timeout=930)
+        r = await comp.execute("shell.exec", {"command": _script_cmd("install"), "timeout": 900}, timeout=930)
         res = getattr(r, "result", None) or {}
+        code = res.get("exit_code")
         st = await refresh(store, comp, mid, 10)
-        ok = bool(getattr(r, "success", False)) and bool(st.get("installed"))
-        return {"ok": ok, "seen": st, "exit_code": res.get("exit_code"),
-                "log": ((res.get("stdout") or "") + "\n" + (res.get("stderr") or ""))[-3000:],
-                "error": None if ok else (getattr(r, "error", None) or "安装没有完成（看日志）")}
+        ran = bool(getattr(r, "success", False)) or code == 0
+        ok = ran and bool(st.get("installed"))
+        s = summarize(res.get("stdout") or "", res.get("stderr") or "", code if res else None)
+        err = None
+        if not ok:
+            err = s["error"] or getattr(r, "error", None) or "安装没有完成"
+            if not s["error"] and ran and not st.get("installed"):
+                err = "脚本跑完了，但没检测到 BrowserOS"
+        out = {"ok": ok, "seen": st, "exit_code": code, "error": err, "detail": s["detail"], "step": s["step"],
+               "need_sudo": s["need_sudo"], "agent_old": bool(st.get("agent_old")),
+               "log": "\n".join(meaningful_lines((res.get("stdout") or "") + "\n" + (res.get("stderr") or "")))[-3000:]}
+        if s["need_sudo"] or st.get("agent_old"):
+            out["command"] = MANUAL_CMD
+        return out

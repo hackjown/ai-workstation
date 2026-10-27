@@ -1,4 +1,4 @@
-// node tests/js/mate_map_test.js — state→emotion mapping of apps/web/mate-map.js (run by tests/test_mate_map.py)
+// node tests/js/mate_map_test.js — 球球 state→emotion mapping of apps/web/mate-map.js (run by tests/test_mate_map.py)
 const assert = require("assert");
 const M = require("../../apps/web/mate-map.js");
 const ev = (type, data) => ({ type, data: data || {} });

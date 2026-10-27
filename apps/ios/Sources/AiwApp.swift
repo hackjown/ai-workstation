@@ -6,6 +6,7 @@ struct AiwApp: App {
     @StateObject private var api = API.shared
     @StateObject private var hub = Hub.shared
     @AppStorage("appearance") private var appearance = "system"
+    @Environment(\.scenePhase) private var phase
     var body: some Scene {
         WindowGroup {
             Group {
@@ -20,6 +21,9 @@ struct AiwApp: App {
                 if api.configured { hub.start() }
             }
             .onChange(of: api.token) { _ in api.configured ? hub.start() : hub.stop() }
+            // 微信「用其他应用打开」/ Open In delivers a file URL; the share extension opens aiw://import (Import.swift)
+            .onOpenURL { ImportCenter.shared.handle($0) }
+            .onChange(of: phase) { p in if p == .active { ImportCenter.shared.collectShared() } }
         }
     }
 }

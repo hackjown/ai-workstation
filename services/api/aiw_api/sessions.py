@@ -445,6 +445,19 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    bos_on = False
+                    try:   # BrowserOS neo on this computer (设置 › 电脑): element-level bos_* tools, one tab group per task
+                        from . import browseros as _bos
+                        bos_on = not cleanup and await _bos.for_task(self.store, computer, task.machine_id)
+                        if bos_on:
+                            loop.bos_enabled = True
+                            loop.system += "\n" + _bos.PROMPT
+                            loop.tools.bos_key = task.id
+                            loop.tools.bos_title = (task.prompt or "")[:200]
+                            src = getattr(task, "source", None) or ""
+                            loop.tools.bos_category = {"watch_order": "shopping", "xhs": "social-media"}.get(src, "other")
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("browseros unavailable: %s", e)
                     from . import shopwatch
                     if shopwatch.is_order_task(task):   # no 提交订单/支付 click before the user confirms
                         shopwatch.guard(loop.tools, shopwatch.ensure_state(task.id), computer)
@@ -456,7 +469,14 @@ class SessionManager:
                             return await self.dispatch(_live, items, timeout_s, _emit)
                         loop.dispatcher = _dispatcher
                     live.loop = loop
-                    t = await loop.run()
+                    try:
+                        t = await loop.run()
+                    finally:
+                        if bos_on:   # drop the task's MCP connection (its tabs stay for the replay)
+                            try:
+                                await computer.execute("browseros.call", {"tool": "close", "key": task.id}, timeout=10)
+                            except Exception:  # noqa: BLE001
+                                pass
                 status, result = t.status.value, t.result
             except Exception as e:  # noqa: BLE001
                 status, result = "failed", f"{type(e).__name__}: {e}"

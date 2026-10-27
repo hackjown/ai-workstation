@@ -103,6 +103,33 @@ CATALOG: list[dict] = [
               "the counter} → layer.new.layerViaCopy → edit.transform {rect:[x0,y0,x1,y1], quad: same box with its top moved "
               "up by D} → layer.flattenImage --out. Keep posters/objects in front outside both regions, then crop-compare "
               "before/after at the junction and send both.")},
+    {"id": "video-remake", "title": "复刻视频", "icon": "film",
+     "desc": "复刻/仿拍一条参考视频：逐镜抽帧分析，出人物和场景参考图提示词（绑定 @图片N），再写可直接生成的逐秒视频提示词",
+     "path": "~/.claude/skills/video-remake",
+     "auto": (r"(复刻|仿拍|翻拍|照着拍|拍同款|做同款)[\s\S]{0,80}(视频|视屏|短片|片子|\.mp4|\.mov|\.webm|\.m4v)"
+              r"|(视频|视屏|短片)\S{0,8}(复刻|仿拍|翻拍)"
+              r"|(分析|反推|拆解|拉片)[\s\S]{0,30}(视频|视屏|短片)[\s\S]{0,30}提示词"
+              r"|\.(mp4|mov|webm|m4v)\b[\s\S]*提示词|提示词[\s\S]*\.(mp4|mov|webm|m4v)\b"
+              r"|remake\s+(this\s+|the\s+|a\s+)?video"),
+     "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/video-remake-setup.sh "
+               "-o /tmp/vrs.sh && bash /tmp/vrs.sh"),
+     "note": ("SKILL.md asks you to read its template.md and example-麻将局.md as well; do. Deliver a remake kit, not a "
+              "description. A) `python3 ~/.claude/skills/video-remake/remake.py frames "
+              "<video> --out ~/workspace/remake/<name>` (probe, hard cuts, one frame per second, a frame after each cut, "
+              "sheet.jpg; printed paths are already relative to ~/workspace for read_image); read sheet.jpg, then each "
+              "shot's frames with read_image paths=[...] (<= 8 per call) and log timing, shot size, camera move, action "
+              "per second. B) one character slot per recurring person (群像 slot for a background group): a standalone "
+              "reference-image prompt (age range, face, hair, outfit colour+material, accessories, neutral standing pose, "
+              "front + three-quarter view, plain light-grey background; props seen only in some seconds stay out). "
+              "C) one scene slot per location, no people, same camera angle and aspect as the video. Slots are "
+              "@图片1.. in order, characters first, scenes last. D) the final prompt exactly in the user's cleaned format "
+              "(example-麻将局.md): 参考图绑定 (`@图片N是<ID>（…）`) / 参考图使用规则 / 全片统一设定 (with 时长与画幅) / "
+              "逐秒提示词 (`第 N 秒（0:00–0:01）· 标题`, every person and place as @图片N, never 男子/女主/aliases) / 输出约束 "
+              "(outfit locks, prop time windows, 无文字无字幕无水印); no vague words (等等/之类/大概/一些…), timings "
+              "contiguous and adding up to the duration, > 15 s split into 片段. Write remake/<name>/复刻_<name>.md by "
+              "template.md, run `remake.py check 复刻_<name>.md --duration <s>` until OK, `remake.py json … --analysis "
+              "analysis.json > 复刻_<name>.json`, send_file both, done with the slot table and the check result. "
+              "Reference images only when the user asks for them.")},
     {"id": "photopea", "title": "Photopea 修图", "icon": "image",
      "desc": "AI 改图后用 Photopea 精修文字、图层，导出 PSD / PNG",
      "path": "", "setup": "", "note": "Use the image_edit tool for the AI edit and the photopea tool for exact finishing."},

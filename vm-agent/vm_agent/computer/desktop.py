@@ -33,12 +33,14 @@ APP_COMMANDS = {
     "chrome": "google-chrome --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium-browser --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome",
     "chromium": "chromium --no-first-run || chromium-browser --no-first-run",
     "browser": "google-chrome --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium-browser --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome",
+    # BrowserOS neo (deploy/vm/browseros-setup.sh): its MCP server on 127.0.0.1:9210 comes up with the window
+    "browseros": "browserclaw --no-first-run --no-default-browser-check || browseros --no-first-run",
     "terminal": "xfce4-terminal || x-terminal-emulator",
     "files": "thunar",
     "editor": "mousepad",
 }
 
-APP_PROCESS = {"chrome": "chrome", "chromium": "chromium", "browser": "chrom",
+APP_PROCESS = {"chrome": "chrome", "chromium": "chromium", "browser": "chrom", "browseros": "lib/browserclaw/browserclaw",
                "terminal": "xfce4-terminal", "files": "thunar", "editor": "mousepad"}
 
 

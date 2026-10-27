@@ -20,7 +20,7 @@ from aiw_protocols import AgentEvent, EventType, Task, TaskStatus
 from llm_router import LLMRequest, LLMRouter
 from PIL import Image
 from tool_router import ToolExecutor, tool_schemas
-from tool_router.registry import SUBAGENT_TOOLS
+from tool_router.registry import BOS_TOOLS, SUBAGENT_TOOLS
 
 from . import cad as _cad
 from . import video as _video
@@ -104,6 +104,8 @@ class AgentLoop:
         self.ask, self.remember = ask, remember
         self.extra_tools = extra_tools or {}
         self._secrets: dict[str, str] = {}  # form values the model only sees as {{key}}
+        self.bos_enabled = False  # set by the session manager when this computer has BrowserOS switched on
+        self._bos_hist: list[int] = []  # history indexes of BrowserOS results (older snapshots get trimmed)
         self.subagent_llm = subagent_llm
         # set by the API's session manager when other computers can take work: async (items, timeout_s) -> results.
         # None (a child task, a single computer, tests) hides the dispatch tool.
@@ -410,11 +412,18 @@ class AgentLoop:
                 cad_blind = True
             else:
                 cad_blind = False
+            bos_blind = (self.step > 1 and str(self._last_tool or "").startswith("bos_")
+                         and not (self._last_tool == "bos_tabs" and getattr(self, "_bos_front", False)))
+            if bos_blind and not blind:
+                blind = True
             if blind:  # a shell/file step does not change the screen: skip the screenshot and the vision call
                 before, shown = None, self._last_shown
                 note = ((note + "\n") if note else "") + (
                     "Screen not re-read: the last LibreCAD batch went through. Send the next batch from your plan; "
                     "the screen is shown again every few batches." if cad_blind else
+                    "No screenshot: your last step was a BrowserOS tool and its result above shows the page (diff or "
+                    "snapshot). Continue with bos_*; call screenshot only if you fall back to clicking by coordinates."
+                    if bos_blind else
                     "No screenshot: this task looks like shell/file work (files are under ~/workspace, uploads in "
                     "~/workspace/uploads). Start with shell; call screenshot only if you need the desktop." if first_blind else
                     "Screen not re-read: your last step was a shell/file action. Keep working in the shell; "
@@ -616,6 +625,12 @@ class AgentLoop:
                     break
                 await self.emit(EventType.RECOVERY, attempt=attempt + 1, note=f"transient error, retrying: {outcome.error[:120]}")
                 await asyncio.sleep(1.5 * (attempt + 1))
+            if outcome.action == "browseros.call" and self._secrets and isinstance(outcome.result, dict):
+                t = str(outcome.result.get("text") or "")
+                for sv in self._secrets.values():   # a diff can echo a filled value back
+                    if sv and len(sv) >= 3:
+                        t = t.replace(sv, "••••")
+                outcome.result["text"] = t
             if decision.tool == "send_file" and outcome.success and isinstance(outcome.result, dict):
                 await self._deliver_file(outcome.result)
                 outcome.result = {k: v for k, v in outcome.result.items() if k != "content_b64"}
@@ -639,6 +654,9 @@ class AgentLoop:
             v = self.validator.check(outcome.action, outcome.success, outcome.error, before, after)
             await self.emit(EventType.VALIDATION, success=v.success, change=v.changed, message=v.message)
             self.history.append(_hist_line(self.step, decision, outcome, v.message))
+            if outcome.action == "browseros.call":
+                self._bos_front = decision.tool == "bos_tabs" and (decision.args or {}).get("action") == "front" and outcome.success
+                self._trim_bos(len(self.history) - 1)
             self._last_ok = ((decision.tool, repr(sorted(decision.args.items()))), self.step) if outcome.success else None
             self._fresh = after if (after and outcome.success) else None
             if decision.tool == "image_edit" and outcome.success:
@@ -866,7 +884,36 @@ class AgentLoop:
         self._acted = True
         return "user filled the form: " + "; ".join(shown) + ". Type each value into its own field of the page now."
 
+    def _trim_bos(self, idx: int) -> None:
+        """Keep the newest BrowserOS readbacks whole; older snapshots/diffs shrink to their first lines (they are
+        stale anyway, and three store-page snapshots fill the model's context)."""
+        self._bos_hist = [i for i in self._bos_hist if i < len(self.history)] + [idx]
+        keep = int(os.environ.get("AIW_BOS_KEEP", "2"))
+        for i in self._bos_hist[:-keep]:
+            line = self.history[i]
+            if len(line) > 700 and "[older BrowserOS output trimmed" not in line:
+                self.history[i] = line[:500] + " …[older BrowserOS output trimmed; refs from it are stale: take a new bos_snapshot]"
+        self._bos_hist = self._bos_hist[-(keep + 30):]
+
     def _fill_secrets(self, tool: str, args: dict) -> dict:
+        if tool == "bos_act" and self._secrets and "{{" in repr(args):
+            out, hit = dict(args), False
+
+            def sub(v):
+                nonlocal hit
+                if isinstance(v, str) and "{{" in v:
+                    for k, val in self._secrets.items():
+                        if "{{" + k + "}}" in v:
+                            v, hit = v.replace("{{" + k + "}}", val), True
+                return v
+            for k in ("text", "value"):
+                if k in out:
+                    out[k] = sub(out[k])
+            if isinstance(out.get("fields"), list):
+                out["fields"] = [{**f, "value": sub(f.get("value"))} if isinstance(f, dict) else f for f in out["fields"]]
+            if hit:
+                out["secret"] = True
+            return out
         if tool != "type" or not self._secrets or "{{" not in str(args.get("text") or ""):
             return args
         text = str(args["text"])
@@ -1625,6 +1672,8 @@ class AgentLoop:
         hide = [] if _cad.script_drawing_allowed(self.task.prompt) else ["cad_draw"]
         if not self.dispatcher:
             hide.append("dispatch")
+        if not self.bos_enabled:
+            hide.extend(BOS_TOOLS)
         return tuple(hide)
 
     async def _dispatch(self, a: dict) -> str:
@@ -1752,6 +1801,13 @@ def _hist_line(step, decision, outcome, vmsg) -> str:
     elif outcome.action == "files.list" and outcome.success and isinstance(outcome.result, dict):
         ents = outcome.result.get("entries") or []
         res = " entries=" + ", ".join((e.get("name", "") + ("/" if e.get("dir") else "")) for e in ents[:60])
+    elif outcome.action == "browseros.call" and isinstance(outcome.result, dict):
+        el = outcome.result.get("element")
+        res = (f" on [{el}]" if el else "") + (
+            " result:\n" + _clip(outcome.result.get("text") or "", int(os.environ.get("AIW_BOS_HIST_CHARS", "8000")))
+            if outcome.success else "")
+        if decision.tool == "bos_act" and isinstance(decision.args, dict) and decision.args.get("secret"):
+            args = {k: ("••••" if k in ("text", "value", "fields") else v) for k, v in args.items() if k != "secret"}
     status = "ok" if outcome.success else f"FAILED ({outcome.error})"
     return f"{step}. {decision.tool}({args}) -> {status}{res}; {vmsg}"
 

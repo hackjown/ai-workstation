@@ -1,0 +1,53 @@
+/* Approval + takeover cards (approval.js). Uses the theme tokens from ui.css. */
+.ask.c.apv{background:var(--panel)!important;border:1px solid var(--line2);border-left:4px solid var(--acc);gap:8px;padding:14px 16px;max-width:620px}
+.ask.c.apv.r-low{border-left-color:var(--ok)}
+.ask.c.apv.r-high{border-left-color:var(--bad)}
+.apv-k{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:var(--mute)}
+.apv-k svg.i{width:16px;height:16px;color:var(--acc)}
+.apv-risk{display:inline-flex;align-items:center;height:22px;padding:0 9px;border-radius:999px;font-size:12px;font-weight:700;margin-left:auto;white-space:nowrap}
+.apv-risk.low{background:var(--okBg);color:var(--ok);border:1px solid var(--okLine)}
+.apv-risk.medium{background:var(--accBg);color:var(--acc);border:1px solid var(--accLine)}
+.apv-risk.high{background:var(--badBg);color:var(--bad);border:1px solid var(--badLine)}
+.apv-t{display:block;font-size:17px;line-height:1.4;font-weight:700;color:var(--text);word-break:break-word}
+.apv-w{margin:0;font-size:14px;line-height:1.6;color:var(--text);word-break:break-word}
+.apv-sec{display:grid;grid-template-columns:48px 1fr;gap:8px;align-items:start}
+.apv-l{font-size:12px;font-weight:700;color:var(--dim);padding-top:3px;letter-spacing:.5px}
+.apv-chips{display:flex;flex-wrap:wrap;gap:6px}
+.apv-chip{display:inline-flex;align-items:center;gap:5px;max-width:100%;padding:3px 9px;border-radius:6px;background:var(--panel2);border:1px solid var(--line);font-size:12.5px;line-height:1.45;color:var(--text);word-break:break-all}
+.apv-chip em{font-style:normal;font-weight:700;color:var(--mute);white-space:nowrap}
+.apv-chip.k-delete em{color:var(--bad)}
+.apv-chip.k-create em,.apv-chip.k-write em{color:var(--acc)}
+.apv-chip.k-computer em,.apv-chip.k-site em{color:var(--ok)}
+.apv-chip.k-money{border-color:var(--badLine)} .apv-chip.k-money em{color:var(--bad)}
+.apv-risks{margin:0;padding-left:18px;font-size:13.5px;line-height:1.6;color:var(--text)}
+.apv-why{margin:0;font-size:13px;line-height:1.55;color:var(--mute);word-break:break-word}
+.apv-btns{margin-top:4px}
+.apv-btns .btn{min-width:84px;justify-content:center}
+.apv-tech{border-top:1px dashed var(--line2);padding-top:8px}
+.apv-tech summary{cursor:pointer;font-size:12.5px;color:var(--dim);list-style:none}
+.apv-tech summary::before{content:"▸ ";}
+.apv-tech[open] summary::before{content:"▾ ";}
+.apv-tech pre{margin:8px 0 4px;padding:10px;max-height:220px;overflow:auto;background:var(--panel3);border:1px solid var(--line);border-radius:6px;font:12px/1.5 var(--mono);white-space:pre-wrap;word-break:break-all;color:var(--mute)}
+
+.actcard.apv-tk{max-width:560px;border-left:4px solid var(--bad)}
+.actcard.apv-tk .ac-k{display:flex;align-items:center;gap:6px;color:var(--bad)}
+.actcard.apv-tk .ac-k svg.i{width:16px;height:16px}
+.actcard.apv-tk .apv-t{font-size:17px;margin:2px 0 8px}
+.actcard.apv-tk .tk-do{margin:0 0 10px;padding:10px 12px;background:var(--accBg);border:1px solid var(--accLine);border-radius:8px;color:var(--text);font-size:14px;line-height:1.6}
+.actcard.apv-tk .tk-do span{display:block;font-size:12px;font-weight:700;color:var(--acc);margin-bottom:2px}
+.actcard.apv-tk .apv-chips{margin-bottom:10px}
+.actcard.apv-tk .tk-why{margin:0 0 12px;font-size:13px;color:var(--mute)}
+.actcard.apv-tk .opts{margin-bottom:8px}
+.actcard.apv-tk .small{margin:0}
+
+.apv-log{display:flex;flex-direction:column;gap:6px;border-top:1px solid var(--line);padding-top:8px}
+.apv-row{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px;font-size:13px}
+.apv-row .apv-risk{margin-left:0;height:20px;font-size:11.5px}
+.apv-dec{font-weight:700;white-space:nowrap;color:var(--ok)}
+.apv-row.no .apv-dec{color:var(--bad)}
+.apv-row details{flex:1 1 240px;min-width:0}
+.apv-row summary{cursor:pointer;list-style:none;color:var(--text);word-break:break-word}
+.apv-row details[open]{display:flex;flex-direction:column;gap:6px}
+.apv-row details p{margin:0;color:var(--mute)}
+.apv-tt{color:var(--text);word-break:break-word}
+@media (max-width:760px){.apv-sec{grid-template-columns:1fr;gap:4px}.apv-btns .btn{flex:1}}

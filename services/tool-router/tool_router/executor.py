@@ -112,6 +112,8 @@ class ToolExecutor:
             r = await self.computer.execute(spec.action, payload, observe=observe, timeout=t_out)
         await self._audit({"phase": "result", "tool": name, "action": spec.action, "success": r.success,
                            "error": r.error, "duration_ms": r.duration_ms})
+        if r.success and hasattr(self.policy, "note_success"):
+            self.policy.note_success(spec.action, payload)
         return ToolOutcome(name, spec.action, r.success, decision, r.result, r.error, r.screenshot)
 
     async def _bos(self, name: str, args: dict, intent: str = "") -> ToolOutcome:

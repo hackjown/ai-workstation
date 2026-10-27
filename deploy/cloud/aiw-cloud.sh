@@ -47,6 +47,10 @@ do_install() {
   "$V/bin/python" -m playwright install chromium >>"$LOG" 2>&1 || true
   step motion   # huashu-motion videos: node 22, chrome, ffmpeg, uv (task-247)
   bash "$R/deploy/vm/motion-setup.sh" >>"$LOG" 2>&1 || true
+  if [ "${AIW_BROWSEROS:-0}" = 1 ]; then   # optional: BrowserOS neo (amd64 only); also 设置 › 电脑 › BrowserOS › 安装
+    step browseros
+    DISPLAY=$DISP bash "$R/deploy/vm/browseros-setup.sh" install >>"$LOG" 2>&1 || true
+  fi
   DISPLAY=$DISP desktop_icons >>"$LOG" 2>&1 || true
   echo INSTALLED > "$ST"
   toolbox_bg
@@ -99,6 +103,7 @@ ENV
   umask 022
   screen_size
   toolbox_bg
+  [ -x /usr/bin/browserclaw ] && DISPLAY=$DISP bash "$R/deploy/vm/browseros-setup.sh" start >/dev/null 2>&1 &
   [ -f "$(xdg-user-dir DESKTOP 2>/dev/null || echo $HOME/Desktop)/librecad.desktop" ] || DISPLAY=$DISP desktop_icons >/dev/null 2>&1 || true
   # restart when the token changed (a new API host) or the agent died
   if pgrep -f "vm_agent.server.websocket" >/dev/null && cmp -s "$S/vm-agent.env" "$S/vm-agent.env.running"; then

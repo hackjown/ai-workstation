@@ -1,4 +1,4 @@
-"""云宝 expression assistant: the task state → emotion mapping (apps/web/mate-map.js) and the vendored Mood Mates files."""
+"""球球 expression assistant: the task state → emotion mapping (apps/web/mate-map.js) and the vendored Emotion Ball files."""
 import re
 import shutil
 import subprocess
@@ -8,7 +8,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "apps" / "web"
-VENDOR = WEB / "vendor" / "moodmates"
+VENDOR = WEB / "vendor" / "emotionball"
+FILES = ("rings.js", "emotions.js", "ball.js", "engine.js")   # load order
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -27,15 +28,34 @@ def test_every_mapped_id_exists_in_vendored_emotions():
         assert need in used
 
 
-def test_vendor_has_licence_and_attribution_and_no_ball_visuals():
-    assert "Mood Mates Community License" in (VENDOR / "LICENSE").read_text(encoding="utf-8")
+def test_vendor_keeps_licence_notice_and_non_commercial_note():
+    assert "Emotion Ball Community License" in (VENDOR / "LICENSE").read_text(encoding="utf-8")
+    notice = (VENDOR / "NOTICE.md").read_text(encoding="utf-8")
+    assert "禁止任何商业用途" in notice and "commercial use is prohibited" in notice
     readme = (VENDOR / "README.md").read_text(encoding="utf-8")
-    assert "sam70361/aora-bot" in readme
+    assert "sam70361/aora-bot" in readme and "NON-COMMERCIAL" in readme
+    assert "非商用" in (ROOT / "README.md").read_text(encoding="utf-8")
     names = {p.name for p in VENDOR.iterdir()}
-    assert {"geometry.js", "render.js", "features.js", "fx.js", "emotions.js", "engine.js", "nimbo.js"} <= names
-    assert not any(n in names for n in ("ball.js", "rings.js", "twinkle.js"))
+    assert set(FILES) <= names
+    # only the engine files: not the upstream gallery site
+    assert not any(n in names for n in ("app.js", "i18n.js", "hero-particles.js"))
+
+
+def test_pages_load_emotion_ball_in_order_and_no_mood_mates():
+    assert not (WEB / "vendor" / "moodmates").exists()
     for page in ("index.html", "mate.html"):
         html = (WEB / page).read_text(encoding="utf-8")
-        assert "emotion-ball" not in html
-        order = [html.find(f"vendor/moodmates/{n}") for n in ("geometry.js", "render.js", "features.js", "fx.js", "emotions.js", "engine.js", "nimbo.js")]
-        assert all(i > 0 for i in order) and order == sorted(order), f"{page}: wrong Mood Mates load order"
+        assert "moodmates" not in html and "MoodMates" not in html
+        order = [html.find(f"vendor/emotionball/{n}") for n in FILES]
+        assert all(i > 0 for i in order) and order == sorted(order), f"{page}: wrong Emotion Ball load order"
+        assert html.find("vendor/emotionball/engine.js") < html.find('src="mate-map.js"')
+    js = (WEB / "mate.js").read_text(encoding="utf-8") + (WEB / "mate.html").read_text(encoding="utf-8")
+    assert "EmotionBall.create(" in js and 'shape: "blob"' in js and "handleAIMessage" in js and "burst(" in js and "setActive(" in js
+    css = (WEB / "mate.css").read_text(encoding="utf-8")
+    assert "#09090b" in css   # 暗黑 backdrop
+
+
+def test_ios_bundle_copies_emotion_ball_and_licence():
+    sh = (ROOT / "apps" / "ios" / "build-ipa.sh").read_text(encoding="utf-8")
+    assert "vendor/emotionball/*.js" in sh and "emotionball/LICENSE" in sh and "emotionball/NOTICE.md" in sh
+    assert "moodmates" not in sh

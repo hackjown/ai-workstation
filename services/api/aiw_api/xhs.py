@@ -1055,12 +1055,12 @@ def mount(app, store, sessions, notifier, auth) -> None:
     dep = [Depends(auth)]
     _orig_answer = sessions.answer_confirm
 
-    def answer_confirm(sid: str, approve: bool) -> bool:   # an explicit 拒绝 on the review card skips the batch
+    def answer_confirm(sid: str, approve: bool, *rest) -> bool:   # an explicit 拒绝 on the review card skips the batch
         try:
             note_confirm_answer(sessions, sid, approve)
         except Exception:  # noqa: BLE001
             pass
-        return _orig_answer(sid, approve)
+        return _orig_answer(sid, approve, *rest)   # rest: scope ("task" = 本任务内都允许)
     sessions.answer_confirm = answer_confirm
 
     @app.get("/api/xhs", dependencies=dep)

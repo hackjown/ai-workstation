@@ -67,6 +67,8 @@ class Store:
 
     def upsert_machine(self, m: dict):
         now = time.time()
+        if "raw_name" in m:   # a row read back from machines()/machine(): keep the stored name, not the display name
+            m = {**m, "name": m.get("raw_name") or m["id"]}
         self._x("""INSERT INTO machines VALUES (?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET provider=excluded.provider, provider_vm_id=excluded.provider_vm_id,
                    name=excluded.name, agent_endpoint=excluded.agent_endpoint,
@@ -77,12 +79,43 @@ class Store:
     def set_machine_status(self, mid: str, status: str, ip: Optional[str] = None):
         self._x("UPDATE machines SET status=?, ip=COALESCE(?, ip), updated_at=? WHERE id=?", (status, ip, time.time(), mid))
 
+    # Display names (iOS v2): InstaBox computers are 云电脑 1, 2, 3… in the order they were added, unless the user
+    # renamed one (kv "machine_names" {id: name}, shared by web and iOS). `name` is the display name everywhere the
+    # API hands out machines (lists, pickers, the agent's COMPUTERS roster, dispatch cards); `raw_name` is the stored one.
+    NAMES_KEY = "machine_names"
+
+    def _named(self, rows: list[dict]) -> list[dict]:
+        custom = self.kv_get(self.NAMES_KEY, {}) or {}
+        clouds = sorted((r for r in rows if (r.get("provider") or "") == "instabox"),
+                        key=lambda r: (r.get("created_at") or 0, r["id"]))
+        order = {r["id"]: i + 1 for i, r in enumerate(clouds)}
+        out = []
+        for r in rows:
+            raw = r.get("name") or r["id"]
+            default = f"云电脑 {order[r['id']]}" if r["id"] in order else raw
+            mine = str(custom.get(r["id"]) or "").strip() or None
+            out.append({**r, "raw_name": raw, "default_name": default, "custom_name": mine, "name": mine or default,
+                        "order": order.get(r["id"])})
+        return out
+
     def machines(self) -> list[dict]:
-        return self._x("SELECT * FROM machines ORDER BY id")
+        return self._named(self._x("SELECT * FROM machines ORDER BY id"))
 
     def machine(self, mid: str) -> Optional[dict]:
-        r = self._x("SELECT * FROM machines WHERE id=?", (mid,))
-        return r[0] if r else None
+        return next((m for m in self.machines() if m["id"] == mid), None)
+
+    def rename_machine(self, mid: str, name: Optional[str]) -> Optional[dict]:
+        """Set (or with an empty name, clear) the user's name for a computer. None when there is no such computer."""
+        if not self._x("SELECT id FROM machines WHERE id=?", (mid,)):
+            return None
+        names = self.kv_get(self.NAMES_KEY, {}) or {}
+        clean = " ".join(str(name or "").split())
+        if clean:
+            names[mid] = clean
+        else:
+            names.pop(mid, None)
+        self.kv_set(self.NAMES_KEY, names)
+        return self.machine(mid)
 
     def create_task(self, t: dict):
         now = time.time()
@@ -132,11 +165,27 @@ class Store:
         return r[0] if r else None
 
     def threads(self, archived: bool = False, limit: int = 100) -> list[dict]:
-        return self._x("""SELECT t.*, (SELECT prompt FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_prompt,
+        rows = self._x("""SELECT t.*, (SELECT prompt FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_prompt,
                           (SELECT status FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_status,
-                          (SELECT COUNT(*) FROM tasks WHERE thread_id=t.id) AS task_count
+                          (SELECT COUNT(*) FROM tasks WHERE thread_id=t.id) AS task_count,
+                          (SELECT substr(result, 1, 300) FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_result,
+                          (SELECT source FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_source,
+                          (SELECT plan FROM tasks WHERE thread_id=t.id ORDER BY created_at DESC LIMIT 1) AS last_plan,
+                          (SELECT COUNT(*) FROM artifacts a JOIN sessions s ON a.session_id=s.id JOIN tasks k ON s.task_id=k.id
+                             WHERE k.thread_id=t.id AND a.kind='file') AS file_count,
+                          (SELECT a.path FROM artifacts a JOIN sessions s ON a.session_id=s.id JOIN tasks k ON s.task_id=k.id
+                             WHERE k.thread_id=t.id AND a.kind='file' ORDER BY a.created_at DESC LIMIT 1) AS last_file
                           FROM threads t WHERE archived=? AND t.parent_task_id IS NULL
                           ORDER BY updated_at DESC LIMIT ?""", (1 if archived else 0, limit))
+        for r in rows:   # history cards (iOS v2): a thin progress bar from the newest task's plan, when it has one
+            try:
+                plan = json.loads(r.pop("last_plan") or "null") or {}
+            except (TypeError, ValueError):
+                plan = {}
+            plan = plan if isinstance(plan, dict) else {}
+            steps = plan.get("steps") or []
+            r["progress"] = round(len(set(plan.get("done") or [])) / len(steps), 3) if steps else None
+        return rows
 
     def update_thread(self, tid: str, title: Optional[str] = None, archived: Optional[bool] = None):
         if title is not None:
@@ -219,6 +268,9 @@ class Store:
 
     def delete_machine(self, mid: str):
         self._x("DELETE FROM machines WHERE id=?", (mid,))
+        names = self.kv_get(self.NAMES_KEY, {}) or {}
+        if names.pop(mid, None) is not None:
+            self.kv_set(self.NAMES_KEY, names)
 
     def update_task(self, tid: str, status: str, result: Optional[str] = None):
         self._x("UPDATE tasks SET status=?, result=COALESCE(?, result), updated_at=? WHERE id=?",

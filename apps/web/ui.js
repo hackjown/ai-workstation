@@ -737,17 +737,42 @@ function bosSection(bos) {
   const st = (m) => { const s = m.seen || {};
     if (!s.at) return '<span class="chip">未检测</span>';
     if (!s.installed) return '<span class="chip">未安装</span>';
+    if (s.agent_old) return '<span class="chip warn">已安装 · vm-agent 需更新</span>';
     return s.running ? `<span class="chip ok">运行中${s.version ? " · " + esc(s.version) : ""}</span>` : `<span class="chip">已安装 · 未运行</span>`; };
+  const note = (m) => { const s = m.seen || {};
+    if (s.agent_old) return "BrowserOS 已装好，但这台电脑的 vm-agent 太旧，用不了它。在这台电脑的终端里跑下面这行更新：";
+    return m.enabled ? "任务里优先用 BrowserOS 按元素操作网页" : s.installed ? "已关闭，任务只用截图点击" : ""; };
   const rows = ms.map((m) => { const s = m.seen || {}; const id = esc(m.id);
     return `<div class="rw"><div class="k"><div class="mach"><span class="ic">${icon("monitor")}</span><div><b>${esc(m.name)}</b><span class="mono">${m.cloud ? "云电脑" : "本地"}</span></div></div></div>
-      <div class="v">${st(m)}<span class="small" id="bosT_${id}">${m.enabled ? "任务里优先用 BrowserOS 按元素操作网页" : s.installed ? "已关闭，任务只用截图点击" : ""}</span></div>
-      <div class="t">${s.installed ? `<input type="checkbox" ${m.enabled ? "checked" : ""} onchange="bosToggle('${id}',this.checked)" aria-label="在这台电脑上使用 BrowserOS" />`
-        : `<button type="button" class="btn sm" onclick="bosInstall('${id}')">安装</button>`}</div></div>`; }).join("");
+      <div class="v">${st(m)}<span class="small" id="bosT_${id}">${esc(note(m))}</span><div id="bosC_${id}">${m.command ? bosCmd(m.command) : ""}</div></div>
+      <div class="t">${s.installed && !s.agent_old ? `<input type="checkbox" ${m.enabled ? "checked" : ""} onchange="bosToggle('${id}',this.checked)" aria-label="在这台电脑上使用 BrowserOS" />`
+        : `<button type="button" class="btn sm" onclick="bosInstall('${id}')">${s.installed ? "重装" : "安装"}</button>`}</div></div>`; }).join("");
   return `<div class="rows" id="sBos">
       <div class="rw head"><div class="k">BrowserOS · 按网页元素操作，省 token、少点错</div><div>${on ? `<span class="chip ok">${on} 台已开启</span>` : '<span class="chip">未开启</span>'}</div></div>
       ${rows || '<div class="rw"><div class="k small">还没有电脑</div></div>'}
       <div class="savebar"><span class="note" id="bosNote">装好后默认开启；网站登录要在 BrowserOS 里登一次（接管桌面）。只支持 x86 电脑。</span><button type="button" class="btn sm" onclick="bosRefresh()">重新检测</button></div>
     </div>`;
+}
+/* the one-line command for the computer's own terminal (接管桌面 › 终端, or ssh); no password goes through Aiw */
+function bosCmd(cmd) {
+  return `<div class="bos-cmd"><code>${esc(cmd)}</code><button type="button" class="btn sm" onclick="bosCopy(this)" data-cmd="${esc(cmd)}">复制</button></div>
+    <span class="small">打开「接管桌面」里的终端粘贴运行，输一次这台电脑的密码；跑完回来点「重新检测」。</span>`;
+}
+function bosCopy(btn) {
+  const text = btn.getAttribute("data-cmd") || "";
+  const done = () => toast("已复制命令");
+  if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(done, () => {}); return; }
+  const ta = document.createElement("textarea"); ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); done(); } catch (e) { toast("复制失败，请手动选中命令"); }
+  ta.remove();
+}
+/* what a failed install says: the script's own error line (+ a couple of lines before it), never curl's progress meter */
+function bosInstallMsg(r) {
+  if (r.need_sudo) return "需要这台电脑的 sudo 密码。Aiw 不经手密码：在这台电脑的终端里跑下面这行即可：";
+  if (r.ok && r.agent_old) return "BrowserOS 已装好，但这台电脑的 vm-agent 太旧，用不了它。在这台电脑的终端里跑下面这行更新：";
+  const d = (r.detail || []).filter(Boolean).slice(-2);
+  return "安装没有完成：" + (r.error || "未知原因") + (d.length ? " · " + d.join(" · ") : "");
 }
 async function bosRefresh() { $("bosNote").textContent = "检测中…"; try { await api("GET", "/api/browseros?refresh_now=true"); loadSettings(); } catch (err) { $("bosNote").textContent = err.message; } }
 async function bosToggle(id, on) {
@@ -756,11 +781,13 @@ async function bosToggle(id, on) {
   catch (err) { toast(err.message); }
 }
 async function bosInstall(id) {
-  if (!confirm("在这台电脑上安装 BrowserOS？要下载约 200 MB，几分钟。")) return;
-  const el = $("bosT_" + id); if (el) el.textContent = "安装中，几分钟…";
+  if (!confirm("在这台电脑上安装 BrowserOS？要下载约 200 MB，几分钟。已经装好的话只检查并启动它。")) return;
+  const el = $("bosT_" + id), box = $("bosC_" + id);
+  if (el) el.textContent = "安装中，几分钟…"; if (box) box.innerHTML = "";
   try { const r = await api("POST", `/api/browseros/${encodeURIComponent(id)}/install`);
-    if (r.ok) { toast("BrowserOS 已装好并开启"); loadSettings(); }
-    else if (el) el.textContent = (r.error || "安装失败") + (r.log ? " · " + r.log.split("\n").filter(Boolean).slice(-2).join(" · ") : ""); }
+    if (r.ok && !r.agent_old) { toast("BrowserOS 已装好并开启"); loadSettings(); return; }
+    if (el) el.textContent = bosInstallMsg(r);
+    if (box && r.command) box.innerHTML = bosCmd(r.command); }
   catch (err) { if (el) el.textContent = err.message; }
 }
 

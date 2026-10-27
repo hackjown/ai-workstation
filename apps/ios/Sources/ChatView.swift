@@ -104,7 +104,7 @@ final class TaskLive: ObservableObject {
         guard sock == nil, !sid.isEmpty, let u = API.shared.wsURL("/ws/session/\(sid)") else { return }
         steps = []; files = []; loaded = true
         let s = Socket(u)
-        s.onMessage = { [weak self] m in if m.s("kind") == "event" { self?.apply(m) } }
+        s.onMessage = { [weak self] m in if m.s("kind") == "event" { self?.apply(m); MateBus.shared.event(m) } }
         s.start(); sock = s
     }
     func loadHistory(_ sid: String) async {
@@ -231,6 +231,11 @@ struct ChatView: View {
         }
         .navigationTitle(m.threadId == nil ? "新对话" : m.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .principal) {   // 云宝 beside the title (MateView.swift)
+            MateTitle(title: m.threadId == nil ? "新对话" : m.title,
+                      status: m.tasks.last.map { t in let l = m.live(t).status; return l.isEmpty ? t.s("status") : l } ?? "",
+                      threadId: m.threadId)
+        } }
         .task { await m.load() }
         .refreshable { await m.load() }
         .onChange(of: hub.tick) { _ in

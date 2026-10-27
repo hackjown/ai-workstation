@@ -33,7 +33,7 @@ struct SettingsView: View {
                 Section(footer: Text("点赞、回复评论、给兴趣相近的笔记写评论、发笔记；评论和笔记先给你审核")) {
                     NavigationLink { XhsView() } label: { Label("小红书运营", systemImage: "heart.text.square") }
                 }
-                Section(footer: Text("对话标题旁的云宝随任务状态变表情：接收、思考、操作、等你、完成、出错")) {
+                Section(footer: Text("对话标题旁的球球随任务状态变表情：接收、思考、操作、等你、完成、出错（形象仅供个人学习研究，非商用）")) {
                     Toggle("表情助手", isOn: $mate)
                 }
                 Section(header: Text("外观"), footer: Text("跟随系统时，白天浅色、晚上深色，随 iPhone 的设置自动切换")) {

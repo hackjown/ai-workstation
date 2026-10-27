@@ -55,6 +55,7 @@
         if (d.success === false && blocked(d.error, d.result)) return { id: ID.REFUSED };
         return null;
       case "agent.confirm_required": return { id: ID.WAIT };
+      case "agent.confirm_answered": return { id: ID.BUSY };
       case "agent.input_required": {
         var f = d.form || {};
         if (blocked(d.question, f.title)) return { id: ID.REFUSED };

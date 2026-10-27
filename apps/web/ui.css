@@ -600,3 +600,7 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
   border-radius:var(--r-md);background:var(--accBg);color:var(--text);font:inherit;font-size:13px;text-align:left;cursor:pointer}
 .fromp span{color:var(--amber);font-weight:600;white-space:nowrap}
 .fromp b{font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* computers: 当前 badge + the long id as grey small text (settings › 电脑) */
+.curb{display:inline-block;margin-left:6px;padding:0 6px;border-radius:5px;background:var(--acc);color:var(--onAcc);font:600 11px/18px var(--sans);vertical-align:1px}
+.mach .mono.idl,.rw .mono.idl{font:400 11px var(--mono);color:var(--mute);opacity:.8;word-break:break-all}

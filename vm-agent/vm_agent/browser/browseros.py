@@ -72,8 +72,15 @@ def status() -> dict:
     """Cheap (no MCP round trip): installed? MCP port answering? Used by system.health."""
     mcp, cdp = ports()
     b = binary()
-    return {"installed": bool(b), "running": _port_open(mcp), "mcp_port": mcp, "cdp_port": cdp,
+    # both ports: the MCP server (browseros-claw-server) can outlive a browser window that crashed or was closed,
+    # and then 9210 still answers while nothing can be driven
+    return {"installed": bool(b), "running": _port_open(mcp) and _port_open(cdp), "mcp_port": mcp, "cdp_port": cdp,
             "version": version() if b else None}
+
+
+def _up() -> bool:
+    mcp, cdp = ports()
+    return _port_open(mcp) and _port_open(cdp)
 
 
 class BrowserOS:
@@ -89,25 +96,27 @@ class BrowserOS:
 
     # ------------------------------------------------------------------ process
     async def ensure_running(self, wait_s: float = 30) -> bool:
-        mcp, _ = ports()
-        if _port_open(mcp):
+        if _up():
             return True
         b = binary()
         if not b:
             raise RuntimeError("BrowserOS is not installed on this computer (deploy/vm/browseros-setup.sh)")
         async with self._start_lock:
-            if _port_open(mcp):
+            if _up():
                 return True
             env = dict(self.env)
             env.setdefault("DISPLAY", os.environ.get("DISPLAY", ":0"))
             if not _running():
+                # an MCP server left over from a browser that went away holds 9210: clear it so the new one binds
+                kill = await asyncio.create_subprocess_shell("pkill -f browseros-claw-server >/dev/null 2>&1; sleep 1")
+                await kill.wait()
                 proc = await asyncio.create_subprocess_shell(
                     f"nohup {b} --no-first-run --no-default-browser-check >/dev/null 2>&1 &", env=env)
                 await proc.wait()
             t0 = time.monotonic()
             while time.monotonic() - t0 < wait_s:
                 await asyncio.sleep(0.5)
-                if _port_open(ports()[0]):
+                if _up():
                     await asyncio.sleep(1.0)   # the MCP server answers a moment before its first tool call works
                     return True
         raise RuntimeError(f"BrowserOS started but its MCP server did not come up on port {ports()[0]} within {wait_s:.0f}s")

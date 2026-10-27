@@ -17,7 +17,7 @@ REST (see README "API" for the full list)
   GET  /api/machines/{id}/desktop      -> noVNC URL (proxied through this API)
   GET  /api/machines/{id}/screenshot   -> PNG
   POST /api/agent/pause|resume|stop|takeover   {session_id}
-  POST /api/agent/confirm              {session_id, approve}
+  POST /api/agent/confirm              {session_id, approve, scope?: "task"}
 WebSocket
   /ws/session/{session_id}             live agent events
   /ws/desktop/{machine_id}             VNC websocket proxy (noVNC connects here)
@@ -121,6 +121,7 @@ class Ctl(BaseModel):
 class Confirm(BaseModel):
     session_id: str
     approve: bool
+    scope: Optional[str] = None   # "task": also allow the rest of this task's confirmations (not payments/posts)
 
 class Snap(BaseModel):
     name: str
@@ -410,7 +411,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.post("/api/agent/confirm", dependencies=[Depends(auth)])
     async def confirm(body: Confirm):
         try:
-            return {"answered": sessions.answer_confirm(body.session_id, body.approve)}
+            args = (body.session_id, body.approve) + ((body.scope,) if body.scope else ())
+            return {"answered": sessions.answer_confirm(*args)}
         except KeyError:
             raise HTTPException(404, "session not live")
 
@@ -1208,7 +1210,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                 if op in ("pause", "resume", "stop", "takeover"):
                     await sessions.control(sid, op)
                 elif op == "confirm":
-                    sessions.answer_confirm(sid, bool(msg.get("approve")))
+                    sessions.answer_confirm(sid, bool(msg.get("approve")), *((msg["scope"],) if msg.get("scope") else ()))
                 elif op == "answer":
                     sessions.answer_question(sid, str(msg.get("text") or ""))
         except WebSocketDisconnect:

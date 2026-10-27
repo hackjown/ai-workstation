@@ -5,6 +5,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
     @State private var machines: [JSON] = []
     @AppStorage("appearance") private var appearance = "system"
+    @AppStorage("mate") private var mate = true
     var body: some View {
         NavigationStack {
             Form {
@@ -31,6 +32,9 @@ struct SettingsView: View {
                 }
                 Section(footer: Text("点赞、回复评论、给兴趣相近的笔记写评论、发笔记；评论和笔记先给你审核")) {
                     NavigationLink { XhsView() } label: { Label("小红书运营", systemImage: "heart.text.square") }
+                }
+                Section(footer: Text("对话标题旁的云宝随任务状态变表情：接收、思考、操作、等你、完成、出错")) {
+                    Toggle("表情助手", isOn: $mate)
                 }
                 Section(header: Text("外观"), footer: Text("跟随系统时，白天浅色、晚上深色，随 iPhone 的设置自动切换")) {
                     Picker("外观", selection: $appearance) {

@@ -506,7 +506,7 @@ struct ComputerSheet: View {
         let id = m.s("id"), cur = id == api.machine, c = conn(m)
         let cloud = m.s("provider") == "instabox"
         HStack(alignment: .top, spacing: 12) {
-            MateView(status: "", threadId: nil, bus: false, emotion: c == .online ? "02" : "00")
+            MateView(status: "", threadId: nil, bus: false, emotion: c == .online ? "02" : "00", animate: c == .online)
                 .frame(width: 44, height: 44).accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 6) {

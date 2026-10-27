@@ -127,7 +127,8 @@ async def test_max_steps(env):
     loop, _ = make_loop(comp, [("move", {"x": 5, "y": 5})] * 50, tmp)
     loop.cfg.max_steps = 3
     t = await loop.run()
-    assert t.status == TaskStatus.FAILED and "max steps" in t.result
+    # nobody to ask in this test: it ends, but with a report of what happened instead of "max steps reached"
+    assert t.status == TaskStatus.FAILED and "步数用完" in t.result and "最后做过的步骤" in t.result
 
 
 def test_policy_levels():

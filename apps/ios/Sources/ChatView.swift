@@ -210,13 +210,7 @@ struct ChatView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
                     if let p = m.parentThread { parentBanner(p) }
-                    if m.tasks.isEmpty {
-                        VStack(spacing: 10) {
-                            Image(systemName: "face.smiling").font(.system(size: 36)).foregroundColor(amber)
-                            Text("让 Aiw 在电脑上替你做事").foregroundColor(.secondary)
-                            Text("点 + 上传文件或选技能").font(.caption).foregroundColor(.secondary)
-                        }.frame(maxWidth: .infinity).padding(.top, 80)
-                    }
+                    if m.tasks.isEmpty { HomeEmpty(threadId: m.threadId) }
                     ForEach(m.tasks.indices, id: \.self) { i in
                         TaskBlock(t: m.tasks[i], live: m.live(m.tasks[i]), preview: $preview, reload: { await m.load() })
                     }
@@ -234,7 +228,7 @@ struct ChatView: View {
         .toolbar { ToolbarItem(placement: .principal) {   // 云宝 beside the title (MateView.swift)
             MateTitle(title: m.threadId == nil ? "新对话" : m.title,
                       status: m.tasks.last.map { t in let l = m.live(t).status; return l.isEmpty ? t.s("status") : l } ?? "",
-                      threadId: m.threadId)
+                      threadId: m.threadId, showMate: !m.tasks.isEmpty)
         } }
         .task { await m.load() }
         .refreshable { await m.load() }
@@ -324,7 +318,7 @@ struct ChatView: View {
                         .frame(width: 36, height: 36)
                         .background(Color(.secondarySystemBackground)).clipShape(Circle())
                 }
-                TextField("给 Aiw 一个任务…", text: $text, axis: .vertical)
+                TextField("点击 + 上传文件或选技能", text: $text, axis: .vertical)
                     .lineLimit(1...6).focused($focused)
                     .padding(.horizontal, 12).padding(.vertical, 9)
                     .background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 18))
@@ -402,6 +396,29 @@ struct ChatView: View {
         defer { if ok { u.stopAccessingSecurityScopedResource() } }
         guard let d = try? Data(contentsOf: u) else { m.err = "读不了 \(u.lastPathComponent)"; return }
         await send(name: u.lastPathComponent, data: d)
+    }
+}
+
+/// iOS v2 empty home: the real 球球 (amber disc) centred, one line of slogan under it.
+struct HomeEmpty: View {
+    let threadId: String?
+    @AppStorage("mate") private var mateOn = true
+    var body: some View {
+        VStack(spacing: 18) {
+            if mateOn {
+                MateView(status: "", threadId: threadId).frame(width: 112, height: 112).accessibilityLabel("球球")
+            } else {
+                Circle().fill(amber).frame(width: 112, height: 112)
+                    .overlay(Image(systemName: "sparkles").font(.system(size: 40, weight: .medium)).foregroundColor(.white))
+                    .accessibilityHidden(true)
+            }
+            Text("让 Aiw 在云电脑上替你干活")
+                .font(.system(size: 15, weight: .regular))
+                .foregroundColor(Color(.secondaryLabel))
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, max(60, UIScreen.main.bounds.height * 0.25))
     }
 }
 

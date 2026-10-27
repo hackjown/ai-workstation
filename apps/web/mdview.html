@@ -1,0 +1,40 @@
+<!doctype html>
+<!-- AIW file preview page for the iOS app (MarkdownPreview.swift loads it from the app bundle in a WKWebView).
+     The app calls aiwShow(base64Utf8, kind, fontPx) once the page has loaded. Works in a browser too:
+     mdview.html?src=<url>&kind=md for a quick look. -->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light dark" />
+<link rel="stylesheet" href="mdview.css" />
+<style>
+  html,body{margin:0;background:var(--mdv-bg)}
+  #doc{padding:16px max(16px,env(safe-area-inset-right)) 48px max(16px,env(safe-area-inset-left))}
+  #doc.mdv-mono{padding:12px}
+</style>
+</head>
+<body>
+<div id="doc" class="mdv"></div>
+<script src="vendor/markdown/markdown-it.min.js"></script>
+<script src="vendor/markdown/purify.min.js"></script>
+<script src="mdview.js"></script>
+<script>
+  function aiwShow(b64, kind, fontPx) {
+    var bytes = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0); });
+    var text = new TextDecoder("utf-8").decode(bytes);
+    if (fontPx) document.documentElement.style.setProperty("--mdv-size", fontPx + "px");
+    AiwMd.show(document.getElementById("doc"), text, kind || "md");
+    return true;
+  }
+  function aiwFont(px) { document.documentElement.style.setProperty("--mdv-size", px + "px"); }
+  (function () {   // browser use: ?src=...&kind=...&theme=light|dark
+    var q = new URLSearchParams(location.search);
+    if (q.get("theme")) document.documentElement.dataset.theme = q.get("theme");
+    if (q.get("src")) fetch(q.get("src")).then(function (r) { return r.text(); }).then(function (t) {
+      AiwMd.show(document.getElementById("doc"), t, q.get("kind") || AiwMd.kindOf(q.get("src")) || "md");
+    });
+  })();
+</script>
+</body>
+</html>

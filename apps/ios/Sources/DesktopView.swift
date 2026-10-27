@@ -1,6 +1,11 @@
 import SwiftUI
 import WebKit
 
+extension Notification.Name {
+    /// A computer was renamed or picked in the 电脑 sheet: pickers and the switcher bar reload their list.
+    static let aiwMachinesChanged = Notification.Name("aiwMachinesChanged")
+}
+
 /// The agent's computer, pinned above the conversation: a live picture while you watch, the real desktop when you take over.
 struct DesktopPane: View {
     @EnvironmentObject var api: API
@@ -59,6 +64,9 @@ struct DesktopPane: View {
         .overlay(Divider(), alignment: .bottom)
         .onAppear { if liveSession != nil { open = true } }
         .task { machines = (try? await api.list("/api/machines")) ?? [] }
+        .onReceive(NotificationCenter.default.publisher(for: .aiwMachinesChanged)) { _ in
+            Task { machines = (try? await api.list("/api/machines")) ?? [] }
+        }
         .onChange(of: liveSession) { s in if s != nil { withAnimation { open = true } } }
         .onReceive(timer) { _ in if open && phase == .active && !taking { Task { await grab() } } }
         .fullScreenCover(isPresented: $taking) {
@@ -68,8 +76,9 @@ struct DesktopPane: View {
 
     var current: JSON { machines.first { $0.s("id") == api.machine } ?? [:] }
     func label(_ m: JSON) -> String {
-        let n = m.s("name").isEmpty ? m.s("id") : m.s("name")
-        return m.s("provider") == "instabox" ? n + "（云电脑）" : n + "（本地）"
+        let n = m.s("name").isEmpty ? m.s("id") : m.s("name")   // display name: 云电脑 N or the user's own (shared with web)
+        if m.s("provider") == "instabox" { return n.contains("云") ? n : n + "（云电脑）" }
+        return n + "（本地）"
     }
     func pick(_ id: String) {
         api.setMachine(id); image = nil; note = ""

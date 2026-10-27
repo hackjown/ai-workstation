@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-<title>云宝</title>
-<!-- 云宝 (Mood Mates, github.com/sam70361/aora-bot, non-commercial licence: vendor/moodmates/LICENSE).
+<title>球球</title>
+<!-- 球球 · 暗黑 (Emotion Ball, github.com/sam70361/aora-bot emotion-ball/; visuals for personal learning/research only,
+     no commercial use: vendor/emotionball/LICENSE + NOTICE.md).
      Embedded by the iOS app (WKWebView, bundled copy) in the chat header. The app drives it with evaluateJavaScript:
        aiwMate.event({type, data})  a task/session event (mapped by mate-map.js)
        aiwMate.status("running")    a task's stored status
@@ -13,18 +14,20 @@
      ?static=1 renders single frames only (Reduce Motion). -->
 <style>
   html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; -webkit-user-select: none; user-select: none; }
-  #m { position: absolute; inset: 0; }
+  /* 暗黑 look of the upstream gallery: cream ball on #09090b with a violet glow and a drop shadow (?bg=0: no backdrop) */
+  #m { position: absolute; inset: 0; box-sizing: border-box; border-radius: 50%; padding: 9%; color-scheme: dark;
+       background: radial-gradient(circle at 50% 42%, rgba(145,109,255,.30), rgba(145,109,255,.08) 48%, transparent 70%), #09090b;
+       box-shadow: inset 0 0 0 1px rgba(255,255,255,.08); --sketch-ink: rgba(226,232,248,.82); }
+  #m.nobg { background: transparent; box-shadow: none; padding: 0; }
+  #m > svg { filter: drop-shadow(0 2px 3px rgba(0,0,0,.55)); }
 </style>
 </head>
 <body>
-<div id="m" role="img" aria-label="云宝"></div>
-<script src="vendor/moodmates/geometry.js"></script>
-<script src="vendor/moodmates/render.js"></script>
-<script src="vendor/moodmates/features.js"></script>
-<script src="vendor/moodmates/fx.js"></script>
-<script src="vendor/moodmates/emotions.js"></script>
-<script src="vendor/moodmates/engine.js"></script>
-<script src="vendor/moodmates/nimbo.js"></script>
+<div id="m" role="img" aria-label="球球"></div>
+<script src="vendor/emotionball/rings.js"></script>
+<script src="vendor/emotionball/emotions.js"></script>
+<script src="vendor/emotionball/ball.js"></script>
+<script src="vendor/emotionball/engine.js"></script>
 <script src="mate-map.js"></script>
 <script>
 (function () {
@@ -32,7 +35,9 @@
   var q = new URLSearchParams(location.search);
   var still = q.get("static") === "1" || (window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches);
   var M = AiwMood, ID = M.ID, cur = q.get("e") || ID.IDLE, settleT = 0, live = !still;
-  var eng = MoodMates.create(document.getElementById("m"), { character: "nimbo", emotion: cur, eyeScale: +(q.get("eye") || 1.7), lite: q.get("lite") === "1", autostart: live });
+  var host = document.getElementById("m");
+  if (q.get("bg") === "0") host.className = "nobg";
+  var eng = EmotionBall.create(host, { emotion: cur, idle: false, shape: "blob", eyeScale: +(q.get("eye") || 1.6), lite: q.get("lite") === "1", autostart: live, label: "球球" });
   if (!live) eng.renderStatic();
   function post(o) { try { window.webkit.messageHandlers.mate.postMessage(o); } catch (e) { /* not in the app */ } }
   var HOLD = { "31": 1400, "39": 1400, "36": 700, "40": 700, "38": 900 }, holdUntil = 0, holdT = 0, queuedSettle = false;
@@ -47,9 +52,9 @@
     if (id !== cur) holdUntil = now + (HOLD[id] || 0);
     clearTimeout(settleT); settleT = 0;
     if (settle) settleT = setTimeout(function () { settleT = 0; set(ID.IDLE); }, settle);
-    if (id !== cur) { cur = id; eng.setEmotion(id); }
+    if (id !== cur) { cur = id; eng.handleAIMessage({ emotionId: id }); }
     if (!live) eng.renderStatic(); else if (burst) eng.burst(24);
-    document.getElementById("m").setAttribute("aria-label", "云宝 · " + (M.NAMES[id] || id));
+    document.getElementById("m").setAttribute("aria-label", "球球 · " + (M.NAMES[id] || id));
     post({ mood: id });
   }
   window.aiwMate = {

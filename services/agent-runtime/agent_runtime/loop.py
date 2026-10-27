@@ -133,6 +133,85 @@ class AgentLoop:
             await self._emit_fn(AgentEvent(session_id=self.session_id, type=type_, step=self.step, data=data))
 
     # ---------------------------------------------------------------- observe
+    async def _see(self) -> tuple[Optional[str], tuple[int, int]]:
+        """The screen for this step. Working in BrowserOS, the page the task is on is brought to the front first and
+        checked; when the desktop still shows another window, a picture of the page itself is used instead
+        (task-d76ffb0bd1 took 13 screenshots of BrowserOS's session-replay window while the captcha sat elsewhere)."""
+        p = getattr(self, "_bos_page", None)
+        last = str(self._last_tool or "")
+        if (p is not None and self.step - getattr(self, "_bos_step", -99) <= 4
+                and (last == "screenshot" or last.startswith("bos_"))):
+            try:
+                v = await self._bos_view(int(p))
+            except (StopRequested, asyncio.CancelledError):
+                raise
+            except Exception as e:  # noqa: BLE001  fall back to the desktop screenshot
+                await self.emit(EventType.ERROR, error=f"找页面窗口失败，改用桌面截图：{type(e).__name__}: {str(e)[:160]}")
+                v = None
+            if v:
+                return v
+        self._page_view = None
+        return await self.observe()
+
+    async def _bos_view(self, page: int):
+        ex = getattr(self.computer, "execute", None)
+        if ex is None:
+            return None
+        key = getattr(self.tools, "bos_key", None) or "default"
+        r = await asyncio.wait_for(ex("browseros.call", {"tool": "front", "args": {"page": page}, "key": key},
+                                      observe=False, timeout=20), 25)
+        res = r.result if (r and isinstance(r.result, dict)) else {}
+        if not r or not r.success or "verified" not in res:   # an older vm-agent: no way to tell, use the desktop
+            return None
+        self._fresh = None   # a screenshot taken before the window was raised shows the wrong window
+        if res.get("verified"):
+            self._page_view = None
+            return None   # the desktop now shows the page: a new screenshot is right
+        r2 = await asyncio.wait_for(ex("browseros.call", {"tool": "page_shot", "args": {"page": page}, "key": key},
+                                       observe=False, timeout=30), 35)
+        res2 = r2.result if (r2 and isinstance(r2.result, dict)) else {}
+        imgs = res2.get("images") or []
+        if not r2.success or not imgs or not imgs[0].get("data"):
+            return None
+        raw = imgs[0]["data"]
+        img = Image.open(io.BytesIO(base64.b64decode(raw))).convert("RGB")
+        full = img.size
+        scale = 1.0
+        if img.width > self.cfg.llm_image_width:
+            ratio = self.cfg.llm_image_width / img.width
+            img = img.resize((self.cfg.llm_image_width, int(img.height * ratio)))
+            scale = 1 / ratio
+        buf = io.BytesIO(); img.save(buf, "JPEG", quality=75)
+        artifact = self._save_artifact(raw)
+        await self.emit(EventType.OBSERVATION, width=full[0], height=full[1], artifact=artifact, page_shot=True,
+                        page=page, url=res2.get("url"))
+        self._page_view = {"page": page, "scale": scale}
+        self._page_note = (f"The desktop shows another window ({res.get('window') or 'unknown'}), so this image is BrowserOS "
+                           f"page {page} ({res2.get('url') or res.get('url') or ''}) itself, taken from the browser. Its "
+                           "coordinates are page coordinates: act by ref with bos_act, or bos_act kind=click_at with x,y "
+                           "read from THIS image. If it shows a captcha/slider/login only a person can pass, call "
+                           "request_takeover now.")
+        return base64.b64encode(buf.getvalue()).decode(), img.size
+
+    def _page_click(self, decision) -> None:
+        """While the model looks at a page picture (not the desktop), its coordinates belong to that page: a desktop
+        click becomes bos_act click_at on the page, and page coordinates are scaled back to full size."""
+        pv = getattr(self, "_page_view", None)
+        if not pv:
+            return
+        a = dict(decision.args or {})
+        sc = float(pv.get("scale") or 1.0)
+        if decision.tool in ("click", "double_click", "left_click") and a.get("x") is not None and a.get("y") is not None:
+            decision.tool = "bos_act"
+            decision.args = {"page": pv["page"], "kind": "click_at", "x": round(float(a["x"]) * sc),
+                             "y": round(float(a["y"]) * sc)}
+            return
+        if (decision.tool == "bos_act" and str(a.get("kind") or "") in ("click_at", "type_at", "hover_at", "drag")
+                and sc != 1.0 and a.get("x") is not None and a.get("y") is not None):
+            a["x"], a["y"] = round(float(a["x"]) * sc), round(float(a["y"]) * sc)
+            a.setdefault("page", pv["page"])
+            decision.args = a
+
     async def observe(self) -> tuple[Optional[str], tuple[int, int]]:
         fresh, self._fresh = self._fresh, None
         if fresh:  # the screenshot taken right after the last action is still current: no second grab
@@ -456,8 +535,11 @@ class AgentLoop:
                     "Screen not re-read: your last step was a shell/file action. Keep working in the shell; "
                     "call screenshot only if you need to see the desktop.")
             else:
-                before, shown = await self.observe()
+                before, shown = await self._see()
                 self._last_shown = shown
+                if getattr(self, "_page_note", None):
+                    note = ((note + "\n") if note else "") + self._page_note
+                    self._page_note = None
 
             desc = await self._look(before, shown) if self.vision_llm and before else None
             send_shot = before
@@ -641,6 +723,7 @@ class AgentLoop:
                 note = "Paused before acting; previous decision discarded. Re-assess."
                 continue
 
+            self._page_click(decision)
             self._last_tool = decision.tool
             await self.emit(EventType.ACTION, tool=decision.tool, args=decision.args)
             handled = await self._loop_tool(decision)
@@ -712,6 +795,15 @@ class AgentLoop:
             self.history.append(_hist_line(self.step, decision, outcome, v.message))
             if outcome.action == "browseros.call":
                 self._bos_front = decision.tool == "bos_tabs" and (decision.args or {}).get("action") == "front" and outcome.success
+                if outcome.success:   # which BrowserOS page the task is on, so a screenshot can find it
+                    pg = (decision.args or {}).get("page")
+                    m = re.search(r"opened page (\d+)", str((outcome.result or {}).get("text") or "")
+                                  if isinstance(outcome.result, dict) else "")
+                    if m:
+                        pg = int(m.group(1))
+                    if pg is not None:
+                        self._bos_page = int(pg)
+                    self._bos_step = self.step
                 self._trim_bos(len(self.history) - 1)
             self._last_ok = ((decision.tool, repr(sorted(decision.args.items()))), self.step) if outcome.success else None
             self._fresh = after if (after and outcome.success) else None

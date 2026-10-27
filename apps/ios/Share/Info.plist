@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+  <key>CFBundleDisplayName</key><string>Aiw</string>
+  <key>CFBundleExecutable</key><string>AiwShare</string>
+  <key>CFBundleIdentifier</key><string>com.hackjown.aiworkstation.share</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>AiwShare</string>
+  <key>CFBundlePackageType</key><string>XPC!</string>
+  <!-- build-ipa.sh copies the app's version and build number in here -->
+  <key>CFBundleShortVersionString</key><string>0</string>
+  <key>CFBundleVersion</key><string>0</string>
+  <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+  <key>MinimumOSVersion</key><string>16.0</string>
+  <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+  <key>NSExtension</key><dict>
+    <key>NSExtensionPointIdentifier</key><string>com.apple.share-services</string>
+    <key>NSExtensionPrincipalClass</key><string>ShareViewController</string>
+    <key>NSExtensionAttributes</key><dict>
+      <!-- files, images, video, audio, PDFs, Office docs, zips, web links and plain text -->
+      <key>NSExtensionActivationRule</key><string>SUBQUERY (extensionItems, $extensionItem, SUBQUERY ($extensionItem.attachments, $attachment, ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.item" OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.data" OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.url" OR ANY $attachment.registeredTypeIdentifiers UTI-CONFORMS-TO "public.plain-text").@count &gt;= 1).@count &gt;= 1</string>
+    </dict>
+  </dict>
+</dict></plist>

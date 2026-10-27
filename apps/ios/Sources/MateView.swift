@@ -44,23 +44,30 @@ final class MateBus {
     }
 }
 
-/// The inline navigation title with the 球球 beside it.
+/// The inline navigation title with the 球球 beside it (hidden on the empty home, where the big 球球 is the mascot).
 struct MateTitle: View {
     let title: String
     let status: String
     let threadId: String?
+    var showMate = true
     @AppStorage("mate") private var on = true
     var body: some View {
         HStack(spacing: 6) {
-            if on { MateView(status: status, threadId: threadId).frame(width: 30, height: 30).accessibilityLabel("球球") }
+            if on && showMate { MateView(status: status, threadId: threadId).frame(width: 30, height: 30).accessibilityLabel("球球") }
             Text(title).font(.headline).lineLimit(1)
         }
     }
 }
 
+/// iOS v2: the disc behind 球球 is the app accent (mate.html?ring=amber); the web keeps the dark disc.
+/// `bus: false` makes a standalone picture (computer list) that never takes the live events from the chat's 球球;
+/// `emotion` then picks its face (e.g. "00" asleep/offline, "02" idle).
 struct MateView: UIViewRepresentable {
     let status: String
     let threadId: String?
+    var bus = true
+    var emotion: String? = nil
+    var ring = "amber"
     @Environment(\.scenePhase) private var phase
     @Environment(\.accessibilityReduceMotion) private var still
 
@@ -78,19 +85,23 @@ struct MateView: UIViewRepresentable {
         w.scrollView.backgroundColor = .clear
         w.scrollView.isScrollEnabled = false
         w.isUserInteractionEnabled = false
-        w.navigationDelegate = context.coordinator
-        MateBus.shared.attach(w, thread: threadId)
-        let q = "?static=\(still ? 1 : 0)"
+        w.navigationDelegate = bus ? context.coordinator : nil
+        if bus { MateBus.shared.attach(w, thread: threadId) }
+        var q = "?static=\(still || !bus ? 1 : 0)&ring=\(ring)"
+        if let e = emotion { q += "&e=\(e.filter { $0.isNumber })" }
+        if !bus { q += "&lite=1" }
         if let u = Bundle.main.url(forResource: "mate", withExtension: "html", subdirectory: "mate"),
            let full = URL(string: u.absoluteString + q) {
             w.loadFileURL(full, allowingReadAccessTo: u.deletingLastPathComponent())
-        } else if let u = API.shared.url("/mate.html", query: [URLQueryItem(name: "static", value: still ? "1" : "0")]) {
+        } else if let u = API.shared.url("/mate.html", query: [URLQueryItem(name: "static", value: still || !bus ? "1" : "0"),
+                                                              URLQueryItem(name: "ring", value: ring), URLQueryItem(name: "e", value: emotion ?? "02")]) {
             w.load(URLRequest(url: u))
         }
         return w
     }
 
     func updateUIView(_ w: WKWebView, context: Context) {
+        guard bus else { return }
         let c = context.coordinator
         MateBus.shared.attach(w, thread: threadId)
         if c.status != status {

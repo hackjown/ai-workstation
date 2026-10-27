@@ -242,10 +242,10 @@ struct ChatView: View {
             .safeAreaInset(edge: .bottom) { composer }
             .safeAreaInset(edge: .top, spacing: 0) { DesktopPane(liveSession: liveSession, onChange: { await m.load() }) }
         }
-        .navigationTitle(m.threadId == nil ? "新对话" : m.title)
+        .navigationTitle(m.threadId == nil ? "新对话" : cleanTitle(m.title))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .principal) {   // 云宝 beside the title (MateView.swift)
-            MateTitle(title: m.threadId == nil ? "新对话" : m.title,
+            MateTitle(title: m.threadId == nil ? "新对话" : cleanTitle(m.title),
                       status: m.tasks.last.map { t in let l = m.live(t).status; return l.isEmpty ? t.s("status") : l } ?? "",
                       threadId: m.threadId, showMate: !m.tasks.isEmpty)
         } }
@@ -523,20 +523,30 @@ struct TaskBlock: View {
     @State private var downloading = ""
 
     var running: Bool { isLive(live.status) }
+    /// A file sent twice (a retry, history replayed over live events) shows once, newest last.
+    var uniqueFiles: [JSON] {
+        var seen = Set<String>(), out: [JSON] = []
+        for f in live.files.reversed() {
+            let k = f.s("artifact").isEmpty ? f.s("name") : f.s("artifact")
+            if seen.insert(k).inserted { out.insert(f, at: 0) }
+        }
+        return out
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // the user's message
-            HStack { Spacer(minLength: 50)
-                Text(t.s("prompt")).textSelection(.enabled)
-                    .padding(.horizontal, 13).padding(.vertical, 9)
-                    .background(amber.opacity(0.14)).clipShape(RoundedRectangle(cornerRadius: 16))
-            }
+            HStack { Spacer(minLength: 56); UserBubble(prompt: t.s("prompt")) }
             // the agent's side
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
-                    Image(systemName: "face.smiling").foregroundColor(.white).font(.system(size: 12, weight: .bold))
-                        .frame(width: 22, height: 22).background(amber).clipShape(RoundedRectangle(cornerRadius: 6))
+                    if running {   // the live 球球 moves while this task works (MateView.swift)
+                        MateView(status: "", threadId: nil, bus: false, emotion: live.question != nil || live.confirm != nil ? "35" : "32", animate: true)
+                            .frame(width: 26, height: 26).accessibilityHidden(true)
+                    } else {
+                        Image(systemName: live.status == "failed" ? "exclamationmark" : "face.smiling").foregroundColor(.white).font(.system(size: 12, weight: .bold))
+                            .frame(width: 22, height: 22).background(live.status == "failed" ? Color.red.opacity(0.8) : amber).clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
                     Text(statusText[live.status] ?? live.status).font(.caption.bold())
                         .foregroundColor(live.status == "failed" ? .red : running ? amber : .secondary)
                     if running { ProgressView().scaleEffect(0.7) }
@@ -601,9 +611,9 @@ struct TaskBlock: View {
                 if !live.approvals.isEmpty && (running || showSteps) { ApprovalLog(items: live.approvals) }
 
                 if !live.result.isEmpty && !running {
-                    Text(.init(live.result)).textSelection(.enabled).font(.body)
+                    RichText(text: live.result)
                 }
-                ForEach(live.files.indices, id: \.self) { i in fileRow(live.files[i]) }
+                ForEach(uniqueFiles.indices, id: \.self) { i in fileRow(uniqueFiles[i]) }
 
                 DisclosureGroup(isExpanded: $showSteps) {
                     VStack(alignment: .leading, spacing: 6) {
@@ -621,7 +631,7 @@ struct TaskBlock: View {
                 }
                 .onChange(of: showSteps) { open in if open { Task { await live.loadHistory(t.s("session_id")) } } }
             }
-            .padding(12).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 16))
+            .padding(.horizontal, 14).padding(.vertical, 12).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 18))
         }
     }
 

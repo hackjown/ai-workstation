@@ -270,7 +270,9 @@ TOOLS: list[ToolSpec] = [
              {"page": {"type": "integer"}, "ref": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}}},
              ["page", "ref", "files"]),
     ToolSpec("done", None, "Finish: the task is complete. Give a short summary.", {"summary": {"type": "string"}}, ["summary"]),
-    ToolSpec("fail", None, "Give up: the task cannot be completed. Explain why.", {"reason": {"type": "string"}}, ["reason"]),
+    ToolSpec("fail", None, "Only when truly nothing more can be tried: explain in Chinese what was done, where it is stuck and "
+             "what the user could do. The user is then asked whether to retry, take over or stop. For a captcha/login/"
+             "SMS code use request_takeover instead; for missing information use ask_user.", {"reason": {"type": "string"}}, ["reason"]),
 ]
 
 BY_NAME = {t.name: t for t in TOOLS}

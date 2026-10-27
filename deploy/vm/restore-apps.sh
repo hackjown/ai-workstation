@@ -35,6 +35,10 @@ say "常用工具（Office/PDF/OCR/音视频…，要几分钟）"; bash "$V/too
 say "LibreCAD"; command -v librecad >/dev/null || $SUDO apt-get install -y -q librecad fonts-noto-cjk; bash "$V/librecad-setup.sh"
 say "WorkBuddy / CodeBuddy / REA / OfficeCLI"; bash "$V/devagents-setup.sh"
 say "视频工具（huashu-motion）"; bash "$V/motion-setup.sh" || echo "   视频工具没装全，之后可单独重跑 motion-setup.sh"
+# BrowserOS: reinstalled when it was there before the restore marker, or asked for (AIW_BROWSEROS=1)
+if [ "${AIW_BROWSEROS:-0}" = 1 ] || [ -f "$HOME/.config/autostart/browseros.desktop" ] || [ -d "$HOME/.config/browser-claw" ]; then
+  say "BrowserOS"; bash "$V/browseros-setup.sh" install || echo "   BrowserOS 没装上（只支持 amd64），之后可单独重跑 browseros-setup.sh"
+fi
 icons
 say "重启 vm-agent（用上新代码）"; systemctl --user restart vm-agent 2>/dev/null || $SUDO systemctl restart vm-agent 2>/dev/null || echo "   没找到 vm-agent 服务，跳过"
 say "检查"; bash "$V/devagents-setup.sh" check

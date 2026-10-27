@@ -209,6 +209,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     from . import xhs   # 小红书运营: settings, approval queue, pause (/api/xhs/*)
     xhs.mount(app, store, sessions, notifier, auth)
+    from . import browseros   # BrowserOS neo per computer (/api/browseros*)
+    browseros.mount(app, store, sessions, auth)
 
     # ------------------------------------------------------------- tasks
 
@@ -1044,6 +1046,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             try:
                 h = await asyncio.wait_for(sessions.computer(mid).health(), 8)
                 out["agent"] = h.result if h.success else {"ok": False, "error": h.error}
+                if h.success and isinstance(h.result, dict):
+                    browseros.note_health(store, mid, h.result)
             except Exception as e:  # noqa: BLE001
                 out["agent"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
             if out["agent"].get("ok"):

@@ -70,8 +70,38 @@ final class API: ObservableObject {
         }
         return obj
     }
+    /// POST a JSON body with upload progress (0…1) reported on the main thread; used for /api/uploads.
+    func postWithProgress(_ path: String, _ body: JSON, timeout: TimeInterval = 900, progress: @escaping (Double) -> Void) async throws -> JSON {
+        guard let u = url(path) else { throw APIError(message: "服务器地址不对") }
+        var r = URLRequest(url: u, timeoutInterval: timeout)
+        r.httpMethod = "POST"
+        r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let payload = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.upload(for: r, from: payload, delegate: UploadProgress(progress))
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let obj = (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) ?? [:]
+        if code == 401 { throw APIError(message: "令牌不对或已失效") }
+        if code == 413 { throw APIError(message: "文件太大（服务器上限 40MB）") }
+        if code >= 400 {
+            let detail = (obj as? JSON)?.s("detail") ?? ""
+            throw APIError(message: detail.isEmpty ? "请求失败（\(code)）" : detail)
+        }
+        return (obj as? JSON) ?? [:]
+    }
     func list(_ path: String) async throws -> [JSON] { (try await call("GET", path) as? [JSON]) ?? [] }
     func obj(_ method: String, _ path: String, _ body: Any? = nil) async throws -> JSON { (try await call(method, path, body) as? JSON) ?? [:] }
+}
+
+final class UploadProgress: NSObject, URLSessionTaskDelegate {
+    let report: (Double) -> Void
+    init(_ report: @escaping (Double) -> Void) { self.report = report }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
+                    totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+        guard totalBytesExpectedToSend > 0 else { return }
+        let f = min(1, Double(totalBytesSent) / Double(totalBytesExpectedToSend))
+        DispatchQueue.main.async { self.report(f) }
+    }
 }
 
 /// A websocket that reconnects and hands each JSON message to `onMessage` on the main thread.

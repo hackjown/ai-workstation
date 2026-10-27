@@ -26,6 +26,7 @@ class EventType(str, Enum):
     RESUMED = "agent.resumed"
     TAKEOVER = "agent.takeover"
     CONFIRM_REQUIRED = "agent.confirm_required"
+    CONFIRM_ANSWERED = "agent.confirm_answered"   # {approve, by: user|task|timeout|stop, title, summary}
     MESSAGE = "agent.message"
     FILE = "agent.file"
     ERROR = "agent.error"

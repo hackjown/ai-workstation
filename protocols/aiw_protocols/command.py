@@ -38,6 +38,9 @@ class ActionType(str, Enum):
     BROWSER_FORWARD = "browser.forward"
     BROWSER_CLICK = "browser.click"  # click a page element found by its text (DOM), with the real mouse
     BROWSER_FILL = "browser.fill"  # type into a form field found by its label/placeholder
+    # browseros.*: BrowserOS neo's MCP tools (element refs from an accessibility snapshot), proxied by the agent
+    BROWSEROS_CALL = "browseros.call"
+    BROWSEROS_STATUS = "browseros.status"
     # files.*
     FILES_LIST = "files.list"
     FILES_READ = "files.read"
@@ -69,6 +72,8 @@ PAYLOAD_SCHEMA: dict[str, list[str]] = {
     ActionType.BROWSER_NAVIGATE.value: ["url"],
     ActionType.BROWSER_CLICK.value: ["text"],
     ActionType.BROWSER_FILL.value: ["field", "text"],
+    ActionType.BROWSEROS_CALL.value: ["tool"],
+    ActionType.BROWSEROS_STATUS.value: [],
     ActionType.FILES_LIST.value: ["path"],
     ActionType.FILES_READ.value: ["path"],
     ActionType.FILES_WRITE.value: ["path", "content"],

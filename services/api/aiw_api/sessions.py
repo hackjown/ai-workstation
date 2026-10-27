@@ -34,6 +34,7 @@ from tool_router import ToolExecutor
 from .store import Store
 
 log = logging.getLogger("aiw.sessions")
+TASK_ALLOW_NEVER = ("order_confirm", "xhs_review")   # 本任务内都允许 never approves an order or posts for the user
 LIVE_STATES = ("running", "paused", "takeover", "waiting_confirm", "waiting_input")
 FINAL_STATES = ("succeeded", "failed", "stopped", "interrupted", "cancelled")
 
@@ -51,6 +52,9 @@ class LiveSession:
     question_info: Optional[dict] = None
     cleanup: Optional[object] = None
     loop: Optional[object] = None  # the running AgentLoop: confirmations extend its deadline
+    executor: Optional[object] = None   # its ToolExecutor: the policy knows which folders this task made
+    allow_task: bool = False            # the user said 本任务内都允许 (never covers payments or posts)
+    last_thought: str = ""              # the agent's stated reason for the step being confirmed (为什么)
 
 
 class SessionManager:
@@ -290,6 +294,8 @@ class SessionManager:
 
         async def emit(ev: AgentEvent):
             d = ev.model_dump(mode="json")
+            if ev.type == EventType.DECISION:
+                live.last_thought = str(ev.data.get("thought") or "")[:600]
             if ev.type == EventType.THINKING and ev.data.get("live"):
                 # the reasoning text while the model is still thinking: shown live, never stored (the final
                 # reasoning is kept on agent.decision)
@@ -318,33 +324,60 @@ class SessionManager:
             self.store.add_action(sid, rec)
 
         async def confirm(tool, payload, decision) -> bool:
+            summary = await self._confirm_summary(tool, payload, decision, live)
+            brief = {"title": summary["title"], "risk": summary["risk"], "what": summary["what"]}
+            if live.allow_task and tool not in TASK_ALLOW_NEVER and summary.get("category") not in ("pay", "message"):
+                # 本任务内都允许: approved without a card, still on the timeline
+                await emit(AgentEvent(session_id=sid, type=EventType.CONFIRM_ANSWERED,
+                                      data={"tool": tool, "approve": True, "by": "task", **brief, "summary": summary}))
+                return True
             live.confirm = asyncio.get_running_loop().create_future()
-            live.confirm_info = {"tool": tool, "payload": payload, "level": int(decision.level), "reason": decision.reason}
+            live.confirm_info = {"tool": tool, "payload": payload, "level": int(decision.level), "reason": decision.reason,
+                                 "summary": summary, "id": f"c{int(time.time() * 1000)}",
+                                 "task_allow": tool not in TASK_ALLOW_NEVER and summary.get("category") not in ("pay", "message")}
             self.store.update_task(task.id, TaskStatus.WAITING_CONFIRM.value)
             await emit(AgentEvent(session_id=sid, type=EventType.CONFIRM_REQUIRED, data=live.confirm_info))
-            await self._notify("confirm", "需要你确认", f"{decision.reason}：{tool}", task)
+            await self._notify("confirm", "需要你确认", f"{summary['title'].replace('确认：', '', 1)} · {summary['risk_cn']}", task)
             t0 = time.monotonic()
+            by, ok = "user", False
             try:
                 # a price-watch order waits up to 30 min for the user (payload confirm_timeout_s); everything else 5 min
                 wait = float(payload.get("confirm_timeout_s") or 300) if isinstance(payload, dict) else 300.0
-                return await asyncio.wait_for(live.confirm, wait)
+                ok = bool(await asyncio.wait_for(live.confirm, wait))
+                if ok and live.allow_task:
+                    by = "user_task"     # this card's 本任务内都允许
+                return ok
             except asyncio.TimeoutError:
+                by = "timeout"
                 return False
             finally:
                 if getattr(live, "loop", None) is not None:
                     live.loop.add_wait(time.monotonic() - t0)
+                if live.control.state.value == "stopped":
+                    by = "stop"
                 live.confirm = live.confirm_info = None
                 self.store.update_task(task.id, TaskStatus.RUNNING.value)
+                with contextlib.suppress(Exception):
+                    await emit(AgentEvent(session_id=sid, type=EventType.CONFIRM_ANSWERED,
+                                          data={"tool": tool, "approve": ok, "by": by, **brief, "summary": summary}))
 
         async def ask(question: str, options: list, extra: Optional[dict] = None) -> Optional[str]:
             live.question = asyncio.get_running_loop().create_future()
             live.question_info = {"question": question, "options": options}
             if extra:  # a form card to fill, or a takeover request
                 live.question_info["form"] = extra
-            self.store.update_task(task.id, TaskStatus.WAITING_INPUT.value)
             kind = (extra or {}).get("kind")
-            await self._notify("input", "需要你填写资料" if kind == "form" else "需要你接管桌面" if kind == "takeover"
-                               else "Agent 在问你", question, task)
+            if kind == "takeover":   # which computer: the card says where to go
+                with contextlib.suppress(Exception):
+                    m = self.store.machine(task.machine_id) or {}
+                    if not extra.get("machine"):
+                        extra["machine"] = m.get("name") or task.machine_id
+                    extra["machine_id"] = task.machine_id
+            self.store.update_task(task.id, TaskStatus.WAITING_INPUT.value)
+            await self._notify("input", "需要你填写资料" if kind == "form" else
+                               (extra.get("title") or "需要你接管桌面") if kind == "takeover" else "Agent 在问你",
+                               ((extra.get("steps") or question) + (f"（{extra['machine']}）" if extra.get("machine") else ""))
+                               if kind == "takeover" else question, task)
             try:
                 # filling a form or passing a captcha takes longer than answering a question
                 wait = float(self.settings.ask_timeout_s) * (3 if extra else 1)
@@ -438,7 +471,8 @@ class SessionManager:
                     llm, routed = self._task_llm(task.prompt)
                     if routed:
                         await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": f"视频任务，改用视频模型 {routed}"}))
-                    loop = AgentLoop(task, sid, computer, llm, ToolExecutor(computer, confirm=confirm, audit=audit),
+                    live.executor = ToolExecutor(computer, confirm=confirm, audit=audit)
+                    loop = AgentLoop(task, sid, computer, llm, live.executor,
                                      control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,
                                      subagent_llm=self._subagent_llm(), vision_llm=self._vision_llm(), image_cfg=self._image_cfg(),
                                      system_extra=sx.strip(),
@@ -784,8 +818,36 @@ class SessionManager:
         await self._broadcast(live, {"kind": "event", "task_id": live.task.id, **ev.model_dump(mode="json")})
         return {"session_id": sid, "state": c.state.value}
 
-    def answer_confirm(self, sid: str, approve: bool) -> bool:
+    async def _confirm_summary(self, tool, payload, decision, live: LiveSession) -> dict:
+        """Plain-language card for a confirmation (title / 要做什么 / 影响 / 风险 / 为什么), built deterministically;
+        AIW_CONFIRM_LLM=1 lets the model polish title + 要做什么 within AIW_CONFIRM_LLM_TIMEOUT s (risks never change)."""
+        from tool_router.explain import summarize
+        created = getattr(getattr(live.executor, "policy", None), "created", None)
+        mname = ""
+        with contextlib.suppress(Exception):
+            m = self.store.machine(live.task.machine_id) or {}
+            mname = m.get("name") or ""
+        s = summarize(tool, payload if isinstance(payload, dict) else {}, decision.reason, live.last_thought,
+                      int(decision.level), created, mname)
+        if os.environ.get("AIW_CONFIRM_LLM", "").lower() in ("1", "true", "on") and not self._custom_llm:
+            with contextlib.suppress(Exception):
+                import json as _json
+                llm = self._subagent_llm() or self._llm()
+                raw = await asyncio.wait_for(llm.complete(
+                    "把一个电脑操作的确认卡片改写得让普通人一眼看懂。只输出 JSON：{\"title\": \"确认：…（20 字内）\", "
+                    "\"what\": \"一句话说明要做什么\"}。不要淡化风险，不要出现命令原文。",
+                    _json.dumps({"title": s["title"], "what": s["what"], "risks": s["risks"], "why": s["why"]}, ensure_ascii=False),
+                    200), float(os.environ.get("AIW_CONFIRM_LLM_TIMEOUT", "5")))
+                j = _json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
+                t, w = str(j.get("title") or "").strip(), str(j.get("what") or "").strip()
+                if t.startswith("确认") and 4 < len(t) <= 40 and 4 < len(w) <= 160 and "&&" not in w and "rm -" not in w:
+                    s["title"], s["what"], s["polished"] = t if t.startswith("确认：") else "确认：" + t.lstrip("确认:： "), w, True
+        return s
+
+    def answer_confirm(self, sid: str, approve: bool, scope: Optional[str] = None) -> bool:
         live = self.get(sid)
+        if approve and scope == "task" and live.confirm_info and live.confirm_info.get("task_allow"):
+            live.allow_task = True
         if live.confirm and not live.confirm.done():
             live.confirm.set_result(approve)
             return True

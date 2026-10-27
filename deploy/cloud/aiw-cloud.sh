@@ -117,7 +117,8 @@ ENV
   pkill -f "vm_agent.server.websocket" 2>/dev/null; sleep 1
   cp "$S/vm-agent.env" "$S/vm-agent.env.running"
   ( set -a; . "$S/vm-agent.env"; set +a; cd "$HOME/workspace" &&
-    setsid nohup "$V/bin/python" -m vm_agent.server.websocket --host 0.0.0.0 --port 8765 >"$S/vm-agent.log" 2>&1 </dev/null & )
+    setsid nohup "$V/bin/python" -m vm_agent.server.websocket --host 0.0.0.0 --port 8765 >"$S/vm-agent.log" 2>&1 </dev/null & ) \
+    >/dev/null 2>&1 </dev/null   # detach fully: a caller reading our output to EOF (`| tail`, a shell exec) must not wait on the agent
   for _ in $(seq 1 20); do
     ss -ltn 2>/dev/null | grep -q ':8765 ' && { echo AGENT_STARTED; return 0; }
     sleep 0.5

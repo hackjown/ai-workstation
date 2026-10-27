@@ -1,6 +1,6 @@
-/* AIW task state → 云宝 (Mood Mates) emotion ID. Pure functions, no DOM: shared by the web app (mate.js), the page the
+/* AIW task state → 球球 (Emotion Ball) emotion ID. Pure functions, no DOM: shared by the web app (mate.js), the page the
    iOS app embeds (mate.html) and the tests (tests/test_mate_map.py runs tests/js/mate_map_test.js with node).
-   Emotion IDs (agent group 30-41, lifecycle 00-02) are the Mood Mates public contract and never renumbered. */
+   Emotion IDs (agent group 30-41, lifecycle 00-02) are the Emotion Ball public contract (same IDs as Mood Mates) and never renumbered. */
 (function (root, factory) {
   if (typeof module === "object" && module.exports) module.exports = factory();
   else root.AiwMood = factory();

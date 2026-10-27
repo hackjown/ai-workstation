@@ -7,6 +7,12 @@ class Recovery:
         self.computer = computer
 
     async def recover(self, consecutive_failures: int, last_action: str | None) -> str:
+        if last_action == "browseros.call":   # a BrowserOS step: its error says what went wrong; no Escape/xy advice
+            if consecutive_failures >= 3:
+                return ("Three BrowserOS failures in a row. Take a fresh bos_snapshot, or fall back to bos_tabs "
+                        "action=front + screenshot clicks, or call fail with the reason.")
+            return ("The BrowserOS step failed (see its error). Refs go stale after the page changes: take a new "
+                    "bos_snapshot (or bos_grep) and act on the new ref.")
         clicky = not last_action or any(k in str(last_action) for k in ("click", "mouse", "browser", "type", "key"))
         if not clicky:  # task-4e2: a timed-out shell got advice about clicking by x/y
             if consecutive_failures >= 3:

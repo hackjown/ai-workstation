@@ -270,10 +270,13 @@ async def test_vm_agent_proxy_against_mock_mcp(tmp_path, monkeypatch):
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port = srv.server_address[1]
     cfg = tmp_path / "config.json"
-    cfg.write_text(json.dumps({"ports": {"server": port, "cdp": 1}, "instance": {"browseros_version": "0.51"}}))
     from vm_agent.browser import browseros as vb
     monkeypatch.setattr(vb, "CONFIG", str(cfg))
     monkeypatch.setattr(vb, "binary", lambda: "/usr/bin/browserclaw")
+    # only the MCP server answering (its window gone: the server outlives it) is not "running"
+    cfg.write_text(json.dumps({"ports": {"server": port, "cdp": 1}, "instance": {"browseros_version": "0.51"}}))
+    assert not vb.status()["running"]
+    cfg.write_text(json.dumps({"ports": {"server": port, "cdp": port}, "instance": {"browseros_version": "0.51"}}))
     MockMCP.seen = []
     st = vb.status()
     assert st["installed"] and st["running"] and st["mcp_port"] == port and st["version"] == "0.51"

@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable
 
 from aiw_protocols import ActionType as A, Command, CommandResult, Observation
 
+from ..browser.browseros import BrowserOS, status as bos_status
 from ..browser.playwright import Browser
 from ..computer import keyboard, mouse
 from ..computer.desktop import DesktopBackend
@@ -22,6 +23,7 @@ class Router:
     def __init__(self, backend: DesktopBackend, screenshot_max_width: int | None = None):
         self.b = backend
         self.browser = Browser(backend)
+        self.bos = BrowserOS(getattr(backend, "env", None))
         self.max_w = screenshot_max_width
         # GUI input must be serialized: two concurrent clicks would interleave.
         self._input_lock = asyncio.Lock()
@@ -49,6 +51,8 @@ class Router:
             A.BROWSER_FORWARD: lambda p: self.browser.forward(),
             A.BROWSER_CLICK: lambda p: self.browser.click(p["text"]),
             A.BROWSER_FILL: lambda p: self.browser.fill(p["field"], p["text"], bool(p.get("submit"))),
+            A.BROWSEROS_CALL: self._bos_call,
+            A.BROWSEROS_STATUS: self._bos_status,
             A.FILES_LIST: lambda p: _sync(fread.list_dir, p["path"]),
             A.FILES_READ: lambda p: _sync(fread.read, p["path"], p.get("binary", False)),
             A.FILES_WRITE: lambda p: _sync(fwrite.write, p["path"], p["content"], p.get("append", False)),
@@ -57,6 +61,21 @@ class Router:
             A.HEALTH: lambda p: _sync(health, b.name),
         }
         self.handlers = {k.value if hasattr(k, "value") else k: v for k, v in self.handlers.items()}
+
+    async def _bos_call(self, p):
+        if p["tool"] == "close":
+            return await self.bos.close(p.get("key") or "default")
+        return await self.bos.call(p.get("key") or "default", p["tool"], p.get("args") or {}, p.get("title"), p.get("category"))
+
+    async def _bos_status(self, p):
+        st = bos_status()
+        if p.get("start") and st["installed"] and not st["running"]:
+            try:
+                await self.bos.ensure_running()
+            except Exception as e:  # noqa: BLE001
+                st["start_error"] = str(e)[:300]
+            st = {**bos_status(), **({"start_error": st["start_error"]} if st.get("start_error") else {})}
+        return st
 
     async def _cursor(self, _p):
         x, y = await self.b.cursor()
@@ -90,7 +109,10 @@ class Router:
                 obs = Observation(screenshot=result.pop("screenshot"), width=result["width"],
                                   height=result["height"])
             ok = not (cmd.type == A.SHELL_EXEC.value and result.get("exit_code") not in (0, None))
-            return CommandResult(id=cmd.id, success=ok, result=result, observation=obs,
+            err = None
+            if cmd.type == A.BROWSEROS_CALL.value and result.get("is_error"):
+                ok, err = False, (result.get("text") or "BrowserOS error")[:4000]
+            return CommandResult(id=cmd.id, success=ok, result=result, observation=obs, error=err,
                                  duration_ms=int((time.monotonic() - t0) * 1000))
         except asyncio.TimeoutError:
             return CommandResult(id=cmd.id, success=False, error=f"timeout after {cmd.timeout}s")

@@ -135,7 +135,7 @@ def test_policy_levels():
     L = lambda a, pl: p.check(a, pl).level
     assert L("computer.open_app", {"name": "chrome"}) == RiskLevel.L0
     assert L("files.write", {"path": "notes.txt", "content": "x"}) == RiskLevel.L1
-    assert L("shell.exec", {"command": "sudo apt install ffmpeg"}) == RiskLevel.L2
+    assert L("shell.exec", {"command": "sudo apt install ffmpeg"}) == RiskLevel.L3   # installs and sudo ask now
     assert L("shell.exec", {"command": "rm -rf build/"}) == RiskLevel.L3
     assert L("files.upload", {"path": ".ssh/id_rsa", "content_b64": ""}) == RiskLevel.L3
     assert L("shell.exec", {"command": "pvesh get /nodes"}) == RiskLevel.L4

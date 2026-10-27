@@ -8,8 +8,8 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>AIW</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>3.0</string>
-  <key>CFBundleVersion</key><string>13</string>
+  <key>CFBundleShortVersionString</key><string>3.1</string>
+  <key>CFBundleVersion</key><string>14</string>
   <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
   <key>MinimumOSVersion</key><string>16.0</string>
   <key>LSRequiresIPhoneOS</key><true/>
@@ -27,6 +27,30 @@
     <key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array></dict></dict>
   <key>CFBundleIcons~ipad</key><dict><key>CFBundlePrimaryIcon</key><dict>
     <key>CFBundleIconFiles</key><array><string>AppIcon60x60</string><string>AppIcon76x76</string></array></dict></dict>
+  <!-- 微信「用其他应用打开」/ Open In: Aiw takes any file as a copy (Documents/Inbox) and attaches it to a new chat -->
+  <key>CFBundleDocumentTypes</key><array>
+    <dict><key>CFBundleTypeName</key><string>图片</string><key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>public.image</string><string>public.jpeg</string><string>public.png</string><string>public.heic</string></array></dict>
+    <dict><key>CFBundleTypeName</key><string>视频</string><key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>public.movie</string><string>public.video</string><string>public.mpeg-4</string><string>com.apple.quicktime-movie</string></array></dict>
+    <dict><key>CFBundleTypeName</key><string>音频</string><key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>public.audio</string><string>public.mp3</string><string>public.mpeg-4-audio</string></array></dict>
+    <dict><key>CFBundleTypeName</key><string>PDF</string><key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>com.adobe.pdf</string></array></dict>
+    <dict><key>CFBundleTypeName</key><string>文本</string><key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>public.text</string><string>public.plain-text</string><string>public.utf8-plain-text</string><string>public.json</string><string>net.daringfireball.markdown</string><string>public.comma-separated-values-text</string></array></dict>
+    <dict><key>CFBundleTypeName</key><string>Office 文档</string><key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>org.openxmlformats.wordprocessingml.document</string><string>org.openxmlformats.spreadsheetml.sheet</string><string>org.openxmlformats.presentationml.presentation</string><string>org.openxmlformats.openxml</string><string>com.microsoft.word.doc</string><string>com.microsoft.excel.xls</string><string>com.microsoft.powerpoint.ppt</string><string>com.microsoft.word.wordml</string></array></dict>
+    <dict><key>CFBundleTypeName</key><string>压缩包</string><key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>public.zip-archive</string><string>com.pkware.zip-archive</string><string>public.archive</string></array></dict>
+    <dict><key>CFBundleTypeName</key><string>任意文件</string><key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>public.item</string><string>public.data</string><string>public.content</string></array></dict>
+  </array>
+  <key>LSSupportsOpeningDocumentsInPlace</key><false/>
+  <key>UIFileSharingEnabled</key><true/>
+  <key>CFBundleURLTypes</key><array><dict>
+    <key>CFBundleURLName</key><string>com.hackjown.aiworkstation.import</string>
+    <key>CFBundleURLSchemes</key><array><string>aiw</string></array></dict></array>
   <key>NSAppTransportSecurity</key><dict>
     <key>NSAllowsArbitraryLoads</key><true/>
     <key>NSAllowsArbitraryLoadsInWebContent</key><true/>

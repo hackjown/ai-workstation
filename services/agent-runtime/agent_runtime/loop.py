@@ -27,6 +27,7 @@ from . import video as _video
 from . import image_edit as _ie
 from . import image_brief as _ib
 from . import photopea as _pp
+from . import escalate as _es
 
 # Only an explicit "go on with the earlier drawing" resumes. The bare words matched far too much: run 3ac's prompt said
 # "把那张补画完整" (redraw that thin sheet) and was taken for a resume, so the previous run's DXF stayed in cad/, LibreCAD
@@ -209,10 +210,15 @@ class AgentLoop:
         stop = getattr(getattr(self, "control", None), "stopped", None)
         stop_w = asyncio.ensure_future(stop.wait()) if stop is not None else None
         start = time.monotonic()
+        self._t0 = start
         stopped = False
         try:
             while True:
-                left = self.cfg.timeout_s + self._waited - (time.monotonic() - start)
+                asking = getattr(self, "_asking_since", None)   # a question open right now does not use up the budget
+                left = (self.cfg.timeout_s + self._waited + (time.monotonic() - asking if asking else 0)
+                        - (time.monotonic() - start))
+                if asking and left <= 0:
+                    left = 30
                 if left <= 0:
                     raise asyncio.TimeoutError
                 done, _ = await asyncio.wait({job, stop_w} - {None}, timeout=left, return_when=asyncio.FIRST_COMPLETED)
@@ -269,11 +275,13 @@ class AgentLoop:
                         msg += f"；时间用完前的最新一版结果已发给你（{self._last_image}），可能还没完全达到要求"
                 except Exception:  # noqa: BLE001
                     pass
-            self._finish(TaskStatus.FAILED, msg)
+            self._finish(TaskStatus.FAILED, _es.report("time", msg, self.history, getattr(self, "_last_page", None),
+                                                       getattr(getattr(self, "_stall", None), "blocked", "")))
         except StopRequested:
             self._finish(TaskStatus.STOPPED, "stopped by user")
         except Exception as e:  # noqa: BLE001
-            self._finish(TaskStatus.FAILED, f"{type(e).__name__}: {e}")
+            self._finish(TaskStatus.FAILED, _es.report("error", f"{type(e).__name__}: {e}", self.history,
+                                                       getattr(self, "_last_page", None)))
         if plan_job and not plan_job.done():
             plan_job.cancel()
         if self.task.status == TaskStatus.SUCCEEDED and self.plan_steps and len(self.plan_done) < len(self.plan_steps):
@@ -391,7 +399,26 @@ class AgentLoop:
             except Exception as e:  # noqa: BLE001  the agent can still do it the long way
                 await self.emit(EventType.ERROR, error=f"自动修图首轮失败，改由模型逐步处理：{type(e).__name__}: {str(e)[:160]}")
                 note = None
-        while self.step < self.cfg.max_steps:
+        self._stall = _es.Stall()
+        self._time_asked = False
+        while True:
+            if self.step >= self.cfg.max_steps:
+                n = await self._escalate("max_steps", f"已经执行了 {self.step} 步")
+                if n is None:
+                    return
+                note, failures, shots = n, 0, 0
+            t0 = getattr(self, "_t0", None)
+            if t0 and not self._time_asked and self.ask and (
+                    self.cfg.timeout_s + self._waited - (time.monotonic() - t0)) < min(90.0, 0.15 * self.cfg.timeout_s):
+                self._time_asked = True
+                n = await self._escalate("time", f"任务时间预算 {self.cfg.timeout_s:.0f} 秒快用完了")
+                if n is None:
+                    return
+                note, failures, shots = n, 0, 0
+            if self.step == self.cfg.max_steps - 3:
+                note = ((note + "\n") if note else "") + (
+                    "Only 3 steps are left in this task's budget. If you can finish, finish (send what you have, then done). "
+                    "If something blocks you, call request_takeover or ask_user NOW and explain the problem to the user.")
             if await self.control.checkpoint():
                 self._fresh = None
                 note = ("The user took over the desktop and has now returned control. "
@@ -503,8 +530,12 @@ class AgentLoop:
                         "far apart look small; trust the command history. Continue with the next cad_command batch "
                         "from your plan (cad/plan.md).")
                 continue
-            if shots >= 4:
-                decision.tool, decision.args = "done", {"summary": decision.thought or "已截图，但模型未给出描述。"}
+            if shots >= 4:   # it used to end the task as "done" with no answer; now the user hears it is stuck
+                n = await self._escalate("stall", decision.thought or "连续截图，没有下一步操作")
+                if n is None:
+                    return
+                note, failures, shots = n, 0, 0
+                continue
             if (decision.tool == "done" and self._cad_task and not self._sent_file and self._done_rejects < 6
                     and self.step < self.cfg.max_steps - 3):
                 self._done_rejects += 1
@@ -586,9 +617,12 @@ class AgentLoop:
                 self._rep = self._rep + 1 if sig == self._prev_sig else 0
                 self._prev_sig = sig
                 if self._rep >= 4:
-                    await self.emit(EventType.VALIDATION, success=False, change=0.0, message="同一操作连续重复，已停止")
-                    self._finish(TaskStatus.FAILED, f"模型连续 {self._rep + 1} 次重复同一操作（{decision.tool}），已停止以免空转。请换更稳定的主模型或把任务拆小。")
-                    return
+                    await self.emit(EventType.VALIDATION, success=False, change=0.0, message="同一操作连续重复，先问你怎么办")
+                    n = await self._escalate("repeat", f"连续 {self._rep + 1} 次执行同一个操作（{decision.tool}），结果没有变化")
+                    if n is None:
+                        return
+                    note, failures = n, 0
+                    continue
                 if self._rep >= 2:
                     self.history.append(f"{self.step}. {decision.tool} SKIPPED: same call as the previous {self._rep} steps; its result is already above")
                     note = (f"You have issued the identical {decision.tool} call {self._rep + 1} times in a row. Its result is already in "
@@ -649,13 +683,28 @@ class AgentLoop:
                 self._acted = True
             await self.emit(EventType.ACTION_RESULT, tool=outcome.tool, success=outcome.success,
                             error=outcome.error, result=_short(outcome.result))
+            seen = ""
+            if isinstance(outcome.result, dict):
+                seen = str(outcome.result.get("text") or outcome.result.get("stdout") or "")[:20000]
+            st = self._stall.feed(decision.tool, decision.args, seen + " " + str(outcome.error or "") + " " + (desc or ""))
+            if st in ("blocked", "stall") and outcome.control is None:
+                self.history.append(_hist_line(self.step, decision, outcome, "looked again; the page has not moved"))
+                n = await self._escalate(st, decision.thought or "")
+                if n is None:
+                    return
+                note, failures = n, 0
+                continue
+            stall_note = _es.NUDGE if st == "nudge" else None
 
             if outcome.control == "done":
                 self._finish(TaskStatus.SUCCEEDED, decision.args.get("summary", "done"))
                 return
-            if outcome.control == "fail":
-                self._finish(TaskStatus.FAILED, decision.args.get("reason", "agent gave up"))
-                return
+            if outcome.control == "fail":   # the model may not give up on its own: the user decides
+                n = await self._escalate("fail", str(decision.args.get("reason") or decision.thought or ""))
+                if n is None:
+                    return
+                note, failures = n, 0
+                continue
 
             after = outcome.screenshot
             v = self.validator.check(outcome.action, outcome.success, outcome.error, before, after)
@@ -678,9 +727,12 @@ class AgentLoop:
             if not outcome.success and (outcome.error or "").startswith("missing args"):
                 failures += 1
                 if failures >= self.cfg.max_consecutive_failures:
-                    self._finish(TaskStatus.FAILED, f"模型连续 {failures} 次调用 {decision.tool} 时没有给出参数（{outcome.error}）。"
-                                                    "多半是模型输出被截断或网关不支持工具参数，可换模型或调大 AIW_LLM_MAX_TOKENS。")
-                    return
+                    n = await self._escalate("noargs", f"模型连续 {failures} 次调用 {decision.tool} 时没有给出参数（{outcome.error}），"
+                                                       "多半是模型输出被截断，可换主模型或调大 AIW_LLM_MAX_TOKENS")
+                    if n is None:
+                        return
+                    note, failures = n, 0
+                    continue
                 note = (f"Your last {decision.tool} call had no arguments ({outcome.error}). Call it again WITH the "
                         "required arguments. If the content is long, use files_write to save a script first, then run it.")
                 continue
@@ -693,11 +745,15 @@ class AgentLoop:
             else:
                 failures += 1
                 if failures >= self.cfg.max_consecutive_failures:
-                    self._finish(TaskStatus.FAILED, f"too many consecutive failures; last: {v.message}")
-                    return
+                    n = await self._escalate("errors", f"连续 {failures} 步出错，最后一次：{v.message} {outcome.error or ''}")
+                    if n is None:
+                        return
+                    note, failures = n, 0
+                    continue
                 note = await self.recovery.recover(failures, outcome.action)
                 await self.emit(EventType.RECOVERY, attempt=failures, note=note)
-        self._finish(TaskStatus.FAILED, f"max steps ({self.cfg.max_steps}) reached")
+            if stall_note:
+                note = ((note + "\n") if note else "") + stall_note
 
 
     async def _look(self, shot: str, shown: tuple[int, int]) -> Optional[str]:
@@ -762,12 +818,12 @@ class AgentLoop:
             opts = [str(o) for o in (a.get("options") or [])][:6]
             await self.emit(EventType.INPUT_REQUIRED, question=q, options=opts)
             t0 = time.monotonic()
-            reply = await self.ask(q, opts) if self.ask else None
+            reply = await self._ask(q, opts)
             self.add_wait(time.monotonic() - t0)
             await self.emit(EventType.INPUT_ANSWERED, answer=reply)
             await self.emit(EventType.ACTION_RESULT, tool=t, success=reply is not None, error=None if reply else "no answer",
                             result={"answer": reply})
-            return f"user answered: {reply!r}" if reply else "user did not answer within the time limit; decide yourself or fail"
+            return f"user answered: {reply!r}" if reply else "user did not answer within the time limit; decide yourself (never give up silently)"
         if t == "click_element":
             return await self._click_element(a, decision.thought)
         if t == "cad_draw":
@@ -834,12 +890,18 @@ class AgentLoop:
     async def _ask(self, q: str, opts: list, extra: Optional[dict] = None):
         if not self.ask:
             return None
-        if extra is None:
-            return await self.ask(q, opts)
+        self._asking_since = time.monotonic()
         try:
-            return await self.ask(q, opts, extra)
-        except TypeError:  # an older ask() without the extra argument
-            return await self.ask(q, opts)
+            if getattr(self, "_stall", None) is not None:
+                self._stall.reset()
+            if extra is None:
+                return await self.ask(q, opts)
+            try:
+                return await self.ask(q, opts, extra)
+            except TypeError:  # an older ask() without the extra argument
+                return await self.ask(q, opts)
+        finally:
+            self._asking_since = None
 
     async def _ask_form(self, a: dict, intent: str) -> str:
         """ask_user with `fields`: the user gets a card, opens it, fills the fields. Passwords and other secret
@@ -936,7 +998,7 @@ class AgentLoop:
         if ex is None:
             return page
         try:
-            r = await asyncio.wait_for(ex("shell.exec", {"command": "curl -s -m 2 http://127.0.0.1:9222/json/list", "timeout": 4},
+            r = await asyncio.wait_for(ex("shell.exec", {"command": "curl -s -m 2 http://127.0.0.1:9222/json/list || curl -s -m 2 http://127.0.0.1:9110/json/list", "timeout": 5},
                                           observe=False, timeout=6), 6)
             import json as _json
             tabs = _json.loads(((r.result or {}).get("stdout") or "[]")) if r and r.success else []
@@ -947,6 +1009,61 @@ class AgentLoop:
         except Exception:  # noqa: BLE001  the card falls back to what the agent said
             pass
         return page
+
+    async def _escalate(self, kind: str, detail: str) -> Optional[str]:
+        """Instead of failing: ask for a takeover (captcha/login wall on the page) or ask the user what to do.
+        Returns the note to continue with, or None when the task has ended (stopped by the user, nobody answered,
+        or nobody can be asked) - always with a full report as the result. See escalate.py."""
+        page = await self._page_now()
+        stall = getattr(self, "_stall", None) or _es.Stall()
+        self._stall = stall
+        blocked = stall.blocked or ("验证" if kind == "blocked" else "")
+        await self.emit(EventType.VALIDATION, success=False, change=0.0, message="需要你：" + _es.KIND_TEXT.get(kind, kind))
+        if not self.ask:
+            self._finish(TaskStatus.FAILED, _es.report(kind, detail, self.history, page, blocked))
+            return None
+        if blocked:
+            act = "slider" if re.search(r"滑块|拖动|slide", blocked, re.I) else "captcha"
+            r = await self._request_takeover({"action": act, "url": page.get("url") or "",
+                                              "what_to_do": f"在页面上完成「{blocked}」（滑块/图形验证码等），完成后点「完成，交还给 Aiw」",
+                                              "reason": f"页面出现「{blocked}」，需要真人完成验证"},
+                                             f"页面出现「{blocked}」验证，Aiw 过不去，需要你来完成")
+            self.history.append(f"{self.step}. request_takeover(auto: {blocked}) -> {r}")
+            if r.startswith("the user handled it"):
+                stall.reset()
+                return ("The user completed the verification on the desktop. Re-read the page now (bos_snapshot of the page "
+                        "you were on) and continue the task from there.")
+        q = _es.question(kind, detail, page, blocked)
+        await self.emit(EventType.INPUT_REQUIRED, question=q, options=list(_es.OPTIONS))
+        t0 = time.monotonic()
+        reply = await self._ask(q, list(_es.OPTIONS))
+        self.add_wait(time.monotonic() - t0)
+        await self.emit(EventType.INPUT_ANSWERED, answer=reply)
+        c = _es.choice(reply)
+        if c == "takeover":
+            r = await self._request_takeover({"action": "other", "url": page.get("url") or "",
+                                              "what_to_do": "在桌面上把卡住的这一步处理掉，完成后点「完成，交还给 Aiw」",
+                                              "reason": _es.KIND_TEXT.get(kind, "卡住了")}, detail or "")
+            self.history.append(f"{self.step}. request_takeover(user chose to take over) -> {r}")
+            if r.startswith("the user handled it"):
+                c, reply = "retry", "我已经在桌面上处理好了，接着做"
+            else:
+                c = "none" if "did not take over" in r else "stop"
+        if c == "retry":
+            self.cfg.max_steps = max(self.cfg.max_steps, self.step + 25)
+            if kind == "time":
+                self.cfg.timeout_s += 900
+                self._time_asked = False
+            self._rep, self._prev_sig = 0, None
+            stall.reset()
+            hint = "" if reply in (_es.OPT_RETRY, None) else f" The user said: {reply!r}. Follow it."
+            self.history.append(f"{self.step}. (asked the user: {_es.KIND_TEXT.get(kind, kind)}; they chose to go on)")
+            return (f"You were stuck ({kind}: {str(detail)[:200]}). The user wants you to continue.{hint} Do NOT repeat what "
+                    "already failed: try a different approach. If a person is needed (captcha, login, SMS code), call "
+                    "request_takeover; if you cannot go on, call ask_user and explain. Never give up silently.")
+        self._finish(TaskStatus.STOPPED if c == "stop" else TaskStatus.FAILED,
+                     _es.report(kind, detail, self.history, page, blocked, answer=reply if c == "stop" else None))
+        return None
 
     async def _request_takeover(self, a: dict, intent: str) -> str:
         from tool_router.explain import takeover_card
@@ -964,10 +1081,10 @@ class AgentLoop:
         await self.emit(EventType.ACTION_RESULT, tool="request_takeover", success=reply is not None and not cancelled,
                         error="用户取消了接管" if cancelled else None, result={})
         if reply is None:
-            return "the user did not take over in time; try once more yourself, or fail with the reason"
+            return "the user did not take over in time; try once more yourself, or ask_user explaining what blocks you"
         if cancelled:
             return ("the user cancelled the takeover and will not do this step. Do not request_takeover for it again; "
-                    "find another way that does not need it, or fail and explain what is blocked.")
+                    "find another way that does not need it, or ask_user explaining what is blocked.")
         return f"the user handled it on the desktop (said: {reply!r}). Take a screenshot and continue from what is shown now."
 
     async def _click_element(self, a: dict, intent: str) -> str:

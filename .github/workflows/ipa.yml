@@ -33,7 +33,10 @@ jobs:
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body "Build OK at ${GITHUB_SHA::7} ($(du -h apps/ios/AIWorkstation.ipa | cut -f1))"
+        run: |
+          if grep -q "AiwShare.appex embedded" /tmp/build.log; then ext="with AiwShare.appex"
+          else ext=$'WITHOUT AiwShare.appex (extension build failed)\n```\n'"$(grep -E "Share/.*error:" -A3 /tmp/build.log | head -60)"$'\n```'; fi
+          gh issue comment 1 --repo "$GITHUB_REPOSITORY" --body "Build OK at ${GITHUB_SHA::7} ($(du -h apps/ios/AIWorkstation.ipa | cut -f1)) $ext"
       - uses: actions/upload-artifact@v4
         with:
           name: AIWorkstation-ipa

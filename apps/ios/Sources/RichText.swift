@@ -1,0 +1,196 @@
+import SwiftUI
+
+// Readable chat text (iOS 3.3). The agent's replies are Markdown-ish plain text: paragraphs, "- " lists, numbered
+// steps, headings, code fences, long ~/workspace/... paths. SwiftUI's Text(.init(s)) only does inline Markdown, so a
+// list showed its raw "- " marks and every path broke across lines. RichText renders the blocks natively with real
+// spacing, bullets with a hanging indent, a bold lead-in for "名称：说明" items, and long file paths shortened to the
+// file name in a code chip (the full path is on the file card and under 查看步骤).
+
+/// One block of a reply.
+enum RichBlock {
+    case para(String)
+    case heading(String, Int)
+    case bullet(String, level: Int)
+    case number(String, String)          // marker ("1."), text
+    case quote(String)
+    case code(String)
+    case table([String])
+}
+
+func richBlocks(_ src: String) -> [RichBlock] {
+    var out: [RichBlock] = []
+    var para: [String] = []
+    var code: [String]? = nil
+    var table: [String] = []
+    func flushPara() { if !para.isEmpty { out.append(.para(para.joined(separator: "\n"))); para = [] } }
+    func flushTable() { if !table.isEmpty { out.append(.table(table)); table = [] } }
+    for raw in src.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        if var c = code {
+            if line.hasPrefix("```") { out.append(.code(c.joined(separator: "\n"))); code = nil } else { c.append(raw); code = c }
+            continue
+        }
+        if line.hasPrefix("```") { flushPara(); flushTable(); code = []; continue }
+        if line.hasPrefix("|") { flushPara(); table.append(line); continue } else { flushTable() }
+        if line.isEmpty { flushPara(); continue }
+        let indent = raw.prefix { $0 == " " || $0 == "\t" }.count
+        if let h = line.firstIndex(where: { $0 != "#" }), line.hasPrefix("#"), line[h] == " " {
+            flushPara(); out.append(.heading(String(line[h...]).trimmingCharacters(in: .whitespaces), line.distance(from: line.startIndex, to: h))); continue
+        }
+        if let f = line.first, "-*•·+".contains(f), line.count > 1, line[line.index(after: line.startIndex)] == " " {
+            flushPara(); out.append(.bullet(String(line.dropFirst(2)), level: indent >= 2 ? 1 : 0)); continue
+        }
+        if let r = line.range(of: #"^(\d{1,2}|[一二三四五六七八九十]{1,2})[.、)）]\s*"#, options: .regularExpression), r.upperBound < line.endIndex {
+            flushPara()
+            let mark = line[r].trimmingCharacters(in: .whitespaces)
+            out.append(.number(mark, String(line[r.upperBound...]))); continue
+        }
+        if line.hasPrefix(">") { flushPara(); out.append(.quote(String(line.dropFirst()).trimmingCharacters(in: .whitespaces))); continue }
+        if line.allSatisfy({ "-_*=".contains($0) }) && line.count >= 3 { flushPara(); continue }   // --- rules
+        para.append(line)
+    }
+    if let c = code { out.append(.code(c.joined(separator: "\n"))) }
+    flushPara(); flushTable()
+    return out
+}
+
+private let pathRx = try! NSRegularExpression(
+    pattern: #"(?<![\w:/.`])(?:~?/)?(?:[\w.\-~\p{Han}]+/)+([^\s/`：:，,。；;、）)（(】\]]+\.[A-Za-z0-9]{1,6})(?![\w/])"#)
+
+/// Long file paths -> `file.ext` (a code chip); URLs are left alone.
+func shortPaths(_ s: String) -> String {
+    let ns = s as NSString
+    var out = s
+    for m in pathRx.matches(in: s, range: NSRange(location: 0, length: ns.length)).reversed() {
+        let whole = ns.substring(with: m.range), name = ns.substring(with: m.range(at: 1))
+        if !whole.contains("/") { continue }
+        if let r = Range(m.range, in: out) { out.replaceSubrange(r, with: "`\(name)`") }
+    }
+    return out
+}
+
+/// Inline Markdown (bold, italic, code, links) for one block, with paths shortened.
+func inlineMD(_ s: String, leadBold: Bool = false) -> AttributedString {
+    var t = shortPaths(s)
+    // "瘦脸：在脸部…" -> "**瘦脸**：在脸部…" for list items whose short lead-in names the point
+    if leadBold, !t.hasPrefix("**"), let r = t.range(of: "：") ?? t.range(of: ": "),
+       t.distance(from: t.startIndex, to: r.lowerBound) in 1...10, !t[..<r.lowerBound].contains("`") {
+        t = "**" + String(t[..<r.lowerBound]) + "**" + String(t[r.lowerBound...])
+    }
+    let opt = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+    return (try? AttributedString(markdown: t, options: opt)) ?? AttributedString(t)
+}
+
+/// A whole reply, rendered block by block.
+struct RichText: View {
+    let text: String
+    var font: Font = .callout
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            ForEach(Array(richBlocks(text).enumerated()), id: \.offset) { _, b in block(b) }
+        }
+        .font(font)
+        .lineSpacing(3)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder func block(_ b: RichBlock) -> some View {
+        switch b {
+        case .para(let s):
+            Text(inlineMD(s)).fixedSize(horizontal: false, vertical: true)
+        case .heading(let s, let lvl):
+            Text(inlineMD(s)).font(lvl <= 2 ? .headline : .subheadline.weight(.semibold)).padding(.top, 2)
+        case .bullet(let s, let lvl):
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Text(lvl == 0 ? "•" : "◦").fontWeight(.heavy).foregroundColor(lvl == 0 ? amber : .secondary)
+                Text(inlineMD(s, leadBold: true)).fixedSize(horizontal: false, vertical: true)
+            }.padding(.leading, lvl == 0 ? 2 : 16)
+        case .number(let n, let s):
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(n).foregroundColor(amber).fontWeight(.semibold).monospacedDigit()
+                Text(inlineMD(s, leadBold: true)).fixedSize(horizontal: false, vertical: true)
+            }
+        case .quote(let s):
+            HStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 1.5).fill(amber.opacity(0.6)).frame(width: 3)
+                Text(inlineMD(s)).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        case .code(let s):
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(s).font(.system(.footnote, design: .monospaced)).padding(10)
+            }.background(Color(.tertiarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 8))
+        case .table(let rows):
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(rows.filter { !$0.replacingOccurrences(of: "|", with: "").allSatisfy { "-: ".contains($0) } }.enumerated()), id: \.offset) { i, r in
+                        let cells = r.trimmingCharacters(in: CharacterSet(charactersIn: "| ")).components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+                        HStack(spacing: 14) {
+                            ForEach(Array(cells.enumerated()), id: \.offset) { _, c in
+                                Text(inlineMD(c)).font(i == 0 ? .footnote.weight(.semibold) : .footnote).frame(minWidth: 60, alignment: .leading)
+                            }
+                        }
+                    }
+                }.padding(10)
+            }.background(Color(.tertiarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+}
+
+/// The user's message split into what they asked, the skills they picked and the files they attached.
+struct PromptParts {
+    var text: String
+    var skills: [String]
+    var files: [String]
+    init(_ p: String) {
+        skills = skillIds(p)
+        var s = p
+        if s.hasPrefix("【技能"), let r = s.range(of: "】") { s = String(s[r.upperBound...]) }
+        files = []
+        if let r = s.range(of: "附件（已放到电脑上）：") {
+            files = s[r.upperBound...].split(whereSeparator: \.isNewline).map {
+                $0.trimmingCharacters(in: CharacterSet(charactersIn: "-•* ")) }.filter { !$0.isEmpty }
+                .map { ($0 as NSString).lastPathComponent }
+            s = String(s[..<r.lowerBound])
+        }
+        text = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// The user's bubble: skill chips, the text, attachment chips.
+struct UserBubble: View {
+    let prompt: String
+    var body: some View {
+        let p = PromptParts(prompt)
+        VStack(alignment: .trailing, spacing: 6) {
+            if !p.skills.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "sparkles"); Text(p.skills.joined(separator: " · ")).lineLimit(1)
+                }.font(.caption.weight(.semibold)).foregroundColor(amber)
+                .padding(.horizontal, 8).padding(.vertical, 4).background(amber.opacity(0.14)).clipShape(Capsule())
+            }
+            if !p.text.isEmpty {
+                Text(inlineMD(p.text)).font(.callout).lineSpacing(3).textSelection(.enabled)
+                    .padding(.horizontal, 13).padding(.vertical, 9)
+                    .background(amber.opacity(0.16)).clipShape(RoundedRectangle(cornerRadius: 16))
+            }
+            ForEach(Array(p.files.enumerated()), id: \.offset) { _, f in
+                HStack(spacing: 5) {
+                    Image(systemName: fileIcon(f)).foregroundColor(amber); Text(f).lineLimit(1).truncationMode(.middle)
+                }.font(.caption).foregroundColor(.secondary)
+                .padding(.horizontal, 9).padding(.vertical, 5).background(Color(.secondarySystemBackground)).clipShape(Capsule())
+            }
+        }.frame(maxWidth: .infinity, alignment: .trailing)
+    }
+}
+
+func fileIcon(_ name: String) -> String {
+    switch (name as NSString).pathExtension.lowercased() {
+    case "jpg", "jpeg", "png", "heic", "webp", "gif": return "photo"
+    case "mp4", "mov", "m4v": return "film"
+    case "pdf": return "doc.richtext"
+    case "xlsx", "xls", "csv": return "tablecells"
+    case "md", "txt", "json": return "doc.text"
+    default: return "doc"
+    }
+}

@@ -61,6 +61,8 @@ PAY_HOSTS = ("pay.jd.com", "cashier", "alipay.com", "pcashier", "payc.m.jd.com")
 
 SUBMIT_RE = re.compile(r"提交订单|确认订单|去结算|结算")
 PAY_RE = re.compile(r"立即支付|确认付款|确认支付|去支付|立即付款|付款|支付|pay\b", re.I)
+# BrowserOS's own MCP / DevTools ports: a shell command talking to them walks around the element gates
+BOS_SHELL_RE = re.compile(r"\b(9110|9210)\b|/mcp(?![\w.-])", re.I)
 SHELL_CLICK_RE = re.compile(r"xdotool|9222|devtools|dispatchMouseEvent|Input\.dispatch|chrome-remote|playwright|puppeteer|"
                             r"pyautogui|ydotool|shop/probe\.py", re.I)
 ENTER_KEYS = re.compile(r"^(enter|return|kp_enter|ctrl\+enter|ctrl\+return)$", re.I)
@@ -311,7 +313,9 @@ def _q(s: str) -> str:
 
 
 async def run_probe(computer, sub: str, timeout: float = 60, **kw) -> dict:
-    r = await computer.execute("shell.exec", {"command": probe_command(sub, **kw), "timeout": timeout}, timeout=timeout + 15)
+    from . import browseros as _bos   # BrowserOS on: read pages over its DevTools port, where the user is logged in
+    r = await computer.execute("shell.exec", {"command": _bos.probe_env(computer) + probe_command(sub, **kw),
+                                              "timeout": timeout}, timeout=timeout + 15)
     res = getattr(r, "result", None) or {}
     out = (res.get("stdout") or "").strip().splitlines()
     for line in reversed(out):
@@ -377,7 +381,7 @@ async def check(sched, w: dict, now: Optional[float] = None) -> dict:
         raw = await run_probe(computer, "probe", timeout=70, url=w["url"], sku=w.get("sku") or "")
         if str(raw.get("error", "")).startswith("NO_CDP"):
             # Chrome is closed (or was started without the debugging port): open it the way the agent does
-            await computer.execute("computer.open_app", {"name": "chrome"}, timeout=30)
+            await computer.execute("computer.open_app", {"name": "browseros" if _bname(store, mid) == "BrowserOS" else "chrome"}, timeout=30)
             await asyncio.sleep(6)
             raw = await run_probe(computer, "probe", timeout=70, url=w["url"], sku=w.get("sku") or "")
         r = parse_snapshot(raw)
@@ -435,8 +439,8 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
     if r["status"] != prev_status:
         if r["status"] == "login":
             await notifier.notify("watch_error", f"需要登录{site_name}：{w['name']}",
-                                  f"「{machine}」上的 Chrome 还没登录{site_name}。请在 AIW 里打开这台电脑的接管桌面，"
-                                  f"在 Chrome 里登录一次（扫码即可），之后价格会自动读取。\n{w['url']}", link=w["url"])
+                                  f"「{machine}」上的 {_bname(store, mid)} 还没登录{site_name}。请在 AIW 里打开这台电脑的接管桌面，"
+                                  f"在 {_bname(store, mid)} 里登录一次（扫码即可），之后价格会自动读取。\n{w['url']}", link=w["url"])
         elif r["status"] == "captcha":
             await notifier.notify("watch_error", f"{site_name}要求验证：{w['name']}",
                                   f"读取价格时遇到滑块/安全验证。请在「{machine}」的接管桌面里完成一次验证；"
@@ -449,6 +453,11 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
     if r["status"] in ("error", "no_price", "no_browser") and fails == 3:
         await notifier.notify("watch_error", f"价格监控失败：{w['name']}", f"连续 3 次读取失败：{r.get('note')}", link=w["url"])
     return {"ok": False, "error": r.get("note") or r["status"], "result": r}
+
+
+def _bname(store, mid) -> str:
+    from . import browseros as _bos
+    return _bos.browser_name(store, mid)
 
 
 def _sync_order_status(store, w: dict) -> None:
@@ -671,7 +680,7 @@ async def gate(state: dict, name: str, args: dict, probe: ProbeFn, scale: float 
     this before the user approved through order_confirm; 提交订单 never (order_confirm clicks it itself)."""
     approved = bool(state.get("approved"))
     a = args or {}
-    if name == "shell" and SHELL_CLICK_RE.search(str(a.get("command") or "")):
+    if name == "shell" and (SHELL_CLICK_RE.search(str(a.get("command") or "")) or BOS_SHELL_RE.search(str(a.get("command") or ""))):
         return "下单任务里不能用 shell 去点击网页或驱动浏览器；用 browser_click 选规格，确认订单页上调用 order_confirm。"
     if name in ("browser_click", "click_element"):
         text = str(a.get("text") or a.get("target") or "")
@@ -732,11 +741,20 @@ def guard(executor, state: dict, computer) -> None:
         return await run_probe(computer, sub, timeout=20, **kw)
 
     async def run(name: str, args: dict, intent: str = ""):
-        why = await gate(state, name, args, probe, float(getattr(executor, "scale", 1.0) or 1.0))
+        scale = float(getattr(executor, "scale", 1.0) or 1.0)
+        if name.startswith("bos_"):   # BrowserOS: judged as the classic click/typing it amounts to
+            from tool_router import browseros as bos
+            why, args = await bos.gate_bos(executor, name, args, lambda n, a: gate(state, n, a, probe, scale),
+                                           bool(state.get("approved")))
+            text = bos.gate_text(name, args)
+            clicky = bool(text)
+        else:
+            why = await gate(state, name, args, probe, scale)
+            text = str((args or {}).get("text") or "")
+            clicky = name == "browser_click"
         if why:
             return ToolOutcome(name, None, False, Decision(RiskLevel.L4, why), error=f"forbidden by policy: {why}")
-        text = str((args or {}).get("text") or "")
-        auto = name == "browser_click" and (state.get("approved") or not PAY_RE.search(text))
+        auto = clicky and (state.get("approved") or not PAY_RE.search(text))
         if not auto:
             return await orig(name, args, intent="")
         saved = executor.confirm

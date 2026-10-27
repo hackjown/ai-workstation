@@ -12,6 +12,8 @@ from enum import IntEnum
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
+from . import explain as _ex
+
 
 class RiskLevel(IntEnum):
     L0 = 0
@@ -61,11 +63,11 @@ SHELL_L3 = [
     (r"\bgit\s+push\b", "publish code"),
 ]
 SHELL_L2 = [
-    (r"\bsudo\b", "privileged command"),
-    (r"\b(apt|apt-get|snap)\s+(install|remove|purge)\b", "package change"),
-    (r"\bpip3?\s+install\b|\bnpm\s+(i|install)\b", "package install"),
     (r"\bsystemctl\b", "service control"),
 ]
+# sudo and package installs used to be L2 (run + audit). They now ask (L3) through the plain-language classifier in
+# explain.py, like deletes outside the workspace, uploads, git push. AIW_AUTO_INSTALL=1 keeps pip/npm installs (not
+# apt/sudo) automatic for setups that relied on that.
 SENSITIVE_PATH = re.compile(r"(\.ssh/|id_rsa|\.env\b|\.aws/|credentials|\.pem$|\.key$|/etc/shadow|password)", re.I)
 PAY_WORDS = re.compile(r"(checkout|payment|pay now|place order|立即支付|确认付款|下单|支付)", re.I)
 
@@ -114,6 +116,15 @@ class PolicyEngine:
         env = os.environ.get("AIW_ALLOW_DOMAINS", "")
         self.allow_domains = allow_domains if allow_domains is not None else [d.strip() for d in env.split(",") if d.strip()]
         self.rules: list[Rule] = [self._shell, self._files, self._net, self._typing, self._dom] + (extra_rules or [])
+        self.created: set = set()   # folders this task made (mkdir / --outdir): deleting them again is routine
+
+    def note_success(self, action: str, payload: dict):
+        """Called after a tool call ran: remember the folders a shell command created."""
+        if action == "shell.exec":
+            try:
+                self.created |= _ex.created_dirs(str((payload or {}).get("command") or ""))
+            except Exception:  # noqa: BLE001
+                pass
 
     def check(self, action: str, payload: dict) -> Decision:
         best = Decision(RiskLevel.L0, "default allow")
@@ -127,16 +138,52 @@ class PolicyEngine:
     def _shell(self, action, p):
         if action != "shell.exec":
             return None
-        cmd = p.get("command", "")
-        if scratch_delete(cmd):  # strip the scratch deletes, judge the rest of the command as usual
+        full = cmd = p.get("command", "")
+        for pat, why in SHELL_L4:
+            if re.search(pat, cmd):
+                return Decision(RiskLevel.L4, f"shell: {why}")
+        if scratch_delete(cmd) or self._own_delete(cmd):  # strip the scratch deletes, judge the rest as usual
             cmd = _RMRF.sub("true", cmd)
-        for pats, lvl in ((SHELL_L4, RiskLevel.L4), (SHELL_L3, RiskLevel.L3), (SHELL_L2, RiskLevel.L2)):
-            for pat, why in pats:
-                if re.search(pat, cmd):
-                    return Decision(lvl, f"shell: {why}")
+        for pat, why in SHELL_L3:
+            if re.search(pat, cmd):
+                return Decision(RiskLevel.L3, f"shell: {why}")
         if SENSITIVE_PATH.search(cmd):
             return Decision(RiskLevel.L3, "shell touches sensitive file")
+        try:
+            e = _ex.explain_shell(full, self.created)
+        except Exception:  # noqa: BLE001
+            e = {"ask": None, "category": "other"}
+        if e.get("ask"):
+            if e.get("category") == "install" and os.environ.get("AIW_AUTO_INSTALL", "").lower() in ("1", "true", "pip", "yes") \
+                    and not re.search(r"\bsudo\b|\b(apt|apt-get|snap|dnf|yum|dpkg)\b|\s-g\b|--global|--break-system", full) \
+                    and not re.search(r"(curl|wget)[^|]*\|\s*(sudo\s+)?(ba|z)?sh\b", full):
+                return Decision(RiskLevel.L2, "shell: package install")
+            return Decision(RiskLevel.L3, f"shell: {e['ask']}")
+        for pat, why in SHELL_L2:
+            if re.search(pat, cmd):
+                return Decision(RiskLevel.L2, f"shell: {why}")
         return Decision(RiskLevel.L1, "shell command")
+
+    def _own_delete(self, cmd: str) -> bool:
+        """rm -rf of folders this task created itself (under the workspace or /tmp), nothing else in the rm."""
+        if not self.created:
+            return False
+        hits = list(_RMRF.finditer(cmd))
+        if not hits or re.search(r"\$\(|`|\*", cmd):
+            return False
+        cwd = "~"
+        m = re.search(r"\bcd\s+([^;&|\s]+)", cmd)
+        if m and cmd.find(m.group(0)) < hits[0].start():
+            cwd = _ex.norm_path(m.group(1))
+        for h in hits:
+            for t in h.group(2).split():
+                if t.startswith("-"):
+                    continue
+                q = _ex.norm_path(t, cwd)
+                if q not in self.created or _ex.zone(q) not in ("workspace", "tmp") or q.rstrip("/") in (
+                        "~/workspace", "~/workspace/uploads", "~/workspace/outputs"):
+                    return False
+        return True
 
     def _files(self, action, p):
         if not action.startswith("files."):

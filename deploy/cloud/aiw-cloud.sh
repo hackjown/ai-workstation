@@ -91,9 +91,14 @@ toolbox_bg() {  # everyday conversion tools (deploy/vm/toolbox-setup.sh), instal
 do_ensure() {
   : "${VM_AGENT_TOKEN:?VM_AGENT_TOKEN missing}"
   [ "$(cat "$ST" 2>/dev/null)" = INSTALLED ] || { echo "NOT_INSTALLED $(cat "$ST" 2>/dev/null)"; return 2; }
+  # newest code from main; AIW_REV in the env makes the check below restart an agent still running older code
+  # (an agent started before the BrowserOS release never reports BrowserOS, so 设置 showed 未检测)
+  [ -d "$R/.git" ] && timeout 25 git -C "$R" pull -q --ff-only >/dev/null 2>&1
+  REV=$(git -C "$R" rev-parse --short HEAD 2>/dev/null || echo unknown)
   umask 077
   cat > "$S/vm-agent.env" <<ENV
 VM_AGENT_TOKEN=$VM_AGENT_TOKEN
+AIW_REV=$REV
 VM_AGENT_BACKEND=x11
 VM_AGENT_FILES_ROOT=$HOME/workspace
 VM_AGENT_WORKDIR=$HOME/workspace
@@ -105,7 +110,7 @@ ENV
   toolbox_bg
   [ -x /usr/bin/browserclaw ] && DISPLAY=$DISP bash "$R/deploy/vm/browseros-setup.sh" start >/dev/null 2>&1 &
   [ -f "$(xdg-user-dir DESKTOP 2>/dev/null || echo $HOME/Desktop)/librecad.desktop" ] || DISPLAY=$DISP desktop_icons >/dev/null 2>&1 || true
-  # restart when the token changed (a new API host) or the agent died
+  # restart when the token or the code changed (a new API host, a git pull) or the agent died
   if pgrep -f "vm_agent.server.websocket" >/dev/null && cmp -s "$S/vm-agent.env" "$S/vm-agent.env.running"; then
     echo AGENT_UP; return 0
   fi

@@ -625,6 +625,13 @@ class AgentLoop:
                     break
                 await self.emit(EventType.RECOVERY, attempt=attempt + 1, note=f"transient error, retrying: {outcome.error[:120]}")
                 await asyncio.sleep(1.5 * (attempt + 1))
+            try:   # the page on screen, for a takeover card's fallback site name
+                if decision.tool in ("browser_open", "browser_navigate", "bos_navigate") and decision.args.get("url"):
+                    self._last_page = {"url": str(decision.args["url"]), "title": ""}
+                if outcome.success and isinstance(outcome.result, dict) and outcome.result.get("url"):
+                    self._last_page = {"url": str(outcome.result["url"]), "title": str(outcome.result.get("title") or "")}
+            except Exception:  # noqa: BLE001
+                pass
             if outcome.action == "browseros.call" and self._secrets and isinstance(outcome.result, dict):
                 t = str(outcome.result.get("text") or "")
                 for sv in self._secrets.values():   # a diff can echo a filled value back
@@ -921,17 +928,46 @@ class AgentLoop:
             text = text.replace("{{" + k + "}}", v)
         return {**args, "text": text, "secret": True}
 
+    async def _page_now(self) -> dict:
+        """The browser page on screen now ({url, title}) for a takeover card: Chrome's DevTools list (3 s at most),
+        else the last url the agent opened."""
+        page = dict(getattr(self, "_last_page", None) or {})
+        ex = getattr(self.computer, "execute", None)
+        if ex is None:
+            return page
+        try:
+            r = await asyncio.wait_for(ex("shell.exec", {"command": "curl -s -m 2 http://127.0.0.1:9222/json/list", "timeout": 4},
+                                          observe=False, timeout=6), 6)
+            import json as _json
+            tabs = _json.loads(((r.result or {}).get("stdout") or "[]")) if r and r.success else []
+            tabs = [t for t in tabs if isinstance(t, dict) and t.get("type") == "page"
+                    and not str(t.get("url", "")).startswith(("devtools://", "chrome-extension://", "chrome://"))]
+            if tabs:
+                page = {"url": tabs[0].get("url") or "", "title": tabs[0].get("title") or ""}
+        except Exception:  # noqa: BLE001  the card falls back to what the agent said
+            pass
+        return page
+
     async def _request_takeover(self, a: dict, intent: str) -> str:
-        reason = str(a.get("reason") or intent or "需要你在桌面上处理一下")[:200]
-        info = {"kind": "takeover", "title": reason}
+        from tool_router.explain import takeover_card
+        page = await self._page_now() if not (a.get("site") and a.get("url")) else {}
+        info = takeover_card(a, intent, page)
+        if not str(a.get("reason") or "").strip():
+            info["reason"] = info["steps"]
+        reason = info["title"].replace("需要你接管：", "", 1)
         await self.emit(EventType.INPUT_REQUIRED, question=reason, options=[], form=info)
         t0 = time.monotonic()
         reply = await self._ask(reason, [], info)
         self.add_wait(time.monotonic() - t0)
-        await self.emit(EventType.INPUT_ANSWERED, answer=reply)
-        await self.emit(EventType.ACTION_RESULT, tool="request_takeover", success=reply is not None, error=None, result={})
+        cancelled = isinstance(reply, str) and reply.strip().lower() in ("__cancel__", "cancel", "取消")
+        await self.emit(EventType.INPUT_ANSWERED, answer=reply, takeover=True, cancelled=cancelled, title=info["title"])
+        await self.emit(EventType.ACTION_RESULT, tool="request_takeover", success=reply is not None and not cancelled,
+                        error="用户取消了接管" if cancelled else None, result={})
         if reply is None:
             return "the user did not take over in time; try once more yourself, or fail with the reason"
+        if cancelled:
+            return ("the user cancelled the takeover and will not do this step. Do not request_takeover for it again; "
+                    "find another way that does not need it, or fail and explain what is blocked.")
         return f"the user handled it on the desktop (said: {reply!r}). Take a screenshot and continue from what is shown now."
 
     async def _click_element(self, a: dict, intent: str) -> str:

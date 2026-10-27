@@ -112,6 +112,7 @@ loadSettings = async function () {
   S.profile = prof;
   const dep = await api("GET", "/api/deploy/config").catch(() => ({ config: {} }));
   const rhosts = await api("GET", "/api/remote-hosts").catch(() => []);
+  const bos = await api("GET", "/api/browseros").catch(() => ({ machines: [] }));
   const [skillList, upd, skJob] = await Promise.all([api("GET", "/api/skills").catch(() => []), api("GET", "/api/update").catch(() => null),
     api("GET", "/api/skills/install").catch(() => null)]);
   S.skillList = skillList; S.skillJob = skJob && Date.now() / 1000 - (skJob.finished || skJob.started || 0) < 1800 ? skJob : null;
@@ -175,6 +176,7 @@ loadSettings = async function () {
         <div class="savebar"><span class="note" id="cloudNote"></span><button type="button" class="btn sm" onclick="cloudLookup()">读取已有机器</button><button class="btn sm primary">添加</button></div>
       </details>
     </form>
+    ${bosSection(bos)}
     <form class="rows" id="sDeploy" onsubmit="depSave(event)">
       <div class="rw head"><div class="k">部署服务器 · 开发好的程序装到这里</div><div>${dep.config.host ? '<span class="chip ok">已设置</span>' : '<span class="chip">未设置</span>'}</div></div>
       ${row("服务器地址", "随时可以换", `<div class="inl"><input name="host" value="${esc(dep.config.host || "")}" placeholder="192.168.50.120 或域名" /><input name="port" value="${esc(dep.config.port || 22)}" style="flex:0 0 80px;min-width:0" aria-label="端口" /></div>`)}
@@ -699,6 +701,40 @@ setComposerBusy = function (t) {
   }
   mobileViewfinder();
 };
+
+/* ---------- BrowserOS (per computer) */
+function bosSection(bos) {
+  const ms = (bos && bos.machines) || [];
+  const on = ms.filter((m) => m.enabled).length;
+  const st = (m) => { const s = m.seen || {};
+    if (!s.at) return '<span class="chip">未检测</span>';
+    if (!s.installed) return '<span class="chip">未安装</span>';
+    return s.running ? `<span class="chip ok">运行中${s.version ? " · " + esc(s.version) : ""}</span>` : `<span class="chip">已安装 · 未运行</span>`; };
+  const rows = ms.map((m) => { const s = m.seen || {}; const id = esc(m.id);
+    return `<div class="rw"><div class="k"><div class="mach"><span class="ic">${icon("monitor")}</span><div><b>${esc(m.name)}</b><span class="mono">${m.cloud ? "云电脑" : "本地"}</span></div></div></div>
+      <div class="v">${st(m)}<span class="small" id="bosT_${id}">${m.enabled ? "任务里优先用 BrowserOS 按元素操作网页" : s.installed ? "已关闭，任务只用截图点击" : ""}</span></div>
+      <div class="t">${s.installed ? `<input type="checkbox" ${m.enabled ? "checked" : ""} onchange="bosToggle('${id}',this.checked)" aria-label="在这台电脑上使用 BrowserOS" />`
+        : `<button type="button" class="btn sm" onclick="bosInstall('${id}')">安装</button>`}</div></div>`; }).join("");
+  return `<div class="rows" id="sBos">
+      <div class="rw head"><div class="k">BrowserOS · 按网页元素操作，省 token、少点错</div><div>${on ? `<span class="chip ok">${on} 台已开启</span>` : '<span class="chip">未开启</span>'}</div></div>
+      ${rows || '<div class="rw"><div class="k small">还没有电脑</div></div>'}
+      <div class="savebar"><span class="note" id="bosNote">装好后默认开启；网站登录要在 BrowserOS 里登一次（接管桌面）。只支持 x86 电脑。</span><button type="button" class="btn sm" onclick="bosRefresh()">重新检测</button></div>
+    </div>`;
+}
+async function bosRefresh() { $("bosNote").textContent = "检测中…"; try { await api("GET", "/api/browseros?refresh_now=true"); loadSettings(); } catch (err) { $("bosNote").textContent = err.message; } }
+async function bosToggle(id, on) {
+  try { await api("PUT", `/api/browseros/${encodeURIComponent(id)}`, { enabled: on }); toast(on ? "已开启 BrowserOS" : "已关闭 BrowserOS，任务改用截图点击");
+    const el = $("bosT_" + id); if (el) el.textContent = on ? "任务里优先用 BrowserOS 按元素操作网页" : "已关闭，任务只用截图点击"; }
+  catch (err) { toast(err.message); }
+}
+async function bosInstall(id) {
+  if (!confirm("在这台电脑上安装 BrowserOS？要下载约 200 MB，几分钟。")) return;
+  const el = $("bosT_" + id); if (el) el.textContent = "安装中，几分钟…";
+  try { const r = await api("POST", `/api/browseros/${encodeURIComponent(id)}/install`);
+    if (r.ok) { toast("BrowserOS 已装好并开启"); loadSettings(); }
+    else if (el) el.textContent = (r.error || "安装失败") + (r.log ? " · " + r.log.split("\n").filter(Boolean).slice(-2).join(" · ") : ""); }
+  catch (err) { if (el) el.textContent = err.message; }
+}
 
 /* ---------- 运维主机 */
 async function rhAdd(e) {

@@ -78,6 +78,7 @@ LIKE_RE = re.compile(r"^\s*(赞|点赞|喜欢|like)\s*$|点赞|like-wrapper|爱�
 ENTER_KEYS = re.compile(r"(^|\+)(enter|return|kp_enter)$", re.I)
 SHELL_INPUT_RE = re.compile(r"xdotool|ydotool|9222|devtools|dispatchKeyEvent|dispatchMouseEvent|Input\.(insert|dispatch)|"
                             r"playwright|puppeteer|selenium|pyautogui|chrome-remote|wtype|xte\b", re.I)
+BOS_SHELL_RE = re.compile(r"\b(9110|9210)\b|/mcp(?![\w.-])", re.I)   # BrowserOS's DevTools / MCP: around the gates
 READ_TOOLS = {"screenshot", "scroll", "move", "files_list", "files_read", "read_image", "update_plan", "ask_user",
               "request_takeover", "remember", "done", "fail", "browser_back", "browser_forward", "send_file", "files_write"}
 
@@ -306,7 +307,9 @@ def probe_command(sub: str = "state") -> str:
 
 async def probe(computer, timeout: float = 20) -> dict:
     try:
-        r = await computer.execute("shell.exec", {"command": probe_command("state"), "timeout": timeout}, timeout=timeout + 10)
+        from . import browseros as _bos   # BrowserOS on: its DevTools port, where the user logged in
+        r = await computer.execute("shell.exec", {"command": _bos.probe_env(computer) + probe_command("state"),
+                                                  "timeout": timeout}, timeout=timeout + 10)
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
     res = getattr(r, "result", None) or {}
@@ -331,6 +334,11 @@ async def check_page(store, notifier, computer, sessions=None, task_id: Optional
     return st, snap
 
 
+def _bname(store, mid) -> str:
+    from . import browseros as _bos
+    return _bos.browser_name(store, mid)
+
+
 async def notify_login(store, notifier, task_id: Optional[str] = None) -> None:
     key = f"xhs_login_notified:{day_key()}"
     if store.kv_get(key) or not notifier:
@@ -339,7 +347,7 @@ async def notify_login(store, notifier, task_id: Optional[str] = None) -> None:
     mid = machine_of(store)
     m = store.machine(mid) if mid else None
     await notifier.notify("xhs_login", "小红书需要登录一次",
-                          f"「{(m or {}).get('name') or mid}」上的 Chrome 还没登录小红书。打开 Aiw → 电脑 → 接管，在 Chrome 里用小红书 App "
+                          f"「{(m or {}).get('name') or mid}」上的 {_bname(store, mid)} 还没登录小红书。打开 Aiw → 电脑 → 接管，在 {_bname(store, mid)} 里用小红书 App "
                           "扫一次二维码即可（登录状态会保存在这台电脑的浏览器里）。", task_id=task_id)
 
 
@@ -647,7 +655,7 @@ def task_tools(store, notifier, task, computer, confirm, sessions=None) -> dict:
             return (f"STOP: 页面出现{WARN_CN[stt]}。已暂停所有小红书操作 24 小时并通知用户。不要尝试处理验证码，"
                     "不要再点任何东西，立即调用 done 说明情况。")
         if stt == "login":
-            return ("NEED_LOGIN: 这台电脑的 Chrome 没登录小红书。已通知用户。调用 request_takeover，请用户在接管桌面里用小红书 App "
+            return (f"NEED_LOGIN: 这台电脑的 {_bname(store, getattr(computer, 'machine_id', None))} 没登录小红书。已通知用户。调用 request_takeover，请用户在接管桌面里用小红书 App "
                     "扫二维码登录（只需一次），用户完成后再继续。")
         return None
 
@@ -863,7 +871,7 @@ def gate(store, state: dict, name: str, args: dict) -> Optional[str]:
         allowed = (armed.get("title") or "") + "\n" + (armed.get("text") or "") + "\n" + "\n".join(armed.get("media") or [])
     if name == "shell":
         cmd = str(args.get("command") or "")
-        if SHELL_INPUT_RE.search(cmd) and "aiw/xhs/probe.py" not in cmd:
+        if (SHELL_INPUT_RE.search(cmd) and "aiw/xhs/probe.py" not in cmd) or BOS_SHELL_RE.search(cmd):
             return "小红书任务里不能用 shell 去驱动浏览器或模拟输入；用 browser_* / type 工具，发送内容要先经用户批准（xhs_begin）。"
         return None
     if name == "type":
@@ -912,6 +920,70 @@ def gate(store, state: dict, name: str, args: dict) -> Optional[str]:
     return None
 
 
+# a like button in an accessibility snapshot is often 'button "赞 128"' or an unnamed heart icon with a count
+LIKE_LOOSE = re.compile(r"^\s*(赞|点赞|喜欢|like|liked|已赞)\b|^\s*(赞|点赞|喜欢)\s*\d|点赞|爱心|heart|like-wrapper", re.I)
+
+
+def _media_ok(files: list, media: list) -> Optional[str]:
+    """Every file to upload must be one of the approved draft's media (same path, or same file name when one side
+    is written with ~ or a different home)."""
+    import os.path as op
+    allowed = [str(m).strip() for m in media or [] if str(m).strip()]
+    for f in files or []:
+        f = str(f).strip()
+        hit = any(f == m or op.expanduser(f) == op.expanduser(m)
+                  or (op.basename(f) == op.basename(m) and (f.endswith(m.lstrip("~")) or m.endswith(f.lstrip("~"))
+                                                            or "/" not in f or "/" not in m))
+                  for m in allowed)
+        if not hit:
+            return f"只能上传已批准草稿里的文件（{', '.join(allowed) or '没有'}），{f} 不在其中。"
+    return None
+
+
+async def gate_bos(executor, store, state: dict, name: str, args: dict) -> tuple[Optional[str], dict]:
+    """gate() for a BrowserOS (bos_*) call: refs resolved to element text, then judged as the classic call."""
+    from tool_router import browseros as bos
+    a = dict(args or {})
+    if state.get("stopped") or pause_state(store):
+        if name in bos.READ_ONLY or (name == "bos_tabs" and a.get("action") in ("list", "active", "close")):
+            return None, a
+        return "小红书运营已因页面警告暂停：不要再操作页面，调用 done。", a
+    armed = state.get("armed")
+    if name == "bos_upload":
+        if not armed:
+            return "没有已批准并用 xhs_begin 打开的草稿时不能上传文件。", a
+        why = _media_ok(a.get("files") or ([a["file"]] if a.get("file") else []), armed.get("media") or [])
+        if why:
+            return why, a
+        a = await bos.annotate(executor, name, a)
+        return None, a
+    why, a = await bos.gate_bos(executor, name, a, lambda n, ca: _async(gate(store, state, n, ca)), bool(armed))
+    if why:
+        return why, a
+    if name == "bos_act" and str(a.get("kind") or "") in bos.CLICK_KINDS:
+        label = (a.get("_labels") or {}).get(str(a.get("ref") or ""), "")
+        if LIKE_LOOSE.search(label) and not LIKE_RE.search(label):   # gate() already took a token for strict matches
+            return _like_token(state), a
+    return None, a
+
+
+async def _async(v):
+    return v
+
+
+def bos_page_step(name: str, args: dict) -> bool:
+    """bos calls after which the page may show a warning: navigation, opening a page, clicks, scrolling."""
+    a = args or {}
+    if name == "bos_navigate":
+        return True
+    if name == "bos_tabs":
+        return a.get("action") == "new"
+    if name == "bos_act":
+        return str(a.get("kind") or "") in ("click", "check", "uncheck", "select", "press", "scroll", "dialog_accept",
+                                            "dialog_dismiss")
+    return False
+
+
 def _is_path(text: str) -> bool:
     t = text.strip()
     return bool(re.match(r"^(~|/home/|/tmp/|/root/)[^\n]{0,300}$", t)) and "\n" not in t
@@ -936,11 +1008,16 @@ def guard(executor, store, state: dict, notifier=None, computer=None, sessions=N
     counter = {"n": 0}
 
     async def run(name: str, args: dict, intent: str = ""):
-        why = gate(store, state, name, args)
+        page_step = name in ("browser_click", "browser_navigate", "browser_open", "click", "click_element", "scroll")
+        if name.startswith("bos_"):   # BrowserOS: judged as the classic click/typing it amounts to
+            why, args = await gate_bos(executor, store, state, name, args)
+            page_step = bos_page_step(name, args)
+        else:
+            why = gate(store, state, name, args)
         if why:
             return ToolOutcome(name, None, False, Decision(RiskLevel.L4, why), error=f"forbidden by policy: {why}")
         out = await orig(name, args, intent)
-        if name in ("browser_click", "browser_navigate", "browser_open", "click", "click_element", "scroll") and computer is not None:
+        if page_step and computer is not None:
             counter["n"] += 1
             if name != "scroll" or counter["n"] % 4 == 0:
                 try:

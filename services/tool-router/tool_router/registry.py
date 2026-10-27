@@ -208,11 +208,65 @@ TOOLS: list[ToolSpec] = [
                  "required": ["goal"]}},
               "timeout_min": {"type": "integer", "description": "overall limit for all items, minutes (default 60)"}},
              ["tasks"]),
+    # BrowserOS neo (only shown when the computer has it and the user left it on in 设置 › 电脑): element-level web
+    # actions through its accessibility snapshot. Each one maps onto BrowserOS's MCP tool of the same suffix.
+    ToolSpec("bos_tabs", "browseros.call",
+             "BrowserOS browser tabs (this task has its own tab group). action=new + url opens a page in the background "
+             "and returns its page id plus a first snapshot; list shows your pages; close closes one; front brings a page "
+             "to the front of the BrowserOS window when you must fall back to screenshot + click by coordinates.",
+             {"action": {"type": "string", "enum": ["new", "list", "active", "close", "front"]},
+              "url": {"type": "string"}, "page": {"type": "integer"}}, ["action"]),
+    ToolSpec("bos_navigate", "browseros.call",
+             "Load a url in a BrowserOS page (or back/forward/reload). Returns the new page's snapshot; old refs are invalid.",
+             {"page": {"type": "integer"}, "action": {"type": "string", "enum": ["url", "back", "forward", "reload"]},
+              "url": {"type": "string"}}, ["page"]),
+    ToolSpec("bos_snapshot", "browseros.call",
+             "Accessibility tree of a BrowserOS page; every actionable element carries [ref=eN] for bos_act. "
+             "mode=interactive (default here) lists only actionables with headings/context: far fewer tokens.",
+             {"page": {"type": "integer"}, "mode": {"type": "string", "enum": ["interactive", "full"]},
+              "depth": {"type": "number"}}, ["page"]),
+    ToolSpec("bos_act", "browseros.call",
+             "Act on a BrowserOS page element by its ref from the latest snapshot: kind=click | fill (ref+value, or "
+             "fields=[{ref,value}] for a whole form) | type (text into the focused element) | press (key, e.g. Enter) | "
+             "select (ref+value) | check | uncheck | hover | focus | scroll (direction, amount) | dialog_accept | "
+             "dialog_dismiss. Returns a short diff of what changed, so no screenshot is needed afterwards. Prefer refs; "
+             "click_at/type_at with viewport x,y only when an element has no ref.",
+             {"page": {"type": "integer"}, "kind": {"type": "string", "enum": [
+                 "click", "fill", "type", "press", "select", "check", "uncheck", "hover", "focus", "scroll",
+                 "dialog_accept", "dialog_dismiss", "click_at", "type_at", "hover_at", "drag"]},
+              "ref": {"type": "string"}, "value": {"type": "string"}, "text": {"type": "string"},
+              "key": {"type": "string"},
+              "fields": {"type": "array", "items": {"type": "object", "properties": {
+                  "ref": {"type": "string"}, "value": {"type": "string"}}, "required": ["ref", "value"]}},
+              "direction": {"type": "string", "enum": ["up", "down", "left", "right"]}, "amount": {"type": "number"},
+              "targetRef": {"type": "string"}, "x": {"type": "number"}, "y": {"type": "number"},
+              "diff": {"type": "string", "description": "summary | none | full (default: capped)"}}, ["page", "kind"]),
+    ToolSpec("bos_read", "browseros.call",
+             "Read a BrowserOS page's content as markdown (or text/links), optionally only a CSS subtree. For reading prices, "
+             "lists, articles; not for acting.",
+             {"page": {"type": "integer"}, "format": {"type": "string", "enum": ["markdown", "text", "links"]},
+              "selector": {"type": "string"}, "viewportOnly": {"type": "boolean"}}, ["page"]),
+    ToolSpec("bos_grep", "browseros.call",
+             "Search a BrowserOS page without dumping it: over=ax matches snapshot lines (keeping their [ref=eN]), "
+             "over=content matches visible text. Cheapest way to find one button or price.",
+             {"page": {"type": "integer"}, "pattern": {"type": "string"}, "over": {"type": "string", "enum": ["ax", "content"]}},
+             ["page", "pattern"]),
+    ToolSpec("bos_diff", "browseros.call", "What changed on a BrowserOS page since the last snapshot/diff.",
+             {"page": {"type": "integer"}}, ["page"]),
+    ToolSpec("bos_wait", "browseros.call",
+             "Wait on a BrowserOS page until text (for=text, value=substring) or a CSS selector appears, or for=time value=ms.",
+             {"page": {"type": "integer"}, "for": {"type": "string", "enum": ["text", "selector", "time"]},
+              "value": {"type": "string"}, "timeout": {"type": "number"}}, ["page"]),
+    ToolSpec("bos_upload", "browseros.call",
+             "Put local files (paths on this computer, e.g. ~/workspace/uploads/a.jpg) on an <input type=file> by its ref.",
+             {"page": {"type": "integer"}, "ref": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}}},
+             ["page", "ref", "files"]),
     ToolSpec("done", None, "Finish: the task is complete. Give a short summary.", {"summary": {"type": "string"}}, ["summary"]),
     ToolSpec("fail", None, "Give up: the task cannot be completed. Explain why.", {"reason": {"type": "string"}}, ["reason"]),
 ]
 
 BY_NAME = {t.name: t for t in TOOLS}
+BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
 LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "read_image", "photopea", "image_edit"}

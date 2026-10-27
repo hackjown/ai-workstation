@@ -104,6 +104,40 @@ const SECTIONS = [["g-model", "模型"], ["g-pc", "电脑"], ["g-conn", "连接�
 const secNo = (id) => { const i = SECTIONS.findIndex((x) => x[0] === id); return `<span class="no">// ${String(i + 1).padStart(2, "0")}</span>`; };
 const pill = (ok, on, off) => `<span class="chip ${ok === true ? "ok" : ok === false ? "" : "bad"}">${ok ? on : off}</span>`;
 function row(k, hint, v, t = "", cls = "") { return `<div class="rw ${cls}"><div class="k">${k}${hint ? `<small>${hint}</small>` : ""}</div><div class="v">${v}</div><div class="t">${t}</div></div>`; }
+/* ---------- computers: display names (云电脑 1, 2, 3… by the order added, or the user's own), shared with iOS */
+function curBadge(id) { return id === MID ? '<span class="curb">当前</span>' : ""; }
+function useBtn(id) { return id === MID ? '<button type="button" class="btn sm" disabled>使用中</button>'
+  : `<button type="button" class="btn sm" onclick="pickMachine('${esc(id)}');go('chat')">使用</button>`; }
+function renameBtn(id, name) { return `<button type="button" class="btn sm" onclick="renameMachine('${esc(id)}', this.dataset.n)" data-n="${esc(name)}">重命名</button>`; }
+function localNameRow(m) {
+  return row("名称", m.custom_name ? "默认 " + esc(m.default_name) : "web 和 iOS 通用", `<div class="mach"><span class="ic">${icon("monitor")}</span><div><b>${esc(m.name)}</b>${curBadge(m.id)}<span class="mono idl">${esc(m.id)}${m.provider_vm_id ? " · VM " + esc(m.provider_vm_id) : ""}</span></div></div>`,
+    useBtn(m.id) + renameBtn(m.id, m.name));
+}
+function cloudRowsHTML(cloudList) {
+  return cloudList.slice().sort((a, b) => (a.order || 99) - (b.order || 99)).map((c) => {
+    const ok = c.status === "ready", paused = c.paused;
+    return `<div class="rw"><div class="k"><div class="mach"><span class="ic">${icon("monitor")}</span><div><b>${esc(c.name)}</b>${curBadge(c.id)}<span class="mono">4 核 8G</span></div></div></div>
+      <div class="v"><span class="mono idl">${esc(c.remote_id || c.id)}</span><span class="small">${esc((c.log || []).slice(-1)[0] || c.error || "空闲 30 分钟自动暂停，发任务时自动唤醒")}</span></div>
+      <div class="t">${c.status === "error" ? '<span class="chip bad">出错</span>' : paused ? '<span class="chip">已暂停</span>' : ok ? '<span class="chip ok">已连接</span>' : `<span class="chip">${CLOUD_ST[c.status] || esc(c.status)}</span>`}
+      ${useBtn(c.id)}${renameBtn(c.id, c.name)}
+      <button type="button" class="btn sm ghost" onclick="cloudSetup('${esc(c.id)}')">重装</button>
+      <button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="cloudRemove('${esc(c.id)}')">移除</button></div></div>`; }).join("");
+}
+async function renameMachine(id, cur) {
+  const n = prompt("给这台电脑起个名字（留空恢复默认名，如「云电脑 1」）", cur || "");
+  if (n === null) return;
+  try { const m = await api("PUT", `/api/machines/${encodeURIComponent(id)}/name`, { name: n.trim() }); toast("已改名为「" + m.name + "」"); loadMachines(); if (S.view === "settings") loadSettings(); }
+  catch (e) { toast(e.message); }
+}
+cloudRefresh = async function () {
+  let list = [];
+  try { list = await api("GET", "/api/cloud"); } catch (e) { return; }
+  const box = $("cloudList"); if (!box) return;
+  box.innerHTML = cloudRowsHTML(list);
+  clearTimeout(cloudRefresh._t);
+  if (list.some((c) => !["ready", "error"].includes(c.status))) cloudRefresh._t = setTimeout(cloudRefresh, 4000);
+  else loadMachines();
+};
 loadSettings = async function () {
   const cloudList = await api("GET", "/api/cloud").catch(() => []);
   if (cloudList.some((c) => !["ready", "error"].includes(c.status))) setTimeout(cloudRefresh, 3000);
@@ -124,14 +158,7 @@ loadSettings = async function () {
   const extra = MODEL_ROLES.filter((r) => !roles.includes(r));
   const mrow = (r) => row(r.label, r.hint, `<div class="mrow"><select name="${r.key}" data-cur="${esc(models[r.key] || "")}" onchange="paintProbe(this)"></select>
       <button type="button" class="btn sm" onclick="probeModel(this)">探测</button><div class="probe"></div></div>`, "", "top");
-  const cloudRows = cloudList.map((c) => {
-    const ok = c.status === "ready", paused = c.paused;
-    return `<div class="rw"><div class="k"><div class="mach"><span class="ic">${icon("monitor")}</span><div><b>${esc(c.name)}</b><span class="mono">4 核 8G</span></div></div></div>
-      <div class="v"><span class="mono">InstaBox · ${esc(c.remote_id || "")}</span><span class="small">${esc((c.log || []).slice(-1)[0] || c.error || "空闲 30 分钟自动暂停，发任务时自动唤醒")}</span></div>
-      <div class="t">${c.status === "error" ? '<span class="chip bad">出错</span>' : paused ? '<span class="chip">已暂停</span>' : ok ? '<span class="chip ok">已连接</span>' : `<span class="chip">${CLOUD_ST[c.status] || esc(c.status)}</span>`}
-      <button type="button" class="btn sm" onclick="pickMachine('${esc(c.id)}');go('chat')">使用</button>
-      <button type="button" class="btn sm ghost" onclick="cloudSetup('${esc(c.id)}')">重装</button>
-      <button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="cloudRemove('${esc(c.id)}')">移除</button></div></div>`; }).join("");
+  const cloudRows = cloudRowsHTML(cloudList);
   const presets = MCP_PRESETS.map((p) => { const on = mcp.some((m) => m.name === p.name);
     return `<div class="rw mcp"><div class="k"><div class="nm">${esc(p.title)} <span class="tag ${p.secret ? "" : "free"}">${p.secret ? "需 Key" : "免费"}</span></div></div>
       <div class="v"><span class="ds">${esc(p.desc)}</span></div>
@@ -163,6 +190,7 @@ loadSettings = async function () {
     <div class="grp-h"><h2>${secNo("g-pc")}电脑</h2><span class="sub">Agent 在这些电脑上操作，聊天里随时切换</span></div>
     <form class="rows" id="sVmNet" onsubmit="saveVmNet(event)">
       <div class="rw head"><div class="k">本地虚拟机${localM ? " · " + esc(localM.name) : ""}</div><div>${localUp == null ? '<span class="chip">未配置</span>' : pill(localUp, "已连接", "未连接")}</div></div>
+      ${localM ? localNameRow(localM) : ""}
       ${row("IP / 主机名", "留空则用 .env 的 AIW_VM_IP", `<input name="ip" value="${esc(vmnet.ip || "")}" placeholder="${esc(vmnet.env_ip || "192.168.50.x")}" /><span class="mono">当前连接 ${esc(vmnet.agent_endpoint || "-")}</span>`, "", "top")}
       ${row("自动跟随", vmnet.pve ? "PVE 报告新 IP 时自动更新" : "未配置 PVE，不可用", "", `<input type="checkbox" name="auto" ${vmnet.auto ? "checked" : ""} ${vmnet.pve ? "" : "disabled"} aria-label="自动跟随" />`, "sw")}
       <div class="savebar"><span class="note">保存立即生效，不用重启</span>${vmnet.pve ? `<button type="button" class="btn sm" onclick="detectVmIp()">从 PVE 检测</button>` : ""}<button class="btn sm primary">保存</button></div>

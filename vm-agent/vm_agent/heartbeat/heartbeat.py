@@ -19,6 +19,8 @@ def health(backend_name: str) -> dict:
         "load": load,
         "disk_free_gb": round(disk.free / 1e9, 1),
         "display": os.environ.get("DISPLAY"),
+        "arch": platform.machine(),
+        "agent_rev": os.environ.get("AIW_REV"),
         "browseros": _browseros(),
     }
 

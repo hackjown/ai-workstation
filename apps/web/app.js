@@ -277,20 +277,15 @@ function renderTask(t) {
     html += `<div class="actcard"><div class="ac-ic">${icon("menu")}</div><div class="ac-b"><div class="ac-k">需要操作</div><b>${esc(fq.title)}</b>
       ${fq.description ? `<p>${esc(fq.description)}</p>` : ""}<button class="btn primary ac-go" onclick="openForm('${t.session_id}')">继续</button></div></div>`;
   } else if (fq && fq.kind === "takeover") {
-    html += `<div class="actcard tk"><div class="ac-ic">${icon("hand")}</div><div class="ac-b"><div class="ac-k">需要你接管</div><b>${esc(fq.title)}</b>
-      <p>接管后直接在桌面上操作，处理好点「完成，继续」，Agent 接着做。</p>
-      <div class="opts"><button class="btn primary" onclick="toggleTakeover()">${icon("hand")}接管桌面</button><button class="btn" onclick="takeoverDone('${t.session_id}')">完成，继续</button></div></div></div>`;
+    html += takeoverCard(fq, t);   // approval.js: what to do, where, which computer; open / hand back / cancel
   } else if (t.pending_question && liveNow) {
     const q = t.pending_question;
     html += `<div class="ask q"><div><b>${esc(S.profile.agent_name || "Agent")} 在问：</b>${esc(q.question)}</div>
       ${q.options && q.options.length ? `<div class="opts">${q.options.map((o) => `<button class="btn sm primary" onclick="answerQ('${t.session_id}', ${esc(JSON.stringify(o))})">${esc(o)}</button>`).join("")}</div>` : ""}
       <form onsubmit="answerQForm(event,'${t.session_id}')"><input name="a" placeholder="回答…" /><button class="btn sm primary">回复</button></form></div>`;
   }
-  if (t.pending_confirm && liveNow) {
-    const c = t.pending_confirm;
-    html += `<div class="ask c"><div><b>需要你确认（L${c.level}）：</b>${esc(c.reason)}</div><div class="small">${esc(toolName(c.tool))} ${esc(JSON.stringify(c.payload).slice(0, 300))}</div>
-      <div class="opts"><button class="btn sm primary" onclick="confirmAct('${t.session_id}',true)">允许</button><button class="btn sm" onclick="confirmAct('${t.session_id}',false)">拒绝</button></div></div>`;
-  }
+  if (t.pending_confirm && liveNow) html += apvCard(t.pending_confirm, t.session_id);   // approval.js: plain summary
+  html += apvLog(evs);   // past confirmations / takeovers with the user's decision
   const allFiles = files.length ? files : (t.files || []).map((f) => ({ name: f.path.split("/").pop(), artifact: f.path }));
   // pictures show as pictures (a grid when there are several); everything else is a download card
   const pics = allFiles.filter((f) => /\.(png|jpe?g|webp|gif)$/i.test(f.name));
@@ -434,7 +429,12 @@ async function ctl(sid, op) { try { await api("POST", `/api/agent/${op}`, { sess
 function clearPend(sid, key) {
   for (const t of ((S.thread && S.thread.tasks) || [])) if (t.session_id === sid) { if (S.pend[t.id]) S.pend[t.id][key] = null; t["pending_" + key] = null; }
 }
-async function confirmAct(sid, ok) { clearPend(sid, "confirm"); renderChat(); await api("POST", "/api/agent/confirm", { session_id: sid, approve: ok }); refreshThread(); }
+async function confirmAct(sid, ok, scope) {
+  clearPend(sid, "confirm"); renderChat();
+  await api("POST", "/api/agent/confirm", { session_id: sid, approve: ok, ...(scope ? { scope } : {}) });
+  if (scope === "task") toast("这个任务里之后的确认都自动允许（付款、发布除外）");
+  refreshThread();
+}
 S.forms = S.forms || {};
 function openForm(sid) {
   const f = S.forms[sid]; if (!f) return;

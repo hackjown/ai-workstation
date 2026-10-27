@@ -67,6 +67,13 @@ display() {  # the desktop the agent drives: Xvnc :1 on the minimal/cloud images
 start() {
   up && { echo "BrowserOS already running"; return 0; }
   installed || { echo "BrowserOS is not installed"; return 1; }
+  if [ -z "${DISPLAY:-}" ] && ! ls /tmp/.X11-unix/X* >/dev/null 2>&1; then
+    echo "This computer has no desktop (no X server, /tmp/.X11-unix is empty). BrowserOS needs one, and so do the"
+    echo "agent's screenshots and the takeover view. Set up the virtual desktop first (TigerVNC :1 + XFCE + vm-agent):"
+    echo "  git clone --depth 1 https://github.com/hackjown/ai-workstation.git ~/ai-workstation && VM_AGENT_TOKEN='...' VNC_PASSWORD='...' bash ~/ai-workstation/deploy/vm/setup-min.sh"
+    echo "then run this script again."
+    return 1
+  fi
   if ! browser_running; then
     pkill -f browseros-claw-server 2>/dev/null && sleep 1   # an orphaned MCP server would hold 9210
     # detached: the caller (vm-agent shell) must not wait on the browser

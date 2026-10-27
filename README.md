@@ -95,7 +95,8 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 ## 安全设计（§19、§30）
 - Agent 不持有 PVE 凭据；PVE Token 只在 VM Runtime，且仅限 VM 100 的电源/快照权限。
-- 所有工具调用必经 Tool Router → Policy Engine：L4（root、碰 PVE、关机、改防火墙、写裸盘）直接拒绝；L3（`rm -rf`、批量删除、`curl|sh`、ssh/scp、内网地址、敏感文件、付款意图、白名单外域名）弹窗等你确认；L2 执行并审计。
+- 所有工具调用必经 Tool Router → Policy Engine：L4（root、碰 PVE、关机、改防火墙、写裸盘）直接拒绝；L3（删除/覆盖工作区以外或你上传的文件、安装软件、sudo、上传/外发数据、`git push`、`curl|sh`、ssh/scp、内网地址、敏感文件、付款意图、白名单外域名）弹窗等你确认；L2 执行并审计。只读命令、在新文件夹里转换文件、删除本任务自己建的临时文件夹不再打扰你。`AIW_AUTO_INSTALL=1` 让 pip/npm 安装恢复免确认（apt/sudo 仍要确认）。
+- 确认卡片说人话：服务器把每一步翻译成标题、要做什么、影响（文件/应用/网站/电脑）、风险标签（低/中/高）和为什么；原始命令收在「查看技术细节」里。可选 `AIW_CONFIRM_LLM=1` 让模型润色标题（超时 `AIW_CONFIRM_LLM_TIMEOUT` 秒，失败用规则版）。按钮：允许 / 拒绝 / 本任务内都允许（付款、发布除外）。接管请求写明在哪台电脑、哪个网站、你要做什么，带「打开桌面接管」「完成，交还给 Aiw」「取消」。
 - VM Agent 以普通用户运行，文件操作限制在 `~/workspace`，Shell 有超时和输出上限。
 - 推荐运行 `deploy/vm/headless-desktop.sh`：用 TigerVNC 在开机时创建独立虚拟桌面 :1，不依赖 PVE 控制台登录，也不会因为控制台黑屏而黑屏。
 - vm-agent 需 Token，x11vnc 只监听 localhost 且必须有密码，6080/8765 端口建议只放行 API 主机。

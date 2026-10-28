@@ -27,7 +27,7 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "2"
+PROBE_VERSION = "3"
 CDP = os.environ.get("VM_AGENT_CDP", "http://127.0.0.1:9222")
 # DevTools is on 127.0.0.1: never through an http_proxy the desktop user may have set (it answers 404 / refuses)
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -193,6 +193,26 @@ def pages() -> list[dict]:
 
 def browser_ws() -> WS:
     return WS(_http("/json/version")["webSocketDebuggerUrl"])
+
+
+CDP_TOOL = os.path.expanduser(os.environ.get("AIW_CHROME_CDP_TOOL", "~/.config/aiw/chrome_cdp.py"))
+
+
+def show_on_screen(target_id: str) -> dict:
+    """Put a tab the user should see (the 确认订单 page being submitted) in front of the screen: its tab selected and
+    its window on top. Target.activateTarget alone is ignored by BrowserOS for its agent tabs, so this goes through
+    chrome_cdp.py front (shipped next to this file by the API), which falls back to selecting the tab by keyboard.
+    Best effort; never used by the background price probe."""
+    import subprocess
+    if not os.path.isfile(CDP_TOOL):
+        return {"ok": False, "error": "chrome_cdp.py not on this computer"}
+    try:
+        port = urlparse(CDP).port or 9222
+        r = subprocess.run([sys.executable, CDP_TOOL, "front", "--port", str(port), "--id", target_id],
+                           capture_output=True, text=True, timeout=30)
+        return json.loads((r.stdout.strip().splitlines() or ["{}"])[-1])
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"[:160]}
 
 
 def out(obj: dict, code: int = 0):
@@ -453,6 +473,7 @@ def cmd_submit(_a):
     bws = browser_ws()
     bws.call("Target.activateTarget", {"targetId": p["id"]})
     bws.close()
+    shown = show_on_screen(p["id"])   # the user is watching this one: the order being placed is on screen
     time.sleep(0.8)
     ws = WS(p["webSocketDebuggerUrl"])
     info = json.loads(ws.eval(SUBMIT_FIND_JS) or "{}")
@@ -473,7 +494,8 @@ def cmd_submit(_a):
     ws.close()
     if not url:
         url = next((x.get("url") for x in pages() if x.get("id") == p["id"]), "")
-    out({"ok": True, "clicked": info.get("text"), "url": url, "still_order_page": is_order_url(url)})
+    out({"ok": True, "clicked": info.get("text"), "url": url, "still_order_page": is_order_url(url),
+         "shown": bool(shown.get("verified"))})
 
 
 def cmd_close_order(_a):

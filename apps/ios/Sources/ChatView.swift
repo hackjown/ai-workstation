@@ -213,6 +213,7 @@ struct ChatView: View {
     @State private var upProgress: Double = 0
     @State private var toast = ""
     @State private var importing = false
+    @StateObject private var voice = SpeechInput()
     @State private var showAttach = false
     @State private var pendingKind: AttachKind? = nil
     @State private var showSkills = false
@@ -286,7 +287,7 @@ struct ChatView: View {
         } }
         .task { await m.load(); pin.toEnd(follow: 3) }
         .refreshable { await m.load() }
-        .onChange(of: phase) { p in if p == .active { Task { await m.load(); pin.toEnd(follow: 2) } } }
+        .onChange(of: phase) { p in if p != .active { voice.stop() }; if p == .active { Task { await m.load(); pin.toEnd(follow: 2) } } }
         .onChange(of: hub.tick) { _ in
             let e = hub.lastEvent
             let tid = e.s("thread_id").isEmpty ? e.o("task").s("thread_id") : e.s("thread_id")
@@ -387,22 +388,31 @@ struct ChatView: View {
                 }.accessibilityLabel("添加：拍照、视频、文件、技能")
                 TextField("和电脑说点什么，点 + 加文件或技能", text: $text, axis: .vertical)
                     .lineLimit(1...6).focused($focused).padding(.vertical, 8)
-                Button { Task { await send() } } label: {
-                    Group { if sending { ProgressView().tint(hInk) } else { Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold)) } }
-                        .foregroundColor(hInk).frame(width: 36, height: 36)
-                        .background(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.gray.opacity(0.4) : hAmber).clipShape(Circle())
-                }.disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending).accessibilityLabel("发送")
+                // 3.8: empty -> the mic (voice input, Speech.swift); listening -> stop; text -> send
+                if voice.active {
+                    MicButton(voice: voice) { voice.stop() }
+                } else if sending || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button { Task { await send() } } label: {
+                        Group { if sending { ProgressView().tint(hInk) } else { Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold)) } }
+                            .foregroundColor(hInk).frame(width: 36, height: 36).background(hAmber).clipShape(Circle())
+                    }.disabled(sending).accessibilityLabel(liveSession != nil ? "排队发送" : "发送")
+                } else {
+                    MicButton(voice: voice) { voice.toggle(current: text) { text = $0 } }
+                }
             }
             .padding(.leading, 4).padding(.trailing, 6).padding(.vertical, 5)
             .background(Color(.systemBackground))
             .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(focused ? hAmber.opacity(0.6) : Color(.separator), lineWidth: 1))
             .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+            if !voice.error.isEmpty { Text(voice.error).font(.caption).foregroundColor(.orange).frame(maxWidth: .infinity, alignment: .leading) }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(.bar)
+        .onDisappear { voice.stop() }
     }
 
     func send() async {
+        if voice.active { voice.stop() }
         var p = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !picked.isEmpty { p = "【技能：\(picked.joined(separator: "、"))】\n" + p }
         if !attach.isEmpty { p += "\n\n附件（已放到电脑上）：\n" + attach.map { "- " + $0.s("vm_path") }.joined(separator: "\n") }
@@ -567,6 +577,45 @@ struct TaskBlock: View {
     @Environment(\.colorScheme) private var cs
 
     var running: Bool { isLive(live.status) }
+    @State private var askNow = false
+    @State private var askStop = false
+    @State private var queueBusy = false
+    @State private var queueErr = ""
+    @State private var busyPrompt = ""
+    /// 3.8: a follow-up waiting in the server's queue (sent while a task ran, or after 停止)
+    var queued: Bool { live.status == "queued" }
+    /// Why it waits (server: tasks[].queue from GET /api/threads/{id})
+    var queueLine: String {
+        let q = t.o("queue")
+        if q.b("first") { return "下一条就发它：电脑做完当前任务马上开始" }
+        let b = q.o("busy")
+        if !b.s("task_id").isEmpty {
+            let what = cleanTitle(String(b.s("prompt").prefix(24)))
+            let st = statusText[b.s("status")] ?? b.s("status")
+            let wait = ["waiting_input", "waiting_confirm", "takeover", "paused"].contains(b.s("status")) ? "（\(st)，它不结束这条就一直等）" : ""
+            return "电脑正在做「\(what)」\(wait)，做完自动发送" + (q.d("ahead") > 0 ? "；前面还有 \(Int(q.d("ahead"))) 条" : "")
+        }
+        if q.b("held") { return "上个任务被停止，排队已暂停：点「立即发送」发出，或删掉" }
+        return "排队中，马上开始"
+    }
+    func sendNow(stop: Bool) async {
+        queueBusy = true; queueErr = ""
+        defer { queueBusy = false }
+        do {
+            let r = try await API.shared.obj("POST", "/api/tasks/\(t.s("id"))/send_now", ["stop_current": stop])
+            if !r.b("started") && !stop, !r.o("queue").o("busy").s("task_id").isEmpty {
+                busyPrompt = cleanTitle(String(r.o("queue").o("busy").s("prompt").prefix(30)))
+                askStop = true   // the computer runs one task at a time: stop it, or let this one go first after it
+            }
+        } catch { queueErr = "没能发送：\(error.localizedDescription)" }
+        await reload()
+    }
+    func dropQueued() async {
+        queueBusy = true; queueErr = ""
+        defer { queueBusy = false }
+        do { _ = try await API.shared.call("DELETE", "/api/tasks/\(t.s("id"))") } catch { queueErr = "没能删除：\(error.localizedDescription)" }
+        await reload()
+    }
     /// A file sent twice (a retry, history replayed over live events) shows once, newest last.
     var uniqueFiles: [JSON] {
         var seen = Set<String>(), out: [JSON] = []
@@ -580,7 +629,11 @@ struct TaskBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // the user's message
-            HStack { Spacer(minLength: 56); UserBubble(prompt: t.s("prompt")) }
+            HStack { Spacer(minLength: 56)
+                if queued {   // 3.8: tap a queued message for 立即发送 / 删除
+                    Button { askNow = true } label: { UserBubble(prompt: t.s("prompt")).opacity(0.65) }.buttonStyle(.plain)
+                } else { UserBubble(prompt: t.s("prompt")) }
+            }
             // the agent's side (3.7): the small 球球 head on the left and the shared task card (CardStyle.swift), the
             // same look as the task cards in the chat
             HStack(alignment: .bottom, spacing: 8) {
@@ -591,7 +644,12 @@ struct TaskBlock: View {
                     Text(statusText[live.status] ?? live.status).font(.caption.bold())
                         .foregroundColor(cardAccent(cardTone(live.status), cs))
                     Spacer()
-                    if running {
+                    if queued {
+                        Button("立即发送") { Task { await sendNow(stop: false) } }.font(.caption.weight(.semibold))
+                            .buttonStyle(.bordered).tint(hAmber).controlSize(.mini).disabled(queueBusy)
+                        Button(role: .destructive) { Task { await dropQueued() } } label: { Image(systemName: "trash").font(.system(size: 15)) }
+                            .accessibilityLabel("删除这条排队消息").disabled(queueBusy)
+                    } else if running {
                         Button(role: .destructive) { Task { _ = try? await API.shared.call("DELETE", "/api/tasks/\(t.s("id"))"); await reload() } } label: {
                             Image(systemName: "stop.circle.fill").font(.system(size: 20))
                         }
@@ -599,6 +657,8 @@ struct TaskBlock: View {
                         Button("重试") { Task { _ = try? await API.shared.call("POST", "/api/tasks/\(t.s("id"))/retry"); await reload() } }.font(.caption)
                     }
                 }
+                if queued { Text(queueLine).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true) }
+                if !queueErr.isEmpty { Text(queueErr).font(.caption).foregroundColor(.red) }
                 if !live.plan.isEmpty {
                     CardProgress(frac: Double(live.planDone.count) / Double(max(1, live.plan.count)), tone: cardTone(live.status))
                 } else if live.status == "succeeded" {
@@ -681,6 +741,16 @@ struct TaskBlock: View {
             .taskCardStyle(cardTone(live.status), cs, radius: 16)
             }
         }
+        .confirmationDialog("这条还在排队", isPresented: $askNow, titleVisibility: .visible) {
+            Button("立即发送") { Task { await sendNow(stop: false) } }
+            Button("删除", role: .destructive) { Task { await dropQueued() } }
+            Button("取消", role: .cancel) {}
+        } message: { Text(queueLine) }
+        .confirmationDialog("电脑正在做「\(busyPrompt)」", isPresented: $askStop, titleVisibility: .visible) {
+            Button("停止它，立即发送这条", role: .destructive) { Task { await sendNow(stop: true) } }
+            Button("等它做完，第一个发") {}
+            Button("取消", role: .cancel) {}
+        } message: { Text("一台电脑一次只做一个任务。这条已经排到最前面。") }
     }
 
     /// The pieces this task dispatched: machine, live status, tap to open that piece's own conversation.

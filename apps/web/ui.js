@@ -266,6 +266,8 @@ loadSettings = async function () {
       ${row("Bark", "iPhone 推荐", `<input name="bark_url" value="${esc(notify.bark_url || "")}" placeholder="https://api.day.app/你的key" />`)}
       ${row("ntfy 主题", "", `<input name="ntfy_url" value="${esc(notify.ntfy_url || "")}" placeholder="https://ntfy.sh/aiw-xxxx" />`)}
       ${row("Webhook", "POST {title, body}", `<input name="webhook_url" value="${esc(notify.webhook_url || "")}" placeholder="https://…" />`)}
+      ${row("点通知打开", "Bark 等推送点开后去哪里", `<select name="link_mode"><option value="app" ${(notify.link_mode || "app") === "app" ? "selected" : ""}>Aiw App（aiw://）</option><option value="web" ${notify.link_mode === "web" ? "selected" : ""}>网页版（需要公网地址）</option></select>`)}
+      ${row("公网地址", "网页版链接和推送图标用，如 https://aiw.example.com", `<input name="public_url" value="${esc(notify.public_url || "")}" placeholder="https://你的服务器地址" />`)}
       ${row("浏览器通知", "这台设备", "", `<button type="button" class="btn sm" onclick="Notification.requestPermission().then(p=>toast('浏览器通知：'+p))">允许</button>`)}
     </div>
   </form>

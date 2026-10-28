@@ -939,7 +939,8 @@ async function detectVmIp() {
   try { const r = await api("POST", "/api/settings/vm/detect"); document.querySelector("#sVmNet [name=ip]").value = r.ip; toast("检测到 " + r.ip + "，点保存生效"); }
   catch (err) { toast("检测失败：" + (err.message || err)); }
 }
-async function saveNotify(e) { e.preventDefault(); const f = e.target; await api("PUT", "/api/settings/notify", { bark_url: f.bark_url.value, ntfy_url: f.ntfy_url.value, webhook_url: f.webhook_url.value }); toast("已保存"); }
+async function saveNotify(e) { e.preventDefault(); const f = e.target; await api("PUT", "/api/settings/notify", { bark_url: f.bark_url.value, ntfy_url: f.ntfy_url.value, webhook_url: f.webhook_url.value,
+  public_url: f.public_url ? f.public_url.value : undefined, link_mode: f.link_mode ? f.link_mode.value : undefined }); toast("已保存"); }
 async function addMcp(e) {
   e.preventDefault(); const f = e.target; const cur = (await api("GET", "/api/integrations")).mcp_servers || [];
   cur.push({ name: f.name.value, url: f.url.value, headers: f.hk.value ? { [f.hk.value]: f.hv.value } : {} });

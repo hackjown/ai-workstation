@@ -27,8 +27,10 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "1"
+PROBE_VERSION = "2"
 CDP = os.environ.get("VM_AGENT_CDP", "http://127.0.0.1:9222")
+# DevTools is on 127.0.0.1: never through an http_proxy the desktop user may have set (it answers 404 / refuses)
+LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ORDER_HOSTS = ("trade.jd.com", "buy.taobao.com", "buy.tmall.com", "h5.m.taobao.com/cart/order", "trade.m.jd.com")
 
 
@@ -124,8 +126,64 @@ class WS:
             pass
 
 
+def cdp_candidates(proc_root: str = "/proc") -> list[str]:
+    """Where a DevTools port may be: the configured one, 9222, then any running chrome/chromium started with
+    --remote-debugging-port (from /proc) or that wrote a DevToolsActivePort file. BrowserOS (9110) only when it is the
+    configured one: a user's Chrome without a port is chrome_cdp.py's job (it reopens Chrome with the port)."""
+    out = [CDP.rstrip("/"), "http://127.0.0.1:9222"]
+    dirs = [os.path.expanduser(d) for d in ("~/.config/aiw-chrome", "~/.config/google-chrome", "~/.config/chromium")]
+    try:
+        pids = [x for x in os.listdir(proc_root) if x.isdigit()]
+    except OSError:
+        pids = []
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if not argv or "chrom" not in os.path.basename(argv[0]).lower() or any(a.startswith("--type=") for a in argv):
+            continue
+        for a in argv:
+            if a.startswith("--remote-debugging-port="):
+                port = a.split("=", 1)[1]
+                if port.isdigit() and port != "0":
+                    out.append(f"http://127.0.0.1:{port}")
+            elif a.startswith("--user-data-dir="):
+                dirs.append(os.path.expanduser(a.split("=", 1)[1]))
+    for d in dirs:
+        try:
+            with open(os.path.join(d, "DevToolsActivePort")) as f:
+                port = f.readline().strip()
+            if port.isdigit():
+                out.append(f"http://127.0.0.1:{port}")
+        except OSError:
+            pass
+    seen, uniq = set(), []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
+def find_cdp() -> str:
+    """Point CDP at the first answering endpoint. '' when found, else what each candidate said."""
+    global CDP
+    tried = []
+    for base in cdp_candidates():
+        try:
+            with LOCAL.open(base + "/json/version", timeout=3) as r:   # noqa: S310 - local only
+                if json.loads(r.read().decode()).get("webSocketDebuggerUrl"):
+                    CDP = base
+                    return ""
+        except Exception as e:  # noqa: BLE001
+            tried.append(f"{base.rsplit(':', 1)[-1]}: {e}")
+    return "; ".join(tried)
+
+
 def _http(path: str):
-    with urllib.request.urlopen(CDP + path, timeout=4) as r:   # noqa: S310 - local DevTools only
+    with LOCAL.open(CDP + path, timeout=4) as r:   # noqa: S310 - local DevTools only
         return json.loads(r.read().decode())
 
 
@@ -163,7 +221,12 @@ EXTRACT_JS = r"""
     ['main', '.tm-promo-price .tm-price'], ['main', '#J_PromoPrice .tm-price'], ['main', '#J_StrPriceModBox .tm-price'],
     ['main', '#J_PromoPriceNum'], ['main', '#J_StrPrice .tb-rmb-num'],
     ['main', '[class*="Price--priceText"]'], ['main', '[class*="highlightPrice"]'], ['final', '[class*="Price--extraPrice"]'],
-    ['main', '[class*="priceText"]'], ['main', '[class*="PriceText"]']
+    ['main', '[class*="priceText"]'], ['main', '[class*="PriceText"]'],
+    // 京东: the classic summary price (<span class="price J-p-100012043978">), the 2024+ page, 秒杀, and PLUS
+    ['main', 'span.price[class*="J-p-"]'], ['main', '.summary-price .price'], ['main', '#jd-price'],
+    ['main', '#banner-miaosha .price'], ['main', '[class*="price_now"]'], ['main', '[class*="priceNow"]'],
+    ['final', '.J-finalPrice'], ['final', '[class*="final-price-num"]'],
+    ['plus', '.p-price-plus .price'], ['plus', '.J-p-plus'], ['plus', '[class*="plus-price"]'], ['plus', '[class*="plusPrice"]']
   ];
   const sel = [];
   for (const [role, q] of SEL) { let els = []; try { els = document.querySelectorAll(q); } catch (e) {}
@@ -189,9 +252,10 @@ EXTRACT_JS = r"""
   }
   const frames = [...document.querySelectorAll('iframe')].filter(vis).map(f => f.src || '').filter(Boolean).slice(0, 10);
   const pw = [...document.querySelectorAll('input[type=password]')].some(vis);
+  let jd_sku = ''; try { jd_sku = String((window.pageConfig && pageConfig.product && pageConfig.product.skuid) || ''); } catch (e) {}
   const title = (document.querySelector('.sku-name, .itemInfo-wrap .sku-name, [class*="ItemTitle--mainTitle"], [class*="mainTitle"], .tb-main-title, .tb-detail-hd h1') || {}).innerText || document.title;
   return JSON.stringify({url: location.href, title: (title || '').trim().slice(0, 120), doc_title: document.title.slice(0, 120),
-    text: (document.body ? document.body.innerText : '').slice(0, 6000), sel, cand, btn, frames, password_input: pw,
+    text: (document.body ? document.body.innerText : '').slice(0, 6000), sel, cand, btn, frames, password_input: pw, jd_sku,
     ready: document.readyState});
 })()
 """
@@ -310,6 +374,10 @@ def cmd_probe(a):
         if ws is None:
             raise RuntimeError("background tab did not appear")
         ws.call("Page.enable")
+        try:   # a background tab otherwise looks unfocused/hidden: some prices render only for a focused page
+            ws.call("Emulation.setFocusEmulationEnabled", {"enabled": True}, 5)
+        except Exception:  # noqa: BLE001
+            pass
         ws.call("Page.navigate", {"url": a.url}, 30)
         end, snap = time.time() + float(a.wait), {}
         picked, last_sig = None, None
@@ -358,6 +426,7 @@ def cmd_probe(a):
             pass
         bws.close()
     snap["probe_version"] = PROBE_VERSION
+    snap["cdp"] = CDP
     out(snap)
 
 
@@ -452,10 +521,9 @@ def main():
     a = ap.parse_args()
     if a.cmd == "version":
         out({"version": PROBE_VERSION})
-    try:
-        _http("/json/version")
-    except Exception as e:  # noqa: BLE001
-        out({"error": f"NO_CDP: {e}"}, 3)
+    why = find_cdp()
+    if why:
+        out({"error": f"NO_CDP: {why}"}, 3)
     try:
         {"probe": cmd_probe, "order": cmd_order, "submit": cmd_submit, "close-order": cmd_close_order,
          "elem-at": cmd_elem_at, "url": cmd_url}[a.cmd](a)

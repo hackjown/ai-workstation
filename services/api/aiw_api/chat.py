@@ -41,6 +41,7 @@ STATUS_CN = {"queued": "排队中", "pending": "准备中", "running": "进行�
              "stopped": "已停止", "interrupted": "被中断", "cancelled": "已取消"}
 ESC_OPTIONS = ["继续，换个方法再试", "我来接管桌面", "停止任务"]
 
+SKILL_RE = re.compile(r"^\s*【技能[:：][^】]+】")
 OFFER_RE = re.compile(r"\[\[\s*交给电脑\s*[:：]\s*(.+?)\s*\]\]", re.S)
 
 ROUTE_PROMPT = """你是消息分流器（ROUTE）。用户在和私人助理聊天；助理背后有一台能操作的电脑（浏览器、文件、软件、下单、注册、画图、做视频、批量处理等）。
@@ -164,6 +165,8 @@ class Chat:
         self._lock = asyncio.Lock()
         self._compacting = False
         self.jobs: set = set()
+        self._reply_job: Optional[asyncio.Task] = None   # the chat reply being written (POST /api/chat/cancel stops it)
+        self._stop_next = False      # 停止 pressed while the message was still being routed: the reply never starts
         sessions.listeners.append(self.on_task_event)
 
     # ------------------------------------------------------------------ messages
@@ -412,6 +415,7 @@ class Chat:
         text = (text or "").strip()
         attachments = [a for a in (attachments or []) if isinstance(a, dict)][:10]
         async with self._lock:
+            self._stop_next = False
             user = self.add("user", "text", text, {"attachments": attachments} if attachments else {})
             await say("user", user)
             if self.memory:   # 记住… / 忘掉… act at once, no model reply needed
@@ -425,18 +429,62 @@ class Chat:
                     await say("route", {"route": "memory"})
                     await say("message", m)
                     return {"route": "memory", "user": user, "messages": [m]}
-            route = {"route": mode, "title": ""} if mode in ("chat", "task") else await self.classify(text)
+            if mode in ("chat", "task"):
+                route = {"route": mode, "title": ""}
+            elif SKILL_RE.match(text):   # a skill picked with "/" (or the + menu) runs on the computer, like the old skills menu
+                route = {"route": "task", "title": "", "skill": True}
+            else:
+                route = await self.classify(text)
             await say("route", route)
             if route["route"] == "task":
                 card = await self.start_task(text, route.get("title") or "", machine_id, attachments, origin=user["id"])
                 await say("task" if card["kind"] == "task" else "message", card)
                 out = {"route": "task", "user": user, "messages": [card]}
             else:
-                m = await self.reply(text, lambda p: say("delta", {"text": p}))
+                await say("status", {"text": "正在想…"})
+                m = await self._reply_cancellable(text, say)
                 await say("message", m)
                 out = {"route": "chat", "user": user, "messages": [m]}
         self.background(self.after_exchange(user, out["messages"]))
         return out
+
+    async def _reply_cancellable(self, text: str, say) -> dict:
+        """The reply runs as its own task so 停止 (POST /api/chat/cancel) can end it; what streamed so far is kept."""
+        shown: list[str] = []
+        if self._stop_next:
+            self._stop_next = False
+            return self.add("assistant", "text", "（已停止，这次没有回复）", {"stopped": True})
+
+        async def delta(p):
+            shown.append(p)
+            await say("delta", {"text": p})
+
+        async def status(t):
+            await say("status", {"text": t})
+        job = asyncio.get_running_loop().create_task(self.reply(text, delta, status))
+        self._reply_job = job
+        try:
+            return await job
+        except asyncio.CancelledError:
+            me = asyncio.current_task()
+            if me is not None and me.cancelling():   # the request itself is going away: let it
+                raise
+            body = "".join(shown).strip()
+            return self.add("assistant", "text", (body + "\n\n（已停止）") if body else "（已停止，这次没有回复）",
+                            {"stopped": True})
+        finally:
+            self._reply_job = None
+
+    def cancel(self) -> bool:
+        """Stop the chat reply being written. False when nothing is being written (a task is stopped from its card)."""
+        job = self._reply_job
+        if job is not None and not job.done():
+            job.cancel()
+            return True
+        if self._lock.locked():      # still routing: the reply will not start (a task that already started is stopped from its card)
+            self._stop_next = True
+            return True
+        return False
 
     def background(self, coro):
         job = asyncio.get_running_loop().create_task(coro)
@@ -452,7 +500,7 @@ class Chat:
             except Exception as e:  # noqa: BLE001
                 log.warning("memory learn: %s", e)
 
-    async def reply(self, text: str, on_delta=None) -> dict:
+    async def reply(self, text: str, on_delta=None, on_status=None) -> dict:
         tools = await self.tools()
         if self.memory and hasattr(self.memory, "prepare"):   # embeds the question when an embedding model is set
             try:
@@ -486,6 +534,11 @@ class Chat:
                      "function": {"name": c["name"], "arguments": json.dumps(c.get("args") or {}, ensure_ascii=False)}}
                     for c in calls]})
                 for c in calls:
+                    if on_status:
+                        try:
+                            await on_status(self.tool_status(c["name"]))
+                        except Exception:  # noqa: BLE001
+                            pass
                     res = await self.run_tool(tools, c["name"], c.get("args") or {})
                     messages.append({"role": "tool", "tool_call_id": c["id"], "content": res[:6000]})
             body = "\n\n".join(p for p in parts if p).strip()
@@ -532,6 +585,12 @@ class Chat:
         except Exception as e:  # noqa: BLE001
             log.warning("chat search tools: %s", e)
         return out
+
+    def tool_status(self, name: str) -> str:
+        """The short line under 球球 while it thinks (正在查…)."""
+        if name in (getattr(self, "_search_names", None) or []):
+            return "正在搜索…"
+        return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:
@@ -638,7 +697,6 @@ class Chat:
 
     async def _push_files(self, attachments: list, machine_id: Optional[str]) -> list:
         """Chat attachments live on the API host (local_only uploads); a task needs them on its computer."""
-        import base64
         out = []
         mid = machine_id or (self.settings.machines[0].id if self.settings and self.settings.machines else "ai-linux-001")
         for a in attachments:
@@ -650,15 +708,14 @@ class Chat:
                     cloud = getattr(self.sessions, "cloud", None)
                     if cloud and cloud.is_cloud(mid):
                         await cloud.wake(mid)
-                    b64 = base64.b64encode(open(self._allowed(local), "rb").read()).decode()
-                    r = await self.sessions.computer(mid).execute("files.upload", {"path": f"uploads/{name}", "content_b64": b64},
-                                                                  observe=False, timeout=120)
-                    if r.success:
-                        a["vm_path"] = f"~/workspace/uploads/{name}"
-                except Exception as e:  # noqa: BLE001  the task still starts; its prompt names the missing file
+                    from .uploads import push_to_vm   # in 16 MB pieces: videos are bigger than one agent message
+                    await push_to_vm(self.sessions.computer(mid), self._allowed(local), f"uploads/{name}")
+                    a["vm_path"] = f"~/workspace/uploads/{name}"
+                except Exception as e:  # noqa: BLE001  the task still starts; its prompt names the missing file and why
                     log.warning("chat attachment upload: %s", e)
+                    a["vm_error"] = str(e)[:200]
                 if not a.get("vm_path"):
-                    a["vm_path"] = f"（没能放到电脑上：{name}）"
+                    a["vm_path"] = f"（没能放到电脑上：{name}" + (f"，{a['vm_error']}" if a.get("vm_error") else "") + "）"
             out.append(a)
         return out
 
@@ -880,6 +937,10 @@ def mount(app, chat: Chat, auth) -> None:
                 yield f"event: {it[0]}\ndata: {json.dumps(it[1], ensure_ascii=False)}\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/api/chat/cancel", dependencies=dep)
+    async def chat_cancel():
+        return {"cancelled": chat.cancel()}
 
     @app.post("/api/chat/messages/{mid}/answer", dependencies=dep)
     async def chat_answer(mid: str, body: AnswerIn):

@@ -213,6 +213,10 @@ struct ChatView: View {
     @State private var upProgress: Double = 0
     @State private var toast = ""
     @State private var importing = false
+    @State private var showAttach = false
+    @State private var pendingKind: AttachKind? = nil
+    @State private var showSkills = false
+    @Environment(\.colorScheme) private var cs
     @ObservedObject private var inbox = ImportCenter.shared
     @FocusState private var focused: Bool
     @StateObject private var pin = BottomPin()
@@ -259,17 +263,16 @@ struct ChatView: View {
                 }
                 if !pin.opened || pin.pinned { pin.toEnd(follow: 3) }
             }
+            // 3.7: the pill floats above the composer inside the safe area it leaves (same as the chat)
+            .overlay(alignment: .bottomTrailing) {
+                if pin.showJump {
+                    JumpToLatest { pin.toEnd(animated: true) }.padding(.trailing, 16).padding(.bottom, 12)
+                }
+            }
+            .animation(.easeOut(duration: 0.18), value: pin.showJump)
             .safeAreaInset(edge: .bottom) {
                 composer
                     .reportsComposerTop()
-                    .overlay(alignment: .topTrailing) {
-                        if pin.showJump {
-                            JumpToLatest { pin.toEnd(animated: true) }
-                                .alignmentGuide(VerticalAlignment.top) { d in d[VerticalAlignment.bottom] + 10 }
-                                .padding(.trailing, 22)
-                        }
-                    }
-                    .animation(.easeOut(duration: 0.18), value: pin.showJump)
             }
             .safeAreaInset(edge: .top, spacing: 0) { DesktopPane(liveSession: liveSession, onChange: { await m.load() }) }
             .onPreferenceChange(ComposerTopKey.self) { pin.composer($0) }
@@ -293,6 +296,17 @@ struct ChatView: View {
         .photosPicker(isPresented: $showPhotos, selection: $photo, matching: .any(of: [.images, .videos]))
         .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { r in
             if case .success(let urls) = r { Task { for u in urls { await uploadFile(u) } } }
+        }
+        .sheet(isPresented: $showAttach, onDismiss: runPending) {   // the same WeChat-like "+" panel as the chat
+            AttachSheet(kinds: [.photo, .video, .library, .file, .skill]) { k in pendingKind = k; showAttach = false }
+                .presentationDetents([.height(AttachSheet.height)]).presentationDragIndicator(.hidden)
+        }
+        .confirmationDialog("选技能", isPresented: $showSkills, titleVisibility: .visible) {
+            ForEach(skills.indices, id: \.self) { i in
+                let id = skills[i].s("id")
+                Button((picked.contains(id) ? "✓ " : "") + (skills[i].s("title").isEmpty ? id : skills[i].s("title"))) { toggleSkill(id) }
+            }
+            Button("取消", role: .cancel) {}
         }
         .sheet(isPresented: $showCamera) { CameraPicker(done: { img in Task { await uploadImage(img) } }, video: { u in Task { await uploadFile(u) } }).ignoresSafeArea() }
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
@@ -366,39 +380,23 @@ struct ChatView: View {
                     }
                 }
             }
-            HStack(alignment: .bottom, spacing: 8) {
-                Menu {
-                    Section("添加文件") {
-                        Button { showPhotos = true } label: { Label("照片或视频", systemImage: "photo.on.rectangle") }
-                        if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                            Button { showCamera = true } label: { Label("拍照或录像", systemImage: "camera") }
-                        }
-                        Button { showFiles = true } label: { Label("文件", systemImage: "folder") }
-                    }
-                    Section("技能") {
-                        ForEach(skills.indices, id: \.self) { i in
-                            let id = skills[i].s("id")
-                            Button { toggleSkill(id) } label: {
-                                if picked.contains(id) { Label(skills[i].s("title"), systemImage: "checkmark") }
-                                else { Text(skills[i].s("title")) }
-                            }
-                        }
-                        if skills.isEmpty { Text("没有可用技能") }
-                    }
-                } label: {
-                    Group { if uploading { ProgressView() } else { Image(systemName: "plus").font(.system(size: 18, weight: .semibold)) } }
+            HStack(alignment: .bottom, spacing: 6) {
+                Button { focused = false; showAttach = true } label: {
+                    Group { if uploading { ProgressView().tint(hAmber) } else { Image(systemName: "plus").font(.system(size: 22, weight: .light)).foregroundColor(hAmber) } }
                         .frame(width: 36, height: 36)
-                        .background(Color(.secondarySystemBackground)).clipShape(Circle())
-                }
-                TextField("点击 + 上传文件或选技能", text: $text, axis: .vertical)
-                    .lineLimit(1...6).focused($focused)
-                    .padding(.horizontal, 12).padding(.vertical, 9)
-                    .background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 18))
+                }.accessibilityLabel("添加：拍照、视频、文件、技能")
+                TextField("和电脑说点什么，点 + 加文件或技能", text: $text, axis: .vertical)
+                    .lineLimit(1...6).focused($focused).padding(.vertical, 8)
                 Button { Task { await send() } } label: {
-                    Group { if sending { ProgressView().tint(.white) } else { Image(systemName: "arrow.up").font(.system(size: 17, weight: .bold)) } }
-                        .foregroundColor(.white).frame(width: 36, height: 36).background(amber).clipShape(Circle())
-                }.disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending)
+                    Group { if sending { ProgressView().tint(hInk) } else { Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold)) } }
+                        .foregroundColor(hInk).frame(width: 36, height: 36)
+                        .background(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.gray.opacity(0.4) : hAmber).clipShape(Circle())
+                }.disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sending).accessibilityLabel("发送")
             }
+            .padding(.leading, 4).padding(.trailing, 6).padding(.vertical, 5)
+            .background(Color(.systemBackground))
+            .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(focused ? hAmber.opacity(0.6) : Color(.separator), lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(.bar)
@@ -414,6 +412,18 @@ struct ChatView: View {
     }
 
     func skillTitle(_ id: String) -> String { skills.first { $0.s("id") == id }?.s("title") ?? id }
+    func runPending() {
+        guard let k = pendingKind else { return }
+        pendingKind = nil
+        switch k {
+        case .photo, .video:
+            if UIImagePickerController.isSourceTypeAvailable(.camera) { showCamera = true } else { m.err = "这台设备没有可用的相机" }
+        case .library: showPhotos = true
+        case .file: showFiles = true
+        case .skill: if skills.isEmpty { m.err = "没有可用技能" } else { showSkills = true }
+        case .task, .link: break
+        }
+    }
     func toggleSkill(_ id: String) { if picked.contains(id) { picked.removeAll { $0 == id } } else { picked.append(id) } }
 
     @discardableResult
@@ -554,6 +564,7 @@ struct TaskBlock: View {
     @State private var showSteps = false
     @State private var answer = ""
     @State private var downloading = ""
+    @Environment(\.colorScheme) private var cs
 
     var running: Bool { isLive(live.status) }
     /// A file sent twice (a retry, history replayed over live events) shows once, newest last.
@@ -570,19 +581,15 @@ struct TaskBlock: View {
         VStack(alignment: .leading, spacing: 10) {
             // the user's message
             HStack { Spacer(minLength: 56); UserBubble(prompt: t.s("prompt")) }
-            // the agent's side
+            // the agent's side (3.7): the small 球球 head on the left and the shared task card (CardStyle.swift), the
+            // same look as the task cards in the chat
+            HStack(alignment: .bottom, spacing: 8) {
+            MateAvatar().padding(.bottom, 2)
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    if running {   // the live 球球 moves while this task works (MateView.swift)
-                        MateView(status: "", threadId: nil, bus: false, emotion: live.question != nil || live.confirm != nil ? "35" : "32", animate: true)
-                            .frame(width: 26, height: 26).accessibilityHidden(true)
-                    } else {
-                        Image(systemName: live.status == "failed" ? "exclamationmark" : "face.smiling").foregroundColor(.white).font(.system(size: 12, weight: .bold))
-                            .frame(width: 22, height: 22).background(live.status == "failed" ? Color.red.opacity(0.8) : amber).clipShape(RoundedRectangle(cornerRadius: 6))
-                    }
+                HStack(spacing: 8) {
+                    CardIcon(st: live.status, side: 26)
                     Text(statusText[live.status] ?? live.status).font(.caption.bold())
-                        .foregroundColor(live.status == "failed" ? .red : running ? amber : .secondary)
-                    if running { ProgressView().scaleEffect(0.7) }
+                        .foregroundColor(cardAccent(cardTone(live.status), cs))
                     Spacer()
                     if running {
                         Button(role: .destructive) { Task { _ = try? await API.shared.call("DELETE", "/api/tasks/\(t.s("id"))"); await reload() } } label: {
@@ -591,6 +598,11 @@ struct TaskBlock: View {
                     } else if ["failed", "stopped", "interrupted"].contains(live.status) {
                         Button("重试") { Task { _ = try? await API.shared.call("POST", "/api/tasks/\(t.s("id"))/retry"); await reload() } }.font(.caption)
                     }
+                }
+                if !live.plan.isEmpty {
+                    CardProgress(frac: Double(live.planDone.count) / Double(max(1, live.plan.count)), tone: cardTone(live.status))
+                } else if live.status == "succeeded" {
+                    CardProgress(frac: 1, tone: .done)
                 }
                 if !live.plan.isEmpty && running {
                     VStack(alignment: .leading, spacing: 3) {
@@ -644,7 +656,7 @@ struct TaskBlock: View {
                 if !live.approvals.isEmpty && (running || showSteps) { ApprovalLog(items: live.approvals) }
 
                 if !live.result.isEmpty && !running {
-                    RichText(text: live.result)
+                    RichText(text: live.result, strong: hStrong(cs)).foregroundColor(hBubbleText(cs))
                 }
                 ForEach(uniqueFiles.indices, id: \.self) { i in fileRow(uniqueFiles[i]) }
 
@@ -663,8 +675,11 @@ struct TaskBlock: View {
                     Text(live.steps.isEmpty ? "步骤" : "\(live.steps.filter { $0.tool != "message" }.count) 个操作").font(.caption).foregroundColor(.secondary)
                 }
                 .onChange(of: showSteps) { open in if open { Task { await live.loadHistory(t.s("session_id")) } } }
+                .tint(hStrong(cs))
             }
-            .padding(.horizontal, 14).padding(.vertical, 12).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 18))
+            .padding(.horizontal, 14).padding(.vertical, 12)
+            .taskCardStyle(cardTone(live.status), cs, radius: 16)
+            }
         }
     }
 
@@ -713,7 +728,7 @@ struct TaskBlock: View {
                 TextField("回答…", text: $answer).textFieldStyle(.roundedBorder)
                 Button("发送") { Task { await reply(answer) } }.disabled(answer.isEmpty)
             }
-        }.padding(10).background(amber.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 12))
+        }.padding(10).askCardStyle(cs, settled: false)
     }
 
     func fileRow(_ f: JSON) -> some View {

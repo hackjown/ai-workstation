@@ -11,6 +11,8 @@ import UIKit
 //   球球 beside them, bold text in light amber; task cards: amber accent on the left, amber status, a progress bar
 // * thinking: 球球 with eyes up (emotion 30) inside a turning dashed ring + three bouncing dots and what it is doing
 // * "/" opens the skill picker above the input; "+" a bottom sheet (拍照 / 录视频 / 照片/视频 / 文件 / 新建任务 / 链接 / 技能 /)
+// 3.6: bubbles placed from the 球球 circle (StageLayout), no quick chips, light-mode white 球球 bubbles, the small 球球
+// head beside replies / cards / thinking, a WeChat-like "+" panel.
 // The 球球 itself (MateView, mate.html) is unchanged: only where it sits, how it moves and its face are set here.
 
 let hAmber = Color(red: 0xF0 / 255, green: 0xA0 / 255, blue: 0x30 / 255)
@@ -20,7 +22,6 @@ let hDark = Color(red: 0x15 / 255, green: 0x12 / 255, blue: 0x0D / 255)
 let hHL = Color(red: 0xFF / 255, green: 0xC3 / 255, blue: 0x5C / 255)
 let hTok = Color(red: 0x2A / 255, green: 0x1D / 255, blue: 0x08 / 255)
 let hStageBubble = Color(red: 0x1C / 255, green: 0x16 / 255, blue: 0x10 / 255)
-let hSheetBg = Color(red: 0x16 / 255, green: 0x16 / 255, blue: 0x16 / 255)
 
 /// A rounded rectangle with its own radius per corner (UnevenRoundedRectangle is iOS 17+; the app runs on 16).
 struct BubbleShape: Shape {
@@ -83,23 +84,30 @@ struct UserBubbleV2: View {
     }
 }
 
-/// 球球's reply bubble: dark, amber border, light-amber bold.
+/// Light mode (3.6): 球球's bubbles are white with an amber border and dark text; bold / links in a deeper amber
+/// (the light #ffc35c of the dark bubble is unreadable on white). Dark mode keeps the v2 dark bubble.
+let hHLLight = Color(red: 0xB8 / 255, green: 0x68 / 255, blue: 0x0C / 255)
+func hStrong(_ cs: ColorScheme) -> Color { cs == .dark ? hHL : hHLLight }
+func hBubbleFill(_ cs: ColorScheme) -> Color { cs == .dark ? hDark : Color.white }
+func hBubbleText(_ cs: ColorScheme) -> Color { cs == .dark ? Color(white: 0.93) : Color(red: 0x1D / 255, green: 0x1A / 255, blue: 0x16 / 255) }
+
+/// 球球's reply bubble: dark with an amber border (dark mode) / white with an amber border (light mode).
 struct AiwBubble: View {
     let text: String
     var error = false
+    @Environment(\.colorScheme) private var cs
     var body: some View {
         Group {
             if !text.contains("\n") && text.count <= 24 {
-                Text(hInline(text)).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                Text(RichText(text: "", strong: hStrong(cs)).md(text)).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             } else {
-                RichText(text: text, strong: hHL)
+                RichText(text: text, strong: hStrong(cs))
             }
         }
-        .foregroundColor(Color(white: 0.93))
+        .foregroundColor(hBubbleText(cs))
         .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(BubbleShape.aiw.fill(hDark))
-        .overlay(BubbleShape.aiw.stroke(error ? Color.red.opacity(0.6) : hAmber.opacity(0.67), lineWidth: 1.5))
-        .environment(\.colorScheme, .dark)
+        .background(BubbleShape.aiw.fill(hBubbleFill(cs)))
+        .overlay(BubbleShape.aiw.stroke(error ? Color.red.opacity(0.6) : hAmber.opacity(cs == .dark ? 0.67 : 0.85), lineWidth: 1.5))
     }
 }
 
@@ -120,32 +128,151 @@ struct BouncingDots: View {
     }
 }
 
-/// Before the first token: 球球 thinking (eyes up), a dashed ring turning around it, dots + what it is doing.
+/// Before the first token (3.6): the small 球球 head in the avatar column, moving and thinking (eyes up, emotion 30),
+/// next to a bubble with the bouncing dots + what it is doing. Same size and place as the avatar of every reply.
 struct ThinkingRow: View {
     let note: String
-    @State private var spin = false
-    @Environment(\.accessibilityReduceMotion) private var still
+    @AppStorage("mate") private var mateOn = true
+    @Environment(\.colorScheme) private var cs
     var body: some View {
-        HStack(spacing: 10) {
-            ZStack {
-                MateView(status: "", threadId: nil, bus: false, emotion: "30", animate: true).frame(width: 40, height: 40)
-                Circle().stroke(hAmber.opacity(0.67), style: StrokeStyle(lineWidth: 2, dash: [4, 4]))
-                    .frame(width: 52, height: 52)
-                    .rotationEffect(.degrees(spin ? 360 : 0))
-                    .animation(still ? nil : Animation.linear(duration: 3.2).repeatForever(autoreverses: false), value: spin)
-            }.frame(width: 52, height: 52)
+        HStack(alignment: .bottom, spacing: 8) {
+            Group {
+                if mateOn {
+                    MateView(status: "", threadId: nil, bus: false, emotion: "30", animate: true)
+                } else { Circle().fill(amber) }
+            }
+            .frame(width: MateAvatar.side, height: MateAvatar.side).clipShape(Circle())
+            .padding(.bottom, 2)
             HStack(spacing: 8) {
                 BouncingDots()
-                Text(note).font(.footnote).foregroundColor(Color(red: 0xC9 / 255, green: 0xA4 / 255, blue: 0x6A / 255))
+                Text(note).font(.footnote).foregroundColor(cs == .dark ? Color(red: 0xC9 / 255, green: 0xA4 / 255, blue: 0x6A / 255) : hHLLight)
             }
             .padding(.horizontal, 14).padding(.vertical, 10)
-            .background(BubbleShape(tl: 18, tr: 18, br: 18, bl: 18).fill(hDark))
-            .overlay(BubbleShape(tl: 18, tr: 18, br: 18, bl: 18).stroke(hAmber.opacity(0.67), lineWidth: 1.5))
+            .background(BubbleShape.aiw.fill(hBubbleFill(cs)))
+            .overlay(BubbleShape.aiw.stroke(hAmber.opacity(cs == .dark ? 0.67 : 0.85), lineWidth: 1.5))
             Spacer(minLength: 20)
         }
-        .onAppear { spin = true }
         .accessibilityElement(children: .combine).accessibilityLabel("球球在想：\(note)")
     }
+}
+
+// MARK: - 球球 stage layout (3.6)
+// 3.5 hung the bubble in an .overlay of the 球球 frame and moved it with alignment guides + offsets: on the phone the guide
+// did not take and the bubble sat on top of 球球. Now every position is computed from the 球球 circle and the stage
+// rectangle: a bubble goes into a slot outside the circle (above / below, and left / right when there is room beside it),
+// never closer than `gap` to the circle, never outside the stage (safe areas are outside the stage already), and when no
+// slot can hold the whole text (a small screen, landscape) it takes the roomier side and is cut to the lines that fit.
+// The same math is in apps/web/home.js (hPlace).
+enum StageSide { case above, below, left, right }
+
+struct StagePlacement: Equatable {
+    var rect: CGRect
+    var side: StageSide
+    var lines: Int?          // nil: the whole text fits; else cut to this many lines
+}
+
+enum StageLayout {
+    static let gap: CGFloat = 30      // bubble edge <-> 球球 circle (room for the two tail dots)
+    static let edge: CGFloat = 14     // bubble <-> stage edge
+    static let lineH: CGFloat = 20    // 15 pt text, 2 pt line spacing
+    static let padV: CGFloat = 20     // vertical padding inside the bubble
+    static let sideMin: CGFloat = 170 // narrowest bubble beside 球球
+
+    /// The order slots are tried in, starting at the bubble's turn: (side, lean); lean moves an above/below bubble
+    /// towards one side (-1 left … +1 right) so consecutive bubbles alternate.
+    static func slots(sides: Bool) -> [(StageSide, CGFloat)] {
+        if sides { return [(StageSide.above, 1), (StageSide.right, 0), (StageSide.below, -1), (StageSide.left, 0), (StageSide.above, -1), (StageSide.below, 1)] }
+        return [(StageSide.above, 1), (StageSide.below, -1), (StageSide.above, -1), (StageSide.below, 1)]
+    }
+    static func sideRoom(_ c: CGPoint, _ r: CGFloat, _ area: CGRect) -> CGFloat {
+        min(area.maxX - edge - (c.x + r + gap), (c.x - r - gap) - (area.minX + edge))
+    }
+    /// Where the bubble of natural size `b` goes for turn `slot`.
+    static func place(slot: Int, bubble b: CGSize, orb c: CGPoint, r: CGFloat, area: CGRect) -> StagePlacement {
+        let list = slots(sides: sideRoom(c, r, area) >= sideMin)
+        for i in 0..<list.count {
+            let (side, lean) = list[(slot % list.count + i) % list.count]
+            let f = frame(side, lean, b, c, r, area)
+            if fits(f, c, r, area) { return StagePlacement(rect: f, side: side, lines: nil) }
+        }
+        // nothing holds the whole text: the placement that shows the most lines, cut to what fits —
+        // above / below at full width, or beside 球球 at the width there is (landscape, small screens)
+        var best: (StagePlacement, Int)? = nil
+        func offer(_ p: StagePlacement, _ shown: Int) { if fits(p.rect, c, r, area), shown > (best?.1 ?? 0) { best = (p, shown) } }
+        let need = max(1, Int(((b.height - padV) / lineH).rounded()))
+        for side in [StageSide.above, .below] {
+            let room = side == .above ? (c.y - r - gap) - (area.minY + edge) : (area.maxY - edge) - (c.y + r + gap)
+            let lines = min(need, Int(((room - padV) / lineH).rounded(.down)))
+            guard lines >= 1 else { continue }
+            let f = frame(side, side == .above ? 1 : -1, CGSize(width: b.width, height: padV + CGFloat(lines) * lineH), c, r, area)
+            offer(StagePlacement(rect: f, side: side, lines: lines), lines)
+        }
+        let sr = sideRoom(c, r, area)
+        if sr >= 110 {
+            let w2 = min(b.width, sr)
+            let want = Int((CGFloat(need) * b.width / w2).rounded(.up))
+            let lines = min(want, Int(((area.height - 2 * edge - padV) / lineH).rounded(.down)))
+            if lines >= 1 {
+                for side in [StageSide.right, .left] {
+                    let f = frame(side, 0, CGSize(width: w2, height: padV + CGFloat(lines) * lineH), c, r, area)
+                    offer(StagePlacement(rect: f, side: side, lines: lines), lines)
+                }
+            }
+        }
+        if let bp = best { return bp.0 }
+        // last resort (a stage too small for anything): one line in the roomier band, kept inside the stage
+        let up = (c.y - r - gap) - (area.minY + edge), down = (area.maxY - edge) - (c.y + r + gap)
+        let side: StageSide = up >= down ? .above : .below
+        var f = frame(side, 0, CGSize(width: b.width, height: padV + lineH), c, r, area)
+        f.origin.y = max(area.minY + edge, min(f.origin.y, area.maxY - edge - f.height))
+        return StagePlacement(rect: f, side: side, lines: 1)
+    }
+    static func frame(_ side: StageSide, _ lean: CGFloat, _ b: CGSize, _ c: CGPoint, _ r: CGFloat, _ area: CGRect) -> CGRect {
+        let minX = area.minX + edge, maxX = area.maxX - edge, minY = area.minY + edge, maxY = area.maxY - edge
+        func clampX(_ x: CGFloat) -> CGFloat { max(minX, min(x, maxX - b.width)) }
+        func clampY(_ y: CGFloat) -> CGFloat { max(minY, min(y, maxY - b.height)) }
+        switch side {
+        case .above: return CGRect(x: clampX(c.x - b.width / 2 + lean * b.width * 0.28), y: c.y - r - gap - b.height, width: b.width, height: b.height)
+        case .below: return CGRect(x: clampX(c.x - b.width / 2 + lean * b.width * 0.28), y: c.y + r + gap, width: b.width, height: b.height)
+        case .right: return CGRect(x: c.x + r + gap, y: clampY(c.y - b.height * 0.65), width: b.width, height: b.height)
+        case .left: return CGRect(x: c.x - r - gap - b.width, y: clampY(c.y - b.height * 0.65), width: b.width, height: b.height)
+        }
+    }
+    /// Inside the stage and clear of the circle (+ most of the gap).
+    static func fits(_ f: CGRect, _ c: CGPoint, _ r: CGFloat, _ area: CGRect) -> Bool {
+        let inner = area.insetBy(dx: edge - 0.5, dy: edge - 0.5)
+        guard inner.contains(f) else { return false }
+        return distance(c, f) >= r + gap * 0.8
+    }
+    /// Distance from a point to a rectangle (0 inside).
+    static func distance(_ p: CGPoint, _ f: CGRect) -> CGFloat {
+        let dx = max(f.minX - p.x, 0, p.x - f.maxX), dy = max(f.minY - p.y, 0, p.y - f.maxY)
+        return (dx * dx + dy * dy).squareRoot()
+    }
+    /// The tail: two dots between the bubble edge facing 球球 and the circle.
+    static func tail(_ p: StagePlacement, _ c: CGPoint, _ r: CGFloat) -> (CGPoint, CGPoint) {
+        let f = p.rect
+        let start: CGPoint
+        switch p.side {
+        case .above: start = CGPoint(x: max(f.minX + 24, min(c.x, f.maxX - 24)), y: f.maxY)
+        case .below: start = CGPoint(x: max(f.minX + 24, min(c.x, f.maxX - 24)), y: f.minY)
+        case .right: start = CGPoint(x: f.minX, y: max(f.minY + 16, min(c.y, f.maxY - 16)))
+        case .left: start = CGPoint(x: f.maxX, y: max(f.minY + 16, min(c.y, f.maxY - 16)))
+        }
+        let vx = start.x - c.x, vy = start.y - c.y, len = max(1, (vx * vx + vy * vy).squareRoot())
+        let edgePt = CGPoint(x: c.x + vx / len * r, y: c.y + vy / len * r)
+        func lerp(_ t: CGFloat) -> CGPoint { CGPoint(x: start.x + (edgePt.x - start.x) * t, y: start.y + (edgePt.y - start.y) * t) }
+        return (lerp(0.32), lerp(0.68))
+    }
+}
+
+private struct StageSizeKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) { let n = nextValue(); if n != .zero { value = n } }
+}
+private struct StageWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 /// 球球 in the middle of the home screen with its briefing popping up around it.
@@ -155,21 +282,55 @@ struct HomeStage: View {
     let act: (JSON) -> Void
     let showChat: () -> Void
     @State private var idx = 0
+    @State private var lineW: CGFloat = 0      // the text on one line (natural width)
+    @State private var natural: CGSize = .zero // the bubble at its width, uncut
     @Environment(\.accessibilityReduceMotion) private var still
     private let tick = Timer.publish(every: 4.5, on: .main, in: .common).autoconnect()
 
     var item: JSON? { m.greet.isEmpty ? nil : m.greet[idx % m.greet.count] }
+    /// the briefing text without Markdown marks (a bubble is plain text)
+    func plain(_ s: String) -> String {
+        s.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "__", with: "").replacingOccurrences(of: "`", with: "")
+    }
     var body: some View {
         GeometryReader { geo in
-            let orb: CGFloat = min(150, geo.size.width * 0.36)
-            let bw = min(260, geo.size.width - 48)
-            ZStack {
+            let top: CGFloat = m.msgs.isEmpty ? 4 : 46               // below the 聊天记录 button
+            let area = CGRect(x: 0, y: top, width: geo.size.width, height: max(120, geo.size.height - top - 4))
+            let orb: CGFloat = max(72, min(150, geo.size.width * 0.36, area.height * 0.3))
+            let c = CGPoint(x: area.midX, y: area.minY + area.height * 0.52)
+            let maxW = min(270, area.width - 2 * StageLayout.edge)
+            let text = plain(item?.s("text") ?? "")
+            let w = max(60, min(maxW, ceil(lineW) + 28 + 1))
+            ZStack(alignment: .topLeading) {
+                // measuring copies (never shown): the one-line width, then the height at the chosen width
+                Text(text).font(.system(size: 15)).fixedSize()
+                    .background(GeometryReader { g in Color.clear.preference(key: StageWidthKey.self, value: g.size.width) })
+                    .hidden().accessibilityHidden(true)
+                label(text, width: w, lines: nil)
+                    .background(GeometryReader { g in Color.clear.preference(key: StageSizeKey.self, value: g.size) })
+                    .hidden().accessibilityHidden(true)
+
                 MateView(status: "", threadId: nil, bus: false, emotion: "02", animate: true, mood: item?.s("mood") ?? "02")
                     .frame(width: orb, height: orb)
-                    .overlay(alignment: idx % 2 == 0 ? Alignment.top : Alignment.bottom) {
-                        if let it = item { bubble(it, slot: idx % 4, width: bw).id("b\(idx)") }
+                    .position(c)
+                if let it = item, natural != .zero {
+                    let p = StageLayout.place(slot: idx, bubble: CGSize(width: w, height: natural.height), orb: c, r: orb / 2, area: area)
+                    let dots = StageLayout.tail(p, c, orb / 2)
+                    ZStack(alignment: .topLeading) {
+                        Circle().fill(hAmber).frame(width: 11, height: 11).position(dots.0)
+                        Circle().fill(hAmber.opacity(0.7)).frame(width: 6, height: 6).position(dots.1)
+                        Button { act(it.o("action")) } label: { label(text, width: p.rect.width, lines: p.lines) }
+                            .buttonStyle(.plain)
+                            .frame(width: p.rect.width, height: p.rect.height)
+                            .position(x: p.rect.midX, y: p.rect.midY)
+                            .accessibilityHint("点一下就去做")
                     }
-                    .position(x: geo.size.width / 2, y: geo.size.height * 0.52)
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+                    .opacity(typing ? 0.45 : 1)
+                    .id("b\(idx)")
+                    .transition(.asymmetric(insertion: .scale(scale: 0.9).combined(with: .opacity),
+                                            removal: .scale(scale: 0.75).combined(with: .opacity)))
+                }
                 VStack {
                     if !m.msgs.isEmpty {
                         Button(action: showChat) {
@@ -180,8 +341,10 @@ struct HomeStage: View {
                     }
                     if !m.err.isEmpty { Text(m.err).font(.footnote).foregroundColor(.red).padding(.horizontal) }
                     Spacer()
-                }
+                }.frame(width: geo.size.width, height: geo.size.height)
             }
+            .onPreferenceChange(StageWidthKey.self) { lineW = $0 }
+            .onPreferenceChange(StageSizeKey.self) { natural = $0 }
         }
         .onReceive(tick) { _ in
             guard !typing, m.greet.count > 1 else { return }
@@ -189,82 +352,80 @@ struct HomeStage: View {
         }
         .onChange(of: m.greetAt) { _ in idx = 0 }
     }
-    /// slot 0 above → right, 1 below ← left, 2 above ← left, 3 below → right; the tail (two dots) points at 球球
-    @ViewBuilder func bubble(_ it: JSON, slot: Int, width: CGFloat) -> some View {
-        let below = slot % 2 == 1
-        let dx: CGFloat = (slot == 0 || slot == 3) ? 36 : -36
-        let tailRight = dx < 0
-        let text = it.s("text")
-        let w = min(width, CGFloat(text.count) * 15.5 + 30)
-        Button { act(it.o("action")) } label: {
-            Text(text).font(.system(size: 15)).foregroundColor(.white).lineSpacing(2).multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 14).padding(.vertical, 10)
-                .frame(width: w, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(hStageBubble))
-                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(hAmber, lineWidth: 1.5))
-                .shadow(color: hAmber.opacity(0.15), radius: 12, y: 6)
-                .overlay(alignment: tailAlign(below: below, right: tailRight)) {
-                    ZStack {
-                        Circle().fill(hAmber).frame(width: 11, height: 11).offset(y: below ? -17 : 17)
-                        Circle().fill(hAmber.opacity(0.7)).frame(width: 6, height: 6).offset(x: tailRight ? 8 : -8, y: below ? -27 : 27)
-                    }.padding(tailRight ? Edge.Set.trailing : Edge.Set.leading, 44)
-                }
-        }
-        .buttonStyle(.plain)
-        .opacity(typing ? 0.45 : 1)
-        .alignmentGuide(below ? VerticalAlignment.bottom : VerticalAlignment.top) { d in below ? d[VerticalAlignment.top] - 28 : d[VerticalAlignment.bottom] + 28 }
-        .offset(x: dx)
-        .transition(.asymmetric(insertion: .scale(scale: 0.9).combined(with: .opacity),
-                                removal: .scale(scale: 0.75).combined(with: .opacity)))
-        .accessibilityHint("点一下就去做")
+    /// The bubble itself: dark with an amber border (the stage look is the same in light and dark).
+    func label(_ text: String, width: CGFloat, lines: Int?) -> some View {
+        Text(text).font(.system(size: 15)).foregroundColor(.white).lineSpacing(2).multilineTextAlignment(.leading)
+            .lineLimit(lines).truncationMode(.tail)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .frame(width: width, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(hStageBubble))
+            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(hAmber, lineWidth: 1.5))
+            .shadow(color: hAmber.opacity(0.15), radius: 12, y: 6)
     }
-}
-
-func tailAlign(below: Bool, right: Bool) -> Alignment {
-    if below { return right ? .topTrailing : .topLeading }
-    return right ? .bottomTrailing : .bottomLeading
 }
 
 /// "+" sheet items.
 enum AttachKind: CaseIterable, Hashable {
     case photo, video, library, file, task, link, skill
-    var emoji: String {
-        switch self { case .photo: return "📷"; case .video: return "🎥"; case .library: return "🖼"; case .file: return "📁"
-        case .task: return "🖥"; case .link: return "🔗"; case .skill: return "✨" }
+    /// SF Symbols, line style (WeChat-like panel, 3.6)
+    var symbol: String {
+        switch self { case .photo: return "camera"; case .video: return "video"; case .library: return "photo.on.rectangle"; case .file: return "folder"
+        case .task: return "desktopcomputer"; case .link: return "link"; case .skill: return "sparkles" }
     }
     var title: String {
         switch self { case .photo: return "拍照"; case .video: return "录视频"; case .library: return "照片/视频"; case .file: return "文件"
         case .task: return "新建任务"; case .link: return "链接"; case .skill: return "技能 /" }
     }
-    var lit: Bool { self == .photo || self == .video }
 }
 
+/// The "+" panel (3.6, like WeChat's): light grey panel (#F7F7F7; dark grey in dark mode), white rounded-square tiles
+/// (dark grey in dark mode) with a thin amber border, grey line icons, the label under the tile, 4 per row, 2 rows a
+/// page, more pages swipe sideways with dots.
 struct AttachSheet: View {
     let pick: (AttachKind) -> Void
-    private let cols = Array(repeating: GridItem(.flexible(), spacing: 12), count: 4)
+    @Environment(\.colorScheme) private var cs
+    static let perPage = 8
+    static let height: CGFloat = 262
+    var pages: [[AttachKind]] {
+        let all = AttachKind.allCases
+        return stride(from: 0, to: all.count, by: AttachSheet.perPage).map { Array(all[$0..<min($0 + AttachSheet.perPage, all.count)]) }
+    }
+    var panel: Color { cs == .dark ? Color(red: 0x1E / 255, green: 0x1E / 255, blue: 0x1E / 255) : Color(red: 0xF7 / 255, green: 0xF7 / 255, blue: 0xF7 / 255) }
+    var tile: Color { cs == .dark ? Color(red: 0x2C / 255, green: 0x2C / 255, blue: 0x2E / 255) : Color.white }
+    var glyph: Color { cs == .dark ? Color(white: 0.78) : Color(white: 0.32) }
+    var caption: Color { cs == .dark ? Color(white: 0.62) : Color(white: 0.45) }
     var body: some View {
-        VStack(spacing: 16) {
-            Capsule().fill(Color(white: 0.27)).frame(width: 40, height: 5).padding(.top, 10)
-            LazyVGrid(columns: cols, spacing: 14) {
-                ForEach(AttachKind.allCases, id: \.self) { k in
-                    Button { pick(k) } label: {
-                        VStack(spacing: 6) {
-                            Text(k.emoji).font(.system(size: 28))
-                                .frame(width: 62, height: 62)
-                                .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(k.lit ? hTok : Color(white: 0.13)))
-                                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(k.lit ? hAmber : Color(white: 0.23), lineWidth: 1))
-                            Text(k.title).font(.caption).foregroundColor(Color(white: 0.8)).lineLimit(1)
-                        }
-                    }.buttonStyle(.plain).accessibilityLabel(k.title)
-                }
+        VStack(spacing: 0) {
+            Capsule().fill(Color.gray.opacity(0.35)).frame(width: 36, height: 5).padding(.top, 8).padding(.bottom, 14)
+            if pages.count > 1 {
+                TabView { ForEach(pages.indices, id: \.self) { i in grid(pages[i]) } }
+                    .tabViewStyle(.page(indexDisplayMode: .always))
+                    .indexViewStyle(.page(backgroundDisplayMode: .never))
+            } else {
+                grid(pages.first ?? [])
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 18)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(hSheetBg.ignoresSafeArea())
-        .environment(\.colorScheme, .dark)
+        .background(panel.ignoresSafeArea())
+    }
+    func grid(_ items: [AttachKind]) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 16) {
+            ForEach(items, id: \.self) { k in
+                Button { pick(k) } label: {
+                    VStack(spacing: 7) {
+                        Image(systemName: k.symbol).font(.system(size: 25, weight: .regular)).foregroundColor(glyph)
+                            .frame(width: 62, height: 62)
+                            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(tile))
+                            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(hAmber.opacity(cs == .dark ? 0.35 : 0.3), lineWidth: 0.75))
+                        Text(k.title).font(.system(size: 12)).foregroundColor(caption).lineLimit(1)
+                    }.frame(maxWidth: .infinity).contentShape(Rectangle())
+                }.buttonStyle(.plain).accessibilityLabel(k.title)
+            }
+        }
+        .padding(.horizontal, 20)
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 }
 
@@ -376,3 +537,113 @@ func slashQuery(_ t: String) -> String? {
 
 /// Characters a query value may carry unescaped (ASCII only: URLComponents on iOS 16 refuses raw non-ASCII).
 let queryValueChars = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+
+// MARK: - Bottom pinning for the chat and the task view (3.6)
+// Both screens are "newest at the bottom" scroll views with the composer in .safeAreaInset(edge: .bottom).
+// Where the content ends and where the composer starts are both measured in global coordinates, so "how far the
+// newest line is below what you see" is exact (no guessing at safe areas or keyboard insets):
+// * pinned (within 60 pt of the end): new messages, streaming text and content that grows after layout (pictures,
+//   steps, RichText measuring late, LazyVStack replacing estimated row heights) keep it at the end
+// * scrolled up: nothing moves; a "↓ 最新消息" pill (like the web's #hToLatest) shows when the end is more than 300 pt
+//   away or something new came in, and tapping it goes to the newest message
+struct ScrollMetrics: Equatable { var endY: CGFloat = 0; var contentH: CGFloat = 0 }
+struct ScrollMetricsKey: PreferenceKey {
+    static var defaultValue = ScrollMetrics()
+    static func reduce(value: inout ScrollMetrics, nextValue: () -> ScrollMetrics) { let n = nextValue(); if n.contentH > 0 { value = n } }
+}
+struct ComposerTopKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { let n = nextValue(); if n > 0 { value = n } }
+}
+extension View {
+    /// on the scroll view's content stack: where it ends (global) and how tall it is
+    func reportsScrollMetrics() -> some View {
+        background(GeometryReader { g in
+            Color.clear.preference(key: ScrollMetricsKey.self, value: ScrollMetrics(endY: g.frame(in: .global).maxY, contentH: g.size.height))
+        })
+    }
+    /// on the composer in .safeAreaInset(edge: .bottom): where the visible part of the scroll view ends (global)
+    func reportsComposerTop() -> some View {
+        background(GeometryReader { g in Color.clear.preference(key: ComposerTopKey.self, value: g.frame(in: .global).minY) })
+    }
+}
+
+final class BottomPin: ObservableObject {
+    static let near: CGFloat = 60, far: CGFloat = 300
+    @Published private(set) var showJump = false
+    private(set) var pinned = true
+    private(set) var opened = false
+    private var last = ScrollMetrics()
+    private var bottom: CGFloat = 0
+    private var unseen = false
+    private var followUntil = Date.distantPast
+    private var holdUntil = Date.distantPast   // a jump is under way: the frames in between do not unpin
+    /// scrolls the ScrollViewReader to the "end" anchor (set by the view; animated or not)
+    var jumpAction: ((Bool) -> Void)?
+
+    /// Go to the newest message and stay there while the content settles (`follow` seconds of growth are followed).
+    func toEnd(animated: Bool = false, follow: TimeInterval = 1.5) {
+        opened = true
+        pinned = true; unseen = false
+        followUntil = max(followUntil, Date().addingTimeInterval(follow))
+        holdUntil = Date().addingTimeInterval(animated ? 0.6 : 0.25)
+        publish()
+        DispatchQueue.main.async { self.jumpAction?(animated) }
+        // once more after layout: rows measured late (pictures, lazy rows) move the end after the first jump
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { if self.pinned { self.jumpAction?(false) } }
+    }
+    /// Something new arrived (a message, a streamed piece, a task). `own`: the user's own send.
+    func newContent(own: Bool = false) {
+        if own || pinned { toEnd(animated: false, follow: 1.2) } else { unseen = true; publish() }
+    }
+    /// The content's end / height changed (scrolling, or the content grew). `live`: a reply or task is running.
+    func metrics(_ mm: ScrollMetrics, live: Bool) {
+        let grew = last.contentH > 0 && abs(mm.contentH - last.contentH) > 0.5
+        last = mm
+        if grew && pinned && (live || Date() < followUntil) {
+            holdUntil = max(holdUntil, Date().addingTimeInterval(0.1))
+            DispatchQueue.main.async { self.jumpAction?(false) }
+            return
+        }
+        recompute()
+    }
+    /// The composer's top moved (keyboard, attachments, skill picker): stay at the end if we were there.
+    func composer(_ top: CGFloat) {
+        guard top > 0 else { return }
+        let moved = bottom > 0 && abs(top - bottom) > 0.5
+        bottom = top
+        if moved && pinned { holdUntil = Date().addingTimeInterval(0.3); DispatchQueue.main.async { self.jumpAction?(false) } }
+        else { recompute() }
+    }
+    private func recompute() {
+        guard bottom > 0, last.contentH > 0 else { return }
+        let d = last.endY - bottom          // how far the newest line is below the visible area
+        if Date() < holdUntil && d > BottomPin.near { publish(); return }
+        pinned = d < BottomPin.near
+        if pinned { unseen = false }
+        publish()
+    }
+    private func publish() {
+        let d = bottom > 0 ? last.endY - bottom : 0
+        let show = !pinned && (d > BottomPin.far || unseen)
+        if show != showJump { showJump = show }
+    }
+}
+
+/// The floating "↓ 最新消息" pill (same look as the web's .fab #hToLatest: a rounded pill, panel colour, thin border,
+/// soft shadow, 13 pt semibold), right above the composer.
+struct JumpToLatest: View {
+    let go: () -> Void
+    var body: some View {
+        Button(action: go) {
+            Text("↓ 最新消息").font(.system(size: 13, weight: .semibold)).foregroundColor(.primary)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(Capsule().fill(Color(.secondarySystemBackground)))
+                .overlay(Capsule().stroke(Color(.separator), lineWidth: 1))
+                .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("跳到最新消息")
+        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+    }
+}

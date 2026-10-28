@@ -27,6 +27,9 @@ struct SettingsView: View {
                         }
                     }
                 }
+                Section(footer: Text("球球记得的你：画像、事实和决定，聊天和每个任务都会参考；可以查看、修改、删除")) {
+                    NavigationLink { MemoryView() } label: { Label("记忆", systemImage: "brain.head.profile") }
+                }
                 Section(footer: Text("降价提醒，可自动下单到付款前，等你确认")) {
                     NavigationLink { ShopWatchView() } label: { Label("京东/淘宝价格监控", systemImage: "tag") }
                 }

@@ -10,15 +10,18 @@
  *     drag, = drag / select (button held until the finger lifts); two-finger drag = scroll.
  *   直点 (direct): the click lands where you touch. While the finger is down a loupe shows the desktop under it,
  *     magnified, with a crosshair; slide to aim, the click happens on release at that exact point.
- *   Both: pinch to zoom (1x-5x) and pan the desktop (two fingers); the zoom is a CSS transform on the iframe.
+ *   Both: pinch to zoom (1x-5x) and pan the desktop (two fingers). The zoom makes the iframe really bigger (its
+ *     layout size, not a CSS scale): noVNC (resize=scale) then draws the desktop bigger and maps every CSS pixel to
+ *     fewer framebuffer pixels, so zooming in really is more precise (a mouse event's clientX is a whole CSS pixel).
  *   Toolbar: mode switch, keyboard (a hidden input; typed text becomes key presses), Esc, Tab, Ctrl (sticky, applies
  *   to the next key), Enter, arrows, ⌫, zoom reset, 横屏 (landscape full screen) and its exit.
  *
- * Coordinates: S = point in the stage (the overlay's own frame; un-rotated when the stage is CSS-rotated for
- * landscape), z / (px, py) = zoom and pan. The iframe is at the stage origin, transformed translate(px,py) scale(z),
- * so the iframe-internal client point is c = (S - pan) / z. noVNC maps that client point to framebuffer pixels itself
- * (its canvas is inside the iframe, untransformed there), so zoom, noVNC's own scale-to-fit and the rotation all
- * compose correctly. The cursor and the loupe are drawn at S = pan + z * c.
+ * Coordinates: S = point in the stage's padding box (the overlay's own frame; un-rotated when the stage is
+ * CSS-rotated for landscape), z / (px, py) = zoom and pan. The iframe sits at the stage origin, z times the stage size,
+ * moved by translate(px, py), so the iframe-internal client point is c = S - pan (rounded to a whole pixel, as a real
+ * mouse event is). noVNC maps that client point to framebuffer pixels itself (its canvas is inside the iframe), so the
+ * zoom, noVNC's own scale-to-fit and the rotation all compose correctly. The cursor is kept as a fraction of the
+ * canvas (u, v), so it stays on the same desktop spot when the zoom changes; it is drawn at S = c + pan.
  *
  * A viewer on another origin (InstaBox cloud computers) cannot be reached from here: then the layer steps aside
  * (touches go to that viewer as before) and says so; landscape still works.
@@ -53,6 +56,10 @@
     "background:rgba(20,17,13,.86);border:1px solid rgba(240,160,48,.55);color:#f3ede4;font:500 12px -apple-system,system-ui,sans-serif;" +
     "pointer-events:none;opacity:0;transition:opacity .25s;white-space:nowrap;max-width:90%;overflow:hidden;text-overflow:ellipsis}" +
     ".aiwt-note.on{opacity:1}" +
+    /* the web app's 你正在操作桌面 banner: readable on the desktop picture, and only its button takes touches */
+    ".aiwt-stage .takebanner{pointer-events:none;background:rgba(20,17,13,.82)!important;color:#f3ede4!important;border:1px solid rgba(240,160,48,.55);z-index:9}" +
+    ".aiwt-stage .takebanner button{pointer-events:auto}" +
+    ".aiwt-stage .vfchip{display:none}" +
     ".aiwt-kb{position:absolute;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0;font-size:16px;z-index:0}" +
     /* landscape: real fullscreen (+ orientation lock) where the browser has it, else this rotated full-screen view */
     ".aiwt-full{position:fixed!important;left:0;top:0;width:100vw!important;height:100vh!important;z-index:2147483000;border-radius:0!important;margin:0!important;aspect-ratio:auto!important}" +
@@ -93,7 +100,7 @@
 
     var st = {
       mode: opts.mode || (localStorage.getItem("aiw_touch_mode") || "trackpad"),
-      z: 1, px: 0, py: 0, cx: -1, cy: -1, ctrl: false, dragging: false, landscape: false, rot: false, pass: false, gone: false
+      z: 1, px: 0, py: 0, u: -1, v: -1, ctrl: false, dragging: false, landscape: false, rot: false, pass: false, gone: false
     };
     var touches = {}, g = null, lastTap = 0, lastTapAt = { x: 0, y: 0 }, holdT = 0, raf = 0, pendMove = false, wheelAcc = 0;
 
@@ -133,35 +140,38 @@
     // ---- geometry
     function W() { return stage.clientWidth; } function H() { return stage.clientHeight; }
     /** client (viewport) point -> stage point S, un-rotating the CSS-rotated landscape view */
-    function toS(x, y) {
-      var r = stage.getBoundingClientRect();
-      if (st.rot) return { x: y - r.top, y: r.right - x };
-      return { x: x - r.left, y: y - r.top };
+    function toS(x, y) {   // relative to the padding box (where the iframe and the overlay sit), not the border
+      var r = stage.getBoundingClientRect(), bl = stage.clientLeft || 0, bt = stage.clientTop || 0;
+      if (st.rot && win.getComputedStyle(stage).transform !== "none") return { x: y - r.top - bl, y: r.right - x - bt };
+      return { x: x - r.left - bl, y: y - r.top - bt };
     }
-    function toC(s) { return { x: (s.x - st.px) / st.z, y: (s.y - st.py) / st.z }; }
-    function fromC(c) { return { x: st.px + st.z * c.x, y: st.py + st.z * c.y }; }
+    function toC(s) { return { x: s.x - st.px, y: s.y - st.py }; }
+    function fromC(c) { return { x: c.x + st.px, y: c.y + st.py }; }
+    function snap(c) { return { x: Math.round(c.x), y: Math.round(c.y) }; }
+    /** the cursor in c space (from its place on the canvas) */
+    function cur0() { var r = crect(); return snap({ x: r.l + st.u * r.w, y: r.t + st.v * r.h }); }
+    function setCur(c) { var r = crect(); st.u = Math.max(0, Math.min(1, (c.x - r.l) / Math.max(1, r.w))); st.v = Math.max(0, Math.min(1, (c.y - r.t) / Math.max(1, r.h))); }
     function clampPan() {
       var w = W(), h = H();
       st.px = Math.min(0, Math.max(w - st.z * w, st.px)); st.py = Math.min(0, Math.max(h - st.z * h, st.py));
     }
-    function clampCursor() {
-      var r = crect();
-      st.cx = Math.max(r.l, Math.min(r.l + r.w - 1, st.cx)); st.cy = Math.max(r.t, Math.min(r.t + r.h - 1, st.cy));
-    }
-    function ensureCursor() { if (st.cx < 0) { var r = crect(); st.cx = r.l + r.w / 2; st.cy = r.t + r.h / 2; } }
+    function ensureCursor() { if (st.u < 0) { st.u = 0.5; st.v = 0.5; } }
     /** zoomed in: keep the cursor on screen by panning (trackpad) */
     function follow() {
       if (st.z <= 1.001) return;
-      var s = fromC({ x: st.cx, y: st.cy }), m = 36, w = W(), h = H();
+      var s = fromC(cur0()), m = 36, w = W(), h = H();
       if (s.x < m) st.px += m - s.x; else if (s.x > w - m) st.px -= s.x - (w - m);
       if (s.y < m) st.py += m - s.y; else if (s.y > h - 70) st.py -= s.y - (h - 70);
       clampPan();
     }
     function paint() {
-      frame.style.transform = st.z > 1.001 || st.px || st.py ? "translate(" + st.px + "px," + st.py + "px) scale(" + st.z + ")" : "";
-      var show = st.mode === "trackpad" && !st.pass && st.cx >= 0;
+      var zoomed = st.z > 1.001;
+      frame.style.width = zoomed ? Math.round(W() * st.z) + "px" : "";
+      frame.style.height = zoomed ? Math.round(H() * st.z) + "px" : "";
+      frame.style.transform = zoomed || st.px || st.py ? "translate(" + st.px + "px," + st.py + "px)" : "";
+      var show = st.mode === "trackpad" && !st.pass && st.u >= 0;
       cur.style.display = show ? "block" : "none";
-      if (show) { var s = fromC({ x: st.cx, y: st.cy }); cur.style.transform = "translate(" + s.x + "px," + s.y + "px)"; }
+      if (show) { var s = fromC(cur0()); cur.style.transform = "translate(" + s.x + "px," + s.y + "px)"; }
       cur.classList.toggle("drag", st.dragging);
       zoomBtn.style.display = st.z > 1.001 ? "" : "none";
     }
@@ -169,6 +179,7 @@
     // ---- events into noVNC
     function fire(type, c, button, buttons) {
       var cv = canvas(), d = idoc(); if (!cv || !d) return false;
+      c = snap(c); st.last = { type: type, x: c.x, y: c.y };
       var v = d.defaultView, E = v.MouseEvent;
       cv.dispatchEvent(new E(type, { bubbles: true, cancelable: true, view: v, clientX: c.x, clientY: c.y,
         screenX: c.x, screenY: c.y, button: button || 0, buttons: buttons == null ? 0 : buttons }));
@@ -214,15 +225,18 @@
     // ---- loupe (direct mode)
     function showLoupe(s) {
       var cv = canvas(); if (!cv) { loupe.style.display = "none"; return; }
-      var size = 124, w = W(), dpr = win.devicePixelRatio || 1;
-      var lx = s.x - size / 2, ly = s.y - size - 46;
-      if (ly < 6) { ly = s.y + 46; }
-      lx = Math.max(6, Math.min(w - size - 6, lx));
+      var w = W(), h = H(), dpr = win.devicePixelRatio || 1;
+      var size = Math.round(Math.max(72, Math.min(124, h * 0.42, w * 0.42))), gap = 34;
+      // above the finger, else below, else beside it (left / right), else wherever it fits best in the stage
+      var cand = [[s.x - size / 2, s.y - size - gap], [s.x - size / 2, s.y + gap], [s.x - size - gap, s.y - size / 2], [s.x + gap, s.y - size / 2]];
+      var fit = cand.filter(function (q) { return q[0] >= 4 && q[1] >= 4 && q[0] + size <= w - 4 && q[1] + size <= h - 4; })[0] || cand[0];
+      var lx = Math.max(4, Math.min(w - size - 4, fit[0])), ly = Math.max(4, Math.min(h - size - 4, fit[1]));
+      loupe.style.width = loupe.style.height = size + "px";
       loupe.style.display = "block"; loupe.style.left = lx + "px"; loupe.style.top = ly + "px";
       dot.style.display = "block"; dot.style.left = s.x + "px"; dot.style.top = s.y + "px";
       if (lc.width !== Math.round(size * dpr)) { lc.width = lc.height = Math.round(size * dpr); }
       var c = toC(s), r = crect(), k = cv.width / Math.max(1, r.w);
-      var mag = 2.6, areaC = size / (mag * st.z);              // the desktop area the loupe shows, in c units
+      var mag = 2.6, areaC = size / mag;                      // the desktop area the loupe shows, in c units
       var sw = areaC * k, sx = (c.x - r.l) * k - sw / 2, sy = (c.y - r.t) * k - sw / 2;
       var x2 = lc.getContext("2d");
       x2.imageSmoothingEnabled = false;
@@ -278,8 +292,10 @@
           if (g.second && !st.dragging && !g.held) startDrag();   // tap, then drag = drag
           var v = Math.hypot(dx, dy) / dt;                          // px / ms
           var gain = 1 + Math.min(2.4, Math.max(0, v - 0.2) * 2.2); // slow 1x (precise) .. fast 3.4x
-          st.cx += dx * gain / st.z; st.cy += dy * gain / st.z;
-          clampCursor(); follow(); queueMove();
+          var r = crect();                                          // zoomed in, the canvas is bigger: finer steps
+          st.u = Math.max(0, Math.min(1, st.u + dx * gain / Math.max(1, r.w)));
+          st.v = Math.max(0, Math.min(1, st.v + dy * gain / Math.max(1, r.h)));
+          follow(); queueMove();
         } else showLoupe(a);
       } else if (g.kind === "two" && p.length === 2) {
         var m = mid(p[0], p[1]), d = dist(p[0], p[1]);
@@ -289,13 +305,13 @@
         }
         if (g.pinch) {
           var z = Math.max(1, Math.min(ZMAX, g.z0 * d / g.d0));
-          var c0 = { x: (g.m0.x - g.px0) / g.z0, y: (g.m0.y - g.py0) / g.z0 };   // the desktop point under the fingers
-          st.z = z; st.px = m.x - z * c0.x; st.py = m.y - z * c0.y; clampPan(); paint();
+          var fx = (g.m0.x - g.px0) / (W() * g.z0), fy = (g.m0.y - g.py0) / (H() * g.z0);   // the spot under the fingers
+          st.z = z; st.px = m.x - fx * W() * z; st.py = m.y - fy * H() * z; clampPan(); paint();
         } else if (g.moved > TAP_MOVE) {   // two-finger drag: scroll (natural direction) at the cursor / fingers
           var sdy = m.y - g.lm.y, sdx = m.x - g.lm.x;
           wheelAcc += -sdy * 2.2;
           if (Math.abs(wheelAcc) >= 1) {
-            var at = st.mode === "trackpad" ? { x: st.cx, y: st.cy } : toC(m);
+            var at = st.mode === "trackpad" ? cur0() : toC(m);
             wheel(at, wheelAcc, -sdx * 2.2); wheelAcc = 0;
           }
         }
@@ -314,28 +330,30 @@
         var quick = now - g.t0 < TAP_MS + (g.second ? 120 : 0);
         if (st.mode === "trackpad") {
           if (st.dragging) endDrag();
-          else if (g.moved < TAP_MOVE && quick) { click({ x: st.cx, y: st.cy }, 0); lastTap = now; lastTapAt = { x: g.x0, y: g.y0 }; }
+          else if (g.moved < TAP_MOVE && quick) { click(cur0(), 0); lastTap = now; lastTapAt = { x: g.x0, y: g.y0 }; }
         } else {
           var c = toC({ x: g.lx, y: g.ly }); hideLoupe();
           var r = crect();
-          if (c.x >= r.l && c.y >= r.t && c.x < r.l + r.w && c.y < r.t + r.h) { st.cx = c.x; st.cy = c.y; click(c, 0); }
+          if (c.x >= r.l && c.y >= r.t && c.x < r.l + r.w && c.y < r.t + r.h) { setCur(c); click(c, 0); }
         }
         g = null;
       } else if (g.kind === "two") {
+        // fingers rarely lift together: the gesture is judged when the last one lifts; the one left down after a
+        // pinch / scroll does nothing
         if (left === 0) {
-          if (!g.pinch && g.moved < TAP_MOVE * 1.5 && now - g.t0 < TAP_MS + 80) {   // two-finger tap: right click
-            click(st.mode === "trackpad" ? { x: st.cx, y: st.cy } : toC(g.m0), 2);
+          if (!g.pinch && g.moved < TAP_MOVE * 1.5 && now - g.t0 < TAP_MS + 120) {   // two-finger tap: right click
+            click(st.mode === "trackpad" ? cur0() : toC(g.m0), 2);
           }
           g = null;
-        } else if (left === 1) { g = { kind: "rest" }; }   // one finger still down after a pinch: ignore it
+        }
       } else if (left === 0) g = null;
     }
-    function startDrag() { st.dragging = true; move({ x: st.cx, y: st.cy }); fire("mousedown", { x: st.cx, y: st.cy }, 0, 1); paint(); }
-    function endDrag() { st.dragging = false; fire("mouseup", { x: st.cx, y: st.cy }, 0, 0); paint(); }
+    function startDrag() { st.dragging = true; move(cur0()); fire("mousedown", cur0(), 0, 1); paint(); }
+    function endDrag() { st.dragging = false; fire("mouseup", cur0(), 0, 0); paint(); }
     function queueMove() {
       paint();
       if (pendMove) return; pendMove = true;
-      raf = win.requestAnimationFrame(function () { pendMove = false; move({ x: st.cx, y: st.cy }); });
+      raf = win.requestAnimationFrame(function () { pendMove = false; move(cur0()); });
     }
     ov.addEventListener("touchstart", onStart, { passive: false });
     ov.addEventListener("touchmove", onMove, { passive: false });
@@ -396,6 +414,12 @@
     sep();
     var zoomBtn = btn("1:1", "缩放复位", function () { st.z = 1; st.px = 0; st.py = 0; paint(); }, true);
     var landBtn = btn("横屏", "横屏全屏", function () { setLandscape(!st.landscape); }, true);
+    var foldBtn = btn("▾", "收起工具条", function () {   // folded: just the mode, 横屏 and this, so the desktop shows
+      var min = !bar.classList.contains("min"); bar.classList.toggle("min", min);
+      foldBtn.textContent = min ? "▸" : "▾"; foldBtn.title = min ? "展开工具条" : "收起工具条"; paint();
+      try { localStorage.setItem("aiw_touch_bar", min ? "min" : ""); } catch (e) { /* private mode */ }
+    }, true);
+    if (localStorage.getItem("aiw_touch_bar") === "min") { bar.classList.add("min"); foldBtn.textContent = "▸"; }
     function setCtrl(on) { st.ctrl = on; ctrlBtn.classList.toggle("on", on); }
     function setMode(m) {
       st.mode = m; localStorage.setItem("aiw_touch_mode", m);
@@ -424,17 +448,28 @@
         try { p = req ? req.call(stage) : null; } catch (e) { p = null; }
         var lock = function () {
           var o = win.screen && win.screen.orientation;
-          if (o && o.lock) return o.lock("landscape").then(function () { setRot(false); }, function () { setRot(true); });
-          setRot(true); return null;
+          if (o && o.lock) return o.lock("landscape").then(function () { setRot(false); }, fallbackRot);
+          fallbackRot(); return null;
         };
-        if (p && p.then) p.then(lock, function () { setRot(true); }); else if (fsEl()) lock(); else setRot(true);
+        if (p && p.then) p.then(lock, fallbackRot); else if (fsEl()) lock(); else fallbackRot();
       } else {
+        wantRot = false;
         try { var o = win.screen && win.screen.orientation; if (o && o.unlock) o.unlock(); } catch (e) { /* ok */ }
         if (fsEl()) { (doc.exitFullscreen || doc.webkitExitFullscreen).call(doc); }
         stage.classList.remove("aiwt-full"); setRot(false);
       }
       if (opts.onLandscape) opts.onLandscape(on);
       relayout();
+    }
+    /** no orientation lock (iPhone Safari, a desktop browser): the rotated view. A fullscreen element cannot be rotated
+     *  (the browser forces transform:none on it), so leave fullscreen first. */
+    var wantRot = false;
+    function fallbackRot() {
+      wantRot = true;
+      if (!fsEl()) { setRot(true); return; }
+      var ex = doc.exitFullscreen || doc.webkitExitFullscreen, q = null;
+      try { q = ex.call(doc); } catch (e) { q = null; }
+      if (q && q.then) q.then(function () { setRot(true); }, function () { setRot(true); }); else setTimeout(function () { setRot(true); }, 120);
     }
     /** the CSS-rotated view, only while the phone is held upright (a phone already turned needs no rotation) */
     function setRot(on) {
@@ -443,20 +478,20 @@
       relayout();
     }
     function relayout() {
-      setTimeout(function () { st.z = 1; st.px = 0; st.py = 0; st.cx = -1; ensureCursor(); paint(); }, 350);
+      setTimeout(function () { st.z = 1; st.px = 0; st.py = 0; ensureCursor(); paint(); }, 350);
     }
-    function onFs() { if (!fsEl() && st.landscape && !opts.native && !st.rot) { st.landscape = false; stage.classList.remove("aiwt-full"); landBtn.textContent = "横屏"; landBtn.classList.remove("on"); if (opts.onLandscape) opts.onLandscape(false); relayout(); } }
+    function onFs() { if (!fsEl() && st.landscape && !opts.native && !st.rot && !wantRot) { st.landscape = false; stage.classList.remove("aiwt-full"); landBtn.textContent = "横屏"; landBtn.classList.remove("on"); if (opts.onLandscape) opts.onLandscape(false); relayout(); } }
     doc.addEventListener("fullscreenchange", onFs); doc.addEventListener("webkitfullscreenchange", onFs);
-    function onResize() { if (st.landscape && !opts.native && stage.classList.contains("aiwt-full")) setRot(st.rot || win.innerHeight > win.innerWidth); else relayout(); }
+    function onResize() { if (st.landscape && !opts.native && stage.classList.contains("aiwt-full")) setRot(wantRot && win.innerHeight > win.innerWidth); else relayout(); }
     win.addEventListener("resize", onResize);
 
     setMode(st.mode);
     checkReach(); tidy();
-    var poll = setInterval(function () { if (st.gone) return; checkReach(); tidy(); if (st.cx < 0) { ensureCursor(); paint(); } }, 1500);
+    var poll = setInterval(function () { if (st.gone) return; checkReach(); tidy(); paint(); }, 1500);
 
     return {
       setMode: setMode, setLandscape: setLandscape,
-      state: function () { return { mode: st.mode, z: st.z, px: st.px, py: st.py, cx: st.cx, cy: st.cy, pass: st.pass, landscape: st.landscape, rot: st.rot }; },
+      state: function () { var c = cur0(); return { mode: st.mode, z: st.z, px: st.px, py: st.py, cx: c.x, cy: c.y, u: st.u, v: st.v, pass: st.pass, landscape: st.landscape, rot: st.rot, last: st.last }; },
       /** for tests / the screenshots: map a stage point to the iframe client point */
       map: function (x, y) { return toC({ x: x, y: y }); },
       detach: function () {
@@ -465,7 +500,7 @@
         win.removeEventListener("resize", onResize);
         doc.removeEventListener("fullscreenchange", onFs); doc.removeEventListener("webkitfullscreenchange", onFs);
         [ov, cur, dot, loupe, bar, note, kb].forEach(function (e) { e.remove(); });
-        frame.style.transform = ""; stage.classList.remove("aiwt-stage", "aiwt-full", "aiwt-rot");
+        frame.style.transform = ""; frame.style.width = ""; frame.style.height = ""; stage.classList.remove("aiwt-stage", "aiwt-full", "aiwt-rot");
       }
     };
   }

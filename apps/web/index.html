@@ -80,6 +80,7 @@
           <input type="file" id="hlib" hidden multiple accept="image/*,video/*" onchange="hUpload(this.files, this)" />
           <div class="hinput"><span id="htokens" class="htokens"></span>
             <textarea id="hprompt" rows="1" placeholder="和我聊聊，或输入 / 选技能…" oninput="hInput(this)" onkeydown="hKey(event)" onblur="hBlur()" aria-autocomplete="list" aria-controls="hskills"></textarea></div>
+          <button type="button" class="hmic" id="hMicBtn" onclick="hVoice()" aria-label="语音输入" hidden><i data-i="mic"></i></button>
           <button class="send" id="hSendBtn" aria-label="发送"><i data-i="up"></i></button>
         </form>
       </div>

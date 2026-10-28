@@ -310,3 +310,13 @@ html[data-theme=light] .hbb:hover { box-shadow:0 6px 28px rgba(240,160,48,.32); 
 .hbd.d2 { opacity:1; }
 html[data-theme=light] .hhist { background:#fff; color:#b8680c; border-color:rgba(240,160,48,.7); }
 .deep-hit{outline:2px solid var(--amber);outline-offset:2px;border-radius:12px;animation:deepHit 1.6s ease-out 2}@keyframes deepHit{0%{box-shadow:0 0 0 0 rgba(232,160,80,.6)}100%{box-shadow:0 0 0 14px rgba(232,160,80,0)}}
+/* 3.8 mic at the right of the input (empty box), ■ while listening; queued messages under the chat */
+.hmic { width:36px; height:36px; flex:none; border-radius:50%; border:1px solid var(--line, rgba(128,128,128,.35)); background:transparent;
+  color:inherit; display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
+.hmic[hidden], #hSendBtn[hidden] { display:none !important; }
+.hmic svg { width:18px; height:18px; }
+.hmic.rec { background:var(--h-amber); border-color:var(--h-amber); color:var(--h-ink); box-shadow:0 0 0 0 rgba(240,160,48,.55); animation:hmicPulse 1.3s ease-out infinite; }
+@keyframes hmicPulse { 0% { box-shadow:0 0 0 0 rgba(240,160,48,.55); } 100% { box-shadow:0 0 0 12px rgba(240,160,48,0); } }
+#hmsgs .hqueued .bubble { opacity:.6; cursor:pointer; }
+#hmsgs .hq-meta { color:var(--h-amber); font-size:12px; text-align:right; }
+#hmsgs .hq-meta .link { color:inherit; text-decoration:underline; font-size:12px; padding:0; }

@@ -19,7 +19,7 @@
    Loaded last: wraps go()/newThread() from app.js; the task view itself is untouched. */
 "use strict";
 
-const HS = { msgs: [], hasMore: false, loading: false, loaded: false, stream: null, mode: "auto", attach: [], scroll: null,
+const HS = { msgs: [], outbox: [], hasMore: false, loading: false, loaded: false, stream: null, mode: "auto", attach: [], scroll: null,
   sending: false, agent: "", lastRead: 0, tasks: [], tkFilter: "all", archived: [], skills: [], stageOff: false, liveAv: null };
 const hBox = () => $("hmsgs");
 const hTime = (ts) => { const d = new Date(ts * 1000), n = new Date();
@@ -170,7 +170,7 @@ function hRender(keep) {
   const list = HS.msgs.slice();
   if (HS.stream) list.push(HS.stream);
   const top = HS.hasMore ? `<div class="hmore">${HS.loading ? "加载中…" : "上滑加载更早的消息"}</div>` : (list.length ? `<div class="hmore end">· 聊天从这里开始 ·</div>` : "");
-  box.innerHTML = list.length ? top + list.map(hMsg).join("") : hEmpty();
+  box.innerHTML = (list.length ? top + list.map(hMsg).join("") : hEmpty()) + (HS.outbox || []).map(hQueued).join("");
   paintIcons(box);
   hThinkLive();
   if (keep === "bottom") hScrollLatest();
@@ -285,7 +285,7 @@ function hKey(e) {
   if (e.key === "Backspace" && HS.skills.length && t.selectionStart === 0 && t.selectionEnd === 0) { e.preventDefault(); hSkRemove(HS.skills[HS.skills.length - 1]); return; }
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && window.innerWidth > 760) { e.preventDefault(); hSend(e); }
 }
-function hInput(el) { autoGrow(el); localStorage.setItem("aiw_hdraft", el.value); hStageTyping(el.value); hSlashCheck(el); }
+function hInput(el) { autoGrow(el); localStorage.setItem("aiw_hdraft", el.value); hStageTyping(el.value); hSlashCheck(el); hKeys(); }
 function hBlur() { setTimeout(() => { if (document.activeElement !== $("hprompt")) { hSkClose(); hStageTyping($("hprompt").value, true); } }, 150); }
 function hUse(t) { $("hprompt").value = t; autoGrow($("hprompt")); $("hprompt").focus(); hStageTyping(t); }
 function hStreamShow(text, note) {
@@ -298,11 +298,21 @@ function hStreamShow(text, note) {
   if (!hPatch(HS.stream)) hRender();
   if (near) hScrollLatest();
 }
-function hSendKey(busy) {   // ↑ send / ■ stop while 球球 is answering
-  const b = $("hSendBtn"); if (!b) return;
-  b.classList.toggle("stop", !!busy); b.classList.remove("busy");
-  b.setAttribute("aria-label", busy ? "停止" : "发送"); b.title = busy ? "停止" : "";
-  b.innerHTML = icon(busy ? "stop" : "up");
+function hSendKey(busy) { hKeys(); }
+/* 3.8 the right-hand button(s): listening -> the mic (■ to finish); typed text / files -> ↑ send (queued while 球球
+   answers); a reply with nothing typed -> ■ stop; otherwise the mic (Web Speech API where the browser has it) */
+function hKeys() {
+  const b = $("hSendBtn"), mic = $("hMicBtn"); if (!b) return;
+  const box = $("hprompt"), has = !!((box && box.value.trim()) || HS.attach.length);
+  const canMic = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  const stop = HS.sending && !has && !hRec;
+  const showMic = !!mic && canMic && (hRec || (!has && !HS.sending));
+  b.hidden = showMic;
+  if (mic) { mic.hidden = !showMic; mic.classList.toggle("rec", !!hRec); mic.setAttribute("aria-label", hRec ? "停止语音输入" : "语音输入");
+    mic.innerHTML = hRec ? icon("stop") : icon("mic"); }
+  b.classList.toggle("stop", stop); b.classList.remove("busy");
+  b.setAttribute("aria-label", stop ? "停止" : HS.sending ? "排队发送" : "发送"); b.title = stop ? "停止" : "";
+  b.innerHTML = icon(stop ? "stop" : "up");
 }
 async function hStop() {
   try {
@@ -312,18 +322,43 @@ async function hStop() {
 }
 async function hSend(e) {
   if (e) e.preventDefault();
-  if (HS.sending) { hStop(); return; }
   hSkClose();
   const box = $("hprompt"), raw = box.value, body = raw.trim();
+  // 3.8: while 球球 answers, an empty box stops the reply; a typed message queues and goes out after it (before, the
+  // button was always 停止 then, and Enter stopped the reply instead of sending what you typed)
+  if (HS.sending && !body && !HS.attach.length) { hStop(); return; }
+  if (hRec) hRec.stop();
   if (HS.attach.some((a) => a.up)) { toast("附件还在上传，传完再发"); return; }
   if (!body && !HS.attach.length) { if (HS.skills.length) toast("说说要用这个技能做什么"); return; }
   const skills = HS.skills.slice();
   const text = skills.length ? `【技能：${skills.join("、")}】\n${body}` : body;   // the old + menu's marker (agent_runtime/skills.py)
   const attachments = HS.attach.map(({ up, pct, uid, ...a }) => a), mode = HS.mode;
-  HS.sending = true; hSendKey(true);
   if (hStaged()) { HS.stageOff = true; hStage(false); }
   box.value = ""; autoGrow(box); localStorage.removeItem("aiw_hdraft"); HS.attach = []; hRenderAttach(); hSetMode("auto");
   HS.skills = []; hRenderTokens();
+  if (HS.sending) { HS.outbox.push({ id: "q-" + Date.now(), text, attachments, mode }); hRender(); hScrollLatest(); hKeys(); return; }
+  await hSendNow(text, attachments, mode, { raw, skills });
+  await hFlush();
+}
+async function hFlush() {   // queued messages, oldest first, one after the other
+  while (!HS.sending && HS.outbox.length) {
+    const q = HS.outbox.shift();
+    if (!(await hSendNow(q.text, q.attachments, q.mode))) { HS.outbox.unshift(q); hRender(); break; }
+  }
+}
+function hQueued(q) {
+  return `<div class="u hrow hqueued" data-id="${q.id}"><div class="bubble" onclick="hQueuedMenu('${q.id}')" title="点一下：立即发送或删除">${hUserText(q.text || "（附件）")}</div>
+    <div class="hmeta hq-meta">排队中 · 回复完自动发送 · <button class="link" onclick="hQueuedNow('${q.id}')">立即发送</button> · <button class="link" onclick="hQueuedDrop('${q.id}')">删除</button></div></div>`;
+}
+function hQueuedMenu(id) { if (confirm(HS.sending ? "立即发送这条？（会停止球球正在写的回复）\n取消 = 继续排队" : "立即发送这条？")) hQueuedNow(id); }
+async function hQueuedNow(id) {
+  const i = HS.outbox.findIndex((q) => q.id === id); if (i < 0) return;
+  HS.outbox.unshift(HS.outbox.splice(i, 1)[0]);
+  if (HS.sending) await hStop(); else await hFlush();
+}
+function hQueuedDrop(id) { HS.outbox = HS.outbox.filter((q) => q.id !== id); hRender(); hKeys(); }
+async function hSendNow(text, attachments, mode, undo) {
+  HS.sending = true; hSendKey(true);
   hUpsert({ id: "tmp-" + Date.now(), role: "user", kind: "text", text: text || "（附件）", data: { attachments }, tmp: true }, { stick: true });
   hStreamShow("", "正在想…");
   let gotReply = false;
@@ -356,12 +391,14 @@ async function hSend(e) {
   } catch (err) {
     toast("发送失败：" + err.message);
     HS.msgs = HS.msgs.filter((m) => !m.tmp);
-    if (!$("hprompt").value) { box.value = raw; autoGrow(box); }
-    HS.attach = attachments; hRenderAttach(); HS.skills = skills; hRenderTokens();
+    const box = $("hprompt");
+    if (undo && !box.value) { box.value = undo.raw; autoGrow(box); HS.attach = attachments; hRenderAttach(); HS.skills = undo.skills; hRenderTokens(); }
+    return false;
   } finally {
     HS.stream = null; HS.sending = false; hSendKey(false);
     hRender(); if (gotReply) hScrollLatest();
   }
+  return true;
 }
 /* + sheet: photos, videos and files go up as raw bytes (POST /api/uploads/raw; a video is far over the old 40 MB JSON cap) */
 const H_MAX_MB = 500;
@@ -397,6 +434,7 @@ async function hUpload(list, input) {
   }
 }
 function hRenderAttach() {
+  setTimeout(hKeys, 0);
   $("hattach").innerHTML = HS.attach.map((a, i) => `<span class="chip ${a.up ? "up" : ""}">${hAttIcon(a)} ${esc(a.name)}${a.up ? `<span class="hpct">${a.pct || 0}%</span>` : ""}<button class="link" aria-label="移除" onclick="HS.attach.splice(${i},1);hRenderAttach()">${icon("x")}</button></span>`).join("");
 }
 function hSetMode(m) {
@@ -500,10 +538,12 @@ function hVoice() {   // dictation into the input (the browser's speech recognit
   if (hRec) { hRec.stop(); return; }
   const el = $("hprompt"), base = el.value;
   hRec = new SR(); hRec.lang = "zh-CN"; hRec.interimResults = true; hRec.continuous = true;
-  hRec.onresult = (e) => { let t = ""; for (const r of e.results) t += r[0].transcript; el.value = (base ? base + " " : "") + t; hInput(el); };
-  hRec.onend = () => { hRec = null; $("hPlusBtn").classList.remove("rec"); };
-  hRec.onerror = (e) => toast("语音输入：" + e.error);
-  hRec.start(); $("hPlusBtn").classList.add("rec"); toast("在听…再点一次 ＋ › 语音 结束");
+  hRec.onresult = (e) => { let t = ""; for (const r of e.results) t += r[0].transcript;
+    el.value = base + (base && /[A-Za-z0-9]$/.test(base) && /^[A-Za-z0-9]/.test(t) ? " " : "") + t; hInput(el); };
+  hRec.onend = () => { hRec = null; $("hPlusBtn").classList.remove("rec"); hKeys(); };
+  hRec.onerror = (e) => toast(e.error === "not-allowed" || e.error === "service-not-allowed" ? "没有麦克风权限：在浏览器的网站设置里允许麦克风" : "语音输入：" + e.error);
+  try { hRec.start(); } catch (err) { hRec = null; toast("语音输入没能开始：" + err.message); hKeys(); return; }
+  $("hPlusBtn").classList.add("rec"); hKeys(); toast("在听…点右边的 ■ 结束");
 }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("hsheet").classList.contains("on")) hSheet(false); });
 
@@ -837,3 +877,5 @@ function tSheet(on) {
   const pm = $("plusMenu"); if (on && pm) pm.classList.remove("open");
 }
 function tPick(id) { tSheet(false); $(id).click(); }
+
+setTimeout(() => { try { hKeys(); } catch (e) { /* composer not on this page */ } }, 0);

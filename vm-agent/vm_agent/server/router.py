@@ -57,7 +57,7 @@ class Router:
             A.FILES_READ: lambda p: _sync(fread.read, p["path"], p.get("binary", False)),
             A.FILES_WRITE: lambda p: _sync(fwrite.write, p["path"], p["content"], p.get("append", False)),
             A.FILES_DOWNLOAD: lambda p: transfer.download(p["url"], p.get("path")),
-            A.FILES_UPLOAD: lambda p: _sync(transfer.upload, p["path"], p["content_b64"]),
+            A.FILES_UPLOAD: lambda p: _sync(transfer.upload, p["path"], p["content_b64"], bool(p.get("append"))),
             A.HEALTH: lambda p: _sync(health, b.name),
         }
         self.handlers = {k.value if hasattr(k, "value") else k: v for k, v in self.handlers.items()}

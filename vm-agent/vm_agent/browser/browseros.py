@@ -29,6 +29,10 @@ BINARIES = ("browserclaw", "browseros", "browseros-neo")
 # windows/history; save_skill/mark_skill_run; request_human_help: AIW has its own takeover) is refused here.
 ALLOWED = {"tabs", "navigate", "snapshot", "diff", "act", "read", "grep", "wait", "upload", "screenshot", "name_session"}
 MAX_TEXT = int(os.environ.get("VM_AGENT_BOS_MAX_TEXT", "60000"))
+# calls after which the page they worked on is brought to the front of the screen (the user watching the desktop, or
+# taking it over, sees the page the agent is on; BrowserOS itself opens every agent page in the background)
+FRONT_TOOLS = {"tabs", "navigate", "act", "read", "snapshot", "grep", "diff", "wait", "upload", "screenshot"}
+FRONT_SKIP_S = 30   # same page, same active window as last time, within this long: already in front
 IDLE_S = 4 * 3600   # forget a task's MCP connection after this long unused
 _TIP = re.compile(r"^Tip: this session is .*$", re.M)
 
@@ -89,6 +93,7 @@ class BrowserOS:
         self.conns: dict[str, dict] = {}       # task key -> {"sid", "used", "named"}
         self._locks: dict[str, asyncio.Lock] = {}
         self._start_lock = asyncio.Lock()
+        self._fronted: dict[str, tuple] = {}     # task key -> (page, active window title, time) of the last front
 
     @property
     def url(self) -> str:
@@ -162,7 +167,7 @@ class BrowserOS:
             self._locks.pop(k, None)
 
     async def call(self, key: str, tool: str, args: Optional[dict] = None, title: Optional[str] = None,
-                   category: Optional[str] = None) -> dict:
+                   category: Optional[str] = None, front: Optional[bool] = None) -> dict:
         if tool not in ALLOWED and tool not in ("front", "page_shot"):
             raise PermissionError(f"BrowserOS tool '{tool}' is not available through AIW")
         await self.ensure_running()
@@ -174,7 +179,21 @@ class BrowserOS:
                 return await self._front(key, (args or {}).get("page"))
             if tool == "page_shot":
                 return await self._page_shot(key, (args or {}).get("page"))
-            return await self._call(key, tool, _clean_args(tool, args or {}), title, category)
+            clean = _clean_args(tool, args or {})
+            out = await self._call(key, tool, clean, title, category)
+            page = front_page(tool, clean, out) if self._autofront(front) else None
+            if page is not None:
+                try:
+                    f = await asyncio.wait_for(self._front(key, page, quick=True), 25)
+                    out["front"] = {k: f.get(k) for k in ("verified", "how", "window", "page") if k in f}
+                except Exception as e:  # noqa: BLE001 - showing the page is a courtesy; the call itself worked
+                    out["front"] = {"verified": False, "error": f"{type(e).__name__}: {e}"[:200]}
+            return out
+
+    def _autofront(self, front: Optional[bool]) -> bool:
+        if front is not None:
+            return bool(front)
+        return (self.env.get("VM_AGENT_BOS_AUTOFRONT") or os.environ.get("VM_AGENT_BOS_AUTOFRONT") or "1") != "0"
 
     async def _call(self, key: str, tool: str, args: dict, title: Optional[str], category: Optional[str]) -> dict:
         for attempt in range(2):
@@ -205,10 +224,12 @@ class BrowserOS:
     async def _target(self, key: str, page) -> tuple[Optional[dict], str]:
         """(DevTools target of a task's page, error text). The page number is BrowserOS's, from its tab list."""
         listing = (await self._call(key, "tabs", {"action": "list"}, None, None)).get("text", "")
-        url = None
-        for m in re.finditer(r"^\[(\d+)\]\s+(\S+)", listing, re.M):
+        url, group = None, None
+        for m in re.finditer(r"^\[(\d+)\]\s+(\S+)(.*)$", listing, re.M):
             if page is None or int(m.group(1)) == int(page):
                 url = m.group(2)
+                g = re.search(r"\[group ([0-9A-Za-z_-]+)\]", m.group(3) or "")
+                group = g.group(1) if g else None
                 if page is not None:
                     break
         if not url:
@@ -222,6 +243,7 @@ class BrowserOS:
         if not t:
             return None, f"no DevTools target for {url}"
         t["_cdp"] = cdp
+        t["_group"] = group
         return t, ""
 
     async def _sh(self, cmd: str) -> str:
@@ -231,49 +253,63 @@ class BrowserOS:
         out, _ = await asyncio.wait_for(proc.communicate(), 10)
         return (out or b"").decode(errors="ignore")
 
-    async def _front(self, key: str, page) -> dict:
-        """Bring a task's page to the front: its tab in its window, and THAT window on top of the desktop.
+    async def _active_page(self, key: str) -> Optional[int]:
+        """BrowserOS's own answer to which page is the selected tab ('Active page: [3] ...')."""
+        txt = (await self._call(key, "tabs", {"action": "active"}, None, None)).get("text", "")
+        m = re.search(r"Active page:\s*\[(\d+)\]", txt)
+        return int(m.group(1)) if m else None
 
-        BrowserOS keeps each AIW task's tabs in a tab group of their own window. The old code raised whichever
-        BrowserOS window xdotool found first, which was often the user's window with the session-replay page
-        (task-d76ffb0bd1: 13 screenshots of the replay page while the captcha sat in the task's window). Now the
-        window is found by the tab's title and the result says whether the desktop really shows the page."""
+    async def _front(self, key: str, page, quick: bool = False) -> dict:
+        """Bring a task's page to the front: its tab selected in its window, and THAT window on top of the desktop.
+
+        BrowserOS opens every agent page in the background, in a tab group of the task that it may show collapsed,
+        and it ignores DevTools activation of those tabs: /json/activate, Target.activateTarget and Page.bringToFront
+        all answer OK and the window keeps showing the BrowserOS neo home tab (checked live on 云电脑 2, 2026-10-28,
+        after bos_tabs opened github.com/liangdabiao/whiteboard-teacher-video). So: expand the task's group, then
+        chrome_cdp.front (DevTools activation + raise the window, and when the window's title still is not the page's,
+        Ctrl+PageDown in that window until it is). Checked by the window title and BrowserOS's own active page.
+        quick: skip everything when this page was put in front last time and the same window is still active."""
+        from . import chrome_cdp
+        if quick:
+            last = self._fronted.get(key)
+            if last and last[0] == page and time.time() - last[2] < FRONT_SKIP_S:
+                now = (await self._sh("xdotool getactivewindow getwindowname 2>/dev/null")).strip()
+                if now and now == last[1]:
+                    return {"ok": True, "is_error": False, "verified": True, "how": "already", "window": now,
+                            "page": page, "text": f"page {page} is already in front"}
         t, err = await self._target(key, page)
         if not t:
             return {"ok": False, "is_error": True, "text": err}
-        async with httpx.AsyncClient(timeout=5, trust_env=False) as cl:
-            await cl.get(f"http://127.0.0.1:{t['_cdp']}/json/activate/{t['id']}")
-        await asyncio.sleep(0.3)
-        title = (t.get("title") or "").strip()
-        verified, active = False, ""
-        try:
-            if title:
-                pat = re.escape(title[:60]).replace("'", ".")
-                ids = (await self._sh(f"xdotool search --name '{pat}' 2>/dev/null")).split()
-                for wid in ids[:6]:
-                    await self._sh(f"xdotool windowmap {wid} 2>/dev/null; xdotool windowactivate --sync {wid} 2>/dev/null; "
-                                   f"xdotool windowraise {wid} 2>/dev/null; true")
-                    active = (await self._sh("xdotool getactivewindow getwindowname 2>/dev/null")).strip()
-                    if title[:30] in active:
-                        verified = True
-                        break
-            if not verified:   # no window title to go by: the old way, then check again
-                await self._sh("xdotool search --onlyvisible --class 'browserclaw|chromium-browser|BrowserOS' "
-                               "windowactivate 2>/dev/null; wmctrl -x -a browserclaw 2>/dev/null; true")
-                active = (await self._sh("xdotool getactivewindow getwindowname 2>/dev/null")).strip()
-                verified = bool(title) and title[:30] in active
-        except Exception:  # noqa: BLE001  no xdotool / no X: the page itself is still activated
-            pass
-        url = t.get("url") or ""
+        if t.get("_group"):   # a tab in a collapsed group cannot be selected from the keyboard (and is invisible)
+            try:
+                await self._call(key, "tab_groups", {"action": "update", "groupId": t["_group"], "collapsed": False},
+                                 None, None)
+            except Exception:  # noqa: BLE001
+                pass
+        env = {**self.env, "DISPLAY": self.env.get("DISPLAY") or os.environ.get("DISPLAY") or ":0"}
+        f = await asyncio.to_thread(chrome_cdp.front, t["_cdp"], t["id"], t.get("url") or "", env)
+        verified, active = bool(f.get("verified")), f.get("window") or ""
+        if page is not None:
+            try:
+                ap = await self._active_page(key)
+                if ap is not None and ap != int(page):
+                    verified = False
+            except Exception:  # noqa: BLE001
+                pass
+        if verified:
+            self._fronted[key] = (page, active, time.time())
+        else:
+            self._fronted.pop(key, None)
+        url, title = t.get("url") or "", (t.get("title") or "").strip()
         if verified:
             text = (f"page {page} ({url}) is now the visible tab and its window is on top of the desktop; "
                     "screenshot / click by coordinates now act on it.")
         else:
-            text = (f"page {page} ({url}) is the active tab of its BrowserOS window, but the desktop shows another "
+            text = (f"page {page} ({url}) could not be brought to the front; the desktop shows another "
                     f"window ({active or 'unknown'}). Desktop screenshots will NOT show this page; the agent uses a "
                     "picture of the page itself instead.")
         return {"ok": True, "is_error": False, "text": text, "verified": verified, "window": active, "url": url,
-                "title": title}
+                "title": title, "how": f.get("how"), "page": page}
 
     async def _page_shot(self, key: str, page) -> dict:
         """A picture of the page itself over DevTools (Page.captureScreenshot), whatever window is on the desktop.
@@ -335,6 +371,24 @@ def _running() -> bool:
     except OSError:
         pass
     return False
+
+
+def front_page(tool: str, args: dict, out: dict) -> Optional[int]:
+    """The page a successful call opened or worked on, when it is one to show; None = leave the screen alone."""
+    if tool not in FRONT_TOOLS or not out.get("ok") or out.get("is_error"):
+        return None
+    if tool == "tabs":
+        act = str(args.get("action") or "")
+        if act not in ("new", "open"):
+            return None   # list / active / close show nothing new
+        m = re.search(r"(?:opened|new) page\s*\[?(\d+)", out.get("text") or "", re.I) or \
+            re.search(r"^\[(\d+)\]", out.get("text") or "", re.M)
+        return int(m.group(1)) if m else None
+    p = args.get("page")
+    try:
+        return int(p) if p is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _label(title: str) -> str:

@@ -65,7 +65,9 @@ class Router:
     async def _bos_call(self, p):
         if p["tool"] == "close":
             return await self.bos.close(p.get("key") or "default")
-        return await self.bos.call(p.get("key") or "default", p["tool"], p.get("args") or {}, p.get("title"), p.get("category"))
+        kw = {"front": bool(p["front"])} if p.get("front") is not None else {}   # False: a lookup, keep the screen
+        return await self.bos.call(p.get("key") or "default", p["tool"], p.get("args") or {}, p.get("title"), p.get("category"),
+                                   **kw)
 
     async def _bos_status(self, p):
         st = bos_status()

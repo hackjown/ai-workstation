@@ -335,3 +335,18 @@ async def test_takeover_choice_posts_a_takeover_message(stack):
         return next((m for m in h if m["kind"] == "task_result"), None)
     res = await wait_for(ended, 10)
     assert res["data"]["status"] in ("stopped", "failed")
+
+
+def test_answer_text_never_shows_null():
+    """3.7: a resolved ask/form card showed "已回答：<null>" (iOS printed NSNull). The server now sends resolved.text."""
+    from aiw_api.chat import answer_text, _row
+    import json as _j
+    assert answer_text(None) == "" and answer_text("") == "" and answer_text("null") == "" and answer_text("{}") == ""
+    assert answer_text("done") == "已完成，交还给电脑" and answer_text("__cancel__") == "已取消"
+    assert answer_text("A1893，iPadOS 17") == "A1893，iPadOS 17"
+    f = [{"key": "model", "label": "型号"}, {"key": "os", "label": "系统版本"}]
+    assert answer_text(_j.dumps({"model": "A2602", "os": "17.5"}, ensure_ascii=False), f) == "型号：A2602；系统版本：17.5"
+    row = _row({"id": "m", "data": _j.dumps({"resolved": {"answer": None}})})
+    assert row["data"]["resolved"]["text"] == ""
+    row = _row({"id": "m", "data": _j.dumps({"resolved": {"answer": True}})})
+    assert row["data"]["resolved"]["text"] == "已允许"

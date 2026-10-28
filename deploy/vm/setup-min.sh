@@ -129,6 +129,8 @@ bash "$REPO/deploy/vm/toolbox-setup.sh" install || true   # office/PDF/OCR/image
 [ "${AIW_BROWSEROS:-0}" = 1 ] && { DISPLAY=:1 bash "$REPO/deploy/vm/browseros-setup.sh" install || true; }
 D=$H/Desktop; mkdir -p "$D"; for a in librecad libreoffice-writer libreoffice-calc; do [ -f /usr/share/applications/$a.desktop ] && cp -f /usr/share/applications/$a.desktop "$D/" && chmod +x "$D/$a.desktop"; done
 xfconf-query --display :1 -c xfwm4 -p /general/use_compositing -n -t bool -s false 2>/dev/null || true
+# Chrome/Chromium always with the DevTools port 9222 (menu, panel, desktop icon, autostart): price watch + browser tools
+bash "$REPO/deploy/vm/chrome-cdp-setup.sh" install || true
 
 echo
 echo "Done. Virtual desktop :1 ($GEOMETRY) runs at boot without any login."

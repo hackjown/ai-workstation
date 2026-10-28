@@ -74,9 +74,23 @@ function hTaskCard(m) {
   const retry = ["failed", "stopped", "interrupted"].includes(st) && d.task_id
     ? `<button class="btn xs" onclick="event.stopPropagation();hRetry('${esc(d.task_id)}')">${icon("retry")}重试</button>` : "";
   return hA(m, `<div class="hcard st-${esc(st)}" role="button" tabindex="0" onclick="hOpenTask('${m.id}')" onkeydown="if(event.key==='Enter')hOpenTask('${m.id}')">
-    <div class="hc-ic">${live && st === "running" ? '<span class="spin"></span>' : icon("monitor")}</div>
+    <div class="hc-ic">${live && st === "running" ? '<span class="spin"></span>' : st === "succeeded" ? icon("check") : icon("monitor")}</div>
     <div class="grow"><div class="hc-t">${esc(d.title || m.text || "任务")}</div><div class="hc-s">${esc(sub || "交给电脑的任务")}</div>${plan}</div>
     <div class="hc-r">${chip(st)}${retry}<span class="hc-go">${icon("chev")}</span></div></div>`, "nm");
+}
+/* what a resolved question / form card says (3.7: the server sends resolved.text; a form answered with nothing used
+   to show "已回答：null") */
+function hResolved(r) {
+  const a = r.answer;
+  if (a === true || a === false) return a ? "已允许" : "已拒绝";
+  let t = typeof r.text === "string" ? r.text : null;
+  if (t === null) {
+    t = a == null ? "" : a === "done" ? "已完成，交还给电脑" : String(a);
+    if (/^\s*\{/.test(t)) { try { const o = JSON.parse(t); t = Object.entries(o).filter(([, v]) => v != null && String(v).trim()).map(([k, v]) => k + "：" + v).join("；"); } catch (e) { /* keep */ } }
+  }
+  t = t.trim();
+  if (!t || t === "null" || t === "{}") return "已回答";
+  return t.startsWith("已") ? t : "已回答：" + t.slice(0, 80);
 }
 function hAsk(m) {
   const d = m.data || {}, k = d.ask_kind || "question";
@@ -85,8 +99,7 @@ function hAsk(m) {
     <div class="hq-q">${esc(m.text || d.question || "")}</div>`;
   if (k === "takeover" && d.takeover && (d.takeover.steps || d.takeover.reason)) body += `<div class="small hq-d">${esc(d.takeover.steps || d.takeover.reason)}</div>`;
   if (done) {
-    const a = done.answer;
-    body += `<div class="hq-done">${icon("check")}${esc(a === true ? "已允许" : a === false ? "已拒绝" : a === "done" ? "已完成，交还给电脑" : "已回答：" + String(a).slice(0, 80))}</div>`;
+    body += `<div class="hq-done">${icon("check")}${esc(hResolved(done))}</div>`;
   } else if (stale) {
     body += `<div class="hq-done muted">已过期（任务已经不在等这个回答）</div>`;
   } else if (k === "takeover") {
@@ -768,3 +781,49 @@ if ($("hprompt").value.trim()) HB.stopped = true;   // a draft is waiting: 球�
 paintIcons();
 go("home");
 autoGrow($("hprompt"));   // measured once the view is visible (a hidden textarea measures 0)
+
+
+/* ======================================================= 3.7
+   * ↓ 最新消息 / ↓ 最新 float above the composer's REAL top (its height changes with attachments, the skill picker,
+     a growing textarea, the on-screen keyboard), not at a fixed 110px that the input bar grew over
+   * the task view's "+" opens the same WeChat-like panel as the chat (拍照 / 录视频 / 照片/视频 / 文件 / 技能) */
+function hPlaceFabs() {
+  [["hToLatest", "v-home"], ["toLatest", "v-chat"]].forEach(([f, v]) => {
+    const fab = $(f), view = $(v); if (!fab || !view) return;
+    const w = view.querySelector(".composer-wrap"); if (!w) return;
+    const vb = view.getBoundingClientRect(), wb = w.getBoundingClientRect();
+    if (!vb.height || !wb.height) return;
+    fab.style.bottom = Math.max(12, Math.round(vb.bottom - wb.top + 12)) + "px";
+  });
+}
+(function () {
+  const ro = window.ResizeObserver ? new ResizeObserver(() => hPlaceFabs()) : null;
+  document.querySelectorAll("#v-home, #v-chat, #v-home .composer-wrap, #v-chat .composer-wrap").forEach((e) => ro && ro.observe(e));
+  window.addEventListener("resize", hPlaceFabs);
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", hPlaceFabs);
+  const _go37 = go; go = function () { const r = _go37.apply(this, arguments); setTimeout(hPlaceFabs, 0); return r; };
+  setTimeout(hPlaceFabs, 0);
+})();
+(function tSheetSetup() {
+  const view = $("v-chat"), clip = document.querySelector('#v-chat .composer button[aria-label="添加"], #v-chat .composer button[aria-label="附件"]');
+  if (!view || !clip || $("tsheet")) return;
+  view.insertAdjacentHTML("beforeend", `<div id="tsheetDim" class="hsheet-dim" onclick="tSheet(false)"></div>
+    <div id="tsheet" class="hsheet" role="dialog" aria-label="添加" aria-hidden="true"><div class="hs-grab"></div><div class="hs-grid"><div class="hs-page">
+      <button class="hs-it" onclick="tPick('tcam')"><span class="hs-ic">${icon("camera")}</span>拍照</button>
+      <button class="hs-it" onclick="tPick('tvid')"><span class="hs-ic">${icon("video")}</span>录视频</button>
+      <button class="hs-it" onclick="tPick('tlib')"><span class="hs-ic">${icon("image")}</span>照片/视频</button>
+      <button class="hs-it" onclick="tPick('file')"><span class="hs-ic">${icon("folder")}</span>文件</button>
+      <button class="hs-it" onclick="tSheet(false);togglePlus()"><span class="hs-ic">${icon("sparkle")}</span>技能</button>
+    </div></div></div>
+    <input type="file" id="tcam" hidden accept="image/*" capture="environment" onchange="uploadFiles(this.files)" />
+    <input type="file" id="tvid" hidden accept="video/*" capture="environment" onchange="uploadFiles(this.files)" />
+    <input type="file" id="tlib" hidden multiple accept="image/*,video/*" onchange="uploadFiles(this.files)" />`);
+  clip.setAttribute("onclick", "tSheet()");
+  clip.classList.add("hplus"); clip.innerHTML = "＋";
+})();
+function tSheet(on) {
+  const sh = $("tsheet"); if (!sh) return; if (on === undefined) on = !sh.classList.contains("on");
+  sh.classList.toggle("on", on); $("tsheetDim").classList.toggle("on", on); sh.setAttribute("aria-hidden", on ? "false" : "true");
+  const pm = $("plusMenu"); if (on && pm) pm.classList.remove("open");
+}
+function tPick(id) { tSheet(false); $(id).click(); }

@@ -61,7 +61,7 @@ const IC = {
   clip: "M21.4 11.1l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5",
   mic: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3",
   eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z", up: "M12 19V5M5 12l7-7 7 7", stop: "M7 7h10v10H7z", check: "M20 6 9 17l-5-5", x: "M18 6 6 18M6 6l12 12",
-  chev: "M9 18l6-6-6-6", bulb: "M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z", file: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6",
+  chev: "M9 18l6-6-6-6", back: "M15 18l-6-6 6-6", bulb: "M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7c.6.5 1 1.2 1 2V17h6v-.3c0-.8.4-1.5 1-2A7 7 0 0 0 12 2z", file: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6",
   retry: "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5", play: "M6 4l14 8-14 8z", hand: "M18 11V6a2 2 0 0 0-4 0M14 10V4a2 2 0 0 0-4 0v2M10 10.5V6a2 2 0 0 0-4 0v8a8 8 0 0 0 16 0v-3a2 2 0 0 0-4 0",
   receipt: "M4 2v20l3-2 3 2 3-2 3 2 3-2 1 .7V2l-3 2-3-2-3 2-3-2-3 2zM8 8h8M8 12h8M8 16h5", trash: "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6",
   bolt: "M13 2 3 14h9l-1 8 10-12h-9z", brain: "M12 5a3 3 0 0 0-5.9.8A3 3 0 0 0 4 11a3 3 0 0 0 2 5.2A3 3 0 0 0 12 18zM12 5a3 3 0 0 1 5.9.8A3 3 0 0 1 20 11a3 3 0 0 1-2 5.2A3 3 0 0 1 12 18z",
@@ -171,8 +171,10 @@ function subscribe(t) {
   if (S.sock[t.session_id]) return;
   const ws = new WebSocket(wsUrl(`/ws/session/${t.session_id}`));
   S.sock[t.session_id] = ws; S.evs[t.id] = [];
+  ws.onopen = () => { if (window.onAiwEventsOpen) window.onAiwEventsOpen(); };
   ws.onmessage = (m) => {
-    const e = JSON.parse(m.data); if (e.kind !== "event") return;
+    const e = JSON.parse(m.data);
+    if (window.onAiwEvent) { try { window.onAiwEvent(e); } catch (err) { console.warn(err); } }   // home.js: the persistent chat if (e.kind !== "event") return;
     // reasoning streamed while the model thinks: kept aside (replaced each time), not appended to the event list
     if (e.type === "agent.thinking" && (e.data || {}).live) { S.think[t.id] = e.data; onLiveEvent(curTask(t), e); return; }
     if (e.type === "agent.thinking" || e.type === "agent.decision") delete S.think[t.id];
@@ -738,8 +740,10 @@ async function openNote(id) {
 }
 function connectEvents() {
   const ws = new WebSocket(wsUrl("/ws/events"));
+  ws.onopen = () => { if (window.onAiwEventsOpen) window.onAiwEventsOpen(); };
   ws.onmessage = (m) => {
     const e = JSON.parse(m.data);
+    if (window.onAiwEvent) { try { window.onAiwEvent(e); } catch (err) { console.warn(err); } }   // home.js: the persistent chat
     if (e.kind === "notification") { $("bellDot").classList.add("on"); toast(e.notification.title + (e.notification.body ? "：" + e.notification.body.slice(0, 60) : ""));
       if (NATIVE) NATIVE.postMessage({ op: "notify", title: e.notification.title, body: e.notification.body || "" });
       else if (document.hidden && "Notification" in window && Notification.permission === "granted") new Notification(e.notification.title, { body: e.notification.body || "" }); }

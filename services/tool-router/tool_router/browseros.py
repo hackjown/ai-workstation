@@ -82,7 +82,8 @@ async def resolve(computer, key: Optional[str], page, refs: list[str], timeout: 
         return {}
     pat = r"\[ref=(" + "|".join(re.escape(r) for r in refs) + r")\]"
     r = await computer.execute("browseros.call", {"tool": "grep", "key": key or "default",
-                                                  "args": {"page": page, "over": "ax", "pattern": pat, "limit": 20}},
+                                                  "args": {"page": page, "over": "ax", "pattern": pat, "limit": 20},
+                                                  "front": False},   # a gate's lookup, not the agent's step
                                observe=False, timeout=timeout)
     if not getattr(r, "success", False):
         return {}

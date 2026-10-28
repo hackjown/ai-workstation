@@ -219,9 +219,9 @@ TOOLS: list[ToolSpec] = [
     # BrowserOS neo (only shown when the computer has it and the user left it on in 设置 › 电脑): element-level web
     # actions through its accessibility snapshot. Each one maps onto BrowserOS's MCP tool of the same suffix.
     ToolSpec("bos_tabs", "browseros.call",
-             "BrowserOS browser tabs (this task has its own tab group). action=new + url opens a page in the background "
-             "and returns its page id plus a first snapshot; list shows your pages; close closes one; front brings a page "
-             "to the front of the BrowserOS window when you must fall back to screenshot + click by coordinates.",
+             "BrowserOS browser tabs (this task has its own tab group). action=new + url opens a page and returns its page "
+             "id plus a first snapshot; list shows your pages; close closes one. The page you open or work on is put on "
+             "the screen automatically (the user watches it); front does that again by hand.",
              {"action": {"type": "string", "enum": ["new", "list", "active", "close", "front"]},
               "url": {"type": "string"}, "page": {"type": "integer"}}, ["action"]),
     ToolSpec("bos_navigate", "browseros.call",

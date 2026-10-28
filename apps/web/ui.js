@@ -282,10 +282,7 @@ loadSettings = async function () {
       <div class="savebar"><button class="btn sm primary">保存</button></div>
     </form>
     <div class="rows">
-      <div class="rw head"><div class="k">记忆 · Agent 每次任务都会参考</div><div class="small">${mems.length} 条</div></div>
-      ${mems.map((m) => `<div class="rw"><div class="memrow" style="grid-column:1/3">${esc(m.text)}<small>${m.source === "user" ? "你添加" : "Agent 记下"} · ${ago(m.created_at)}</small></div>
-        <div class="t"><button class="btn sm ghost" onclick='editMem(${esc(JSON.stringify(m))})'>编辑</button><button class="btn sm ghost" style="color:var(--bad)" onclick="delRow('memories','${m.id}',loadSettings)">删除</button></div></div>`).join("")}
-      <form onsubmit="addMem(event)">${row("添加记忆", "", `<input name="t" placeholder="例如：周报放在 ~/workspace/reports，用 Word 格式" />`, `<button class="btn sm">添加</button>`)}</form>
+      ${row("记忆", "聊天和每个任务都会参考；在聊天里说「记住…」「忘掉…」也行", `<span class="small">${mems.length} 条</span>`, `<button type="button" class="btn sm" onclick="go('memory')">管理记忆 ›</button>`)}
     </div>
   </section>
 

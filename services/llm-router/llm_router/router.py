@@ -51,6 +51,26 @@ class LLMProvider(abc.ABC):
         """Look at an image and answer in text (the 'eyes' role). Optional per provider."""
         raise NotImplementedError
 
+    async def chat(self, messages: list[dict], tools: Optional[list[dict]] = None, max_tokens: int = 1500,
+                   on_delta: Optional[Callable[[str], Awaitable[None]]] = None) -> dict:
+        """A multi-turn chat reply (the persistent 小秘 chat): {"content": str, "tool_calls": [{id, name, args}]}.
+        `messages` are OpenAI-style ({role, content} plus assistant tool_calls / role tool results); `on_delta` gets
+        each new piece of the visible answer while it streams. Providers without a native chat fall back to
+        complete() on the flattened conversation, with no tools."""
+        system = "\n\n".join(str(m.get("content") or "") for m in messages if m.get("role") == "system")
+        convo = flatten_chat([m for m in messages if m.get("role") != "system"])
+        text = await self.complete(system, convo, max_tokens)
+        if on_delta and text:
+            await on_delta(text)
+        return {"content": text or "", "tool_calls": []}
+
+
+def flatten_chat(messages: list[dict]) -> str:
+    """A chat as plain text for providers that only do single-prompt completions."""
+    names = {"user": "用户", "assistant": "助理", "tool": "工具结果"}
+    lines = [f"{names.get(m.get('role'), m.get('role'))}：{m.get('content') or ''}" for m in messages]
+    return "\n".join(lines) + "\n助理："
+
 
 class ScriptedProvider(LLMProvider):
     """Replays a fixed list of decisions. For tests and offline demos."""
@@ -145,6 +165,26 @@ class LLMRouter:
             except Exception as e:  # noqa: BLE001
                 last = e
         raise RuntimeError(f"no provider could describe the image: {last}")
+
+    async def chat(self, messages: list[dict], tools: Optional[list[dict]] = None, max_tokens: int = 1500,
+                   on_delta: Optional[Callable[[str], Awaitable[None]]] = None) -> dict:
+        """Chat reply with fallback across providers. Once a provider has streamed part of an answer the next one is
+        not tried (the user would see two answers glued together); the error goes up instead."""
+        last = None
+        for p in self.providers:
+            sent = []
+
+            async def cb(piece: str, _sent=sent):
+                _sent.append(piece)
+                if on_delta:
+                    await on_delta(piece)
+            try:
+                return await p.chat(messages, tools, max_tokens, cb if on_delta else None)
+            except Exception as e:  # noqa: BLE001
+                last = e
+                if sent:
+                    raise
+        raise RuntimeError(f"no provider could chat: {type(last).__name__}: {last}")
 
     async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
         last = None

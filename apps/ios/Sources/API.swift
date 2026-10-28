@@ -82,10 +82,29 @@ final class API: ObservableObject {
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         let obj = (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) ?? [:]
         if code == 401 { throw APIError(message: "令牌不对或已失效") }
-        if code == 413 { throw APIError(message: "文件太大（服务器上限 40MB）") }
+        if code == 413 { throw APIError(message: "文件太大（服务器上限 100MB）") }
         if code >= 400 {
             let detail = (obj as? JSON)?.s("detail") ?? ""
             throw APIError(message: detail.isEmpty ? "请求失败（\(code)）" : detail)
+        }
+        return (obj as? JSON) ?? [:]
+    }
+    /// v2 (3.5): a photo / video / file as the request body (POST /api/uploads/raw), streamed from disk with progress.
+    func postFile(_ path: String, file: URL, contentType: String = "application/octet-stream", timeout: TimeInterval = 1800,
+                  progress: @escaping (Double) -> Void) async throws -> JSON {
+        guard let u = url(path) else { throw APIError(message: "服务器地址不对") }
+        var r = URLRequest(url: u, timeoutInterval: timeout)
+        r.httpMethod = "POST"
+        r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        r.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        let (data, resp) = try await URLSession.shared.upload(for: r, fromFile: file, delegate: UploadProgress(progress))
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        let obj = (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) ?? [:]
+        if code == 401 { throw APIError(message: "令牌不对或已失效") }
+        if code == 404 { throw APIError(message: "服务器版本太旧，不支持大文件上传：请先更新服务器") }
+        if code >= 400 {
+            let detail = (obj as? JSON)?.s("detail") ?? ""
+            throw APIError(message: code == 413 ? "文件太大（\(detail)）" : detail.isEmpty ? "上传失败（\(code)）" : detail)
         }
         return (obj as? JSON) ?? [:]
     }

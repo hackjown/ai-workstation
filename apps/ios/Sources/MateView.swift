@@ -143,65 +143,102 @@ struct MateView: UIViewRepresentable {
     }
 }
 
-/// v2 home (3.5): the small 球球 beside each of 球球's messages. One still frame of the real 球球 (the bundled mate.html,
-/// same look as everywhere), rendered once off screen and reused as an image, so a long chat holds no WKWebViews.
+/// v2 home: the small 球球 head beside each of 球球's messages, task cards and the thinking row. One still frame of the
+/// real 球球 (the bundled mate.html, amber disc, same look as in the title), rendered once and reused as an image, so a
+/// long chat holds no WKWebViews.
+/// 3.6 fix (the "eye" avatar): 3.5 parked the web view at (-400,-400), outside the window, and snapped it 0.4 s after
+/// load. WebKit does not lay out / paint a view outside the window's bounds reliably, so the frame came back with the
+/// disc squashed into a lens and the ball tiny. Now the view sits inside the window (under the app's root view, so it
+/// is never seen), the disc is pinned to an exact square in CSS, and the frame is only taken once the page reports a
+/// square disc with the ball drawn; the image itself must be square too, else it is retried (3 times, then the amber disc).
 final class MateSnapshot: NSObject, ObservableObject, WKNavigationDelegate {
     static let shared = MateSnapshot()
+    static let px: CGFloat = 96
     @Published var image: UIImage?
     private var web: WKWebView?
     private var started = false
     private var tries = 0
 
     func start() {
-        guard !started, tries < 3 else { return }
+        guard !started, image == nil, tries < 3 else { return }
+        guard let win = UIApplication.shared.connectedScenes.compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.start() }   // no window yet (launch)
+            return
+        }
         started = true
         tries += 1
-        let w = WKWebView(frame: CGRect(x: 0, y: 0, width: 96, height: 96), configuration: WKWebViewConfiguration())
+        let w = WKWebView(frame: CGRect(x: 0, y: 0, width: MateSnapshot.px, height: MateSnapshot.px), configuration: WKWebViewConfiguration())
         w.isOpaque = false
         w.backgroundColor = .clear
         w.scrollView.backgroundColor = .clear
+        w.scrollView.isScrollEnabled = false
+        w.isUserInteractionEnabled = false
         w.navigationDelegate = self
         web = w
-        // WebKit only paints a web view that is in a window: park it off screen in the key window until the frame is taken
-        let win = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
-        w.frame.origin = CGPoint(x: -400, y: -400)
-        win?.addSubview(w)
+        win.insertSubview(w, at: 0)   // inside the window, behind the root view: painted, never visible
         if let u = Bundle.main.url(forResource: "mate", withExtension: "html", subdirectory: "mate"),
            let full = URL(string: u.absoluteString + "?static=1&ring=amber&e=02&lite=1") {
             w.loadFileURL(full, allowingReadAccessTo: u.deletingLastPathComponent())
         } else if let u = API.shared.url("/mate.html", query: [URLQueryItem(name: "static", value: "1"), URLQueryItem(name: "ring", value: "amber"),
                                                               URLQueryItem(name: "e", value: "02"), URLQueryItem(name: "lite", value: "1")]) {
             w.load(URLRequest(url: u))
-        } else { started = false }
+        } else { fail(w) }
     }
     func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            let cfg = WKSnapshotConfiguration()
-            cfg.afterScreenUpdates = true
-            w.takeSnapshot(with: cfg) { img, _ in
-                DispatchQueue.main.async {
-                    if let img = img { self?.image = img } else { self?.started = false }
-                    w.removeFromSuperview()
-                    self?.web = nil
-                }
+        let px = Int(MateSnapshot.px)
+        // an exact square disc, whatever the viewport turned out to be, then one static frame
+        let js = "(function(){var m=document.getElementById('m');m.style.inset='auto';m.style.left='0px';m.style.top='0px';"
+            + "m.style.width='\(px)px';m.style.height='\(px)px';if(window.aiwMate)aiwMate.active(false);return 1;})()"
+        w.evaluateJavaScript(js) { [weak self] _, _ in self?.check(w, left: 12) }
+    }
+    /// wait until the disc is square and the ball is drawn, then take the frame
+    private func check(_ w: WKWebView, left: Int) {
+        let probe = "(function(){var m=document.getElementById('m'),r=m.getBoundingClientRect(),s=m.querySelector('svg');"
+            + "return [r.width,r.height,s?s.getBoundingClientRect().width:0];})()"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            w.evaluateJavaScript(probe) { v, _ in
+                let a = (v as? [NSNumber])?.map { CGFloat($0.doubleValue) } ?? []
+                let ok = a.count == 3 && a[0] > 40 && abs(a[0] - a[1]) < 1 && a[2] > a[0] * 0.5
+                if ok || left <= 0 { self?.snap(w) } else { self?.check(w, left: left - 1) }
             }
         }
     }
-    func webView(_ w: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { started = false; w.removeFromSuperview(); web = nil }
+    private func snap(_ w: WKWebView) {
+        let cfg = WKSnapshotConfiguration()
+        cfg.afterScreenUpdates = true
+        cfg.rect = CGRect(x: 0, y: 0, width: MateSnapshot.px, height: MateSnapshot.px)
+        w.takeSnapshot(with: cfg) { [weak self] img, _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let img = img, img.size.width > 10, abs(img.size.width - img.size.height) < 1 {
+                    self.image = img
+                    w.removeFromSuperview(); self.web = nil
+                } else { self.fail(w) }
+            }
+        }
+    }
+    private func fail(_ w: WKWebView) {
+        w.removeFromSuperview(); web = nil; started = false
+        if tries < 3 { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.start() } }
+    }
+    func webView(_ w: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail(w) }
+    func webView(_ w: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { fail(w) }
 }
 
-/// The small 球球 avatar (a still frame; an amber disc until the frame is ready).
+/// The small 球球 head avatar (a still frame of the real ball; an amber disc until the frame is ready), always round.
 struct MateAvatar: View {
-    var size: CGFloat = 30
+    static let side: CGFloat = 30
+    var size: CGFloat = MateAvatar.side
     @ObservedObject private var snap = MateSnapshot.shared
+    @AppStorage("mate") private var mateOn = true
     var body: some View {
         Group {
-            if let img = snap.image { Image(uiImage: img).resizable().scaledToFit() }
+            if mateOn, let img = snap.image { Image(uiImage: img).resizable().aspectRatio(1, contentMode: .fill) }
             else { Circle().fill(amber) }
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
-        .onAppear { snap.start() }
+        .onAppear { if mateOn { snap.start() } }
         .accessibilityHidden(true)
     }
 }

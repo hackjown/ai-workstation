@@ -12,6 +12,8 @@ xcrun --sdk iphoneos swiftc -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as
 cp Info.plist $APP/
 # 球球 page for the chat header (MateView.swift): same files the web app serves (+ the non-commercial LICENSE/NOTICE)
 mkdir -p $APP/mate/vendor/emotionball && cp ../web/mate.html ../web/mate-map.js $APP/mate/ && cp ../web/vendor/emotionball/*.js ../web/vendor/emotionball/LICENSE ../web/vendor/emotionball/NOTICE.md $APP/mate/vendor/emotionball/
+# takeover touch page (DesktopView.swift TakeoverWeb): takeover.html + takeover.js, inlined at load
+mkdir -p $APP/takeover && cp ../web/takeover.html ../web/takeover.js $APP/takeover/
 # file preview page (MarkdownPreview.swift): the web app's renderer (markdown-it + DOMPurify, vendored) and styles
 mkdir -p $APP/mdview/vendor/markdown && cp ../web/mdview.html ../web/mdview.js ../web/mdview.css $APP/mdview/ && cp ../web/vendor/markdown/*.js ../web/vendor/markdown/LICENSE-* $APP/mdview/vendor/markdown/
 python3 - "$APP" <<'PY'

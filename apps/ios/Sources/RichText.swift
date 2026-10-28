@@ -81,12 +81,17 @@ func inlineMD(_ s: String, leadBold: Bool = false) -> AttributedString {
     return (try? AttributedString(markdown: t, options: opt)) ?? AttributedString(t)
 }
 
-/// A whole reply, rendered block by block.
+/// A whole reply, rendered block by block. 3.8: every text block is a SelectableText (partial selection + 复制 /
+/// 复制全文 in the edit menu; links still open); tables stay SwiftUI text (whole-cell copy).
 struct RichText: View {
     let text: String
     var font: Font = .callout
     /// v2 home: 球球's bubbles show bold / highlighted text in light amber (#ffc35c)
     var strong: Color? = nil
+    var style: UIFont.TextStyle = .callout
+    /// the text colour (UIKit draws it, so a .foregroundColor around RichText does not reach it); nil = the bubble text
+    var color: Color? = nil
+    @Environment(\.colorScheme) private var cs
     func md(_ s: String, leadBold: Bool = false) -> AttributedString {
         var a = inlineMD(s, leadBold: leadBold)
         guard let c = strong else { return a }
@@ -95,41 +100,50 @@ struct RichText: View {
         }
         return a
     }
+    var ink: UIColor { UIColor(color ?? hBubbleText(cs)) }
+    func sel(_ s: String, leadBold: Bool = false, style st: UIFont.TextStyle? = nil, weight: UIFont.Weight = .regular,
+             tint: UIColor? = nil) -> some View {
+        SelectableText(text: uiAttributed(inlineMD(s, leadBold: leadBold), style: st ?? style, weight: weight, color: tint ?? ink,
+                                          strong: strong.map { UIColor($0) }),
+                       whole: text, link: strong.map { UIColor($0) } ?? UIColor(amber))
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             ForEach(Array(richBlocks(text).enumerated()), id: \.offset) { _, b in block(b) }
         }
         .font(font)
         .lineSpacing(3)
-        .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder func block(_ b: RichBlock) -> some View {
         switch b {
         case .para(let s):
-            Text(md(s)).fixedSize(horizontal: false, vertical: true)
+            sel(s)
         case .heading(let s, let lvl):
-            Text(md(s)).font(lvl <= 2 ? .headline : .subheadline.weight(.semibold)).padding(.top, 2)
+            sel(s, style: lvl <= 2 ? .headline : .subheadline, weight: .semibold).padding(.top, 2)
         case .bullet(let s, let lvl):
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
+            HStack(alignment: .top, spacing: 7) {   // .top: a UIKit text view has no SwiftUI text baseline
                 Text(lvl == 0 ? "•" : "◦").fontWeight(.heavy).foregroundColor(lvl == 0 ? amber : .secondary)
-                Text(md(s, leadBold: true)).fixedSize(horizontal: false, vertical: true)
+                sel(s, leadBold: true)
             }.padding(.leading, lvl == 0 ? 2 : 16)
         case .number(let n, let s):
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
                 Text(n).foregroundColor(amber).fontWeight(.semibold).monospacedDigit()
-                Text(md(s, leadBold: true)).fixedSize(horizontal: false, vertical: true)
+                sel(s, leadBold: true)
             }
         case .quote(let s):
             HStack(spacing: 8) {
                 RoundedRectangle(cornerRadius: 1.5).fill(amber.opacity(0.6)).frame(width: 3)
-                Text(md(s)).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                sel(s, tint: .secondaryLabel)
             }
         case .code(let s):
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(s).font(.system(.footnote, design: .monospaced)).padding(10)
-            }.background(Color(.tertiarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 8))
+            SelectableText(text: NSAttributedString(string: s, attributes: [
+                .font: UIFont.monospacedSystemFont(ofSize: UIFont.preferredFont(forTextStyle: .footnote).pointSize, weight: .regular),
+                .foregroundColor: ink]), whole: text)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.tertiarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 8))
         case .table(let rows):
             ScrollView(.horizontal, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 4) {

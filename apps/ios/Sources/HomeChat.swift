@@ -395,7 +395,7 @@ struct HomeChatView: View {
                 RichText(text: msg.s("text"), strong: hStrong(cs))
                     .foregroundColor(hBubbleText(cs))
                     .padding(.leading, 16).padding(.trailing, 13).padding(.vertical, 10)
-                    .background(BubbleShape.aiw.fill(hBubbleFill(cs)))
+                    .background(BubbleShape.aiw.fill(hBubbleFill(cs)).copyMenu(msg.s("text")))
                     .overlay(alignment: .leading) { Rectangle().fill(ok ? okGreen : Color.red).frame(width: 3) }
                     .clipShape(BubbleShape.aiw)
                     .overlay(BubbleShape.aiw.stroke(hAmber.opacity(cs == .dark ? 0.67 : 0.85), lineWidth: 1.5))

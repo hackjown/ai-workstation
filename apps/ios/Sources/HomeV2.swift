@@ -67,14 +67,15 @@ struct UserBubbleV2: View {
                         }
                     }
                 }
-                if !p.text.isEmpty {
-                    Text(inlineMD(p.text)).font(.callout.weight(.medium)).lineSpacing(2).textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                if !p.text.isEmpty {   // 3.8: partial selection + 复制 (SelectableText.swift)
+                    SelectableText(text: uiAttributed(inlineMD(p.text), style: .callout, weight: .medium, color: UIColor(hInk), lineSpacing: 2),
+                                   whole: p.text, link: UIColor(hInk))
                 }
             }
             .foregroundColor(hInk)
             .padding(.horizontal, 14).padding(.vertical, 10)
-            .background(BubbleShape.user.fill(LinearGradient(colors: [hAmber2, hAmber], startPoint: .topLeading, endPoint: .bottomTrailing)))
+            .background(BubbleShape.user.fill(LinearGradient(colors: [hAmber2, hAmber], startPoint: .topLeading, endPoint: .bottomTrailing))
+                .copyMenu(p.text))
             ForEach(attachments.indices, id: \.self) { i in
                 let a = attachments[i]
                 Label(a.s("name"), systemImage: a.s("kind") == "video" ? "film" : fileIcon(a.s("name"))).font(.caption).foregroundColor(.secondary)
@@ -98,15 +99,16 @@ struct AiwBubble: View {
     @Environment(\.colorScheme) private var cs
     var body: some View {
         Group {
-            if !text.contains("\n") && text.count <= 24 {
-                Text(RichText(text: "", strong: hStrong(cs)).md(text)).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            if !text.contains("\n") && text.count <= 24 {   // short: the bubble hugs the text (still selectable)
+                SelectableText(text: uiAttributed(inlineMD(text), style: .callout, color: UIColor(hBubbleText(cs)), strong: UIColor(hStrong(cs))),
+                               whole: text, link: UIColor(hStrong(cs)))
             } else {
                 RichText(text: text, strong: hStrong(cs))
             }
         }
         .foregroundColor(hBubbleText(cs))
         .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(BubbleShape.aiw.fill(hBubbleFill(cs)))
+        .background(BubbleShape.aiw.fill(hBubbleFill(cs)).copyMenu(text))
         .overlay(BubbleShape.aiw.stroke(error ? Color.red.opacity(0.6) : hAmber.opacity(cs == .dark ? 0.67 : 0.85), lineWidth: 1.5))
     }
 }
@@ -322,6 +324,7 @@ struct HomeStage: View {
                         Circle().fill(hAmber).frame(width: 6, height: 6).position(dots.1)
                         Button { act(it.o("action")) } label: { label(text, width: p.rect.width, lines: p.lines) }
                             .buttonStyle(.plain)
+                            .copyMenu(text)   // 3.8: tap runs it, long-press copies it (a tap target can't also select)
                             .frame(width: p.rect.width, height: p.rect.height)
                             .position(x: p.rect.midX, y: p.rect.midY)
                             .accessibilityHint("点一下就去做")

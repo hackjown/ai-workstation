@@ -543,7 +543,7 @@ function hVoice() {   // dictation into the input (the browser's speech recognit
   hRec.onend = () => { hRec = null; $("hPlusBtn").classList.remove("rec"); hKeys(); };
   hRec.onerror = (e) => toast(e.error === "not-allowed" || e.error === "service-not-allowed" ? "没有麦克风权限：在浏览器的网站设置里允许麦克风" : "语音输入：" + e.error);
   try { hRec.start(); } catch (err) { hRec = null; toast("语音输入没能开始：" + err.message); hKeys(); return; }
-  $("hPlusBtn").classList.add("rec"); hKeys(); toast("在听…点右边的 ■ 结束");
+  hKeys(); toast("在听…点右边的 ■ 结束");
 }
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("hsheet").classList.contains("on")) hSheet(false); });
 

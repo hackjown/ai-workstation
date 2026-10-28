@@ -168,6 +168,8 @@ class Chat:
         self._reply_job: Optional[asyncio.Task] = None   # the chat reply being written (POST /api/chat/cancel stops it)
         self._stop_next = False      # 停止 pressed while the message was still being routed: the reply never starts
         sessions.listeners.append(self.on_task_event)
+        from . import shopwatch
+        shopwatch.bind(chat=self)        # price-watch questions with one-tap 立即重试 land in this chat
 
     # ------------------------------------------------------------------ messages
     def add(self, role: str, kind: str, text: str = "", data: Optional[dict] = None, task_id: Optional[str] = None) -> dict:
@@ -232,7 +234,7 @@ class Chat:
                 if st in ("running", "paused", "takeover") + WAITING and not self.sessions.live_for_task(t["id"]):
                     st = "interrupted"
                 m = self.update(m["id"], data={"status": st, "status_line": STATUS_CN.get(st, st)}, push=False) or m
-        elif m["kind"] in ("ask", "confirm") and not d.get("resolved") and not d.get("stale"):
+        elif m["kind"] in ("ask", "confirm") and not d.get("resolved") and not d.get("stale") and not d.get("watch_id"):
             live = self.sessions.live.get(d.get("session_id") or "")
             pending = live and (live.question_info if m["kind"] == "ask" else live.confirm_info)
             if not pending:
@@ -831,6 +833,9 @@ class Chat:
         d = m["data"]
         if d.get("resolved"):
             raise ValueError("这个问题已经回答过了")
+        if d.get("watch_id"):           # a price watch's question (立即重试 / 暂停), not a task's
+            from . import shopwatch
+            return await shopwatch.answer_ask(self, m, (choice if choice is not None else text) or OPT_RETRY_WATCH)
         sid = d.get("session_id") or ""
         try:
             if m["kind"] == "confirm":
@@ -848,6 +853,9 @@ class Chat:
             raise ValueError("这个问题已经过期（任务已经不在等这个回答了）")
         m = self.update(mid, data={"resolved": {"answer": ans, "by": "chat", "at": time.time()}})
         return {"ok": True, "message": m, "open_task": isinstance(ans, str) and "接管" in ans}
+
+
+OPT_RETRY_WATCH = "立即重试"
 
 
 def _short_title(prompt: str) -> str:

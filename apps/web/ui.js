@@ -707,7 +707,7 @@ function mobileViewfinder() {
   vf.querySelector(".mvf-now span").textContent = c ? c.textContent : live ? (document.querySelector("#msgs .work .head .grow") || { textContent: "工作中…" }).textContent : "电脑画面 · 任务没在运行";
 }
 // taking over needs the screen: open it first
-function mvfTake() { if (!S.take) localStorage.setItem("aiw_mvf_fold", "0"); toggleTakeover(); setTimeout(mobileViewfinder, 50); }
+function mvfTake() { if (!S.take) localStorage.setItem("aiw_mvf_fold", "0"); toggleTakeover(); setTimeout(() => { mobileViewfinder(); if (typeof deskTouch === "function") deskTouch(); }, 50); }
 function mvfFold() { localStorage.setItem("aiw_mvf_fold", localStorage.getItem("aiw_mvf_fold") === "1" ? "0" : "1"); mobileViewfinder(); }
 const _patchChatVF = patchChat;
 patchChat = function () { _patchChatVF(); mobileViewfinder(); };

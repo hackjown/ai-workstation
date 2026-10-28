@@ -10,6 +10,9 @@ import UniformTypeIdentifiers
 /// * questions / confirmations come in as messages with buttons; 我来接管桌面 opens the task view in takeover
 /// * a reply that needs the computer has 交给电脑去做 (POST /api/chat/messages/{id}/to_task)
 /// * 新建任务 (top right) sends the next message straight to the computer (mode "task")
+/// * 3.5 (v2 mockup, HomeV2.swift): with nothing new, 球球 and its briefing (GET /api/greeting) instead of the chat;
+///   amber / dark bubbles with a small 球球, thinking 球球 + 停止, "/" skill picker, "+" sheet with camera / video / library
+///   (videos too) / files / 新建任务 / 链接 / 技能, uploads through POST /api/uploads/raw
 enum Route: Hashable {
     case task(String, takeover: Bool)   // a task's thread
     case newTask                       // a blank task view (files shared from other apps land here)
@@ -26,6 +29,12 @@ final class HomeChat: ObservableObject {
     @Published var err = ""
     @Published var agent = "小秘"
     @Published var bottomTick = 0              // bumped when the view should scroll to the newest message
+    // v2 (3.5): with nothing new the home shows 球球 and its briefing (GET /api/greeting) instead of the chat
+    @Published var staged = false
+    @Published var greet: [JSON] = []
+    @Published var chips: [JSON] = []
+    @Published var greetAt: Date? = nil
+    var stageOff = false
 
     @MainActor func index(_ id: String) -> Int? { msgs.firstIndex { $0.s("id") == id } }
 
@@ -34,8 +43,14 @@ final class HomeChat: ObservableObject {
             let r = try await API.shared.obj("GET", "/api/chat?limit=60")
             msgs = r.a("messages"); hasMore = r.b("has_more"); loaded = true; err = ""
             if !r.s("agent_name").isEmpty { agent = r.s("agent_name") }
+            let readSeq = r.o("read").d("seq")
+            if !stageOff, let last = msgs.last(where: { $0.d("seq") > 0 }) {   // something new since last time: show the chat
+                stageOff = last.d("seq") > readSeq && last.s("role") != "user"
+            }
+            staged = !stageOff
             bottomTick += 1
             markRead()
+            if staged { await loadGreeting() }
         } catch { err = "聊天加载失败：\(error.localizedDescription)" }
     }
     /// Older page above the first message; returns the id that was first, to keep it in place.
@@ -59,6 +74,26 @@ final class HomeChat: ObservableObject {
         sortMsgs()
         if added { bottomTick += 1 }
     }
+    @MainActor func loadGreeting(force: Bool = false) async {
+        if !force, let at = greetAt, Date().timeIntervalSince(at) < 60, !greet.isEmpty { return }
+        do {
+            let g = try await API.shared.obj("GET", "/api/greeting")
+            greet = g.a("items"); chips = g.a("chips")
+            if greet.isEmpty { greet = [["text": "有什么要我做的，直接说就行。", "mood": "02", "action": ["type": "focus"]]] }
+        } catch {   // never silent: say it, and still greet
+            greet = [["text": "播报没取到（\(error.localizedDescription)）。有什么要我做的，直接说就行。", "mood": "34", "action": ["type": "focus"]]]
+            chips = [["label": "💬 随便聊聊", "action": ["type": "focus"]]]
+        }
+        greetAt = Date()
+    }
+    @MainActor func leaveStage() { stageOff = true; if staged { staged = false; bottomTick += 1 } }
+    /// 停止 while 球球 is answering (POST /api/chat/cancel keeps what streamed so far).
+    @MainActor func cancel() async {
+        do {
+            let r = try await API.shared.obj("POST", "/api/chat/cancel")
+            if !r.b("cancelled") { err = "这条已经交给电脑了：要停的话，点任务卡片进去停止" }
+        } catch { err = "停止失败：\(error.localizedDescription)" }
+    }
     static func order(_ m: JSON) -> Double { let s = m.d("seq"); return s > 0 ? s : 1e15 }   // unsent ones last
     @MainActor func sortMsgs() { msgs.sort { HomeChat.order($0) < HomeChat.order($1) } }
 
@@ -67,6 +102,7 @@ final class HomeChat: ObservableObject {
         if let i = index(m.s("id")) { msgs[i] = m; return }
         if m.s("role") == "user" { msgs.removeAll { $0.b("tmp") && $0.s("text") == m.s("text") } }
         if m.s("role") != "user" && m.s("kind") == "text" { stream = nil }
+        if staged { leaveStage() }   // something new: the chat takes over from 球球's briefing
         msgs.append(m); sortMsgs()
         bottomTick += 1
         markRead()
@@ -84,6 +120,7 @@ final class HomeChat: ObservableObject {
     @MainActor func send(_ text: String, attachments: [JSON], mode: String) async -> Bool {
         guard !sending else { return false }
         sending = true; err = ""
+        leaveStage()
         defer { sending = false; stream = nil; streamNote = "" }
         let tmp: JSON = ["id": "tmp-\(Date().timeIntervalSince1970)", "role": "user", "kind": "text",
                          "text": text.isEmpty ? "（附件）" : text, "data": ["attachments": attachments], "tmp": true]
@@ -111,7 +148,8 @@ final class HomeChat: ObservableObject {
                 guard let d = raw.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d) as? JSON else { continue }
                 switch event {
                 case "user": upsert(obj, stick: true)
-                case "route": if obj.s("route") == "task" { streamNote = "正在交给电脑…" }
+                case "route": if obj.s("route") == "task" { streamNote = obj.b("skill") ? "正在把技能交给电脑…" : "正在交给电脑…" }
+                case "status": if acc.isEmpty { streamNote = obj.s("text") }
                 case "delta": acc += obj.s("text"); stream = acc; bottomTick += 1
                 case "message", "task": stream = nil; upsert(obj, stick: true)
                 case "done": break
@@ -160,7 +198,15 @@ struct HomeChatView: View {
     @State private var mode = "auto"
     @State private var attach: [JSON] = []
     @State private var uploading = false
-    @State private var photo: PhotosPickerItem?
+    @State private var photos: [PhotosPickerItem] = []
+    @State private var camera: CamMode? = nil
+    @State private var showAttach = false
+    @State private var pending: AttachKind? = nil
+    @State private var showLink = false
+    @State private var linkText = ""
+    @State private var skills: [JSON] = []
+    @State private var picked: [String] = []
+    @State private var pct: Double = 0
     @State private var showPhotos = false
     @State private var showFiles = false
     @State private var preview: Preview?
@@ -176,6 +222,10 @@ struct HomeChatView: View {
 
     var body: some View {
         ScrollViewReader { proxy in
+          Group {
+            if m.staged {
+                HomeStage(m: m, typing: typing, act: runAction, showChat: { m.leaveStage() })
+            } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     if m.hasMore {
@@ -202,14 +252,17 @@ struct HomeChatView: View {
                 if atBottom || m.sending { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) } }
             }
             .onChange(of: m.loaded) { ok in if ok { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { proxy.scrollTo("end", anchor: .bottom) } } }
-            .safeAreaInset(edge: .bottom) { composer }
+            .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { proxy.scrollTo("end", anchor: .bottom) } }
+            }
+          }
+          .safeAreaInset(edge: .bottom) { composer }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button(action: openSettings) { Image(systemName: "gearshape").font(.system(size: 17)) }.accessibilityLabel("设置")
             }
-            ToolbarItem(placement: .principal) { MateTitle(title: m.agent, status: liveStatus, threadId: nil, showMate: true) }
+            ToolbarItem(placement: .principal) { MateTitle(title: m.agent, status: liveStatus, threadId: nil, showMate: !m.staged) }
             ToolbarItemGroup(placement: .navigationBarTrailing) {
                 Button { mode = "task"; focused = true } label: { Image(systemName: "square.and.pencil").font(.system(size: 17)) }
                     .accessibilityLabel("新建任务")
@@ -224,12 +277,30 @@ struct HomeChatView: View {
             }
         }
         .task { if !m.loaded { await m.load() }; if text.isEmpty { text = draft } }
+        .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .refreshable { await m.load() }
         .onReceive(hub.events) { e in m.onEvent(e) }
         .onChange(of: phase) { p in if p == .active { Task { await m.sync() } } }
-        .onChange(of: text) { t in draft = t }
-        .onChange(of: photo) { item in Task { await addPhoto(item) } }
-        .photosPicker(isPresented: $showPhotos, selection: $photo, matching: .images)
+        .onChange(of: text) { t in draft = t; onText(t) }
+        .onChange(of: m.staged) { on in if on { Task { await m.loadGreeting() } } }
+        .onChange(of: photos) { items in
+            guard !items.isEmpty else { return }
+            let list = items; photos = []
+            Task { for it in list { await addPicked(it) } }
+        }
+        .photosPicker(isPresented: $showPhotos, selection: $photos, maxSelectionCount: 9, matching: .any(of: [.images, .videos]))
+        .sheet(isPresented: $showAttach, onDismiss: runPending) {
+            AttachSheet { k in pending = k; showAttach = false }
+                .presentationDetents([.height(250)]).presentationDragIndicator(.hidden)
+        }
+        .fullScreenCover(item: $camera) { md in
+            HomeCamera(mode: md) { u, img in camera = nil; Task { await gotCamera(u, img) } }.ignoresSafeArea()
+        }
+        .alert("添加链接", isPresented: $showLink) {
+            TextField("https://…", text: $linkText).keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+            Button("添加") { addLink() }
+            Button("取消", role: .cancel) {}
+        } message: { Text("网页、视频或商品的链接") }
         .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { r in
             if case .success(let urls) = r { Task { for u in urls { await addFile(u) } } }
         }
@@ -243,92 +314,114 @@ struct HomeChatView: View {
     @ViewBuilder func row(_ msg: JSON) -> some View {
         let d = msg.o("data")
         if msg.s("role") == "user" {
-            HStack { Spacer(minLength: 40)
+            HStack { Spacer(minLength: 48)
                 VStack(alignment: .trailing, spacing: 3) {
-                    Text(msg.s("text")).font(.callout).textSelection(.enabled)
-                        .padding(.horizontal, 13).padding(.vertical, 9)
-                        .background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    ForEach(d.a("attachments").indices, id: \.self) { i in
-                        Label(d.a("attachments")[i].s("name"), systemImage: "paperclip").font(.caption).foregroundColor(.secondary)
-                    }
+                    UserBubbleV2(text: msg.s("text"), attachments: d.a("attachments"), skillTitle: skillTitle)
                     Text(msg.b("tmp") ? "发送中…" : when(msg.d("created_at"))).font(.caption2).foregroundColor(.secondary)
                 }
             }
         } else {
             switch msg.s("kind") {
-            case "task": TaskCardRow(msg: msg, open: { open(msg, takeover: false) }, retry: { Task { await m.retry(d.s("task_id")) } })
-            case "ask": AskRow(msg: msg, model: m, open: { take in open(msg, takeover: take) })
-            case "confirm": ConfirmRow(msg: msg, model: m, open: { open(msg, takeover: false) })
+            case "task": withAvatar(meta: false) { TaskCardRow(msg: msg, open: { open(msg, takeover: false) }, retry: { Task { await m.retry(d.s("task_id")) } }) }
+            case "ask": withAvatar(meta: false) { AskRow(msg: msg, model: m, open: { take in open(msg, takeover: take) }) }
+            case "confirm": withAvatar(meta: false) { ConfirmRow(msg: msg, model: m, open: { open(msg, takeover: false) }) }
             case "task_result": resultRow(msg)
             default: textRow(msg)
             }
         }
     }
+    /// 球球's messages carry a small 球球 on the left (a still frame, see MateAvatar)
+    @ViewBuilder func withAvatar<C: View>(meta: Bool, @ViewBuilder _ c: () -> C) -> some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            MateAvatar().padding(.bottom, meta ? 18 : 2)
+            c()
+        }
+    }
     @ViewBuilder func textRow(_ msg: JSON) -> some View {
         let d = msg.o("data")
-        VStack(alignment: .leading, spacing: 6) {
-            RichText(text: msg.s("text"))
-                .padding(.horizontal, 13).padding(.vertical, 9)
-                .background(Color(.systemBackground))
-                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(d.b("error") ? Color.red.opacity(0.5) : Color(.separator).opacity(0.5)))
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            if !d.s("offer_task").isEmpty {
-                if d.s("task_started").isEmpty {
-                    Button { Task { await m.toTask(msg.s("id")) } } label: { Label("交给电脑去做", systemImage: "desktopcomputer") }
-                        .buttonStyle(.borderedProminent).tint(amber).controlSize(.small)
-                } else {
-                    Label("已交给电脑", systemImage: "checkmark").font(.caption).foregroundColor(.secondary)
+        withAvatar(meta: true) {
+            VStack(alignment: .leading, spacing: 6) {
+                AiwBubble(text: msg.s("text"), error: d.b("error"))
+                if !d.s("offer_task").isEmpty {
+                    if d.s("task_started").isEmpty {
+                        Button { Task { await m.toTask(msg.s("id")) } } label: { Label("交给电脑去做", systemImage: "desktopcomputer") }
+                            .buttonStyle(.borderedProminent).tint(amber).controlSize(.small)
+                    } else {
+                        Label("已交给电脑", systemImage: "checkmark").font(.caption).foregroundColor(.secondary)
+                    }
                 }
+                Text(when(msg.d("created_at"))).font(.caption2).foregroundColor(.secondary)
             }
-            Text(when(msg.d("created_at"))).font(.caption2).foregroundColor(.secondary)
-        }.padding(.trailing, 30)
+            Spacer(minLength: 24)
+        }
     }
     @ViewBuilder func streamRow(_ s: String) -> some View {
-        HStack {
+        Group {
             if s.isEmpty {
-                HStack(spacing: 6) { ProgressView().controlSize(.small); Text(m.streamNote.isEmpty ? "正在想…" : m.streamNote).font(.caption).foregroundColor(.secondary) }
-                    .padding(.horizontal, 13).padding(.vertical, 10)
-                    .background(Color(.systemBackground)).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                ThinkingRow(note: m.streamNote.isEmpty ? "正在想…" : m.streamNote)
             } else {
-                RichText(text: s).padding(.horizontal, 13).padding(.vertical, 9)
-                    .background(Color(.systemBackground)).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                withAvatar(meta: false) { AiwBubble(text: s); Spacer(minLength: 24) }
             }
-            Spacer(minLength: 30)
         }.id("stream")
     }
     @ViewBuilder func resultRow(_ msg: JSON) -> some View {
         let d = msg.o("data")
         let ok = d.s("status") == "succeeded"
-        VStack(alignment: .leading, spacing: 6) {
-            RichText(text: msg.s("text"))
-                .padding(.leading, 15).padding(.trailing, 12).padding(.vertical, 9)
-                .background(Color(.systemBackground))
-                .overlay(alignment: .leading) { Rectangle().fill(ok ? okGreen : Color.red).frame(width: 3) }
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            ForEach(d.a("files").indices, id: \.self) { i in
-                let f = d.a("files")[i]
-                Button { Task { await openFile(f.s("path"), f.s("name")) } } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: f.s("kind") == "image" ? "photo" : f.s("kind") == "video" ? "film" : "doc").foregroundColor(amber)
-                            .frame(width: 32, height: 32).background(amber.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 8))
-                        Text(f.s("name")).font(.callout.weight(.medium)).lineLimit(1).foregroundColor(.primary)
-                        Spacer(minLength: 0)
-                        Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
-                    }.padding(8).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 12))
-                }.buttonStyle(.plain)
-            }
-            HStack(spacing: 6) {
-                Text(when(msg.d("created_at"))).font(.caption2).foregroundColor(.secondary)
-                if !d.s("thread_id").isEmpty {
-                    Button(d.b("has_more") ? "查看完整结果 ›" : "查看任务 ›") { open(msg, takeover: false) }.font(.caption2)
+        withAvatar(meta: true) {
+            VStack(alignment: .leading, spacing: 6) {
+                RichText(text: msg.s("text"), strong: hHL)
+                    .foregroundColor(Color(white: 0.93))
+                    .padding(.leading, 16).padding(.trailing, 13).padding(.vertical, 10)
+                    .background(BubbleShape.aiw.fill(hDark))
+                    .overlay(alignment: .leading) { Rectangle().fill(ok ? okGreen : Color.red).frame(width: 3) }
+                    .clipShape(BubbleShape.aiw)
+                    .overlay(BubbleShape.aiw.stroke(hAmber.opacity(0.67), lineWidth: 1.5))
+                    .environment(\.colorScheme, .dark)
+                ForEach(d.a("files").indices, id: \.self) { i in
+                    let f = d.a("files")[i]
+                    Button { Task { await openFile(f.s("path"), f.s("name")) } } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: f.s("kind") == "image" ? "photo" : f.s("kind") == "video" ? "film" : "doc").foregroundColor(amber)
+                                .frame(width: 32, height: 32).background(amber.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 8))
+                            Text(f.s("name")).font(.callout.weight(.medium)).lineLimit(1).foregroundColor(.primary)
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                        }.padding(8).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 12))
+                    }.buttonStyle(.plain)
+                }
+                HStack(spacing: 6) {
+                    Text(when(msg.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+                    if !d.s("thread_id").isEmpty {
+                        Button(d.b("has_more") ? "查看完整结果 ›" : "查看任务 ›") { open(msg, takeover: false) }.font(.caption2)
+                    }
                 }
             }
-        }.padding(.trailing, 30)
+            Spacer(minLength: 24)
+        }
     }
 
     // MARK: composer
+    var typing: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !picked.isEmpty }
+    var slashQ: String? { picked.count < 5 ? slashQuery(text) : nil }
+    var placeholder: String { mode == "task" ? "要电脑做什么？" : picked.isEmpty ? "和我聊聊，或输入 / 选技能…" : "说说要用它做什么…" }
     var composer: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
+            if let q = slashQ { SkillPicker(rows: skillRows(q), query: q) { chooseSkill($0) } }
+            if m.staged && !m.chips.isEmpty && slashQ == nil {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(m.chips.indices, id: \.self) { i in
+                            let c = m.chips[i]
+                            Button { runAction(c.o("action")) } label: {
+                                Text(c.s("label")).font(.footnote).foregroundColor(.primary).lineLimit(1)
+                                    .padding(.horizontal, 12).padding(.vertical, 7)
+                                    .background(Capsule().fill(Color(.secondarySystemBackground)))
+                                    .overlay(Capsule().stroke(Color(.separator)))
+                            }.buttonStyle(.plain)
+                        }
+                    }.padding(.horizontal, 2).padding(.vertical, 1)
+                }
+            }
             if mode == "task" {
                 HStack(spacing: 6) {
                     Image(systemName: "desktopcomputer")
@@ -341,44 +434,133 @@ struct HomeChatView: View {
             if !attach.isEmpty || uploading {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack {
-                        if uploading { ProgressView().controlSize(.small) }
+                        if uploading {
+                            HStack(spacing: 6) { ProgressView(value: pct).frame(width: 60).tint(hAmber); Text("上传 \(Int(pct * 100))%").font(.caption2.monospacedDigit()) }
+                                .padding(.horizontal, 8).padding(.vertical, 5).background(Color(.secondarySystemBackground)).clipShape(Capsule())
+                        }
                         ForEach(attach.indices, id: \.self) { i in
                             HStack(spacing: 4) {
-                                Image(systemName: "paperclip"); Text(attach[i].s("name")).lineLimit(1)
-                                Button { attach.remove(at: i) } label: { Image(systemName: "xmark.circle.fill") }
+                                Image(systemName: attach[i].s("kind") == "video" ? "film" : fileIcon(attach[i].s("name"))); Text(attach[i].s("name")).lineLimit(1)
+                                Button { attach.remove(at: i) } label: { Image(systemName: "xmark.circle.fill") }.accessibilityLabel("移除附件")
                             }.font(.caption).padding(.horizontal, 8).padding(.vertical, 5).background(Color(.secondarySystemBackground)).clipShape(Capsule())
                         }
                     }
                 }
             }
-            HStack(alignment: .bottom, spacing: 8) {
-                Menu {
-                    Button { showPhotos = true } label: { Label("照片", systemImage: "photo") }
-                    Button { showFiles = true } label: { Label("文件", systemImage: "folder") }
-                } label: { Image(systemName: "plus").font(.system(size: 18, weight: .medium)).frame(width: 34, height: 34) }
-                    .accessibilityLabel("添加附件")
-                TextField(mode == "task" ? "要电脑做什么？" : "和我聊聊，或者让电脑去办件事…", text: $text, axis: .vertical)
-                    .lineLimit(1...6).focused($focused).padding(.vertical, 8)
-                Button { Task { await send() } } label: {
-                    Image(systemName: m.sending ? "ellipsis" : "arrow.up").font(.system(size: 16, weight: .bold)).foregroundColor(.white)
-                        .frame(width: 34, height: 34).background(canSend ? amber : Color.gray.opacity(0.4)).clipShape(Circle())
-                }.disabled(!canSend).accessibilityLabel("发送")
+            HStack(alignment: .bottom, spacing: 6) {
+                Button { focused = false; showAttach = true } label: {
+                    Image(systemName: "plus").font(.system(size: 22, weight: .light)).foregroundColor(hAmber).frame(width: 36, height: 36)
+                }.accessibilityLabel("添加：拍照、视频、文件、技能")
+                HStack(spacing: 6) {
+                    ForEach(picked, id: \.self) { id in SkillToken(title: skillTitle(id)) { picked.removeAll { $0 == id } } }
+                    TextField(placeholder, text: $text, axis: .vertical)
+                        .lineLimit(1...6).focused($focused).padding(.vertical, 8)
+                }
+                Button { if m.sending { Task { await m.cancel() } } else { Task { await send() } } } label: {
+                    Image(systemName: m.sending ? "stop.fill" : "arrow.up").font(.system(size: m.sending ? 13 : 16, weight: .bold))
+                        .foregroundColor(m.sending ? hAmber : hInk)
+                        .frame(width: 36, height: 36).background(m.sending ? Color(white: 0.2) : (canSend ? hAmber : Color.gray.opacity(0.4))).clipShape(Circle())
+                }.disabled(!m.sending && !canSend).accessibilityLabel(m.sending ? "停止" : "发送")
             }
-            .padding(.horizontal, 8).padding(.vertical, 4)
+            .padding(.leading, 4).padding(.trailing, 6).padding(.vertical, 5)
             .background(Color(.systemBackground))
-            .overlay(RoundedRectangle(cornerRadius: 24, style: .continuous).stroke(focused ? amber.opacity(0.6) : Color(.separator), lineWidth: 1))
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(focused ? hAmber.opacity(0.6) : Color(.separator), lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         }
         .padding(.horizontal, 12).padding(.top, 6).padding(.bottom, 8)
         .background(.bar)
     }
     var canSend: Bool { !m.sending && !uploading && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attach.isEmpty) }
 
-    func send() async {
+    // MARK: "/" skills (the same list and the same 【技能：…】 marker the old + menu used)
+    func skillTitle(_ id: String) -> String {
+        let s = skills.first { $0.s("id") == id }
+        return (s?.s("title").isEmpty ?? true) ? id : s!.s("title")
+    }
+    func skillRows(_ q: String) -> [JSON] {
+        let k = q.lowercased()
+        let hit = skills.filter { s in k.isEmpty || [s.s("id"), s.s("title"), s.s("desc")].contains { $0.lowercased().contains(k) } }
+        let first = hit.filter { $0.s("id").lowercased().hasPrefix(k) }, rest = hit.filter { !$0.s("id").lowercased().hasPrefix(k) }
+        return Array((first + rest).prefix(30))
+    }
+    func chooseSkill(_ id: String) {
+        if let r = text.range(of: "/[^\\s/]*$", options: .regularExpression) { text.removeSubrange(r) }
+        if !picked.contains(id) { picked.append(id) }
+        focused = true
+    }
+    /// Return while the picker is open picks its first row (a hardware keyboard or the on-screen one)
+    func onText(_ t: String) {
+        guard t.hasSuffix("\n") else { return }
+        let before = String(t.dropLast())
+        if let q = slashQuery(before), let first = skillRows(q).first { text = before; chooseSkill(first.s("id")) }
+    }
+    func insertSlash() {
+        text += (text.isEmpty || text.hasSuffix(" ") || text.hasSuffix("\n")) ? "/" : " /"
+        focused = true
+    }
+
+    // MARK: 球球's briefing actions (bubbles and chips)
+    func runAction(_ a: JSON) {
+        switch a.s("type") {
+        case "thread":
+            if !a.s("thread_id").isEmpty { path.append(.task(a.s("thread_id"), takeover: false)) }
+        case "retry":
+            Task {
+                do {
+                    let r = try await API.shared.obj("POST", "/api/tasks/\(a.s("task_id"))/retry")
+                    let tid = r.s("thread_id").isEmpty ? a.s("thread_id") : r.s("thread_id")
+                    m.greetAt = nil
+                    if !tid.isEmpty { path.append(.task(tid, takeover: false)) }
+                } catch { m.err = "没能接着做：\(error.localizedDescription)" }
+            }
+        case "view":
+            switch a.s("view") {
+            case "routines": openSheet(.routine)
+            case "tracking": openSheet(.tracking)
+            case "computer": openSheet(.computer)
+            case "tasks": openSheet(.history)
+            default: focused = true
+            }
+        case "prompt": text = a.s("text"); focused = true
+        case "send": text = a.s("text"); Task { await send() }
+        default: focused = true
+        }
+    }
+
+    // MARK: "+" sheet
+    func runPending() {
+        guard let k = pending else { return }
+        pending = nil
+        switch k {
+        case .photo, .video:
+            if UIImagePickerController.isSourceTypeAvailable(.camera) { camera = k == .video ? .video : .photo }
+            else { m.err = "这台设备没有可用的相机" }
+        case .library: showPhotos = true
+        case .file: showFiles = true
+        case .task: mode = "task"; focused = true
+        case .link:
+            let pb = UIPasteboard.general.hasURLs ? (UIPasteboard.general.url?.absoluteString ?? "") : ""
+            linkText = pb.isEmpty ? "https://" : pb
+            showLink = true
+        case .skill: insertSlash()
+        }
+    }
+    func addLink() {
+        let u = linkText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !u.isEmpty, u != "https://" else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        text = (t.isEmpty ? "" : t + " ") + u + " "
+        focused = true
+    }
+
+    func send() async {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.isEmpty && attach.isEmpty { if !picked.isEmpty { m.err = "说说要用这个技能做什么" }; return }
+        let sk = picked
+        let t = sk.isEmpty ? body : "【技能：\(sk.joined(separator: "、"))】\n" + body
         let files = attach, md = mode
-        text = ""; attach = []; mode = "auto"; draft = ""
-        if !(await m.send(t, attachments: files, mode: md)) { text = t; attach = files; mode = md }
+        text = ""; attach = []; mode = "auto"; draft = ""; picked = []
+        if !(await m.send(t, attachments: files, mode: md)) { text = body; attach = files; mode = md; picked = sk }
     }
     func open(_ msg: JSON, takeover: Bool) {
         let tid = msg.o("data").s("thread_id")
@@ -393,29 +575,57 @@ struct HomeChatView: View {
         try? FileManager.default.moveItem(at: tmp, to: dest)
         preview = Preview(url: dest)
     }
-    func addPhoto(_ item: PhotosPickerItem?) async {
-        guard let item = item else { return }
-        photo = nil
+
+    // MARK: uploads (POST /api/uploads/raw: the file itself, so videos work; chat attachments stay on the API host)
+    func gotCamera(_ u: URL?, _ img: UIImage?) async {
+        if let u = u {
+            await uploadFile(u, name: u.lastPathComponent, type: u.pathExtension.lowercased() == "mp4" ? "video/mp4" : "video/quicktime")
+        } else if let img = img, let jpg = img.jpegData(compressionQuality: 0.85) {
+            await uploadData(jpg, name: "photo-\(Int(Date().timeIntervalSince1970)).jpg", type: "image/jpeg")
+        }
+    }
+    func addPicked(_ item: PhotosPickerItem) async {
+        if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) || $0.conforms(to: .video) }) {
+            do {
+                guard let mv = try await item.loadTransferable(type: PickedMovie.self) else { m.err = "读不了这个视频"; return }
+                let ext = mv.url.pathExtension.lowercased()
+                await uploadFile(mv.url, name: "video-\(Int(Date().timeIntervalSince1970)).\(ext.isEmpty ? "mov" : ext)",
+                                 type: ext == "mp4" ? "video/mp4" : "video/quicktime")
+            } catch { m.err = "读不了这个视频：\(error.localizedDescription)" }
+            return
+        }
         guard let d = try? await item.loadTransferable(type: Data.self) else { m.err = "读不了这张照片"; return }
         let jpg = UIImage(data: d)?.jpegData(compressionQuality: 0.85) ?? d
-        await upload(name: "photo-\(Int(Date().timeIntervalSince1970)).jpg", data: jpg)
+        await uploadData(jpg, name: "photo-\(Int(Date().timeIntervalSince1970)).jpg", type: "image/jpeg")
     }
     func addFile(_ u: URL) async {
         let ok = u.startAccessingSecurityScopedResource()
         defer { if ok { u.stopAccessingSecurityScopedResource() } }
-        guard let d = try? Data(contentsOf: u) else { m.err = "读不了 \(u.lastPathComponent)"; return }
-        await upload(name: u.lastPathComponent, data: d)
+        let dst = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(u.lastPathComponent)")
+        try? FileManager.default.removeItem(at: dst)
+        do { try FileManager.default.copyItem(at: u, to: dst) } catch { m.err = "读不了 \(u.lastPathComponent)"; return }
+        let type = UTType(filenameExtension: u.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+        await uploadFile(dst, name: u.lastPathComponent, type: type)
     }
-    /// Chat attachments stay on the API host (local_only); a task the chat starts copies them to its computer.
-    func upload(name: String, data: Data) async {
-        if data.count > 40 * 1024 * 1024 { m.err = "\(name) 超过 40MB"; return }
-        uploading = true
+    func uploadData(_ data: Data, name: String, type: String) async {
+        let dst = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do { try data.write(to: dst) } catch { m.err = "存不了临时文件：\(error.localizedDescription)"; return }
+        await uploadFile(dst, name: name, type: type)
+    }
+    func uploadFile(_ u: URL, name: String, type: String) async {
+        let size = ((try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? NSNumber)?.intValue ?? 0
+        if size > 500 * 1024 * 1024 { m.err = "\(name) 超过 500MB"; return }
+        uploading = true; pct = 0
         defer { uploading = false }
+        let q = name.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? "file"
+        let mid = API.shared.machine.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? ""
         do {
-            let r = try await API.shared.postWithProgress("/api/uploads", ["name": name, "content_b64": data.base64EncodedString(),
-                                                                           "machine_id": API.shared.machine, "local_only": true]) { _ in }
+            var r = try await API.shared.postFile("/api/uploads/raw?name=\(q)&machine_id=\(mid)&local_only=true", file: u, contentType: type) { f in
+                DispatchQueue.main.async { pct = f }
+            }
+            if r.s("kind").isEmpty && type.hasPrefix("video") { r["kind"] = "video" }
             attach.append(r)
-        } catch { m.err = "上传失败：\(error.localizedDescription)" }
+        } catch { m.err = "上传失败：\(name)：\(error.localizedDescription)" }
     }
 }
 
@@ -441,7 +651,7 @@ struct HomeChatEmpty: View {
     }
 }
 
-/// A task in the chat: title, status, step / plan progress; tap → the task view.
+/// A task in the chat (v2): dark card, amber accent on the left, the status line in amber, a progress bar; tap → the task view.
 struct TaskCardRow: View {
     let msg: JSON
     let open: () -> Void
@@ -451,33 +661,42 @@ struct TaskCardRow: View {
         let st = d.s("status").isEmpty ? "running" : d.s("status")
         let live = isLive(st)
         let total = d.d("plan_total"), done = d.d("plan_done")
+        let frac: Double = total > 0 ? min(1, done / total) : st == "succeeded" ? 1 : (live && d.d("max_steps") > 0 ? min(1, d.d("step") / d.d("max_steps")) : (live ? 0.04 : 0))
+        let bad = ["failed", "interrupted", "stopped"].contains(st)
         Button(action: open) {
             HStack(spacing: 12) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 9).fill((st == "succeeded" ? okGreen : amber).opacity(0.13))
-                    if live && st == "running" { ProgressView().controlSize(.small) }
-                    else { Image(systemName: st == "succeeded" ? "checkmark" : "desktopcomputer").foregroundColor(st == "succeeded" ? okGreen : amber) }
+                    RoundedRectangle(cornerRadius: 9).fill(st == "succeeded" ? okGreen.opacity(0.18) : hTok)
+                    if live && st == "running" { ProgressView().controlSize(.small).tint(hAmber) }
+                    else { Image(systemName: st == "succeeded" ? "checkmark" : "desktopcomputer").foregroundColor(st == "succeeded" ? okGreen : hAmber) }
                 }.frame(width: 36, height: 36)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(cleanTitle(d.s("title").isEmpty ? msg.s("text") : d.s("title"))).font(.callout.weight(.semibold)).lineLimit(2).foregroundColor(.primary)
-                    Text(sub(d, st)).font(.caption).foregroundColor(.secondary).lineLimit(1)
-                    if total > 0 {
-                        ProgressView(value: min(done, total), total: total).tint(amber).scaleEffect(x: 1, y: 0.6, anchor: .center)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(cleanTitle(d.s("title").isEmpty ? msg.s("text") : d.s("title"))).font(.callout.weight(.semibold)).lineLimit(2).foregroundColor(.white)
+                    Text((live ? "● " : "") + sub(d, st)).font(.caption).foregroundColor(bad ? Color.red.opacity(0.85) : hAmber).lineLimit(1)
+                    if frac > 0 {
+                        GeometryReader { g in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color(white: 0.165))
+                                Capsule().fill(st == "succeeded" ? okGreen : hAmber).frame(width: max(4, g.size.width * frac))
+                            }
+                        }.frame(height: 4).padding(.top, 4)
                     }
                 }
                 Spacer(minLength: 4)
                 VStack(alignment: .trailing, spacing: 6) {
                     Chip(text: statusText[st] ?? st, color: chipColor(st), dot: true)
-                    if ["failed", "stopped", "interrupted"].contains(st) && !d.s("task_id").isEmpty {
+                    if bad && !d.s("task_id").isEmpty {
                         Button("重试", action: retry).font(.caption.weight(.semibold)).buttonStyle(.bordered).controlSize(.mini)
-                    } else { Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary) }
+                    } else { Image(systemName: "chevron.right").font(.caption).foregroundColor(Color(white: 0.55)) }
                 }
             }
-            .padding(12)
-            .background(Color(.systemBackground))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(["waiting_input", "waiting_confirm", "takeover"].contains(st) ? amber : Color(.separator).opacity(0.7), lineWidth: 1))
+            .padding(.vertical, 11).padding(.leading, 14).padding(.trailing, 12)
+            .background(Color(white: 0.067))
+            .overlay(alignment: .leading) { Rectangle().fill(bad ? Color.red : hAmber).frame(width: 4) }
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(["waiting_input", "waiting_confirm", "takeover"].contains(st) ? hAmber : Color(white: 0.2), lineWidth: 1))
+            .environment(\.colorScheme, .dark)
         }
         .buttonStyle(.plain)
         .padding(.trailing, 20)

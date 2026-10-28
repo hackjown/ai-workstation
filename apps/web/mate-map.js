@@ -108,6 +108,11 @@
     return id;
   }
 
-  return { ID: ID, NAMES: NAMES, SETTLE_MS: SETTLE_MS, forTool: forTool, fromEvent: fromEvent, fromStatus: fromStatus,
+  /* 3.8 球球 look, shared by every 球球 (web header / home orb / avatars / computer minis, iOS mate.html): a white face
+     with black eyes inside an amber ring (mate.css / mate.html draw the ring). The per-emotion body colours of the
+     engine (red when failing, pink, …) are replaced by white; expressions, eye shapes and animation are unchanged. */
+  var BALL_LOOK = { color: "#FFFFFF", eyeColor: "#1A1A1A" };
+
+  return { ID: ID, NAMES: NAMES, LOOK: BALL_LOOK, SETTLE_MS: SETTLE_MS, forTool: forTool, fromEvent: fromEvent, fromStatus: fromStatus,
     forMachine: forMachine, replay: replay, isLive: isLive, blocked: function (x) { return blocked(x); } };
 });

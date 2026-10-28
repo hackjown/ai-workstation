@@ -111,7 +111,7 @@
 
 /* ======================================================= v2 home (2026-10-28, approved mockup)
    Colours from the mockup: user = amber gradient, 球球 = dark with an amber border (3.6: white with an amber border in the light theme).
-   The 球球 itself (.mate: engine, disc, colours) is untouched; only its size, placement and motion are set here. */
+   The 球球 itself (.mate: engine, ring, colours) lives in mate.css (3.8: amber ring, white face, black eyes); only its size, placement and motion are set here. */
 #v-home { position:relative; }
 :root { --h-amber:#f0a030; --h-amber2:#ffbe4d; --h-hl:#ffc35c; --h-dark:#15120d; --h-ink:#2a1a05; }
 

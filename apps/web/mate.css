@@ -1,16 +1,19 @@
 /* 球球 expression assistant (mate.js). Engine: vendor/emotionball (SVG, sized by its host; visuals non-commercial).
-   暗黑 look of the upstream gallery (emotion-ball/css/style.css, html[data-theme="dark"] + .stage): cream ball on the
-   #09090b backdrop, a soft violet glow behind it (--accent-soft) and a drop shadow under it. */
+   3.8: amber ring, white face, black eyes in both themes (the dark theme gets a brighter ring and a near-white face). */
 .mate {
+  /* 3.8 look (user's request): an amber ring, a white face, black eyes (engine body white via AiwMood.LOOK). The ring is
+     a radial gradient in % of the radius, so it keeps its proportion at every size; the old dark / amber discs are gone. */
+  --mate-fill: #ffffff; --mate-ring: #c87618;
   display: inline-block; flex: none; position: relative; line-height: 0; pointer-events: auto; box-sizing: border-box;
-  border-radius: 50%; color-scheme: dark;
-  background: var(--mate-glow, radial-gradient(circle at 50% 42%, rgba(145, 109, 255, 0.30), rgba(145, 109, 255, 0.08) 48%, transparent 70%)), var(--mate-disc, #09090b);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 1px 3px rgba(0, 0, 0, 0.25);
-  --sketch-ink: rgba(226, 232, 248, 0.82);
+  border-radius: 50%; color-scheme: light;
+  background: radial-gradient(circle closest-side, var(--mate-fill) 0, var(--mate-fill) 89.5%, var(--mate-ring) 91.5%, var(--mate-ring) 100%, transparent 100.5%);
+  box-shadow: 0 1px 3px rgba(90, 50, 0, 0.18);
+  --sketch-ink: rgba(26, 26, 26, 0.85);
 }
-/* inset (not padding: a % padding follows the parent's width) keeps the ball inside the disc at any size */
-.mate > svg { position: absolute; left: var(--mate-pad, 9%); top: var(--mate-pad, 9%); width: calc(100% - 2 * var(--mate-pad, 9%)) !important;
-  height: calc(100% - 2 * var(--mate-pad, 9%)) !important; overflow: visible; display: block; filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.55)); }
+html[data-theme="dark"] .mate { --mate-fill: #f7f4ee; --mate-ring: #e8a050; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45); }
+/* inset (not padding: a % padding follows the parent's width) keeps the ball inside the ring at any size */
+.mate > svg { position: absolute; left: var(--mate-pad, 10%); top: var(--mate-pad, 10%); width: calc(100% - 2 * var(--mate-pad, 10%)) !important;
+  height: calc(100% - 2 * var(--mate-pad, 10%)) !important; overflow: visible; display: block; filter: drop-shadow(0 1.5px 2px rgba(120, 70, 10, 0.22)); }
 .mate-head { width: 36px; height: 36px; margin: -4px 4px -4px 0; cursor: default; }
 body:not(.mate-chat) .mate-head, body.mate-off .mate { display: none; }
 @media (max-width: 760px) { .mate-head { width: 30px; height: 30px; margin: -2px 2px -2px 0; } }
@@ -19,8 +22,6 @@ body:not(.mate-chat) .mate-head, body.mate-off .mate { display: none; }
 .iconbox.has-mate > :not(.mate), .mach .ic.has-mate > :not(.mate) { visibility: hidden; }
 .mate-mini { position: absolute; inset: 0; width: auto; height: auto; border-radius: inherit; --mate-pad: 11%; }
 .mate-mini.inline { width: 22px; height: 22px; vertical-align: -6px; margin-left: 6px; position: relative; display: inline-block; border-radius: 50%; --mate-pad: 6%; }
-.iconbox.has-mate, .mach .ic.has-mate { background: #09090b; overflow: hidden; }
-.mate-slot { position: relative; width: 34px; height: 34px; flex: none; margin-left: 8px; border-radius: 10px; background: #09090b; overflow: hidden; }
-/* amber disc (the app accent), same as mate.html?ring=amber: add class "amber" or set --mate-disc / --mate-glow */
-.mate.amber { --mate-disc: #c87618; --mate-glow: radial-gradient(circle at 50% 36%, rgba(255, 214, 150, 0.38), rgba(255, 190, 110, 0.10) 50%, transparent 72%);
-  --sketch-ink: rgba(255, 246, 232, 0.92); }
+.iconbox.has-mate, .mach .ic.has-mate { background: transparent; overflow: hidden; }
+.mate-slot { position: relative; width: 34px; height: 34px; flex: none; margin-left: 8px; border-radius: 50%; background: transparent; overflow: hidden; }
+/* .amber: kept for old markup; since 3.8 every 球球 has the same amber ring and white face */

@@ -52,10 +52,22 @@ def test_pages_load_emotion_ball_in_order_and_no_mood_mates():
     js = (WEB / "mate.js").read_text(encoding="utf-8") + (WEB / "mate.html").read_text(encoding="utf-8")
     assert "EmotionBall.create(" in js and 'shape: "blob"' in js and "handleAIMessage" in js and "burst(" in js and "setActive(" in js
     css = (WEB / "mate.css").read_text(encoding="utf-8")
-    assert "#09090b" in css   # 暗黑 backdrop
+    # 3.8 look: amber ring + white face + black eyes everywhere (the dark 暗黑 backdrop and the red body are gone)
+    assert "#09090b" not in css and "--mate-ring" in css and "--mate-fill: #ffffff" in css
+    page = (WEB / "mate.html").read_text(encoding="utf-8")
+    assert "--mate-ring" in page and "M.LOOK.color" in page and "MAP.LOOK.color" in (WEB / "mate.js").read_text(encoding="utf-8")
+    mm = (WEB / "mate-map.js").read_text(encoding="utf-8")
+    assert 'BALL_LOOK = { color: "#FFFFFF", eyeColor: "#1A1A1A" }' in mm
 
 
 def test_ios_bundle_copies_emotion_ball_and_licence():
     sh = (ROOT / "apps" / "ios" / "build-ipa.sh").read_text(encoding="utf-8")
     assert "vendor/emotionball/*.js" in sh and "emotionball/LICENSE" in sh and "emotionball/NOTICE.md" in sh
     assert "moodmates" not in sh
+
+
+def test_ios_mate_head_is_white_with_amber_ring():
+    swift = (ROOT / "apps" / "ios" / "Sources" / "MateView.swift").read_text(encoding="utf-8")
+    head = swift[swift.index("struct MateHead"):]
+    assert "strokeBorder" in head and "Color.white" in head and "MateHead.eye" in head
+    assert "0xF6 / 255" not in head   # the old cream ball on the amber disc

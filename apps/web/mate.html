@@ -4,29 +4,27 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>球球</title>
-<!-- 球球 · 暗黑 (Emotion Ball, github.com/sam70361/aora-bot emotion-ball/; visuals for personal learning/research only,
+<!-- 球球 (Emotion Ball, github.com/sam70361/aora-bot emotion-ball/; visuals for personal learning/research only,
      no commercial use: vendor/emotionball/LICENSE + NOTICE.md).
      Embedded by the iOS app (WKWebView, bundled copy) in the chat header. The app drives it with evaluateJavaScript:
        aiwMate.event({type, data})  a task/session event (mapped by mate-map.js)
        aiwMate.status("running")    a task's stored status
        aiwMate.set("33", true)      an emotion id directly (+ burst)
        aiwMate.active(false)        stop the animation loop (app in background)
-     ?static=1 renders single frames only (Reduce Motion). ?ring=amber: amber #C87618 disc (iOS home / chat mascot). -->
+     ?static=1 renders single frames only (Reduce Motion). 3.8: amber ring + white face + black eyes everywhere. -->
 <style>
   html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; -webkit-user-select: none; user-select: none; }
-  /* 暗黑 look of the upstream gallery: cream ball on #09090b with a violet glow and a drop shadow (?bg=0: no backdrop) */
-  /* the disc is two CSS vars, so a host can recolour it without touching the ball or the emotion mapping:
-     ?ring=amber (iOS home + chat mascot) = the app accent #C87618 with a warm glow; default = the 暗黑 look */
-  #m { --mate-disc: #09090b; --mate-glow: radial-gradient(circle at 50% 42%, rgba(145,109,255,.30), rgba(145,109,255,.08) 48%, transparent 70%);
-       --mate-rim: rgba(255,255,255,.08);
-       position: absolute; inset: 0; box-sizing: border-box; border-radius: 50%; padding: 9%; color-scheme: dark;
-       background: var(--mate-glow), var(--mate-disc);
-       box-shadow: inset 0 0 0 1px var(--mate-rim); --sketch-ink: rgba(226,232,248,.82); }
-  #m.amber { --mate-disc: #C87618; --mate-rim: rgba(255,255,255,.16); --sketch-ink: rgba(255,246,232,.92);
-       --mate-glow: radial-gradient(circle at 50% 36%, rgba(255,214,150,.38), rgba(255,190,110,.10) 50%, transparent 72%); }
-  #m.amber > svg { filter: drop-shadow(0 2px 3px rgba(90,40,0,.45)); }
-  #m.nobg { background: transparent; box-shadow: none; padding: 0; }
-  #m > svg { filter: drop-shadow(0 2px 3px rgba(0,0,0,.55)); }
+  /* 3.8 look (user's request, replaces the "keep the orb unchanged" rule): an amber ring, a white face, black eyes. The
+     ring is a radial gradient in % of the radius, so it keeps its proportion at every size (112 pt home orb, 30 pt head).
+     The engine's body is white (AiwMood.LOOK), so the red / pink emotion bodies are gone; expressions are unchanged.
+     Dark mode: the same white face (a touch warmer) and a brighter amber ring, so it stays legible on a dark page.
+     ?ring=amber is kept for old callers (same look); ?bg=0: no ring or fill. */
+  #m { --mate-fill: #FFFFFF; --mate-ring: #C87618; --sketch-ink: rgba(26,26,26,.85);
+       position: absolute; inset: 0; box-sizing: border-box; border-radius: 50%; padding: 10%; color-scheme: light;
+       background: radial-gradient(circle closest-side, var(--mate-fill) 0, var(--mate-fill) 90.5%, var(--mate-ring) 92%, var(--mate-ring) 100%, transparent 100.5%); }
+  @media (prefers-color-scheme: dark) { #m { --mate-fill: #F7F4EE; --mate-ring: #E8A050; } }
+  #m.nobg { background: transparent; padding: 0; }
+  #m > svg { filter: drop-shadow(0 1.5px 2px rgba(120,70,10,.22)); }
 </style>
 </head>
 <body>
@@ -45,7 +43,8 @@
   var host = document.getElementById("m");
   if (q.get("bg") === "0") host.className = "nobg";
   else if (q.get("ring") === "amber") host.className = "amber";
-  var eng = EmotionBall.create(host, { emotion: cur, idle: false, shape: "blob", eyeScale: +(q.get("eye") || 1.6), lite: q.get("lite") === "1", autostart: live, label: "球球" });
+  var eng = EmotionBall.create(host, { emotion: cur, idle: false, shape: "blob", eyeScale: +(q.get("eye") || 1.6), lite: q.get("lite") === "1", autostart: live, label: "球球",
+                                       color: M.LOOK.color, eyeColor: M.LOOK.eyeColor });
   if (!live) eng.renderStatic();
   function post(o) { try { window.webkit.messageHandlers.mate.postMessage(o); } catch (e) { /* not in the app */ } }
   var HOLD = { "31": 1400, "39": 1400, "36": 700, "40": 700, "38": 900 }, holdUntil = 0, holdT = 0, queuedSettle = false;

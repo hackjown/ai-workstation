@@ -19,9 +19,10 @@
   Mate.prototype.ensure = function () {
     if (this.eng || !this.host.isConnected) return this.eng;
     const still = RM.matches;
-    // 球球 = the default blob body (#F3F0EA, dark eyes); the 暗黑 backdrop comes from mate.css. No idle timer:
+    // 球球 = the blob body in white with black eyes (3.8, MAP.LOOK) inside the amber ring of mate.css. No idle timer:
     // AIW drives standby/sleep itself from the machine state.
     this.eng = EmotionBall.create(this.host, { emotion: this.id || ID.IDLE, idle: false, shape: "blob", eyeScale: this.opts.eyeScale || 1.6,
+      color: MAP.LOOK.color, eyeColor: MAP.LOOK.eyeColor,
       lite: !!this.opts.lite, autostart: !still && !document.hidden && this.vis !== false, label: "球球" });
     if (still) this.eng.renderStatic();
     return this.eng;

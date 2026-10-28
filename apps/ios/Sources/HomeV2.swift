@@ -139,7 +139,7 @@ struct ThinkingRow: View {
             Group {
                 if mateOn {
                     MateView(status: "", threadId: nil, bus: false, emotion: "30", animate: true)
-                } else { Circle().fill(amber) }
+                } else { MateHead(size: MateAvatar.side, face: false) }
             }
             .frame(width: MateAvatar.side, height: MateAvatar.side).clipShape(Circle())
             .padding(.bottom, 2)

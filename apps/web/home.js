@@ -37,7 +37,8 @@ function hAvSvg() {
     if (window.EmotionBall && EmotionBall.create) {
       const host = document.createElement("span"); host.className = "mate amber hav"; host.style.cssText = "position:fixed;left:-200px;top:0";
       document.body.appendChild(host);
-      const eng = EmotionBall.create(host, { emotion: "02", idle: false, shape: "blob", eyeScale: 1.6, lite: true, autostart: false, label: "球球" });
+      const eng = EmotionBall.create(host, { emotion: "02", idle: false, shape: "blob", eyeScale: 1.6, lite: true, autostart: false, label: "球球",
+        color: (window.AiwMood && AiwMood.LOOK || {}).color || "#FFFFFF", eyeColor: (window.AiwMood && AiwMood.LOOK || {}).eyeColor || "#1A1A1A" });
       eng.renderStatic(); let html = host.innerHTML; try { eng.destroy(); } catch (e) { /* ignore */ }
       // 3.7: the clones carried copies of the gradient defs with the same ids, and url(#id) takes the FIRST one in the
       // page: one inside a hidden view (display:none) paints nothing, so the head lost its ball in the task view.

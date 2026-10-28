@@ -59,7 +59,7 @@ struct MateTitle: View {
     }
 }
 
-/// iOS v2: the disc behind 球球 is the app accent (mate.html?ring=amber); the web keeps the dark disc.
+/// 3.8: every 球球 (here and on the web) is a white face with black eyes in an amber ring (mate.html; `ring` is kept for old callers).
 /// `bus: false` makes a standalone picture (computer list) that never takes the live events from the chat's 球球;
 /// `emotion` then picks its face (e.g. "00" asleep/offline, "02" idle).
 struct MateView: UIViewRepresentable {
@@ -159,7 +159,7 @@ struct MateAvatar: View {
     @AppStorage("mate") private var mateOn = true
     var body: some View {
         Group {
-            if mateOn { MateHead(size: size) } else { Circle().fill(amber) }
+            if mateOn { MateHead(size: size) } else { MateHead(size: size, face: false) }
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
@@ -167,38 +167,42 @@ struct MateAvatar: View {
     }
 }
 
-/// The 球球 head as the bundled mate.html draws it (?ring=amber&e=02, still): the amber #C87618 disc with its warm
-/// glow, the cream ball (radial #f6f3ef → #F3F0EA → #d6d3ce, light from the upper left) with a soft shadow, and the
-/// two dark eyes of the idle face up and to the right. Proportions measured from that page's render (ball 73 % of the
-/// disc; eyes at 57 % / 36 % and 71 % / 33 %, tilted about 25°). The orb's own look is unchanged; this is its picture.
+/// The 球球 head as the bundled mate.html draws it (3.8 look, still idle face e=02): an amber ring, a white face, the two
+/// black eyes of the idle face up and to the right. The ring is 9 % of the radius (mate.html: the fill ends at 90.5 % of
+/// the radius); the ball inside is white with the engine's light-from-the-upper-left shading (#FFF → #FFF → #E0E0E0) and
+/// a soft warm shadow; eyes at 57 % / 36 % and 71 % / 33 % of the side, tilted about 25° (measured from the page's render).
+/// Dark mode keeps it white (a touch warmer) with a brighter ring, so it stays legible on a dark background.
 struct MateHead: View {
     var size: CGFloat
-    static let disc = Color(red: 0xC8 / 255, green: 0x76 / 255, blue: 0x18 / 255)
+    var face = true
+    @Environment(\.colorScheme) private var cs
+    static let ringLight = Color(red: 0xC8 / 255, green: 0x76 / 255, blue: 0x18 / 255)
+    static let ringDark = Color(red: 0xE8 / 255, green: 0xA0 / 255, blue: 0x50 / 255)
     static let eye = Color(red: 0x1A / 255, green: 0x1A / 255, blue: 0x1A / 255)
     var body: some View {
         let s = size
+        let fill = cs == .dark ? Color(red: 0xF7 / 255, green: 0xF4 / 255, blue: 0xEE / 255) : Color.white
         ZStack {
-            Circle().fill(MateHead.disc)
-            Circle().fill(RadialGradient(colors: [Color(red: 1, green: 214 / 255, blue: 150 / 255).opacity(0.38),
-                                                  Color(red: 1, green: 190 / 255, blue: 110 / 255).opacity(0.10), .clear],
-                                         center: UnitPoint(x: 0.5, y: 0.36), startRadius: 0, endRadius: s * 0.62))
-            Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: max(0.5, s / 96))
-            Circle()
-                .fill(RadialGradient(stops: [.init(color: Color(red: 0xF6 / 255, green: 0xF3 / 255, blue: 0xEF / 255), location: 0),
-                                             .init(color: Color(red: 0xF3 / 255, green: 0xF0 / 255, blue: 0xEA / 255), location: 0.62),
-                                             .init(color: Color(red: 0xD6 / 255, green: 0xD3 / 255, blue: 0xCE / 255), location: 1)],
-                                     center: UnitPoint(x: 0.38, y: 0.32), startRadius: 0, endRadius: s * 0.73 * 0.75))
-                .frame(width: s * 0.73, height: s * 0.73)
-                .shadow(color: Color(red: 90 / 255, green: 40 / 255, blue: 0).opacity(0.45), radius: max(0.5, s * 0.03), y: s * 0.02)
-                .position(x: s * 0.501, y: s * 0.504)
-            Capsule().fill(MateHead.eye)
-                .frame(width: s * 0.105, height: s * 0.235)
-                .rotationEffect(.degrees(-26))
-                .position(x: s * 0.573, y: s * 0.357)
-            Capsule().fill(MateHead.eye)
-                .frame(width: s * 0.06, height: s * 0.225)
-                .rotationEffect(.degrees(-20))
-                .position(x: s * 0.714, y: s * 0.331)
+            Circle().fill(fill)
+            Circle().strokeBorder(cs == .dark ? MateHead.ringDark : MateHead.ringLight, lineWidth: max(1.5, s * 0.05))
+            if face {
+                Circle()
+                    .fill(RadialGradient(stops: [.init(color: .white, location: 0),
+                                                 .init(color: .white, location: 0.62),
+                                                 .init(color: Color(white: 0xE0 / 255), location: 1)],
+                                         center: UnitPoint(x: 0.38, y: 0.32), startRadius: 0, endRadius: s * 0.78 * 0.75))
+                    .frame(width: s * 0.78, height: s * 0.78)
+                    .shadow(color: Color(red: 120 / 255, green: 70 / 255, blue: 10 / 255).opacity(0.22), radius: max(0.5, s * 0.025), y: s * 0.015)
+                    .position(x: s * 0.5, y: s * 0.5)
+                Capsule().fill(MateHead.eye)
+                    .frame(width: s * 0.105, height: s * 0.235)
+                    .rotationEffect(.degrees(-26))
+                    .position(x: s * 0.573, y: s * 0.357)
+                Capsule().fill(MateHead.eye)
+                    .frame(width: s * 0.06, height: s * 0.225)
+                    .rotationEffect(.degrees(-20))
+                    .position(x: s * 0.714, y: s * 0.331)
+            }
         }
         .frame(width: s, height: s)
         .compositingGroup()

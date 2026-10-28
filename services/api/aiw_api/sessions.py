@@ -37,6 +37,8 @@ log = logging.getLogger("aiw.sessions")
 TASK_ALLOW_NEVER = ("order_confirm", "xhs_review")   # 本任务内都允许 never approves an order or posts for the user
 LIVE_STATES = ("running", "paused", "takeover", "waiting_confirm", "waiting_input")
 FINAL_STATES = ("succeeded", "failed", "stopped", "interrupted", "cancelled")
+CHAT_EVENTS = (EventType.TASK_STARTED, EventType.DECISION, EventType.PLAN, EventType.PLAN_UPDATE,
+               EventType.INPUT_REQUIRED, EventType.INPUT_ANSWERED, EventType.CONFIRM_REQUIRED, EventType.CONFIRM_ANSWERED)
 
 
 @dataclass
@@ -70,6 +72,9 @@ class SessionManager:
         self._drain_lock = asyncio.Lock()
         self.cloud = None  # CloudManager, set by the API
         self._health: dict[str, tuple[float, bool]] = {}   # machine -> (checked at, vm-agent answered)
+        # async fn(task, session_id, msg) told about a task's milestones (start, step, plan, questions, confirmations,
+        # the end): the persistent chat (chat.py) keeps its task cards and escalation messages up to date from these
+        self.listeners: list = []
 
     # ------------------------------------------------------------------ factories
     def _default_computer(self, machine: dict) -> Computer:
@@ -169,7 +174,8 @@ class SessionManager:
         return {"model": model, "key": key, "base_url": base}
 
     # ------------------------------------------------------------------ context
-    def build_context(self, thread_id: Optional[str], exclude_task: Optional[str] = None) -> Optional[str]:
+    def build_context(self, thread_id: Optional[str], exclude_task: Optional[str] = None,
+                      query: Optional[str] = None) -> Optional[str]:
         parts = []
         prof = self.store.kv_get("profile", {}) or {}
         if prof.get("name") or prof.get("tone") or prof.get("about"):
@@ -194,7 +200,9 @@ class SessionManager:
 
     async def submit(self, prompt: str, machine_id: Optional[str] = None, thread_id: Optional[str] = None,
                      source: str = "chat", max_steps: int = 40, timeout_s: float = float(os.environ.get("AIW_TASK_TIMEOUT", "900")), title: Optional[str] = None,
-                     isolated: bool = False) -> dict:
+                     isolated: bool = False, context_extra: Optional[str] = None) -> dict:
+        """context_extra: background the task gets on top of its thread and memory (the chat turns before a task
+        the persistent chat started); kept in kv so a queued task still has it when it starts."""
         machine_id = machine_id or (self.settings.machines[0].id if self.settings.machines else "ai-linux-001")
         if not self.store.machine(machine_id):
             raise KeyError(machine_id)
@@ -208,6 +216,8 @@ class SessionManager:
         self.store.create_task(row)
         if isolated:
             self.store.kv_set(f"isolated:{task.id}", True)
+        if context_extra:
+            self.store.kv_set(f"task_ctx:{task.id}", str(context_extra)[:6000])
         queued = bool(self.busy_session(machine_id)) or thread_id in self.held_threads
         if not queued:
             await self._start_task_row(self.store.task(task.id))
@@ -217,7 +227,10 @@ class SessionManager:
         return {"task": t, "session_id": t.get("session_id"), "queued": queued, "thread_id": thread_id}
 
     async def _start_task_row(self, row: dict, allow_busy: bool = False) -> LiveSession:
-        ctx = self.build_context(row.get("thread_id"), exclude_task=row["id"])
+        ctx = self.build_context(row.get("thread_id"), exclude_task=row["id"], query=row.get("prompt"))
+        extra_ctx = self.store.kv_get(f"task_ctx:{row['id']}")
+        if extra_ctx:
+            ctx = (ctx + "\n\n" if ctx else "") + extra_ctx
         if row.get("parent_id"):
             ctx = _child_note(self.store.task(row["parent_id"]) or {}) + ("\n\n" + ctx if ctx else "")
         steps, secs = _budget(row["prompt"], row.get("max_steps") or 40,
@@ -316,6 +329,8 @@ class SessionManager:
                 pass  # saved by remember()
             msg = {"kind": "event", "task_id": task.id, "thread_id": task.thread_id, **d}
             await self._broadcast(live, msg)
+            if ev.type in CHAT_EVENTS:
+                await self._tell(task, sid, msg)
             if ev.type in (EventType.TASK_STARTED, EventType.TASK_FINISHED, EventType.TASK_FAILED, EventType.PLAN,
                            EventType.PLAN_UPDATE, EventType.CONFIRM_REQUIRED, EventType.INPUT_REQUIRED):
                 await self._event_all(msg)
@@ -516,6 +531,8 @@ class SessionManager:
                 status, result = "failed", f"{type(e).__name__}: {e}"
             self.store.update_task(task.id, status, result)
             self.store.end_session(sid, status)
+            await self._tell(task, sid, {"type": "task.end", "status": status, "result": result,
+                                         "files": [a["path"] for a in self.store.artifacts(sid) if a["kind"] == "file"]})
             if not parent_id:   # a parent that ended (failed, timed out, stopped) leaves no child running
                 try:
                     await self.stop_children(task.id)
@@ -583,6 +600,13 @@ class SessionManager:
                 await self.notifier.notify(kind, title, body, task_id=task.id, thread_id=task.thread_id)
             except Exception as e:  # noqa: BLE001
                 log.warning("notify failed: %s", e)
+
+    async def _tell(self, task: Task, sid: str, msg: dict):
+        for fn in list(self.listeners):
+            try:
+                await fn(task, sid, msg)
+            except Exception as e:  # noqa: BLE001  a listener never breaks a task
+                log.warning("task listener: %s", e)
 
     async def _event_all(self, msg: dict):
         if self.notifier:

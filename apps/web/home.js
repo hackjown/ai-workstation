@@ -10,7 +10,8 @@
    * the sidebar conversation list became the 任务 page (every task, status, retry, replay)
    v2 (2026-10-28, approved mockup): with nothing new, 球球 sits in the middle and its briefing (GET /api/greeting) pops
    up around it as speech bubbles, one every ~4.5 s (the old one fades and shrinks away); 球球's face follows each item,
-   tapping a bubble runs it, quick chips sit above the input and typing stops the rotation. User bubbles are amber,
+   tapping a bubble runs it and typing stops the rotation (3.6: no quick chips; bubbles placed outside the 球球 circle by
+   hPlace; light theme: white 球球 bubbles; the small 球球 head beside replies, cards and thinking; WeChat-like + panel). User bubbles are amber,
    球球's dark with an amber border and a small 球球 beside them; before the first token 球球 thinks (eyes up, dashed ring,
    bouncing dots + what it is doing) and the send key becomes 停止 (POST /api/chat/cancel). "/" opens the skill picker
    (a chosen skill is an amber token, sent as the 【技能：…】 marker like the old + menu), "+" a sheet with 拍照 / 录视频 /
@@ -34,7 +35,7 @@ function hAvSvg() {
   hAvCache = "";
   try {
     if (window.EmotionBall && EmotionBall.create) {
-      const host = document.createElement("span"); host.className = "mate hav"; host.style.cssText = "position:fixed;left:-200px;top:0";
+      const host = document.createElement("span"); host.className = "mate amber hav"; host.style.cssText = "position:fixed;left:-200px;top:0";
       document.body.appendChild(host);
       const eng = EmotionBall.create(host, { emotion: "02", idle: false, shape: "blob", eyeScale: 1.6, lite: true, autostart: false, label: "球球" });
       eng.renderStatic(); hAvCache = host.innerHTML; try { eng.destroy(); } catch (e) { /* ignore */ }
@@ -44,7 +45,7 @@ function hAvSvg() {
   } catch (e) { console.warn("avatar", e); }
   return hAvCache;
 }
-const hAv = () => `<span class="mate hav" aria-hidden="true">${hAvSvg()}</span>`;
+const hAv = () => `<span class="mate amber hav" aria-hidden="true">${hAvSvg()}</span>`;   // the small 球球 head (3.6: amber disc, like iOS)
 const hA = (m, inner, cls) => `<div class="a hrow hwa ${cls || ""}" data-id="${m.id}">${hAv()}${inner}</div>`;
 const SK_MARK = /^\s*【技能[:：]([^】]+)】\n?/;
 function hSkillTitle(id) { const s = ((HK.list || S.skillList || []).find((x) => x.id === id)); return s ? s.title || id : id; }
@@ -127,7 +128,7 @@ function hMsg(m) {
       <div class="meta">${hTime(m.created_at)}${d.thread_id ? ` · <button class="link small" onclick="hOpenTask('${m.id}')">${d.has_more ? "查看完整结果" : "查看任务"} ›</button>` : ""}</div></div>`);
   }
   // assistant text (the one being written: 球球 thinks until the first token)
-  if (m.stream && !m.text) return `<div class="a hrow hwa hthink" data-id="stream"><span class="hav-wrap"><span class="mate hav hav-live" id="hThinkAv" aria-hidden="true">${hAvSvg()}</span><span class="hring"></span></span>
+  if (m.stream && !m.text) return `<div class="a hrow hwa hthink nm" data-id="stream"><span class="mate amber hav hav-live" id="hThinkAv" aria-hidden="true">${hAvSvg()}</span>
     <div class="bubble hdots-b"><span class="hdots"><i></i><i></i><i></i></span><span class="hnote">${esc(m.note || "正在想…")}</span></div></div>`;
   let offer = "";
   if (d.offer_task) offer = d.task_started
@@ -434,11 +435,34 @@ function hSlash() {   // 技能 / in the + sheet: the same as typing "/"
   hInput(el);
 }
 
-/* ---------------------------------------------------------------- "+" sheet */
+/* ---------------------------------------------------------------- "+" sheet (3.6: WeChat-like panel) */
+// grey line icons for the tiles (stroke style of the app's icon set)
+Object.assign(IC, {
+  camera: "M3 8a2 2 0 0 1 2-2h2.5l1.5-2h6l1.5 2H19a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z",
+  video: "M3 7a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM16 10l5-3v10l-5-3",
+  image: "M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM3 16l5-5 4 4 3-3 6 6M15.5 8.5h.01",
+  folder: "M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
+  link: "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1",
+  sparkle: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z",
+});
+document.querySelectorAll("#hsheet [data-hi]").forEach((el) => { el.innerHTML = icon(el.dataset.hi); });   // after IC has them (app.js paints <i data-i> first)
+function hSheetPages() {   // 4 per row, 2 rows a page; more pages swipe sideways (dots under them)
+  const grid = $("hsheet").querySelector(".hs-grid");
+  if (!grid || grid.dataset.paged) return;
+  const items = [...grid.querySelectorAll(".hs-it")].filter((x) => !x.hidden && getComputedStyle(x).display !== "none");
+  grid.dataset.paged = "1"; grid.innerHTML = "";
+  for (let i = 0; i < items.length; i += 8) {
+    const pg = document.createElement("div"); pg.className = "hs-page"; items.slice(i, i + 8).forEach((x) => pg.appendChild(x)); grid.appendChild(pg);
+  }
+  const n = grid.children.length, dots = $("hsDots");
+  dots.hidden = n < 2;
+  dots.innerHTML = Array.from({ length: n }, (_, i) => `<i class="${i ? "" : "on"}"></i>`).join("");
+  grid.onscroll = () => { const k = Math.round(grid.scrollLeft / Math.max(1, grid.clientWidth)); [...dots.children].forEach((d, i) => d.classList.toggle("on", i === k)); };
+}
 function hSheet(on) {
   const sh = $("hsheet"); if (on === undefined) on = !sh.classList.contains("on");
   sh.classList.toggle("on", on); $("hsheetDim").classList.toggle("on", on); sh.setAttribute("aria-hidden", on ? "false" : "true");
-  if (on) { hSkClose(); const f = sh.querySelector(".hs-it"); if (f) setTimeout(() => f.focus(), 50); }
+  if (on) { hSkClose(); hSheetPages(); const f = sh.querySelector(".hs-it"); if (f) setTimeout(() => f.focus(), 50); }
 }
 function hPick(id) { hSheet(false); $(id).click(); }
 function hLink() {
@@ -461,14 +485,14 @@ function hVoice() {   // dictation into the input (the browser's speech recognit
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("hsheet").classList.contains("on")) hSheet(false); });
 
 /* ---------------------------------------------------------------- 球球's briefing (nothing new on the home screen) */
-const HB = { items: [], chips: [], i: -1, timer: 0, shown: 0, stopped: false, mate: null, slot: -1, at: 0, cur: null };
+const HB = { items: [], chips: [], i: -1, timer: 0, shown: 0, stopped: false, mate: null, slot: -1, at: 0, cur: null };   // chips: no longer shown (3.6)
 const HB_MS = 4500;
 const hStaged = () => $("v-home").classList.contains("staged");
 function hStage(on) {
   const v = $("v-home");
   v.classList.toggle("staged", !!on);
   $("hHistBtn").hidden = !HS.msgs.length;
-  if (on) hStageStart(); else hStageStop();
+  if (on) { hStageStart(); const w = document.querySelector("#hbbs .hbw:not(.out)"); if (w) requestAnimationFrame(() => hLayoutBubble(w)); } else hStageStop();
 }
 function hShowChat() { HS.stageOff = true; hStage(false); hRender("bottom"); setTimeout(hScrollLatest, 60); }
 async function hStageStart() {
@@ -483,7 +507,6 @@ async function hStageStart() {
     }
   }
   if (!hStaged()) return;
-  $("hchips").innerHTML = HB.chips.map((c, i) => `<button type="button" onclick="hChip(${i})">${esc(c.label)}</button>`).join("");
   if (!HB.cur) hStageNext();
   hStageRun();
 }
@@ -493,28 +516,106 @@ function hStageRun() {
   HB.timer = setInterval(hStageNext, HB_MS);
 }
 function hStageStop() { clearInterval(HB.timer); HB.timer = 0; }
-function hSlots() { return window.innerWidth <= 760 ? [0, 3, 1, 5] : [0, 2, 3, 1, 4, 5]; }
+/* 3.6: bubble placement computed from the 球球 circle and the stage (same math as iOS StageLayout, HomeV2.swift):
+   a slot outside the circle (above / below, beside it when there is room), never closer than GAP to it, never outside
+   the stage; when no slot holds the whole text, the placement showing the most lines, cut with an ellipsis. */
+const HP = { gap: 30, edge: 14, sideMin: 170 };
+function hSideRoom(c, r, A) { return Math.min(A.x + A.w - HP.edge - (c.x + r + HP.gap), (c.x - r - HP.gap) - (A.x + HP.edge)); }
+function hFrame(side, lean, b, c, r, A) {
+  const minX = A.x + HP.edge, maxX = A.x + A.w - HP.edge, minY = A.y + HP.edge, maxY = A.y + A.h - HP.edge;
+  const cx = (x) => Math.max(minX, Math.min(x, maxX - b.w)), cy = (y) => Math.max(minY, Math.min(y, maxY - b.h));
+  if (side === "above") return { x: cx(c.x - b.w / 2 + lean * b.w * 0.28), y: c.y - r - HP.gap - b.h, w: b.w, h: b.h };
+  if (side === "below") return { x: cx(c.x - b.w / 2 + lean * b.w * 0.28), y: c.y + r + HP.gap, w: b.w, h: b.h };
+  if (side === "right") return { x: c.x + r + HP.gap, y: cy(c.y - b.h * 0.65), w: b.w, h: b.h };
+  return { x: c.x - r - HP.gap - b.w, y: cy(c.y - b.h * 0.65), w: b.w, h: b.h };
+}
+function hDist(p, f) { const dx = Math.max(f.x - p.x, 0, p.x - f.x - f.w), dy = Math.max(f.y - p.y, 0, p.y - f.y - f.h); return Math.hypot(dx, dy); }
+function hFits(f, c, r, A) {
+  const e = HP.edge - 0.5;
+  return f.x >= A.x + e && f.y >= A.y + e && f.x + f.w <= A.x + A.w - e && f.y + f.h <= A.y + A.h - e && hDist(c, f) >= r + HP.gap * 0.8;
+}
+function hPlace(slot, b, c, r, A, lineH, padV) {
+  const L = hSideRoom(c, r, A) >= HP.sideMin
+    ? [["above", 1], ["right", 0], ["below", -1], ["left", 0], ["above", -1], ["below", 1]]
+    : [["above", 1], ["below", -1], ["above", -1], ["below", 1]];
+  for (let i = 0; i < L.length; i++) {
+    const [side, lean] = L[(slot % L.length + i) % L.length], f = hFrame(side, lean, b, c, r, A);
+    if (hFits(f, c, r, A)) return { f, side, lines: 0 };
+  }
+  let best = null;
+  const offer = (f, side, lines) => { if (hFits(f, c, r, A) && lines > (best ? best.lines : 0)) best = { f, side, lines }; };
+  const need = Math.max(1, Math.round((b.h - padV) / lineH));
+  for (const side of ["above", "below"]) {
+    const room = side === "above" ? (c.y - r - HP.gap) - (A.y + HP.edge) : (A.y + A.h - HP.edge) - (c.y + r + HP.gap);
+    const lines = Math.min(need, Math.floor((room - padV) / lineH));
+    if (lines >= 1) offer(hFrame(side, side === "above" ? 1 : -1, { w: b.w, h: padV + lines * lineH }, c, r, A), side, lines);
+  }
+  const sr = hSideRoom(c, r, A);
+  if (sr >= 110) {
+    const w2 = Math.min(b.w, sr), lines = Math.min(Math.ceil(need * b.w / w2), Math.floor((A.h - 2 * HP.edge - padV) / lineH));
+    if (lines >= 1) for (const side of ["right", "left"]) offer(hFrame(side, 0, { w: w2, h: padV + lines * lineH }, c, r, A), side, lines);
+  }
+  if (best) return best;
+  const up = (c.y - r - HP.gap) - (A.y + HP.edge), down = (A.y + A.h - HP.edge) - (c.y + r + HP.gap), side = up >= down ? "above" : "below";
+  const f = hFrame(side, 0, { w: b.w, h: padV + lineH }, c, r, A); f.y = Math.max(A.y + HP.edge, Math.min(f.y, A.y + A.h - HP.edge - f.h));
+  return { f, side, lines: 1 };
+}
+function hTail(p, c, r) {   // two dots between the bubble edge facing 球球 and the circle
+  const f = p.f; let st;
+  if (p.side === "above") st = { x: Math.max(f.x + 24, Math.min(c.x, f.x + f.w - 24)), y: f.y + f.h };
+  else if (p.side === "below") st = { x: Math.max(f.x + 24, Math.min(c.x, f.x + f.w - 24)), y: f.y };
+  else if (p.side === "right") st = { x: f.x, y: Math.max(f.y + 16, Math.min(c.y, f.y + f.h - 16)) };
+  else st = { x: f.x + f.w, y: Math.max(f.y + 16, Math.min(c.y, f.y + f.h - 16)) };
+  const vx = st.x - c.x, vy = st.y - c.y, len = Math.max(1, Math.hypot(vx, vy)), e = { x: c.x + vx / len * r, y: c.y + vy / len * r };
+  return [0.32, 0.68].map((t) => ({ x: st.x + (e.x - st.x) * t, y: st.y + (e.y - st.y) * t }));
+}
+function hLayoutBubble(wrap) {   // place one bubble (wrap = .hbw holding the .hbb and its two dots) for its turn
+  const stage = $("hstage"), orb = $("hstOrb"), b = wrap.querySelector(".hbb"), t = b.querySelector(".hbt");
+  const S0 = stage.getBoundingClientRect(), O = orb.getBoundingClientRect();
+  if (!S0.width || !O.width) return null;
+  const top = $("hHistBtn").hidden ? 4 : 46;
+  const A = { x: 0, y: top, w: S0.width, h: Math.max(120, S0.height - top - 4) };
+  const r = O.width / 2, c = { x: O.left - S0.left + r, y: O.top - S0.top + r - (parseFloat(getComputedStyle(orb).getPropertyValue("--hf")) || 0) };
+  const maxW = Math.min(270, A.w - 2 * HP.edge);
+  b.style.width = ""; b.style.maxWidth = maxW + "px"; t.style.webkitLineClamp = ""; t.classList.remove("cut");
+  const nat = { w: Math.ceil(b.offsetWidth) + 1, h: Math.ceil(b.offsetHeight) };
+  const lh = parseFloat(getComputedStyle(t).lineHeight) || 21, padV = nat.h - Math.round((t.offsetHeight || lh) / lh) * lh;
+  const p = hPlace(+wrap.dataset.slot || 0, nat, c, r, A, lh, Math.max(16, padV));
+  b.style.left = p.f.x + "px"; b.style.top = p.f.y + "px"; b.style.width = p.f.w + "px"; b.style.maxWidth = "none";
+  if (p.lines) { t.classList.add("cut"); t.style.webkitLineClamp = String(p.lines); }
+  b.style.transformOrigin = p.side === "above" ? "50% 100%" : p.side === "below" ? "50% 0" : p.side === "right" ? "0 50%" : "100% 50%";
+  const [d1, d2] = hTail(p, c, r), dots = wrap.querySelectorAll(".hbd");
+  dots[0].style.left = d1.x - 5.5 + "px"; dots[0].style.top = d1.y - 5.5 + "px";
+  dots[1].style.left = d2.x - 3 + "px"; dots[1].style.top = d2.y - 3 + "px";
+  wrap.dataset.side = p.side; wrap.dataset.lines = p.lines;
+  return { bubble: { x: p.f.x, y: p.f.y, w: b.offsetWidth, h: b.offsetHeight }, orb: { cx: c.x, cy: c.y, r }, stage: A, side: p.side, lines: p.lines };
+}
 function hStageNext() {
   if (!HB.items.length) return;
   HB.i = (HB.i + 1) % HB.items.length;
-  const it = HB.items[HB.i], slots = hSlots();
-  HB.slot = slots[(slots.indexOf(HB.slot) + 1) % slots.length];
+  const it = HB.items[HB.i];
+  HB.slot = (HB.slot + 1) % 12;
   const box = $("hbbs");
-  box.querySelectorAll(".hbb").forEach((b) => { b.classList.remove("on"); b.classList.add("out"); setTimeout(() => b.remove(), 650); });
-  const b = document.createElement("button");
-  b.type = "button"; b.className = `hbb s${HB.slot}`; b.textContent = it.text; b.dataset.act = JSON.stringify(it.action || {});
+  box.querySelectorAll(".hbw").forEach((w) => { w.classList.remove("on"); w.classList.add("out"); setTimeout(() => w.remove(), 650); });
+  const w = document.createElement("div");
+  w.className = "hbw"; w.dataset.slot = HB.slot;
+  w.innerHTML = `<span class="hbd d1"></span><span class="hbd d2"></span><button type="button" class="hbb"><span class="hbt"></span></button>`;
+  const b = w.querySelector(".hbb");
+  b.querySelector(".hbt").textContent = String(it.text || "").replace(/\*\*|__|`/g, "");   // a bubble is plain text
+  b.dataset.act = JSON.stringify(it.action || {});
   b.onclick = () => hStageAct(it.action || {});
-  box.appendChild(b);
-  requestAnimationFrame(() => requestAnimationFrame(() => b.classList.add("on")));
+  box.appendChild(w);
+  hLayoutBubble(w);
+  requestAnimationFrame(() => requestAnimationFrame(() => w.classList.add("on")));
   HB.cur = it; HB.shown++;
   if (HB.mate) HB.mate.set(it.mood || "02", { burst: it.mood === "33" });
 }
+window.addEventListener("resize", () => { const w = document.querySelector("#hbbs .hbw.on, #hbbs .hbw:not(.out)"); if (w && hStaged()) hLayoutBubble(w); });
 function hStageTyping(v, blurred) {
   const typing = !!(v || "").trim() || HS.skills.length > 0;
   if (typing && !HB.stopped) { HB.stopped = true; hStageStop(); $("hstage").classList.add("typing"); }
   else if (!typing && HB.stopped && blurred) { HB.stopped = false; $("hstage").classList.remove("typing"); hStageRun(); }
 }
-function hChip(i) { const c = HB.chips[i]; if (c) hStageAct(c.action || {}); }
 async function hStageAct(a) {
   const el = $("hprompt");
   switch (a.type) {

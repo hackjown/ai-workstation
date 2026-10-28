@@ -28,11 +28,13 @@ KEY_ALIASES = {
     "SUPER": "super", "META": "super", "WIN": "super", "CMD": "super",
 }
 
+# ~/.local/bin/aiw-chrome (chrome_cdp.py install-launchers) always starts Chrome with the DevTools port
+AIW_CHROME = '[ -x "$HOME/.local/bin/aiw-chrome" ] && exec "$HOME/.local/bin/aiw-chrome"; '
 # App names the agent may use -> launch commands
 APP_COMMANDS = {
-    "chrome": "google-chrome --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium-browser --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome",
+    "chrome": AIW_CHROME + "google-chrome --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium-browser --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome",
     "chromium": "chromium --no-first-run || chromium-browser --no-first-run",
-    "browser": "google-chrome --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium-browser --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome",
+    "browser": AIW_CHROME + "google-chrome --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome || chromium-browser --no-first-run --no-default-browser-check --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-features=Translate,TranslateUI --password-store=basic --start-maximized --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=$HOME/.config/aiw-chrome",
     # BrowserOS neo (deploy/vm/browseros-setup.sh): its MCP server on 127.0.0.1:9210 comes up with the window
     "browseros": "browserclaw --no-first-run --no-default-browser-check || browseros --no-first-run",
     "terminal": "xfce4-terminal || x-terminal-emulator",
@@ -225,6 +227,10 @@ class X11Backend(DesktopBackend):
             await self._xdo(f"click --repeat {abs(int(dx))} {7 if dx > 0 else 6}")
 
     async def open_app(self, name):
+        if name.lower() in ("chrome", "browser"):
+            got = await _open_chrome(self.env)
+            if got:
+                return {"launched": name, **got}
         cmd = APP_COMMANDS.get(name.lower(), name)
         proc = await asyncio.create_subprocess_shell(
             f"nohup sh -c {shlex.quote(cmd)} >/dev/null 2>&1 &", env=self.env)
@@ -236,6 +242,26 @@ class X11Backend(DesktopBackend):
         pat = APP_PROCESS.get(name.lower(), name)
         code, _, _ = await _run(f"pkill -f {shlex.quote(pat)}", env=self.env)
         return {"closed": name, "matched": code == 0}
+
+
+async def _open_chrome(env: dict) -> Optional[dict]:
+    """Chrome with its DevTools port, always: an instance the user opened without one is reopened with it on the same
+    profile (login kept, chrome_cdp.ensure); one that already has it just gets a new window. None = use the old command."""
+    from urllib.parse import urlparse
+    try:
+        from ..browser import chrome_cdp
+        port = urlparse(os.environ.get("VM_AGENT_CDP", "http://127.0.0.1:9222")).port or 9222
+        r = await asyncio.to_thread(chrome_cdp.ensure, port, (), True, True, "/proc", 40)
+    except Exception:  # noqa: BLE001 - the plain launch command below still runs
+        return None
+    if not r.get("ok"):
+        return None
+    if r.get("how") == "found" and os.access(chrome_cdp.WRAPPER, os.X_OK):
+        proc = await asyncio.create_subprocess_exec(chrome_cdp.WRAPPER, env=env, stdout=asyncio.subprocess.DEVNULL,
+                                                    stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        del proc
+        await asyncio.sleep(1.5)
+    return {"command": "aiw-chrome", "cdp": {k: r.get(k) for k in ("port", "how", "profile") if r.get(k)}}
 
 
 @dataclass

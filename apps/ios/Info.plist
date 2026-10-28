@@ -8,8 +8,8 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>AIW</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>3.7</string>
-  <key>CFBundleVersion</key><string>20</string>
+  <key>CFBundleShortVersionString</key><string>3.8</string>
+  <key>CFBundleVersion</key><string>21</string>
   <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
   <key>MinimumOSVersion</key><string>16.0</string>
   <key>LSRequiresIPhoneOS</key><true/>
@@ -55,8 +55,8 @@
     <key>NSAllowsArbitraryLoads</key><true/>
     <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
     <key>NSAllowsLocalNetworking</key><true/></dict>
-  <key>NSMicrophoneUsageDescription</key><string>录视频时录下声音，或用语音给 Agent 下任务</string>
-  <key>NSSpeechRecognitionUsageDescription</key><string>把你说的话转成文字发给 Agent</string>
+  <key>NSMicrophoneUsageDescription</key><string>语音输入：点输入框右边的麦克风说话，转成文字；录视频时也会录下声音</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>语音输入：把你说的话实时转成文字填进输入框（优先在手机上离线识别）</string>
   <key>NSCameraUsageDescription</key><string>拍照或录像作为附件发给 Agent</string>
   <key>NSPhotoLibraryUsageDescription</key><string>选择图片或视频作为附件发给 Agent</string>
   <key>NSLocalNetworkUsageDescription</key><string>连接局域网里的 Aiw 服务器</string>

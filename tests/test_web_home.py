@@ -48,7 +48,7 @@ def test_settings_memory_page_is_wired():
 def test_v2_home_stage_picker_sheet_and_computer_button():
     """v2 (2026-10-28): 球球 briefing stage, "/" skills, "+" sheet with camera / video, stop key, the 电脑 button."""
     html = (WEB / "index.html").read_text(encoding="utf-8")
-    for needle in ('id="hstage"', 'id="hstOrb"', 'id="hbbs"', 'id="hchips"', 'id="hskills"', 'id="htokens"', 'id="hsheet"',
+    for needle in ('id="hstage"', 'id="hstOrb"', 'id="hbbs"', 'id="hskills"', 'id="htokens"', 'id="hsheet"',
                    'accept="image/*" capture="environment"', 'accept="video/*" capture="environment"', 'accept="image/*,video/*"',
                    "拍照", "录视频", "照片/视频", "文件", "新建任务", "链接", "技能 /", 'placeholder="和我聊聊，或输入 / 选技能…"'):
         assert needle in html, needle
@@ -58,7 +58,7 @@ def test_v2_home_stage_picker_sheet_and_computer_button():
         assert needle in js, needle
     css = (WEB / "home.css").read_text(encoding="utf-8")
     for needle in ("#ffbe4d", "#f0a030", "#2a1a05", "20px 20px 6px 20px", "#15120d", "1.5px solid", "20px 20px 20px 6px", "#ffc35c",
-                   "grid-template-columns:repeat(4, 1fr)", "border-left:4px solid", "dashed"):
+                   "grid-template-columns:repeat(4, 1fr)", "border-left:4px solid"):   # 3.6: no chips, no dashed thinking ring
         assert needle in css, needle
     # the 球球 itself is not restyled: no disc colour / glow overrides in the home stylesheet
     for banned in ("--mate-disc", "--mate-glow"):

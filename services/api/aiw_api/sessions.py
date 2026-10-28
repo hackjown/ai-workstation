@@ -75,6 +75,7 @@ class SessionManager:
         # async fn(task, session_id, msg) told about a task's milestones (start, step, plan, questions, confirmations,
         # the end): the persistent chat (chat.py) keeps its task cards and escalation messages up to date from these
         self.listeners: list = []
+        self.memory = None   # memory.Memory (set by main.build_app): profile + top memories for every task
 
     # ------------------------------------------------------------------ factories
     def _default_computer(self, machine: dict) -> Computer:
@@ -178,11 +179,25 @@ class SessionManager:
                       query: Optional[str] = None) -> Optional[str]:
         parts = []
         prof = self.store.kv_get("profile", {}) or {}
-        if prof.get("name") or prof.get("tone") or prof.get("about"):
-            parts.append("USER PROFILE: " + "; ".join(f"{k}: {prof[k]}" for k in ("name", "tone", "about") if prof.get(k)))
-        mems = self.store.all("memories", limit=40)
-        if mems:
-            parts.append("MEMORY (facts the user told you earlier):\n" + "\n".join(f"- {m['text']}" for m in reversed(mems)))
+        if prof.get("tone"):
+            parts.append(f"USER PROFILE: tone: {prof['tone']}")
+        mem = getattr(self, "memory", None)
+        block = ""
+        if mem is not None:   # memory.py: profile + the top memories for this request, in [MEMORY] … [/MEMORY]
+            try:
+                block = mem.prompt_block(query or "")
+            except Exception as e:  # noqa: BLE001
+                log.warning("memory block: %s", e)
+        if block:
+            parts.append("USER MEMORY (facts, preferences and decisions the user told you earlier; the user's newest "
+                         "words win if they disagree):\n" + block)
+        elif mem is None:
+            if prof.get("name") or prof.get("about"):
+                parts.append("USER PROFILE: " + "; ".join(f"{k}: {prof[k]}" for k in ("name", "about") if prof.get(k)))
+            mems = self.store.all("memories", limit=40)
+            if mems:
+                parts.append("MEMORY (facts the user told you earlier):\n" + "\n".join(f"- {m['text']}" for m in reversed(mems)
+                                                                                      if not m.get("superseded")))
         if thread_id:
             turns = [t for t in self.store.thread_tasks(thread_id) if t["id"] != exclude_task
                      and t["status"] not in ("queued", "cancelled")][-6:]
@@ -227,6 +242,11 @@ class SessionManager:
         return {"task": t, "session_id": t.get("session_id"), "queued": queued, "thread_id": thread_id}
 
     async def _start_task_row(self, row: dict, allow_busy: bool = False) -> LiveSession:
+        if getattr(self, "memory", None) is not None:   # embeds the request when an embedding model is set
+            try:
+                await self.memory.prepare(row.get("prompt") or "")
+            except Exception as e:  # noqa: BLE001
+                log.warning("memory prepare: %s", e)
         ctx = self.build_context(row.get("thread_id"), exclude_task=row["id"], query=row.get("prompt"))
         extra_ctx = self.store.kv_get(f"task_ctx:{row['id']}")
         if extra_ctx:
@@ -404,7 +424,10 @@ class SessionManager:
                 self.store.update_task(task.id, TaskStatus.RUNNING.value)
 
         async def remember(text: str):
-            self.store.insert("memories", {"text": text[:500], "source": task.id})
+            if getattr(self, "memory", None) is not None:   # dedupes, never keeps a password / code / token
+                self.memory.add(text, None, task.id)
+            else:
+                self.store.insert("memories", {"text": text[:500], "source": task.id})
 
         prof = self.store.kv_get("profile", {}) or {}
         system_extra = f"Agent name: {prof['agent_name']}." if prof.get("agent_name") else ""

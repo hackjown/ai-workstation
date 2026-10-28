@@ -85,6 +85,8 @@ cp "$REPO/deploy/vm/novnc.service" ~/.config/systemd/user/novnc.service
 sudo loginctl enable-linger "$USER_NAME"
 systemctl --user daemon-reload
 systemctl --user enable vm-agent x11vnc novnc
+# Chrome always with the DevTools port 9222 (menu, panel, desktop icon, autostart): price watch + browser tools
+bash "$REPO/deploy/vm/chrome-cdp-setup.sh" install || true
 
 echo
 echo "Done. Reboot the VM. After autologin:"

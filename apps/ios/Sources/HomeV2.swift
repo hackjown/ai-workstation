@@ -285,6 +285,7 @@ struct HomeStage: View {
     @State private var lineW: CGFloat = 0      // the text on one line (natural width)
     @State private var natural: CGSize = .zero // the bubble at its width, uncut
     @Environment(\.accessibilityReduceMotion) private var still
+    @Environment(\.colorScheme) private var cs
     private let tick = Timer.publish(every: 4.5, on: .main, in: .common).autoconnect()
 
     var item: JSON? { m.greet.isEmpty ? nil : m.greet[idx % m.greet.count] }
@@ -318,7 +319,7 @@ struct HomeStage: View {
                     let dots = StageLayout.tail(p, c, orb / 2)
                     ZStack(alignment: .topLeading) {
                         Circle().fill(hAmber).frame(width: 11, height: 11).position(dots.0)
-                        Circle().fill(hAmber.opacity(0.7)).frame(width: 6, height: 6).position(dots.1)
+                        Circle().fill(hAmber).frame(width: 6, height: 6).position(dots.1)
                         Button { act(it.o("action")) } label: { label(text, width: p.rect.width, lines: p.lines) }
                             .buttonStyle(.plain)
                             .frame(width: p.rect.width, height: p.rect.height)
@@ -334,9 +335,9 @@ struct HomeStage: View {
                 VStack {
                     if !m.msgs.isEmpty {
                         Button(action: showChat) {
-                            Text("↑ 聊天记录").font(.caption.weight(.medium)).foregroundColor(hHL)
+                            Text("↑ 聊天记录").font(.caption.weight(.medium)).foregroundColor(hStrong(cs))
                                 .padding(.horizontal, 12).padding(.vertical, 5)
-                                .background(hDark.opacity(0.85)).overlay(Capsule().stroke(hAmber.opacity(0.35))).clipShape(Capsule())
+                                .background(cs == .dark ? hDark.opacity(0.85) : Color.white).overlay(Capsule().stroke(hAmber.opacity(cs == .dark ? 0.35 : 0.7))).clipShape(Capsule())
                         }.padding(.top, 10)
                     }
                     if !m.err.isEmpty { Text(m.err).font(.footnote).foregroundColor(.red).padding(.horizontal) }
@@ -352,16 +353,17 @@ struct HomeStage: View {
         }
         .onChange(of: m.greetAt) { _ in idx = 0 }
     }
-    /// The bubble itself: dark with an amber border (the stage look is the same in light and dark).
+    /// The bubble itself (3.7): white with an amber border and dark text in light mode, the dark fill with the amber
+    /// border in dark mode; the two tail dots are amber in both.
     func label(_ text: String, width: CGFloat, lines: Int?) -> some View {
-        Text(text).font(.system(size: 15)).foregroundColor(.white).lineSpacing(2).multilineTextAlignment(.leading)
+        Text(text).font(.system(size: 15)).foregroundColor(cs == .dark ? .white : hBubbleText(cs)).lineSpacing(2).multilineTextAlignment(.leading)
             .lineLimit(lines).truncationMode(.tail)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 14).padding(.vertical, 10)
             .frame(width: width, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(hStageBubble))
+            .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(cs == .dark ? hStageBubble : Color.white))
             .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(hAmber, lineWidth: 1.5))
-            .shadow(color: hAmber.opacity(0.15), radius: 12, y: 6)
+            .shadow(color: hAmber.opacity(cs == .dark ? 0.15 : 0.18), radius: 12, y: 6)
     }
 }
 
@@ -383,12 +385,14 @@ enum AttachKind: CaseIterable, Hashable {
 /// (dark grey in dark mode) with a thin amber border, grey line icons, the label under the tile, 4 per row, 2 rows a
 /// page, more pages swipe sideways with dots.
 struct AttachSheet: View {
+    /// which tiles (the task view shows only the file / skill ones, 3.7)
+    var kinds: [AttachKind] = AttachKind.allCases
     let pick: (AttachKind) -> Void
     @Environment(\.colorScheme) private var cs
     static let perPage = 8
     static let height: CGFloat = 262
     var pages: [[AttachKind]] {
-        let all = AttachKind.allCases
+        let all = kinds
         return stride(from: 0, to: all.count, by: AttachSheet.perPage).map { Array(all[$0..<min($0 + AttachSheet.perPage, all.count)]) }
     }
     var panel: Color { cs == .dark ? Color(red: 0x1E / 255, green: 0x1E / 255, blue: 0x1E / 255) : Color(red: 0xF7 / 255, green: 0xF7 / 255, blue: 0xF7 / 255) }
@@ -630,17 +634,18 @@ final class BottomPin: ObservableObject {
     }
 }
 
-/// The floating "↓ 最新消息" pill (same look as the web's .fab #hToLatest: a rounded pill, panel colour, thin border,
-/// soft shadow, 13 pt semibold), right above the composer.
+/// The floating "↓ 最新消息" pill (3.7, same as the web's .fab #hToLatest): white (light) / the dark bubble fill (dark)
+/// with an amber border, soft shadow, 13 pt semibold; it floats above the composer (see HomeChatView / ChatView).
 struct JumpToLatest: View {
     let go: () -> Void
+    @Environment(\.colorScheme) private var cs
     var body: some View {
         Button(action: go) {
-            Text("↓ 最新消息").font(.system(size: 13, weight: .semibold)).foregroundColor(.primary)
+            Text("↓ 最新消息").font(.system(size: 13, weight: .semibold)).foregroundColor(hBubbleText(cs))
                 .padding(.horizontal, 14).padding(.vertical, 8)
-                .background(Capsule().fill(Color(.secondarySystemBackground)))
-                .overlay(Capsule().stroke(Color(.separator), lineWidth: 1))
-                .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+                .background(Capsule().fill(hBubbleFill(cs)))
+                .overlay(Capsule().stroke(hAmber.opacity(cs == .dark ? 0.75 : 0.9), lineWidth: 1.5))
+                .shadow(color: .black.opacity(cs == .dark ? 0.4 : 0.14), radius: 10, y: 3)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("跳到最新消息")

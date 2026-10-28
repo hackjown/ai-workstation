@@ -69,6 +69,7 @@ class SessionManager:
         self._computer_factory = computer_factory or self._default_computer
         self._computers: dict[str, Computer] = {}
         self.held_threads: set[str] = set()   # queue paused because the user pressed stop
+        self.queue_front: list[str] = []      # queued task ids the user asked to send first (立即发送), oldest ask first
         self._drain_lock = asyncio.Lock()
         self.cloud = None  # CloudManager, set by the API
         self._health: dict[str, tuple[float, bool]] = {}   # machine -> (checked at, vm-agent answered)
@@ -233,7 +234,17 @@ class SessionManager:
             self.store.kv_set(f"isolated:{task.id}", True)
         if context_extra:
             self.store.kv_set(f"task_ctx:{task.id}", str(context_extra)[:6000])
-        queued = bool(self.busy_session(machine_id)) or thread_id in self.held_threads
+        # 3.8: a NEW message in a thread whose queue was paused by 停止 resumes that queue. Before, the hold also caught
+        # every later message: it was queued with the computer idle and nothing (on iOS) could ever release it.
+        if thread_id in self.held_threads and source not in ("resume", "dispatch"):
+            self.held_threads.discard(thread_id)
+        older = any(r["id"] != task.id and r["machine_id"] == machine_id and r.get("thread_id") not in self.held_threads
+                    for r in self.store.tasks_by_status(("queued",)))
+        queued = bool(self.busy_session(machine_id)) or thread_id in self.held_threads or older
+        if older and not self.busy_session(machine_id):   # earlier messages go first, then this one (drain keeps the order)
+            await self.drain(machine_id)
+            t = self.store.task(task.id)
+            return {"task": t, "session_id": t.get("session_id"), "queued": t.get("status") == "queued", "thread_id": thread_id}
         if not queued:
             await self._start_task_row(self.store.task(task.id))
         else:
@@ -264,9 +275,16 @@ class SessionManager:
         async with self._drain_lock:
             if self.busy_session(machine_id):
                 return
-            for row in self.store.tasks_by_status(("queued",)):
-                if row["machine_id"] != machine_id or row.get("thread_id") in self.held_threads:
+            rows = [r for r in self.store.tasks_by_status(("queued",)) if r["machine_id"] == machine_id]
+            front = {tid: i for i, tid in enumerate(self.queue_front)}
+            rows.sort(key=lambda r: (0, front[r["id"]]) if r["id"] in front else (1, 0))   # stable: FIFO after 立即发送 ones
+            for row in rows:
+                if row["id"] in front:   # the user asked for this one now: its thread's pause no longer applies
+                    self.held_threads.discard(row.get("thread_id"))
+                elif row.get("thread_id") in self.held_threads:
                     continue
+                if row["id"] in self.queue_front:
+                    self.queue_front.remove(row["id"])
                 try:
                     await self._start_task_row(row)
                 except Exception as e:  # noqa: BLE001
@@ -284,7 +302,50 @@ class SessionManager:
         if not t or t["status"] != "queued":
             return False
         self.store.update_task(task_id, "cancelled", "removed from queue")
+        if task_id in self.queue_front:
+            self.queue_front.remove(task_id)
         return True
+
+    def queue_info(self, row: dict) -> dict:
+        """Why a queued task has not started: the paused queue of its thread, or the task its computer is busy with."""
+        busy = self.busy_session(row["machine_id"])
+        out: dict = {"held": row.get("thread_id") in self.held_threads, "first": row["id"] in self.queue_front}
+        if busy:
+            bt = self.store.task(busy.task.id) or {}
+            out["busy"] = {"task_id": busy.task.id, "thread_id": busy.task.thread_id, "status": bt.get("status"),
+                           "prompt": (bt.get("prompt") or busy.task.prompt or "")[:120]}
+        ahead = 0
+        for r in self.store.tasks_by_status(("queued",)):
+            if r["id"] == row["id"]:
+                break
+            if r["machine_id"] == row["machine_id"] and r.get("thread_id") not in self.held_threads:
+                ahead += 1
+        out["ahead"] = 0 if out["first"] else ahead
+        return out
+
+    async def send_now(self, task_id: str, stop_current: bool = False) -> dict:
+        """立即发送 for a queued message. The computer runs one task at a time, so: idle -> it starts now; busy -> it
+        goes first in the queue, and with stop_current the running task is stopped so it starts right after."""
+        t = self.store.task(task_id)
+        if not t:
+            raise KeyError(task_id)
+        if t["status"] != "queued":
+            raise ValueError(f"task is {t['status']}, not queued")
+        if task_id in self.queue_front:
+            self.queue_front.remove(task_id)
+        self.queue_front.insert(0, task_id)
+        if t.get("thread_id"):
+            self.held_threads.discard(t["thread_id"])
+        busy = self.busy_session(t["machine_id"])
+        stopped = None
+        if busy and stop_current:
+            stopped = busy.task.id
+            await self.control(busy.id, "stop")   # its runner ends and drains: this one is first
+        elif not busy:
+            await self.drain(t["machine_id"])
+        now = self.store.task(task_id) or t
+        return {"task": now, "started": now.get("status") != "queued", "stopped": stopped,
+                "queue": self.queue_info(now) if now.get("status") == "queued" else None}
 
     async def retry(self, task_id: str) -> dict:
         t = self.store.task(task_id)

@@ -38,7 +38,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -279,6 +279,17 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             return {"stopped": True}
         raise HTTPException(409, "task is not queued or running")
 
+    @app.post("/api/tasks/{task_id}/send_now", dependencies=[Depends(auth)])
+    async def send_now(task_id: str, body: dict = Body(default={})):
+        """立即发送 a queued message: starts it when its computer is idle, else puts it first in the queue
+        ({"stop_current": true} also stops the task the computer is busy with, so it starts right after)."""
+        try:
+            return await sessions.send_now(task_id, bool((body or {}).get("stop_current")))
+        except KeyError:
+            raise HTTPException(404)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+
     @app.get("/api/tasks/{task_id}/receipts", dependencies=[Depends(auth)])
     async def receipts(task_id: str):
         t = store.task(task_id)
@@ -325,6 +336,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             t["live"] = bool(live and live.runner and not live.runner.done())
             t["pending_confirm"] = live.confirm_info if live else None
             t["pending_question"] = live.question_info if live else None
+            if t.get("status") == "queued":   # why it waits (iOS / web show it under the queued message)
+                t["queue"] = sessions.queue_info(t)
             kids = sessions.children_view(t["id"])
             if kids:   # pieces this task dispatched to other computers (each with its own thread)
                 t["children"] = kids

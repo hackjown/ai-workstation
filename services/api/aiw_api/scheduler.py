@@ -64,6 +64,7 @@ class Scheduler:
         try:  # 京东/淘宝 watches keep their own columns on the watches table
             from . import shopwatch
             shopwatch.ensure_columns(store)
+            shopwatch.bind(scheduler=self)   # a price-watch question's 立即重试 runs the check through here
         except Exception as e:  # noqa: BLE001
             log.warning("shop watch columns: %s", e)
 

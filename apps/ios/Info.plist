@@ -49,7 +49,7 @@
   <key>LSSupportsOpeningDocumentsInPlace</key><false/>
   <key>UIFileSharingEnabled</key><true/>
   <key>CFBundleURLTypes</key><array><dict>
-    <key>CFBundleURLName</key><string>com.hackjown.aiworkstation.import</string>
+    <key>CFBundleURLName</key><string>com.hackjown.aiworkstation.links</string>
     <key>CFBundleURLSchemes</key><array><string>aiw</string></array></dict></array>
   <key>NSAppTransportSecurity</key><dict>
     <key>NSAllowsArbitraryLoads</key><true/>

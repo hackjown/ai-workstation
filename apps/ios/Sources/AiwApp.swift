@@ -24,7 +24,8 @@ struct AiwApp: App {
             }
             .onChange(of: api.token) { _ in api.configured ? hub.start() : hub.stop() }
             // 微信「用其他应用打开」/ Open In delivers a file URL; the share extension opens aiw://import (Import.swift)
-            .onOpenURL { ImportCenter.shared.handle($0) }
+            // 3.8: aiw://task|takeover|monitor|chat… are push deep links (DeepLink.swift), the rest imports
+            .onOpenURL { u in if !DeepLinks.shared.handle(u) { ImportCenter.shared.handle(u) } }
             .onChange(of: phase) { p in if p == .active { ImportCenter.shared.collectShared() } }
         }
     }
@@ -35,6 +36,12 @@ final class NotifyDelegate: NSObject, UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ c: UNUserNotificationCenter, willPresent n: UNNotification,
                                 withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
         done([.banner, .sound])
+    }
+    /// 3.8: tapping a local notification opens its item (userInfo "deep", the same path as the push's aiw:// link)
+    func userNotificationCenter(_ c: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        if let p = r.notification.request.content.userInfo["deep"] as? String, let u = deepURL(p) { DeepLinks.shared.handle(u) }
+        done()
     }
 }
 
@@ -59,6 +66,7 @@ final class Hub: ObservableObject {
                 let n = m.o("notification")
                 let c = UNMutableNotificationContent()
                 c.title = n.s("title"); c.body = n.s("body"); c.sound = .default
+                if !n.s("deep").isEmpty { c.userInfo = ["deep": n.s("deep")] }
                 UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: n.s("id"), content: c, trigger: nil))
             }
         }

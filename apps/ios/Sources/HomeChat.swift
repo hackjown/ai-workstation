@@ -338,6 +338,10 @@ struct HomeChatView: View {
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .refreshable { await m.load() }
         .onReceive(hub.events) { e in m.onEvent(e) }
+        // 3.8 aiw://chat (a push): the chat itself, at the newest message
+        .onReceive(NotificationCenter.default.publisher(for: .aiwShowChat)) { _ in
+            Task { await m.sync(); m.leaveStage(); pin.toEnd(follow: 2) }
+        }
         .onChange(of: phase) { p in   // back in the foreground: what came in meanwhile, then the newest message
             if p != .active { voice.stop() }
             if p == .active { Task { await m.sync(); if !m.staged { pin.toEnd(follow: 2) } } }

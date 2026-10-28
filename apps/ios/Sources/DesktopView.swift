@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 import WebKit
 
 extension Notification.Name {
@@ -198,6 +199,11 @@ enum OrientationLock {
 }
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    /// 3.8: the notification delegate is set before launch finishes, so a tap that cold-launches Aiw reaches it.
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        UNUserNotificationCenter.current().delegate = NotifyDelegate.shared
+        return true
+    }
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         OrientationLock.mask
     }

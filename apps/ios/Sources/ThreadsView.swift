@@ -24,6 +24,7 @@ struct RootView: View {
     @State private var sheet: HomeSheet?
     @State private var showSettings = false
     @ObservedObject private var inbox = ImportCenter.shared
+    @ObservedObject private var links = DeepLinks.shared
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -38,7 +39,9 @@ struct RootView: View {
         .sheet(isPresented: $showSettings) { SettingsView() }
         // a file from another app (Open In / share sheet): a blank task view, whose composer picks it up
         .onChange(of: inbox.tick) { _ in toTaskForImport() }
-        .onAppear { toTaskForImport() }
+        .onAppear { toTaskForImport(); openDeep() }
+        // 3.8 push deep links (DeepLink.swift): warm (onChange) and cold launch (onAppear, once signed in)
+        .onChange(of: links.pending) { _ in openDeep() }
         .sheet(item: $sheet) { s in
             sheetView(s)
                 .presentationDetents([.large])
@@ -58,6 +61,40 @@ struct RootView: View {
     }
 
     func openThread(_ id: String) { sheet = nil; path = [.task(id, takeover: false)] }
+    func openDeep() {
+        guard let t = links.take() else { return }
+        showSettings = false
+        switch t {
+        case .chat:
+            sheet = nil; path = []
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NotificationCenter.default.post(name: .aiwShowChat, object: nil) }
+        case .monitor(let id):
+            path = []; links.focusWatch = id
+            sheet = .tracking
+        case .task(let id):
+            sheet = nil
+            Task { await openTask(id, takeover: false) }
+        case .takeover(let machine, let task):
+            sheet = nil
+            if !machine.isEmpty && machine != API.shared.machine { API.shared.setMachine(machine) }
+            if let task = task { Task { await openTask(task, takeover: true) } }
+            else {   // no task: that computer's desktop in a blank task view, then the takeover
+                path = [.newTask]
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    NotificationCenter.default.post(name: .aiwOpenTakeover, object: nil, userInfo: ["machine": machine, "session": ""])
+                }
+            }
+        }
+    }
+    /// a task id -> its thread (the task detail page is the thread view)
+    @MainActor func openTask(_ id: String, takeover: Bool) async {
+        do {
+            let t = try await API.shared.obj("GET", "/api/tasks/\(id)")
+            let tid = t.s("thread_id")
+            if tid.isEmpty || tid == "<null>" { path = []; return }
+            path = [.task(tid, takeover: takeover)]
+        } catch { path = [] }   // gone (deleted): the chat
+    }
     func toTaskForImport() {
         guard inbox.hasPending else { return }
         sheet = nil; showSettings = false

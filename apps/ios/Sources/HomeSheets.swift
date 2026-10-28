@@ -47,8 +47,11 @@ struct TrackingSheet: View {
     @State private var showShop = false
     @State private var showPage = false
     @State private var loaded = false
+    @ObservedObject private var links = DeepLinks.shared
 
     var shop: [JSON] { items.filter { $0.s("mode") == "shop" } }
+    /// 3.8 aiw://monitor/<id> (a price / page watch push): that watch on top with 立即重试
+    var focused: JSON? { links.focusWatch.flatMap { id in items.first { $0.s("id") == id } } }
     var pages: [JSON] { items.filter { $0.s("mode") != "shop" } }
 
     var body: some View {
@@ -60,6 +63,15 @@ struct TrackingSheet: View {
         }) {
             List {
                 if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
+                if let w = focused {
+                    Section(header: Text("通知里的这一项").textCase(nil),
+                            footer: Text(w.s("last_error").isEmpty ? "" : w.s("last_error")).foregroundColor(.red)) {
+                        row(w).listRowBackground(amber.opacity(0.10))
+                        Button { Task { await check(w) } } label: { Label("立即重试", systemImage: "arrow.clockwise") }
+                            .disabled(busy == w.s("id"))
+                        if let u = URL(string: w.s("url")), !w.s("url").isEmpty { Link(destination: u) { Label("打开商品 / 网页", systemImage: "safari") } }
+                    }
+                }
                 Section(header: Text("商品价格").textCase(nil)) {
                     if shop.isEmpty && loaded { Text("还没有价格监控，点右上角「添加」").font(.subheadline).foregroundColor(.secondary) }
                     ForEach(shop.indices, id: \.self) { i in row(shop[i]) }
@@ -75,6 +87,7 @@ struct TrackingSheet: View {
             .refreshable { await load() }
         }
         .task { await load() }
+        .onDisappear { links.focusWatch = nil }
         .sheet(isPresented: $showShop) { AddShopWatchView { Task { await load() } } }
         .sheet(isPresented: $showPage) { AddPageWatchView { Task { await load() } } }
     }

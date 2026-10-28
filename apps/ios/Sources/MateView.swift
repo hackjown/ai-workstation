@@ -70,13 +70,30 @@ struct MateView: UIViewRepresentable {
     var ring = "amber"
     /// For a standalone picture (`bus: false`): keep it moving (an online computer, the card of a working task).
     var animate = false
+    /// For a standalone picture (`bus: false`): change its face live (the home stage follows each briefing item's mood).
+    var mood: String? = nil
     @Environment(\.scenePhase) private var phase
     @Environment(\.accessibilityReduceMotion) private var still
 
     final class Coord: NSObject, WKNavigationDelegate {
         var status = ""
         var active: Bool?
-        func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) { MateBus.shared.loaded(w) }
+        var bus = true
+        var ready = false
+        var mood: String?
+        var shown: String?
+        func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
+            if bus { MateBus.shared.loaded(w); return }
+            ready = true
+            push(w)
+        }
+        /// standalone 球球: set the face it should show now (aiwMate.set in mate.html; burst on 完成)
+        func push(_ w: WKWebView) {
+            guard ready, let m = mood, m != shown else { return }
+            shown = m
+            let id = m.filter { $0.isNumber }
+            w.evaluateJavaScript("window.aiwMate&&aiwMate.set('\(id)', \(id == "33"))", completionHandler: nil)
+        }
     }
     func makeCoordinator() -> Coord { Coord() }
 
@@ -87,24 +104,30 @@ struct MateView: UIViewRepresentable {
         w.scrollView.backgroundColor = .clear
         w.scrollView.isScrollEnabled = false
         w.isUserInteractionEnabled = false
-        w.navigationDelegate = bus ? context.coordinator : nil
+        context.coordinator.bus = bus
+        context.coordinator.mood = mood
+        context.coordinator.shown = mood ?? emotion
+        w.navigationDelegate = context.coordinator
         if bus { MateBus.shared.attach(w, thread: threadId) }
         let frozen = still || (!bus && !animate)
         var q = "?static=\(frozen ? 1 : 0)&ring=\(ring)"
-        if let e = emotion { q += "&e=\(e.filter { $0.isNumber })" }
+        if let e = mood ?? emotion { q += "&e=\(e.filter { $0.isNumber })" }
         if !bus { q += "&lite=1" }
         if let u = Bundle.main.url(forResource: "mate", withExtension: "html", subdirectory: "mate"),
            let full = URL(string: u.absoluteString + q) {
             w.loadFileURL(full, allowingReadAccessTo: u.deletingLastPathComponent())
         } else if let u = API.shared.url("/mate.html", query: [URLQueryItem(name: "static", value: frozen ? "1" : "0"),
-                                                              URLQueryItem(name: "ring", value: ring), URLQueryItem(name: "e", value: emotion ?? "02")]) {
+                                                              URLQueryItem(name: "ring", value: ring), URLQueryItem(name: "e", value: mood ?? emotion ?? "02")]) {
             w.load(URLRequest(url: u))
         }
         return w
     }
 
     func updateUIView(_ w: WKWebView, context: Context) {
-        guard bus else { return }
+        guard bus else {
+            if let m = mood, m != context.coordinator.mood { context.coordinator.mood = m; context.coordinator.push(w) }
+            return
+        }
         let c = context.coordinator
         MateBus.shared.attach(w, thread: threadId)
         if c.status != status {
@@ -117,5 +140,68 @@ struct MateView: UIViewRepresentable {
             c.active = act
             MateBus.shared.js("window.aiwMate&&(aiwMate.still(\(still)),aiwMate.active(\(act)))")
         }
+    }
+}
+
+/// v2 home (3.5): the small 球球 beside each of 球球's messages. One still frame of the real 球球 (the bundled mate.html,
+/// same look as everywhere), rendered once off screen and reused as an image, so a long chat holds no WKWebViews.
+final class MateSnapshot: NSObject, ObservableObject, WKNavigationDelegate {
+    static let shared = MateSnapshot()
+    @Published var image: UIImage?
+    private var web: WKWebView?
+    private var started = false
+    private var tries = 0
+
+    func start() {
+        guard !started, tries < 3 else { return }
+        started = true
+        tries += 1
+        let w = WKWebView(frame: CGRect(x: 0, y: 0, width: 96, height: 96), configuration: WKWebViewConfiguration())
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.scrollView.backgroundColor = .clear
+        w.navigationDelegate = self
+        web = w
+        // WebKit only paints a web view that is in a window: park it off screen in the key window until the frame is taken
+        let win = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
+        w.frame.origin = CGPoint(x: -400, y: -400)
+        win?.addSubview(w)
+        if let u = Bundle.main.url(forResource: "mate", withExtension: "html", subdirectory: "mate"),
+           let full = URL(string: u.absoluteString + "?static=1&ring=amber&e=02&lite=1") {
+            w.loadFileURL(full, allowingReadAccessTo: u.deletingLastPathComponent())
+        } else if let u = API.shared.url("/mate.html", query: [URLQueryItem(name: "static", value: "1"), URLQueryItem(name: "ring", value: "amber"),
+                                                              URLQueryItem(name: "e", value: "02"), URLQueryItem(name: "lite", value: "1")]) {
+            w.load(URLRequest(url: u))
+        } else { started = false }
+    }
+    func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            let cfg = WKSnapshotConfiguration()
+            cfg.afterScreenUpdates = true
+            w.takeSnapshot(with: cfg) { img, _ in
+                DispatchQueue.main.async {
+                    if let img = img { self?.image = img } else { self?.started = false }
+                    w.removeFromSuperview()
+                    self?.web = nil
+                }
+            }
+        }
+    }
+    func webView(_ w: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { started = false; w.removeFromSuperview(); web = nil }
+}
+
+/// The small 球球 avatar (a still frame; an amber disc until the frame is ready).
+struct MateAvatar: View {
+    var size: CGFloat = 30
+    @ObservedObject private var snap = MateSnapshot.shared
+    var body: some View {
+        Group {
+            if let img = snap.image { Image(uiImage: img).resizable().scaledToFit() }
+            else { Circle().fill(amber) }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+        .onAppear { snap.start() }
+        .accessibilityHidden(true)
     }
 }

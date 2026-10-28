@@ -31,6 +31,15 @@ def test_home_js_uses_the_chat_api_and_never_shows_steps():
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
 def test_web_scripts_parse():
-    for f in ("home.js", "app.js", "ui.js"):
+    for f in ("home.js", "memory.js", "app.js", "ui.js"):
         r = subprocess.run(["node", "--check", str(WEB / f)], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
+
+
+def test_settings_memory_page_is_wired():
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    assert 'id="v-memory"' in html and '<script src="memory.js">' in html
+    js = (WEB / "memory.js").read_text(encoding="utf-8")
+    for needle in ("/api/memories", "?all=true", "/restore", '"PUT"', '"DELETE"', "profile", "decision"):
+        assert needle in js, needle
+    assert "go('memory')" in (WEB / "ui.js").read_text(encoding="utf-8")

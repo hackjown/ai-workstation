@@ -82,6 +82,10 @@ def _row(r: dict) -> dict:
     except ValueError:
         d["data"] = {}
     d.pop("conv", None)
+    res = d["data"].get("resolved") if isinstance(d["data"], dict) else None
+    if isinstance(res, dict) and "text" not in res:   # answered before 3.7: derive what the card shows
+        a = res.get("answer")
+        res["text"] = ("已允许" if a else "已拒绝") if isinstance(a, bool) else answer_text(a, d["data"].get("fields"))
     return d
 
 
@@ -108,6 +112,31 @@ class OfferFilter:
         offer = m.group(1).strip()[:500] if m else None
         text = OFFER_RE.sub("", self.raw).strip()
         return text, offer
+
+
+def answer_text(ans: Any, fields: Optional[list] = None, cancelled: bool = False) -> str:
+    """What a resolved ask/form card shows after 已回答 (3.7: was the raw answer, so a form answered with nothing came
+    out as "<null>" on iOS). "" = nothing to show (the card says just 已回答). A form answer is the JSON of its non-secret
+    values: shown as 标签：值 with the field labels; secret fields never reach here."""
+    if cancelled or (isinstance(ans, str) and ans.strip().lower() in ("__cancel__", "cancel")):
+        return "已取消"
+    if ans is None or isinstance(ans, bool):
+        return ""
+    s = str(ans).strip()
+    if not s or s.lower() in ("null", "none", "{}"):
+        return ""
+    if s == "done":
+        return "已完成，交还给电脑"
+    if s.startswith("{"):
+        try:
+            vals = json.loads(s)
+        except ValueError:
+            vals = None
+        if isinstance(vals, dict):
+            label = {str(f.get("key")): str(f.get("label") or f.get("key")) for f in fields or [] if isinstance(f, dict)}
+            parts = [f"{label.get(k, k)}：{v}" for k, v in vals.items() if str(v or "").strip()]
+            return one_line("；".join(parts), 80)
+    return one_line(s, 80)
 
 
 def one_line(text: str, limit: int = 90) -> str:
@@ -774,8 +803,10 @@ class Chat:
                                    (kind, task.id)):
                 m = _row(r)
                 if not m["data"].get("resolved"):
+                    txt = ("已允许" if ans else "已拒绝") if kind == "confirm" else \
+                        answer_text(ans, m["data"].get("fields"), bool(d.get("cancelled")))
                     self.update(m["id"], data={"resolved": {"answer": ans if not isinstance(ans, str) else ans[:200],
-                                                            "by": d.get("by"), "at": time.time()}})
+                                                            "text": txt, "by": d.get("by"), "at": time.time()}})
             self.update(card["id"], data={**base, "status": "running", "status_line": self._line(cd, "running")})
         elif typ == "agent.confirm_required":
             s = d.get("summary") or {}
@@ -821,6 +852,9 @@ class Chat:
             data["takeover"] = {k: form.get(k) for k in ("site", "url", "steps", "reason", "machine", "machine_id", "action_cn")}
         if kind == "form":
             data["form_title"] = form.get("title")
+            # labels only (the answer card shows 标签：值); which fields are secret, never their values
+            data["fields"] = [{"key": f.get("key"), "label": f.get("label"), "secret": bool(f.get("secret"))}
+                              for f in form.get("fields") or [] if isinstance(f, dict)][:20]
         self.add("assistant", "ask", text, data, task_id=task.id)
         self.update(card["id"], data={"status": "waiting_input",
                                       "status_line": "需要你接管" if kind == "takeover" else "等你回答"})
@@ -851,7 +885,8 @@ class Chat:
         if not ok:
             self.update(mid, data={"stale": True})
             raise ValueError("这个问题已经过期（任务已经不在等这个回答了）")
-        m = self.update(mid, data={"resolved": {"answer": ans, "by": "chat", "at": time.time()}})
+        txt = ("已允许" if ans else "已拒绝") if isinstance(ans, bool) else answer_text(ans, d.get("fields"))
+        m = self.update(mid, data={"resolved": {"answer": ans, "text": txt, "by": "chat", "at": time.time()}})
         return {"ok": True, "message": m, "open_task": isinstance(ans, str) and "接管" in ans}
 
 

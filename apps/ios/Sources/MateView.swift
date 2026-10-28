@@ -103,6 +103,7 @@ struct MateView: UIViewRepresentable {
         w.backgroundColor = .clear
         w.scrollView.backgroundColor = .clear
         w.scrollView.isScrollEnabled = false
+        w.scrollView.contentInsetAdjustmentBehavior = .never   // never pushed down by a safe area (see MateAvatar)
         w.isUserInteractionEnabled = false
         context.coordinator.bus = bus
         context.coordinator.mood = mood
@@ -143,102 +144,63 @@ struct MateView: UIViewRepresentable {
     }
 }
 
-/// v2 home: the small 球球 head beside each of 球球's messages, task cards and the thinking row. One still frame of the
-/// real 球球 (the bundled mate.html, amber disc, same look as in the title), rendered once and reused as an image, so a
-/// long chat holds no WKWebViews.
-/// 3.6 fix (the "eye" avatar): 3.5 parked the web view at (-400,-400), outside the window, and snapped it 0.4 s after
-/// load. WebKit does not lay out / paint a view outside the window's bounds reliably, so the frame came back with the
-/// disc squashed into a lens and the ball tiny. Now the view sits inside the window (under the app's root view, so it
-/// is never seen), the disc is pinned to an exact square in CSS, and the frame is only taken once the page reports a
-/// square disc with the ball drawn; the image itself must be square too, else it is retried (3 times, then the amber disc).
-final class MateSnapshot: NSObject, ObservableObject, WKNavigationDelegate {
-    static let shared = MateSnapshot()
-    static let px: CGFloat = 96
-    @Published var image: UIImage?
-    private var web: WKWebView?
-    private var started = false
-    private var tries = 0
-
-    func start() {
-        guard !started, image == nil, tries < 3 else { return }
-        guard let win = UIApplication.shared.connectedScenes.compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.start() }   // no window yet (launch)
-            return
-        }
-        started = true
-        tries += 1
-        let w = WKWebView(frame: CGRect(x: 0, y: 0, width: MateSnapshot.px, height: MateSnapshot.px), configuration: WKWebViewConfiguration())
-        w.isOpaque = false
-        w.backgroundColor = .clear
-        w.scrollView.backgroundColor = .clear
-        w.scrollView.isScrollEnabled = false
-        w.isUserInteractionEnabled = false
-        w.navigationDelegate = self
-        web = w
-        win.insertSubview(w, at: 0)   // inside the window, behind the root view: painted, never visible
-        if let u = Bundle.main.url(forResource: "mate", withExtension: "html", subdirectory: "mate"),
-           let full = URL(string: u.absoluteString + "?static=1&ring=amber&e=02&lite=1") {
-            w.loadFileURL(full, allowingReadAccessTo: u.deletingLastPathComponent())
-        } else if let u = API.shared.url("/mate.html", query: [URLQueryItem(name: "static", value: "1"), URLQueryItem(name: "ring", value: "amber"),
-                                                              URLQueryItem(name: "e", value: "02"), URLQueryItem(name: "lite", value: "1")]) {
-            w.load(URLRequest(url: u))
-        } else { fail(w) }
-    }
-    func webView(_ w: WKWebView, didFinish navigation: WKNavigation!) {
-        let px = Int(MateSnapshot.px)
-        // an exact square disc, whatever the viewport turned out to be, then one static frame
-        let js = "(function(){var m=document.getElementById('m');m.style.inset='auto';m.style.left='0px';m.style.top='0px';"
-            + "m.style.width='\(px)px';m.style.height='\(px)px';if(window.aiwMate)aiwMate.active(false);return 1;})()"
-        w.evaluateJavaScript(js) { [weak self] _, _ in self?.check(w, left: 12) }
-    }
-    /// wait until the disc is square and the ball is drawn, then take the frame
-    private func check(_ w: WKWebView, left: Int) {
-        let probe = "(function(){var m=document.getElementById('m'),r=m.getBoundingClientRect(),s=m.querySelector('svg');"
-            + "return [r.width,r.height,s?s.getBoundingClientRect().width:0];})()"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            w.evaluateJavaScript(probe) { v, _ in
-                let a = (v as? [NSNumber])?.map { CGFloat($0.doubleValue) } ?? []
-                let ok = a.count == 3 && a[0] > 40 && abs(a[0] - a[1]) < 1 && a[2] > a[0] * 0.5
-                if ok || left <= 0 { self?.snap(w) } else { self?.check(w, left: left - 1) }
-            }
-        }
-    }
-    private func snap(_ w: WKWebView) {
-        let cfg = WKSnapshotConfiguration()
-        cfg.afterScreenUpdates = true
-        cfg.rect = CGRect(x: 0, y: 0, width: MateSnapshot.px, height: MateSnapshot.px)
-        w.takeSnapshot(with: cfg) { [weak self] img, _ in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if let img = img, img.size.width > 10, abs(img.size.width - img.size.height) < 1 {
-                    self.image = img
-                    w.removeFromSuperview(); self.web = nil
-                } else { self.fail(w) }
-            }
-        }
-    }
-    private func fail(_ w: WKWebView) {
-        w.removeFromSuperview(); web = nil; started = false
-        if tries < 3 { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.start() } }
-    }
-    func webView(_ w: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail(w) }
-    func webView(_ w: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { fail(w) }
-}
-
-/// The small 球球 head avatar (a still frame of the real ball; an amber disc until the frame is ready), always round.
+/// v2 home: the small 球球 head beside each of 球球's messages, task cards and the thinking row.
+/// 3.7: drawn natively (MateHead), no WKWebView snapshot any more. Root cause of the "eye / lid" avatar on iOS 17:
+/// 3.6 put the hidden snapshot web view at the window's origin (behind the root view). There the web view's scroll view
+/// lies under the status bar, so UIKit gives it an automatic top content inset (the safe area, ~47-59 pt on a notched
+/// iPhone; WebKit on iOS 17 applies it to the page as an obscured inset). The 96 pt page was drawn that far DOWN inside
+/// its own 96 pt frame, so the frame held an empty top half and the TOP half of the disc + ball at the bottom; clipped
+/// to a circle that is a lens: the amber rim as the upper curve, the face with the two eyes, the clip as the lower curve.
+/// The page's own probe (getBoundingClientRect: document coordinates, inset-free) could not see it, the image was
+/// square, so every check passed. A drawing has no web view, no layout timing, no insets: always a full circle.
 struct MateAvatar: View {
     static let side: CGFloat = 30
     var size: CGFloat = MateAvatar.side
-    @ObservedObject private var snap = MateSnapshot.shared
     @AppStorage("mate") private var mateOn = true
     var body: some View {
         Group {
-            if mateOn, let img = snap.image { Image(uiImage: img).resizable().aspectRatio(1, contentMode: .fill) }
-            else { Circle().fill(amber) }
+            if mateOn { MateHead(size: size) } else { Circle().fill(amber) }
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
-        .onAppear { if mateOn { snap.start() } }
         .accessibilityHidden(true)
+    }
+}
+
+/// The 球球 head as the bundled mate.html draws it (?ring=amber&e=02, still): the amber #C87618 disc with its warm
+/// glow, the cream ball (radial #f6f3ef → #F3F0EA → #d6d3ce, light from the upper left) with a soft shadow, and the
+/// two dark eyes of the idle face up and to the right. Proportions measured from that page's render (ball 73 % of the
+/// disc; eyes at 57 % / 36 % and 71 % / 33 %, tilted about 25°). The orb's own look is unchanged; this is its picture.
+struct MateHead: View {
+    var size: CGFloat
+    static let disc = Color(red: 0xC8 / 255, green: 0x76 / 255, blue: 0x18 / 255)
+    static let eye = Color(red: 0x1A / 255, green: 0x1A / 255, blue: 0x1A / 255)
+    var body: some View {
+        let s = size
+        ZStack {
+            Circle().fill(MateHead.disc)
+            Circle().fill(RadialGradient(colors: [Color(red: 1, green: 214 / 255, blue: 150 / 255).opacity(0.38),
+                                                  Color(red: 1, green: 190 / 255, blue: 110 / 255).opacity(0.10), .clear],
+                                         center: UnitPoint(x: 0.5, y: 0.36), startRadius: 0, endRadius: s * 0.62))
+            Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: max(0.5, s / 96))
+            Circle()
+                .fill(RadialGradient(stops: [.init(color: Color(red: 0xF6 / 255, green: 0xF3 / 255, blue: 0xEF / 255), location: 0),
+                                             .init(color: Color(red: 0xF3 / 255, green: 0xF0 / 255, blue: 0xEA / 255), location: 0.62),
+                                             .init(color: Color(red: 0xD6 / 255, green: 0xD3 / 255, blue: 0xCE / 255), location: 1)],
+                                     center: UnitPoint(x: 0.38, y: 0.32), startRadius: 0, endRadius: s * 0.73 * 0.75))
+                .frame(width: s * 0.73, height: s * 0.73)
+                .shadow(color: Color(red: 90 / 255, green: 40 / 255, blue: 0).opacity(0.45), radius: max(0.5, s * 0.03), y: s * 0.02)
+                .position(x: s * 0.501, y: s * 0.504)
+            Capsule().fill(MateHead.eye)
+                .frame(width: s * 0.105, height: s * 0.235)
+                .rotationEffect(.degrees(-26))
+                .position(x: s * 0.573, y: s * 0.357)
+            Capsule().fill(MateHead.eye)
+                .frame(width: s * 0.06, height: s * 0.225)
+                .rotationEffect(.degrees(-20))
+                .position(x: s * 0.714, y: s * 0.331)
+        }
+        .frame(width: s, height: s)
+        .compositingGroup()
     }
 }

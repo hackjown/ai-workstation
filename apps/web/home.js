@@ -38,8 +38,17 @@ function hAvSvg() {
       const host = document.createElement("span"); host.className = "mate amber hav"; host.style.cssText = "position:fixed;left:-200px;top:0";
       document.body.appendChild(host);
       const eng = EmotionBall.create(host, { emotion: "02", idle: false, shape: "blob", eyeScale: 1.6, lite: true, autostart: false, label: "球球" });
-      eng.renderStatic(); hAvCache = host.innerHTML; try { eng.destroy(); } catch (e) { /* ignore */ }
-      host.innerHTML = hAvCache;   // keeps the gradient defs the clones point at
+      eng.renderStatic(); let html = host.innerHTML; try { eng.destroy(); } catch (e) { /* ignore */ }
+      // 3.7: the clones carried copies of the gradient defs with the same ids, and url(#id) takes the FIRST one in the
+      // page: one inside a hidden view (display:none) paints nothing, so the head lost its ball in the task view.
+      // Now the ids are unique to the avatar, only this host keeps the defs, the clones only point at them.
+      (html.match(/id="([^"]+)"/g) || []).forEach((m) => {
+        const id = m.slice(4, -1), nid = "hav-" + id;
+        html = html.split('id="' + id + '"').join('id="' + nid + '"').split("url(#" + id + ")").join("url(#" + nid + ")")
+          .split("url(&quot;#" + id + "&quot;)").join("url(&quot;#" + nid + "&quot;)").split('href="#' + id + '"').join('href="#' + nid + '"');
+      });
+      host.innerHTML = html;       // keeps the gradient defs the clones point at
+      hAvCache = html.replace(/<defs>[\s\S]*?<\/defs>/g, "");
       host.setAttribute("aria-hidden", "true"); host.style.visibility = "hidden";
     }
   } catch (e) { console.warn("avatar", e); }

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>接管桌面</title>
+<!-- The takeover desktop for the iOS app (DesktopView.swift loads this with the Aiw server as its origin, takeover.js
+     inlined) and for a phone browser (/takeover.html?src=<noVNC url>). The noVNC page sits in the iframe (same origin),
+     takeover.js turns touches into precise mouse / key input (trackpad / direct mode, pinch zoom, toolbar, landscape). -->
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+  #stage { position: absolute; inset: 0; }
+  #msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #ddd;
+         font: 15px -apple-system, system-ui, sans-serif; padding: 24px; text-align: center; pointer-events: none; }
+</style>
+<script src="takeover.js"></script>
+</head>
+<body>
+<div id="stage"><iframe id="desk" title="desktop" allow="clipboard-read; clipboard-write"></iframe></div>
+<div id="msg"></div>
+<script>
+(function () {
+  "use strict";
+  var q = new URLSearchParams(location.search);
+  var src = window.AIW_TAKEOVER_SRC || q.get("src") || "";
+  var native = window.AIW_TAKEOVER_NATIVE === true || q.get("native") === "1";
+  var f = document.getElementById("desk");
+  if (!src) { document.getElementById("msg").textContent = "没有桌面地址"; return; }
+  f.src = src;
+  if (!window.AiwTouch) { document.getElementById("msg").textContent = "触控层没加载（takeover.js），直接点画面操作"; return; }
+  window.aiwTouch = AiwTouch.attach(document.getElementById("stage"), f, { native: native });
+})();
+</script>
+</body>
+</html>

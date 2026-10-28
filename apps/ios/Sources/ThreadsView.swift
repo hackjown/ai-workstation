@@ -1,14 +1,15 @@
 import SwiftUI
 import AVFoundation
 
-/// iOS v2 home: always a fresh conversation at launch (past ones live in 历史对话). No drawer: the gear opens 设置,
-/// the "+" opens a native popover menu; every item but 新建对话 opens a large sheet with × and a centred title.
+/// iOS 3.4 home: the persistent chat (HomeChat.swift). The gear opens 设置, the pencil starts a 新建任务, the "+" opens a
+/// native menu; 任务 (every task, was 历史对话) and the rest open as large sheets with × and a centred title. A task opens
+/// as a pushed page (ChatView: the computer on top, the steps below); back returns to the chat where it was.
 enum HomeSheet: String, Identifiable {
     case history, archive, tracking, routine, computer
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .history: return "历史对话"
+        case .history: return "任务"
         case .archive: return "归档"
         case .tracking: return "追踪"
         case .routine: return "例程"
@@ -19,30 +20,25 @@ enum HomeSheet: String, Identifiable {
 
 struct RootView: View {
     @EnvironmentObject var api: API
-    @State private var current: String? = nil      // never restored: the app opens on 新对话
-    @State private var fresh = UUID()
+    @State private var path: [Route] = []
     @State private var sheet: HomeSheet?
     @State private var showSettings = false
     @ObservedObject private var inbox = ImportCenter.shared
 
     var body: some View {
-        NavigationStack {
-            ChatView(threadId: current, onThread: { current = $0 })
-                .id(fresh)   // a new key only when the user picks a thread or starts a new one
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarLeading) {
-                        Button { showSettings = true } label: {
-                            Image(systemName: "gearshape").font(.system(size: 17, weight: .regular))
-                        }.accessibilityLabel("设置")
+        NavigationStack(path: $path) {
+            HomeChatView(path: $path, openSheet: { sheet = $0 }, openSettings: { showSettings = true })
+                .navigationDestination(for: Route.self) { r in
+                    switch r {
+                    case .task(let id, let take): TaskPage(threadId: id, takeover: take)
+                    case .newTask: ChatView(threadId: nil)
                     }
-                    ToolbarItem(placement: .navigationBarTrailing) { homeMenu }
                 }
         }
-        .id(fresh)   // also pops a pushed child thread when the home is reset
         .sheet(isPresented: $showSettings) { SettingsView() }
-        // a file from another app (Open In / share sheet): go to the new-chat home, whose composer picks it up
-        .onChange(of: inbox.tick) { _ in toHomeForImport() }
-        .onAppear { toHomeForImport() }
+        // a file from another app (Open In / share sheet): a blank task view, whose composer picks it up
+        .onChange(of: inbox.tick) { _ in toTaskForImport() }
+        .onAppear { toTaskForImport() }
         .sheet(item: $sheet) { s in
             sheetView(s)
                 .presentationDetents([.large])
@@ -50,37 +46,39 @@ struct RootView: View {
         }
     }
 
-    /// Native menu (material, label on the left, SF Symbol on the right, separators), as in IMG_2914.
-    var homeMenu: some View {
-        Menu {
-            Button { newChat() } label: { Label("新建对话", systemImage: "square.and.pencil") }
-            Button { sheet = .history } label: { Label("历史对话", systemImage: "clock.arrow.circlepath") }
-            Button { sheet = .archive } label: { Label("归档", systemImage: "archivebox") }
-            Button { sheet = .tracking } label: { Label("追踪", systemImage: "scope") }
-            Button { sheet = .routine } label: { Label("例程", systemImage: "arrow.triangle.2.circlepath") }
-            Button { sheet = .computer } label: { Label("电脑", systemImage: "desktopcomputer") }
-        } label: {
-            Image(systemName: "plus").font(.system(size: 19, weight: .medium))
-        }.accessibilityLabel("菜单")
-    }
-
     @ViewBuilder func sheetView(_ s: HomeSheet) -> some View {
         let close = { sheet = nil }
         switch s {
-        case .history: HistorySheet(archived: false, current: current, open: openThread, close: close)
-        case .archive: HistorySheet(archived: true, current: current, open: openThread, close: close)
+        case .history: HistorySheet(archived: false, current: nil, open: openThread, close: close)
+        case .archive: HistorySheet(archived: true, current: nil, open: openThread, close: close)
         case .tracking: TrackingSheet(close: close)
         case .routine: RoutineSheet(open: openThread, close: close)
         case .computer: ComputerSheet(close: close)
         }
     }
 
-    func openThread(_ id: String) { current = id; fresh = UUID(); sheet = nil }
-    func newChat() { current = nil; fresh = UUID() }
-    func toHomeForImport() {
+    func openThread(_ id: String) { sheet = nil; path = [.task(id, takeover: false)] }
+    func toTaskForImport() {
         guard inbox.hasPending else { return }
         sheet = nil; showSettings = false
-        if current != nil { newChat() }
+        path = [.newTask]
+    }
+}
+
+/// A task opened from the chat: the existing task view; in takeover mode the desktop opens full screen once it loaded.
+struct TaskPage: View {
+    let threadId: String
+    let takeover: Bool
+    @State private var asked = false
+    var body: some View {
+        ChatView(threadId: threadId)
+            .onAppear {
+                guard takeover, !asked else { return }
+                asked = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    NotificationCenter.default.post(name: .aiwOpenTakeover, object: nil, userInfo: ["machine": "", "session": ""])
+                }
+            }
     }
 }
 

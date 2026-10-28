@@ -91,3 +91,20 @@
 #threadList[hidden], #archToggle[hidden] { display:none !important; }
 /* ui.css forces #v-chat to flex on phones (for the viewfinder); it is only one view among several now */
 .view#v-chat:not(.on) { display:none !important; }
+
+/* 设置 › 记忆 (memory.js) */
+.mem-head { margin-bottom:12px; } .mem-head .muted { margin-top:4px; }
+.mem-add, .mem-edit { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+.mem-add input, .mem-edit input { flex:1; min-width:0; }
+.mem-add select, .mem-edit select { width:auto; flex:none; }
+.mem-edit { margin:0; }
+.mem-bar { margin-bottom:10px; align-items:center; }
+.mem-bar input.grow { min-width:140px; }
+.seg .mcount { margin-left:5px; font-size:11px; opacity:.6; }
+.item.mem { align-items:flex-start; }
+.item.mem .chip { flex:none; margin-top:2px; }
+.item.mem.old { opacity:.55; } .item.mem.old .mem-t { text-decoration:line-through; }
+.mem-t { white-space:pre-wrap; word-break:break-word; }
+.chip.mk-profile { color:var(--acc); border-color:var(--accLine); }
+.chip.mk-decision { color:var(--ok); border-color:var(--okLine); }
+@media (max-width:760px) { .mem-add, .mem-edit { flex-wrap:wrap; } .mem-add input, .mem-edit input { flex-basis:100%; order:-1; } }

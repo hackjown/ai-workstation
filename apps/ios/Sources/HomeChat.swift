@@ -263,17 +263,18 @@ struct HomeChatView: View {
             }
             }
           }
+          // 3.7: the pill floats over the bottom of the chat, inside the safe area that the composer (its real height)
+          // and the keyboard leave, so it always sits clearly above the input bar. 3.6 hung it on the composer's top
+          // edge with an alignment guide, which iOS 17 did not honour inside an overlay: it covered the input.
+          .overlay(alignment: .bottomTrailing) {
+              if !m.staged && pin.showJump {
+                  JumpToLatest { pin.toEnd(animated: true) }.padding(.trailing, 16).padding(.bottom, 12)
+              }
+          }
+          .animation(.easeOut(duration: 0.18), value: pin.showJump)
           .safeAreaInset(edge: .bottom) {
             composer
                 .reportsComposerTop()
-                .overlay(alignment: .topTrailing) {
-                    if !m.staged && pin.showJump {
-                        JumpToLatest { pin.toEnd(animated: true) }
-                            .alignmentGuide(VerticalAlignment.top) { d in d[VerticalAlignment.bottom] + 10 }
-                            .padding(.trailing, 22)
-                    }
-                }
-                .animation(.easeOut(duration: 0.18), value: pin.showJump)
           }
           .onPreferenceChange(ComposerTopKey.self) { pin.composer($0) }
         }
@@ -659,61 +660,49 @@ struct HomeChatEmpty: View {
     }
 }
 
-/// A task in the chat (v2): dark card, amber accent on the left, the status line in amber, a progress bar; tap → the task view.
+/// A task in the chat (3.7, CardStyle.swift): amber-tinted when finished, white / dark with an amber border while it
+/// runs, a red accent when it failed; the status line in amber, an amber progress bar; tap → the task view.
 struct TaskCardRow: View {
     let msg: JSON
     let open: () -> Void
     let retry: () -> Void
+    @Environment(\.colorScheme) private var cs
     var body: some View {
         let d = msg.o("data")
         let st = d.s("status").isEmpty ? "running" : d.s("status")
         let live = isLive(st)
         let total = d.d("plan_total"), done = d.d("plan_done")
         let frac: Double = total > 0 ? min(1, done / total) : st == "succeeded" ? 1 : (live && d.d("max_steps") > 0 ? min(1, d.d("step") / d.d("max_steps")) : (live ? 0.04 : 0))
-        let bad = ["failed", "interrupted", "stopped"].contains(st)
+        let tone = cardTone(st)
+        let bad = tone == .failed
         Button(action: open) {
             HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 9).fill(st == "succeeded" ? okGreen.opacity(0.18) : hTok)
-                    if live && st == "running" { ProgressView().controlSize(.small).tint(hAmber) }
-                    else { Image(systemName: st == "succeeded" ? "checkmark" : "desktopcomputer").foregroundColor(st == "succeeded" ? okGreen : hAmber) }
-                }.frame(width: 36, height: 36)
+                CardIcon(st: st)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(cleanTitle(d.s("title").isEmpty ? msg.s("text") : d.s("title"))).font(.callout.weight(.semibold)).lineLimit(2).foregroundColor(.white)
-                    Text((live ? "● " : "") + sub(d, st)).font(.caption).foregroundColor(bad ? Color.red.opacity(0.85) : hAmber).lineLimit(1)
-                    if frac > 0 {
-                        GeometryReader { g in
-                            ZStack(alignment: .leading) {
-                                Capsule().fill(Color(white: 0.165))
-                                Capsule().fill(st == "succeeded" ? okGreen : hAmber).frame(width: max(4, g.size.width * frac))
-                            }
-                        }.frame(height: 4).padding(.top, 4)
-                    }
+                    Text(cleanTitle(d.s("title").isEmpty ? msg.s("text") : d.s("title"))).font(.callout.weight(.semibold)).lineLimit(2)
+                        .foregroundColor(cardTitle(cs))
+                    Text((live ? "● " : "") + sub(d, st)).font(.caption).foregroundColor(cardAccent(tone, cs)).lineLimit(1)
+                    if frac > 0 { CardProgress(frac: frac, tone: tone).padding(.top, 4) }
                 }
                 Spacer(minLength: 4)
                 VStack(alignment: .trailing, spacing: 6) {
                     Chip(text: statusText[st] ?? st, color: chipColor(st), dot: true)
                     if bad && !d.s("task_id").isEmpty {
-                        Button("重试", action: retry).font(.caption.weight(.semibold)).buttonStyle(.bordered).controlSize(.mini)
-                    } else { Image(systemName: "chevron.right").font(.caption).foregroundColor(Color(white: 0.55)) }
+                        Button("重试", action: retry).font(.caption.weight(.semibold)).buttonStyle(.bordered).tint(hAmber).controlSize(.mini)
+                    } else { Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary) }
                 }
             }
             .padding(.vertical, 11).padding(.leading, 14).padding(.trailing, 12)
-            .background(Color(white: 0.067))
-            .overlay(alignment: .leading) { Rectangle().fill(bad ? Color.red : hAmber).frame(width: 4) }
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(["waiting_input", "waiting_confirm", "takeover"].contains(st) ? hAmber : Color(white: 0.2), lineWidth: 1))
-            .environment(\.colorScheme, .dark)
+            .taskCardStyle(tone, cs)
         }
         .buttonStyle(.plain)
         .padding(.trailing, 20)
         .accessibilityHint("打开任务")
     }
     func chipColor(_ st: String) -> Color {
-        if st == "succeeded" { return okGreen }
-        if ["failed", "interrupted", "stopped"].contains(st) { return Color.red }
-        return amber
+        if st == "succeeded" { return cs == .dark ? hAmber : hHLLight }
+        if ["failed", "interrupted", "stopped"].contains(st) { return cardRed }
+        return cs == .dark ? hAmber : hHLLight
     }
     func sub(_ d: JSON, _ st: String) -> String {
         var parts: [String] = []
@@ -732,6 +721,7 @@ struct AskRow: View {
     let open: (Bool) -> Void
     @State private var reply = ""
     @State private var busy = false
+    @Environment(\.colorScheme) private var cs
     var body: some View {
         let d = msg.o("data")
         let k = d.s("ask_kind").isEmpty ? "question" : d.s("ask_kind")
@@ -739,13 +729,13 @@ struct AskRow: View {
         let done = !resolved.isEmpty
         let stale = d.b("stale") && !done
         VStack(alignment: .leading, spacing: 8) {
-            Text(head(k) + (d.s("title").isEmpty ? "" : " · " + cleanTitle(d.s("title")))).font(.caption.weight(.bold)).foregroundColor(done || stale ? Color.secondary : amber)
-            Text(msg.s("text")).font(.callout.weight(.semibold)).textSelection(.enabled)
+            Text(head(k) + (d.s("title").isEmpty ? "" : " · " + cleanTitle(d.s("title")))).font(.caption.weight(.bold)).foregroundColor(done || stale ? Color.secondary : hStrong(cs))
+            Text(msg.s("text")).font(.callout.weight(.semibold)).foregroundColor(hBubbleText(cs)).textSelection(.enabled)
             if k == "takeover", !d.o("takeover").s("steps").isEmpty {
                 Text(d.o("takeover").s("steps")).font(.footnote).foregroundColor(.secondary)
             }
             if done {
-                Label(answerText(resolved), systemImage: "checkmark").font(.footnote).foregroundColor(okGreen)
+                Label(resolvedText(resolved), systemImage: "checkmark").font(.footnote).foregroundColor(okGreen)
             } else if stale {
                 Text("已过期（任务已经不在等这个回答）").font(.footnote).foregroundColor(.secondary)
             } else if k == "takeover" {
@@ -767,22 +757,14 @@ struct AskRow: View {
                         .disabled(reply.trimmingCharacters(in: .whitespaces).isEmpty || busy)
                 }
             }
-            if !d.s("thread_id").isEmpty { Button("查看任务 ›") { open(false) }.font(.caption) }
+            if !d.s("thread_id").isEmpty { Button("查看任务 ›") { open(false) }.font(.caption).tint(hStrong(cs)) }
         }
-        .padding(12)
-        .background((done || stale ? Color(.secondarySystemBackground) : amber.opacity(0.08)))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(done || stale ? Color(.separator).opacity(0.6) : amber.opacity(0.5)))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .askCardStyle(cs, settled: done || stale)
         .padding(.trailing, 20)
     }
     func head(_ k: String) -> String {
         switch k { case "takeover": return "需要你接管"; case "form": return "需要你填写"; case "escalate": return "任务卡住了"; default: return "任务在问你" }
-    }
-    func answerText(_ r: JSON) -> String {
-        let a = r["answer"]
-        if let b = a as? Bool { return b ? "已允许" : "已拒绝" }
-        let s = r.s("answer")
-        return s == "done" ? "已完成，交还给电脑" : "已回答：" + String(s.prefix(60))
     }
     func send() { let s = reply.trimmingCharacters(in: .whitespacesAndNewlines); guard !s.isEmpty else { return }; go(["text": s]); reply = "" }
     func go(_ body: JSON) {
@@ -801,18 +783,19 @@ struct ConfirmRow: View {
     @ObservedObject var model: HomeChat
     let open: () -> Void
     @State private var busy = false
+    @Environment(\.colorScheme) private var cs
     var body: some View {
         let d = msg.o("data"), s = d.o("summary")
         let resolved = d.o("resolved")
         let done = !resolved.isEmpty, stale = d.b("stale") && !done
         VStack(alignment: .leading, spacing: 8) {
-            Text("需要你确认" + (d.s("title").isEmpty ? "" : " · " + cleanTitle(d.s("title")))).font(.caption.weight(.bold)).foregroundColor(done || stale ? Color.secondary : amber)
-            Text(s.s("title").isEmpty ? msg.s("text") : s.s("title")).font(.callout.weight(.semibold))
+            Text("需要你确认" + (d.s("title").isEmpty ? "" : " · " + cleanTitle(d.s("title")))).font(.caption.weight(.bold)).foregroundColor(done || stale ? Color.secondary : hStrong(cs))
+            Text(s.s("title").isEmpty ? msg.s("text") : s.s("title")).font(.callout.weight(.semibold)).foregroundColor(hBubbleText(cs))
             if !s.s("what").isEmpty { Text(s.s("what")).font(.footnote).foregroundColor(.secondary) }
             let why = [s.s("risk_cn"), s.s("why")].filter { !$0.isEmpty }.joined(separator: " · ")
             if !why.isEmpty { Text(why).font(.footnote).foregroundColor(.secondary) }
             if done {
-                Label((resolved["answer"] as? Bool) == true ? "已允许" : "已拒绝", systemImage: "checkmark").font(.footnote).foregroundColor(okGreen)
+                Label(resolvedText(resolved), systemImage: "checkmark").font(.footnote).foregroundColor(okGreen)
             } else if stale {
                 Text("已过期（任务已经不在等这个确认）").font(.footnote).foregroundColor(.secondary)
             } else {
@@ -821,12 +804,10 @@ struct ConfirmRow: View {
                     Button("不允许") { go(false) }.buttonStyle(.bordered)
                 }.controlSize(.small).disabled(busy)
             }
-            if !d.s("thread_id").isEmpty { Button("查看任务 ›", action: open).font(.caption) }
+            if !d.s("thread_id").isEmpty { Button("查看任务 ›", action: open).font(.caption).tint(hStrong(cs)) }
         }
-        .padding(12)
-        .background((done || stale ? Color(.secondarySystemBackground) : amber.opacity(0.08)))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(done || stale ? Color(.separator).opacity(0.6) : amber.opacity(0.5)))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .askCardStyle(cs, settled: done || stale)
         .padding(.trailing, 20)
     }
     func go(_ ok: Bool) { busy = true; Task { _ = await model.answer(msg.s("id"), ["approve": ok]); busy = false } }

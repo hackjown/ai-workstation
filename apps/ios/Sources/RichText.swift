@@ -167,30 +167,14 @@ struct PromptParts {
     }
 }
 
-/// The user's bubble: skill chips, the text, attachment chips.
+/// The user's bubble in the task view (3.7): the same as the chat's (UserBubbleV2: amber fill, dark text, skill chips,
+/// attachment lines), so the task view and the chat look alike.
 struct UserBubble: View {
     let prompt: String
     var body: some View {
         let p = PromptParts(prompt)
-        VStack(alignment: .trailing, spacing: 6) {
-            if !p.skills.isEmpty {
-                HStack(spacing: 4) {
-                    Image(systemName: "sparkles"); Text(p.skills.joined(separator: " · ")).lineLimit(1)
-                }.font(.caption.weight(.semibold)).foregroundColor(amber)
-                .padding(.horizontal, 8).padding(.vertical, 4).background(amber.opacity(0.14)).clipShape(Capsule())
-            }
-            if !p.text.isEmpty {
-                Text(inlineMD(p.text)).font(.callout).lineSpacing(3).textSelection(.enabled)
-                    .padding(.horizontal, 13).padding(.vertical, 9)
-                    .background(amber.opacity(0.16)).clipShape(RoundedRectangle(cornerRadius: 16))
-            }
-            ForEach(Array(p.files.enumerated()), id: \.offset) { _, f in
-                HStack(spacing: 5) {
-                    Image(systemName: fileIcon(f)).foregroundColor(amber); Text(f).lineLimit(1).truncationMode(.middle)
-                }.font(.caption).foregroundColor(.secondary)
-                .padding(.horizontal, 9).padding(.vertical, 5).background(Color(.secondarySystemBackground)).clipShape(Capsule())
-            }
-        }.frame(maxWidth: .infinity, alignment: .trailing)
+        UserBubbleV2(text: prompt, attachments: p.files.map { ["name": $0] as JSON }, skillTitle: { $0 })
+            .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }
 

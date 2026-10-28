@@ -12,8 +12,8 @@ every device opens it where the user left off.
   becomes a chat message with buttons, and the end posts a one-line result from 球球 with the task's files.
 * Context: the model gets the last CHAT_TURNS turns verbatim plus a rolling summary of everything older, refreshed
   in the background (kv chat_summary). The screen still gets the full history.
-* Long-term memory (memory.py) plugs in through ``self.memory``: its block goes into the system prompt and it learns
-  from each exchange in the background.
+* Long-term memory (memory.py) plugs in through ``self.memory``: "记住…" / "忘掉…" act at once, the profile and the
+  top memories for the message go into the system prompt, and it learns from each exchange in the background.
 
 No thinking and no agent steps ever go into the chat.
 """
@@ -454,6 +454,11 @@ class Chat:
 
     async def reply(self, text: str, on_delta=None) -> dict:
         tools = await self.tools()
+        if self.memory and hasattr(self.memory, "prepare"):   # embeds the question when an embedding model is set
+            try:
+                await self.memory.prepare(text)
+            except Exception as e:  # noqa: BLE001
+                log.warning("memory prepare: %s", e)
         messages = self.build_messages(text)
         schemas = [t[0] for t in tools.values()]
         parts, offer = [], None

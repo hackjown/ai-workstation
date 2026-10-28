@@ -213,7 +213,9 @@
   }
   document.body.classList.toggle("mate-off", !on());
 
-  window.AiwMate = { set: (id, o) => { const h = headHost(); if (h) h.set(id, o); }, paint: paintCards, enabled: on, setEnabled, _taskMood: taskMood,
+  // create(): a 球球 of its own in any host (home stage, the thinking avatar); same engine and look, the host's CSS sizes it
+  window.AiwMate = { set: (id, o) => { const h = headHost(); if (h) h.set(id, o); }, paint: paintCards,
+    create: (host, opts) => { const m = new Mate(host, opts); if (io) { host._mate = m; io.observe(host); } return m; }, enabled: on, setEnabled, _taskMood: taskMood,
     state: () => [...mates].map((m) => ({ id: m.id, active: !!(m.eng && m.eng._active) })) };
   readPill(); headFromState(); scan();
 })();

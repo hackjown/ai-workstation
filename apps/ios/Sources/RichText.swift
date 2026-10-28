@@ -85,6 +85,16 @@ func inlineMD(_ s: String, leadBold: Bool = false) -> AttributedString {
 struct RichText: View {
     let text: String
     var font: Font = .callout
+    /// v2 home: 球球's bubbles show bold / highlighted text in light amber (#ffc35c)
+    var strong: Color? = nil
+    func md(_ s: String, leadBold: Bool = false) -> AttributedString {
+        var a = inlineMD(s, leadBold: leadBold)
+        guard let c = strong else { return a }
+        for run in a.runs where run.inlinePresentationIntent?.contains(.stronglyEmphasized) == true {
+            a[run.range].foregroundColor = c
+        }
+        return a
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             ForEach(Array(richBlocks(text).enumerated()), id: \.offset) { _, b in block(b) }
@@ -98,23 +108,23 @@ struct RichText: View {
     @ViewBuilder func block(_ b: RichBlock) -> some View {
         switch b {
         case .para(let s):
-            Text(inlineMD(s)).fixedSize(horizontal: false, vertical: true)
+            Text(md(s)).fixedSize(horizontal: false, vertical: true)
         case .heading(let s, let lvl):
-            Text(inlineMD(s)).font(lvl <= 2 ? .headline : .subheadline.weight(.semibold)).padding(.top, 2)
+            Text(md(s)).font(lvl <= 2 ? .headline : .subheadline.weight(.semibold)).padding(.top, 2)
         case .bullet(let s, let lvl):
             HStack(alignment: .firstTextBaseline, spacing: 7) {
                 Text(lvl == 0 ? "•" : "◦").fontWeight(.heavy).foregroundColor(lvl == 0 ? amber : .secondary)
-                Text(inlineMD(s, leadBold: true)).fixedSize(horizontal: false, vertical: true)
+                Text(md(s, leadBold: true)).fixedSize(horizontal: false, vertical: true)
             }.padding(.leading, lvl == 0 ? 2 : 16)
         case .number(let n, let s):
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(n).foregroundColor(amber).fontWeight(.semibold).monospacedDigit()
-                Text(inlineMD(s, leadBold: true)).fixedSize(horizontal: false, vertical: true)
+                Text(md(s, leadBold: true)).fixedSize(horizontal: false, vertical: true)
             }
         case .quote(let s):
             HStack(spacing: 8) {
                 RoundedRectangle(cornerRadius: 1.5).fill(amber.opacity(0.6)).frame(width: 3)
-                Text(inlineMD(s)).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(md(s)).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         case .code(let s):
             ScrollView(.horizontal, showsIndicators: false) {
@@ -127,7 +137,7 @@ struct RichText: View {
                         let cells = r.trimmingCharacters(in: CharacterSet(charactersIn: "| ")).components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
                         HStack(spacing: 14) {
                             ForEach(Array(cells.enumerated()), id: \.offset) { _, c in
-                                Text(inlineMD(c)).font(i == 0 ? .footnote.weight(.semibold) : .footnote).frame(minWidth: 60, alignment: .leading)
+                                Text(md(c)).font(i == 0 ? .footnote.weight(.semibold) : .footnote).frame(minWidth: 60, alignment: .leading)
                             }
                         }
                     }

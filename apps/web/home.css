@@ -250,3 +250,62 @@ body.mate-off .hav, body.mate-off .hst-orb { display:inline-block; }
   .hbw, .hbw .hbb { transition:opacity .2s; transform:none !important; }
 }
 .hinput textarea, .hinput textarea:focus, .hinput textarea:focus-visible { border:0 !important; box-shadow:none !important; outline:none; background:transparent; }
+
+/* ======================================================= 3.7: one look for the chat AND the task view (iOS CardStyle.swift)
+   task / step cards: finished = amber-tinted fill + amber border + amber bar; running / waiting = dark (white in the light
+   theme) + amber border; failed / stopped = a subtle red accent. 3.6 drew every task card black in both themes.
+   question / form cards look like 球球's bubbles; ↓ 最新消息 has an amber border; the briefing bubbles are white in light. */
+#hmsgs .hcard, #msgs .work.tcard { background:var(--h-dark); border:1.5px solid rgba(240,160,48,.67); border-radius:14px; color:#eee; box-shadow:none; }
+#hmsgs .hcard:hover { border-color:var(--h-amber); }
+#hmsgs .hcard .hc-s { color:var(--h-hl); }
+#hmsgs .hcard .hc-ic { background:rgba(240,160,48,.16); color:var(--h-amber); }
+#hmsgs .hcard .hc-bar, #msgs .tcard .hc-bar { height:4px; background:rgba(255,255,255,.12); margin-top:8px; border-radius:2px; overflow:hidden; }
+#hmsgs .hcard .hc-bar i, #msgs .tcard .hc-bar i { display:block; height:100%; background:var(--h-amber); }
+#hmsgs .hcard.st-succeeded, #msgs .work.tcard.st-succeeded { background:#2a2010; border-color:rgba(240,160,48,.55); }
+#hmsgs .hcard.st-succeeded .hc-ic { background:var(--h-amber); color:#fff; }
+#hmsgs .hcard.st-succeeded .hc-bar i, #msgs .tcard.st-succeeded .hc-bar i { background:var(--h-amber); }
+#hmsgs .hcard.st-succeeded .chip, #msgs .tcard.st-succeeded .head .chip { color:var(--h-hl); background:rgba(240,160,48,.14); border-color:rgba(240,160,48,.45); }
+#hmsgs .hcard:is(.st-failed, .st-interrupted, .st-stopped, .st-cancelled),
+#msgs .work.tcard:is(.st-failed, .st-interrupted, .st-stopped, .st-cancelled) { background:#1e1513; border-color:rgba(217,72,59,.5); border-left:1.5px solid rgba(217,72,59,.5);
+  box-shadow:inset 3px 0 0 rgba(217,72,59,.85); }
+#hmsgs .hcard:is(.st-failed, .st-interrupted, .st-stopped) .hc-s { color:#e0675b; }
+#hmsgs .hcard:is(.st-failed, .st-interrupted, .st-stopped) .hc-ic { background:rgba(217,72,59,.13); color:#d9483b; }
+#hmsgs .hcard:is(.st-failed, .st-interrupted, .st-stopped) .hc-bar i, #msgs .tcard:is(.st-failed, .st-interrupted, .st-stopped) .hc-bar i { background:rgba(217,72,59,.8); }
+html[data-theme=light] #hmsgs .hcard, html[data-theme=light] #msgs .work.tcard { background:#fff; color:#1d1a16; border-color:rgba(240,160,48,.85); }
+html[data-theme=light] #hmsgs .hcard .hc-s { color:#b8680c; }
+html[data-theme=light] #hmsgs .hcard .hc-bar, html[data-theme=light] #msgs .tcard .hc-bar { background:rgba(240,160,48,.18); }
+html[data-theme=light] #hmsgs .hcard.st-succeeded, html[data-theme=light] #msgs .work.tcard.st-succeeded { background:#fff4e0; border-color:rgba(240,160,48,.8); }
+html[data-theme=light] #hmsgs .hcard.st-succeeded .chip, html[data-theme=light] #msgs .tcard.st-succeeded .head .chip { color:#b8680c; background:rgba(240,160,48,.16); border-color:rgba(240,160,48,.5); }
+html[data-theme=light] #hmsgs .hcard:is(.st-failed, .st-interrupted, .st-stopped, .st-cancelled),
+html[data-theme=light] #msgs .work.tcard:is(.st-failed, .st-interrupted, .st-stopped, .st-cancelled) { background:#fff8f6; border-color:rgba(217,72,59,.4); }
+html[data-theme=light] #hmsgs .hcard:is(.st-failed, .st-interrupted, .st-stopped) .hc-s { color:#c0392b; }
+/* the task view: the agent's side is a card beside the small 球球 head; the user's bubble is the chat's amber one */
+#msgs .a.tview { display:flex; gap:8px; align-items:flex-end; }
+#msgs .a.tview > .hav { margin-bottom:2px; }
+#msgs .a.tview > .work.tcard { flex:1; min-width:0; padding:12px 14px; gap:10px; }
+#msgs .tcard .head .grow { color:inherit; opacity:.75; }
+#msgs .u .bubble { background:linear-gradient(135deg, var(--h-amber2), var(--h-amber)); color:var(--h-ink); border:0; border-radius:20px 20px 6px 20px; font-weight:500; }
+#msgs .u .bubble .sk { color:var(--h-ink); background:rgba(42,26,5,.12); border-color:rgba(42,26,5,.35); }
+#msgs .a .bubble { background:var(--h-dark); border:1.5px solid rgba(240,160,48,.67); color:#eee; border-radius:20px 20px 20px 6px; }
+#msgs .tcard .bubble.result { background:rgba(240,160,48,.08); border:1px solid rgba(240,160,48,.35); border-radius:12px; }
+#msgs .tcard .bubble.result.bad { background:rgba(217,72,59,.08); border-color:rgba(217,72,59,.35); }
+html[data-theme=light] #msgs .a .bubble { background:#fff; color:#1d1a16; border-color:rgba(240,160,48,.85); }
+html[data-theme=light] #msgs .tcard .bubble.result { background:rgba(255,255,255,.7); border-color:rgba(240,160,48,.45); }
+html[data-theme=light] #msgs .tcard .bubble.result.bad { background:#fff; border-color:rgba(217,72,59,.35); }
+/* question / form / confirmation cards = 球球's bubble */
+#hmsgs .hq { background:var(--h-dark); border:1.5px solid rgba(240,160,48,.67); border-radius:20px 20px 20px 6px; color:#eee; }
+#hmsgs .hq .hq-k { color:var(--h-hl); }
+#hmsgs .hq.off { background:var(--h-dark); border-color:rgba(240,160,48,.4); }
+#hmsgs .hq.off .hq-k { color:var(--dim); }
+html[data-theme=light] #hmsgs .hq { background:#fff; color:#1d1a16; border-color:rgba(240,160,48,.85); }
+html[data-theme=light] #hmsgs .hq .hq-k { color:#b8680c; }
+html[data-theme=light] #hmsgs .hq.off { background:#fff; border-color:rgba(240,160,48,.5); }
+html[data-theme=light] #hmsgs .hq.off .hq-k { color:#8a8178; }
+/* ↓ 最新消息 / ↓ 最新: amber border; white in light, dark in dark; its bottom follows the composer (home.js hPlaceFabs) */
+#hToLatest, #toLatest { background:var(--h-dark); color:#eee; border:1.5px solid rgba(240,160,48,.75); box-shadow:0 6px 18px rgba(0,0,0,.35); z-index:6; }
+html[data-theme=light] #hToLatest, html[data-theme=light] #toLatest { background:#fff; color:#1d1a16; border-color:rgba(240,160,48,.9); box-shadow:0 4px 14px rgba(0,0,0,.12); }
+/* 球球's briefing bubbles: white with an amber border in the light theme (dark theme: the dark fill); amber tail dots */
+html[data-theme=light] .hbb { background:#fff; color:#1d1a16; box-shadow:0 6px 24px rgba(240,160,48,.18); }
+html[data-theme=light] .hbb:hover { box-shadow:0 6px 28px rgba(240,160,48,.32); }
+.hbd.d2 { opacity:1; }
+html[data-theme=light] .hhist { background:#fff; color:#b8680c; border-color:rgba(240,160,48,.7); }

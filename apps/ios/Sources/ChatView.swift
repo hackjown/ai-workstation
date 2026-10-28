@@ -215,6 +215,8 @@ struct ChatView: View {
     @State private var importing = false
     @ObservedObject private var inbox = ImportCenter.shared
     @FocusState private var focused: Bool
+    @StateObject private var pin = BottomPin()
+    @Environment(\.scenePhase) private var phase
 
     init(threadId: String?, fromParent: Bool = false, onThread: @escaping (String) -> Void = { _ in }) {
         _m = StateObject(wrappedValue: ChatModel(threadId)); self.onThread = onThread; self.fromParent = fromParent
@@ -225,9 +227,18 @@ struct ChatView: View {
     }
 
     var body: some View {
+        // 3.6 scroll fix (the task view sometimes could not reach the bottom): the tasks were in a LazyVStack, whose
+        // content height is an estimate until each TaskBlock is realised, and TaskBlocks are tall and change height
+        // after layout (result text measured late, files, the live plan / steps / thinking box, DisclosureGroup); the
+        // only scroll was `proxy.scrollTo("end")` when the task COUNT changed, fired in the same update as the data,
+        // before layout, so it landed on the estimated end, and nothing re-scrolled when the content kept growing.
+        // Now: a plain VStack (a thread holds a handful of tasks: exact heights), a bottom anchor scrolled to after
+        // layout, re-pinned whenever the content height changes while you are at the end (live task, or the few
+        // seconds after opening / a new task), the composer's real top as the visible bottom (keyboard included),
+        // and ↓ 最新消息 when you scrolled up.
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 14) {
                     if let p = m.parentThread { parentBanner(p) }
                     if m.tasks.isEmpty { HomeEmpty(threadId: m.threadId) }
                     ForEach(m.tasks.indices, id: \.self) { i in
@@ -236,11 +247,32 @@ struct ChatView: View {
                     if !m.err.isEmpty { Text(m.err).font(.footnote).foregroundColor(.red) }
                     Color.clear.frame(height: 1).id("end")
                 }.padding(.horizontal, 14).padding(.vertical, 10)
+                .reportsScrollMetrics()
             }
             .scrollDismissesKeyboard(.interactively)
-            .onChange(of: m.tasks.count) { _ in withAnimation { proxy.scrollTo("end") } }
-            .safeAreaInset(edge: .bottom) { composer }
+            .onPreferenceChange(ScrollMetricsKey.self) { mm in pin.metrics(mm, live: liveSession != nil) }
+            .onChange(of: m.tasks.count) { _ in pin.newContent() }
+            .onAppear {
+                pin.jumpAction = { animated in
+                    if animated { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("end", anchor: .bottom) } }
+                    else { proxy.scrollTo("end", anchor: .bottom) }
+                }
+                if !pin.opened || pin.pinned { pin.toEnd(follow: 3) }
+            }
+            .safeAreaInset(edge: .bottom) {
+                composer
+                    .reportsComposerTop()
+                    .overlay(alignment: .topTrailing) {
+                        if pin.showJump {
+                            JumpToLatest { pin.toEnd(animated: true) }
+                                .alignmentGuide(VerticalAlignment.top) { d in d[VerticalAlignment.bottom] + 10 }
+                                .padding(.trailing, 22)
+                        }
+                    }
+                    .animation(.easeOut(duration: 0.18), value: pin.showJump)
+            }
             .safeAreaInset(edge: .top, spacing: 0) { DesktopPane(liveSession: liveSession, onChange: { await m.load() }) }
+            .onPreferenceChange(ComposerTopKey.self) { pin.composer($0) }
         }
         .navigationTitle(m.threadId == nil ? "新对话" : cleanTitle(m.title))
         .navigationBarTitleDisplayMode(.inline)
@@ -249,8 +281,9 @@ struct ChatView: View {
                       status: m.tasks.last.map { t in let l = m.live(t).status; return l.isEmpty ? t.s("status") : l } ?? "",
                       threadId: m.threadId, showMate: !m.tasks.isEmpty)
         } }
-        .task { await m.load() }
+        .task { await m.load(); pin.toEnd(follow: 3) }
         .refreshable { await m.load() }
+        .onChange(of: phase) { p in if p == .active { Task { await m.load(); pin.toEnd(follow: 2) } } }
         .onChange(of: hub.tick) { _ in
             let e = hub.lastEvent
             let tid = e.s("thread_id").isEmpty ? e.o("task").s("thread_id") : e.s("thread_id")
@@ -376,7 +409,7 @@ struct ChatView: View {
         if !picked.isEmpty { p = "【技能：\(picked.joined(separator: "、"))】\n" + p }
         if !attach.isEmpty { p += "\n\n附件（已放到电脑上）：\n" + attach.map { "- " + $0.s("vm_path") }.joined(separator: "\n") }
         sending = true
-        if await m.send(p) { text = ""; attach = []; picked = []; focused = false }
+        if await m.send(p) { text = ""; attach = []; picked = []; focused = false; pin.toEnd(follow: 3) }
         sending = false
     }
 

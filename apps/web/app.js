@@ -335,7 +335,12 @@ $("msgs").addEventListener("scroll", () => { const b = $("msgs"); $("toLatest").
 
 function renderQueue() {
   const q = S.thread ? S.thread.tasks.filter((t) => t.status === "queued") : [];
-  $("queueBar").innerHTML = q.map((t) => `<div class="q"><span>排队：${esc(t.prompt)}</span><button class="icon soft" onclick="cancelQueued('${t.id}')" aria-label="移除">${icon("x")}</button></div>`).join("")
+  // 3.8: each queued message says why it waits and has 立即发送 (the computer runs one task at a time) / 移除
+  const why = (t) => { const x = t.queue || {}; if (x.first) return "下一条就发它";
+    if (x.busy && x.busy.task_id) return `电脑正在做「${esc((x.busy.prompt || "").slice(0, 20))}」（${(STATUS_CN[x.busy.status] || [x.busy.status])[0]}），做完自动发送`;
+    return x.held ? "上个任务被停止，排队已暂停" : "马上开始"; };
+  $("queueBar").innerHTML = q.map((t) => `<div class="q"><span>排队：${esc(t.prompt)}<small class="muted"> · ${why(t)}</small></span>
+    <button class="btn sm" onclick="sendQueuedNow('${t.id}')">立即发送</button><button class="icon soft" onclick="cancelQueued('${t.id}')" aria-label="移除">${icon("x")}</button></div>`).join("")
     + (q.length && S.thread.queue_held ? `<button class="btn sm primary" onclick="resumeQueue()">发送排队消息</button>` : "");
 }
 
@@ -476,6 +481,16 @@ async function answerQ(sid, text) { clearPend(sid, "question"); await api("POST"
 function answerQForm(e, sid) { e.preventDefault(); const v = e.target.a.value.trim(); if (v) answerQ(sid, v); }
 async function retry(id) { const r = await api("POST", `/api/tasks/${id}/retry`); S.threadId = r.thread_id; await refreshThread(true); }
 async function cancelQueued(id) { await api("DELETE", `/api/tasks/${id}`); refreshThread(); }
+async function sendQueuedNow(id) {
+  try {
+    const r = await api("POST", `/api/tasks/${id}/send_now`, {});
+    if (!r.started && r.queue && r.queue.busy && r.queue.busy.task_id
+        && confirm(`电脑正在做「${(r.queue.busy.prompt || "").slice(0, 30)}」。\n停止它，立即发送这条？\n（取消 = 等它做完，这条第一个发）`)) {
+      await api("POST", `/api/tasks/${id}/send_now`, { stop_current: true });
+    }
+  } catch (e) { toast("没能发送：" + e.message); }
+  refreshThread();
+}
 async function resumeQueue() { await api("POST", `/api/threads/${S.threadId}/queue/resume`); refreshThread(); }
 
 async function replay(sid) {

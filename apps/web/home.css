@@ -1,0 +1,93 @@
+/* Aiw home: the persistent chat (home.js) + 任务 page. Uses ui.css tokens (dark / light). */
+#hmsgs { flex:1; padding:22px 18px 18px; display:flex; flex-direction:column; gap:14px; overflow-y:auto; }
+#hmsgs > * { max-width:760px; width:100%; margin-left:auto; margin-right:auto; }
+#v-home .fab { bottom:110px; }
+.hmore { text-align:center; font-size:12px; color:var(--dim); padding:4px 0 8px; }
+.hmore.end { opacity:.7; }
+.hrow .meta { font-size:12px; color:var(--dim); margin-top:4px; }
+.hrow .meta .link { font-size:12px; padding:0; }
+.hbody { max-width:86%; display:flex; flex-direction:column; align-items:flex-start; }
+.hbody .bubble, .hres .bubble { max-width:100%; }
+.bubble.hmd { white-space:normal; }
+.bubble.hmd > :first-child { margin-top:0; } .bubble.hmd > :last-child { margin-bottom:0; }
+.bubble.hmd p { margin:0 0 .5em; } .bubble.hmd ul, .bubble.hmd ol { margin:.2em 0 .5em; padding-left:1.3em; }
+.bubble.hmd pre { white-space:pre-wrap; word-break:break-word; }
+.bubble.hmd a { word-break:break-all; }
+.bubble.err { border:1px solid var(--badLine); }
+.hatt { display:flex; flex-wrap:wrap; gap:4px; justify-content:flex-end; margin-top:4px; }
+.hrow .opts { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+
+/* task card: compact, tappable, follows the task live */
+.hcard { display:flex; align-items:center; gap:12px; width:min(520px, 100%); padding:12px 14px; border:1px solid var(--line2); border-radius:var(--r-card, 10px);
+  background:var(--panel); cursor:pointer; text-align:left; color:var(--text); }
+.hcard:hover { border-color:var(--accLine); }
+.hcard:focus-visible { outline:2px solid var(--acc); outline-offset:2px; }
+.hc-ic { width:34px; height:34px; border-radius:8px; background:var(--accBg); display:grid; place-items:center; flex:none; color:var(--acc); }
+.hc-ic .i { width:18px; height:18px; }
+.hc-t { font-weight:700; font-size:14px; line-height:1.35; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+.hc-s { font-size:12px; color:var(--mute); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.hc-bar { height:3px; border-radius:2px; background:var(--line); margin-top:7px; overflow:hidden; }
+.hc-bar i { display:block; height:100%; background:var(--acc); transition:width .3s; }
+.hc-r { display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex:none; }
+.hc-go { color:var(--dim); line-height:0; } .hc-go .i { width:16px; height:16px; }
+.hcard.st-failed, .hcard.st-interrupted { border-color:var(--badLine); }
+.hcard.st-succeeded .hc-ic { background:var(--okBg); color:var(--ok); }
+.hcard.st-waiting_input, .hcard.st-waiting_confirm, .hcard.st-takeover { border-color:var(--accLine); box-shadow:0 0 0 3px var(--accBg); }
+
+/* questions / confirmations from a task */
+.hq { width:min(520px, 100%); border:1px solid var(--accLine); background:var(--accBg); border-radius:var(--r-card, 10px); padding:12px 14px; }
+.hq.off { border-color:var(--line); background:var(--panel); }
+.hq-k { font-size:12px; font-weight:700; color:var(--acc); margin-bottom:4px; }
+.hq.off .hq-k { color:var(--dim); }
+.hq-q { font-weight:600; white-space:pre-wrap; word-break:break-word; }
+.hq-d { margin-top:4px; color:var(--mute); white-space:pre-wrap; }
+.hq-done { margin-top:8px; font-size:13px; display:flex; align-items:center; gap:6px; color:var(--ok); }
+.hq-done.muted { color:var(--dim); }
+.hq-done .i { width:14px; height:14px; }
+.hq-f { display:flex; gap:6px; margin-top:8px; }
+.hq-f input { flex:1; min-width:0; }
+.hq-open { display:block; margin-top:8px; padding:0; }
+
+/* a task's one-line result from 球球 */
+.hres { max-width:86%; }
+.hres.ok .bubble { border-left:3px solid var(--ok); }
+.hres.bad .bubble { border-left:3px solid var(--bad); }
+.hres .filecard, .hres .gallery { margin-top:6px; }
+
+/* typing dots while the reply is on its way */
+.hdots { display:inline-flex; gap:4px; vertical-align:middle; margin-right:6px; }
+.hdots i { width:6px; height:6px; border-radius:50%; background:var(--dim); animation:hdot 1.2s infinite ease-in-out; }
+.hdots i:nth-child(2) { animation-delay:.15s; } .hdots i:nth-child(3) { animation-delay:.3s; }
+@keyframes hdot { 0%, 80%, 100% { opacity:.25; transform:translateY(0); } 40% { opacity:1; transform:translateY(-3px); } }
+@media (prefers-reduced-motion: reduce) { .hdots i { animation:none; opacity:.6; } }
+
+/* 新建任务 mode above the composer */
+.hmode { max-width:760px; margin:0 auto 6px; display:flex; align-items:center; gap:8px; font-size:13px; padding:6px 10px;
+  border:1px solid var(--accLine); background:var(--accBg); border-radius:8px; color:var(--text); }
+.hmode[hidden] { display:none; }
+.hmode span { flex:1; } .hmode .i { width:16px; height:16px; }
+.hmode .link { padding:0; line-height:0; }
+
+/* header: ← back to the chat, 新建任务 */
+#backBtn[hidden], #newTaskBtn[hidden] { display:none !important; }
+#newTaskBtn { white-space:nowrap; }
+#newTaskBtn .i { width:16px; height:16px; }
+.hwelcome .sugs button { text-align:left; }
+
+/* 任务 page */
+.tk-bar { margin-bottom:12px; align-items:center; }
+.tk-bar input { min-width:160px; }
+.item.tk .acts { flex-wrap:wrap; justify-content:flex-end; }
+.tk-res { margin-top:4px; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+
+@media (max-width:760px) {
+  #hmsgs { padding:14px 12px 12px; }
+  .hbody, .hres { max-width:94%; }
+  #newTaskBtn span { display:none; }
+  #newTaskBtn { padding:6px 8px; }
+  #menuBtn.hide-back { display:none; }
+  #pillAgent { display:none; }
+}
+#threadList[hidden], #archToggle[hidden] { display:none !important; }
+/* ui.css forces #v-chat to flex on phones (for the viewfinder); it is only one view among several now */
+.view#v-chat:not(.on) { display:none !important; }

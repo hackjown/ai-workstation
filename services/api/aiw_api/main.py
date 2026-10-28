@@ -219,6 +219,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     chat = _chat.Chat(store, sessions, notifier, settings, secrets)
     app.state.chat = chat
     _chat.mount(app, chat, auth)
+    from . import memory as _memory   # long-term memory: profile / facts / decisions for the chat and every task
+    mem = _memory.Memory(store, sessions, llm=chat.llm)
+    chat.memory = mem
+    sessions.memory = mem
+    app.state.memory = mem
+    _memory.mount(app, mem, auth)
 
     # ------------------------------------------------------------- tasks
 
@@ -528,23 +534,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         return {**res, "watch": store.get("watches", wid)}
 
     # ------------------------------------------------------------- memory + profile
-    @app.get("/api/memories", dependencies=[Depends(auth)])
-    async def memories():
-        return store.all("memories")
-
-    @app.post("/api/memories", dependencies=[Depends(auth)])
-    async def add_memory(body: MemoryIn):
-        return store.insert("memories", {"text": body.text.strip()[:500], "source": "user"})
-
-    @app.put("/api/memories/{mid_}", dependencies=[Depends(auth)])
-    async def put_memory(mid_: str, body: MemoryIn):
-        store.update("memories", mid_, text=body.text.strip()[:500])
-        return store.get("memories", mid_)
-
-    @app.delete("/api/memories/{mid_}", dependencies=[Depends(auth)])
-    async def del_memory(mid_: str):
-        store.delete("memories", mid_)
-        return {"ok": True}
+    # /api/memories* lives in memory.py (kinds, superseded, search); mounted next to the chat above
 
     @app.get("/api/profile", dependencies=[Depends(auth)])
     async def get_profile():

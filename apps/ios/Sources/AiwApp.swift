@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import UserNotifications
 
 @main
@@ -41,6 +42,8 @@ final class Hub: ObservableObject {
     static let shared = Hub()
     @Published var tick = 0
     @Published var lastEvent: JSON = [:]
+    /// Every event, one by one (onChange(of: tick) can coalesce a burst; the chat must not miss a message)
+    let events = PassthroughSubject<JSON, Never>()
     private var sock: Socket?
     func start() {
         stop()
@@ -50,6 +53,7 @@ final class Hub: ObservableObject {
             guard let self = self else { return }
             self.lastEvent = m
             self.tick += 1
+            self.events.send(m)
             if m.s("kind") == "notification" {
                 let n = m.o("notification")
                 let c = UNMutableNotificationContent()

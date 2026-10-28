@@ -18,6 +18,7 @@
 <link rel="stylesheet" href="mate.css" />
 <link rel="stylesheet" href="mdview.css" />
 <link rel="stylesheet" href="approval.css" />
+<link rel="stylesheet" href="home.css" />
 </head>
 <body>
 <div id="app">
@@ -28,33 +29,66 @@
       <div class="grow"><div class="heading">Aiw</div><div class="small"><span class="sdot" id="agentDot"></span><span id="agentName">小秘</span> · <span id="agentStatus">空闲</span></div></div>
       <span id="sideAvatar" hidden></span>
     </div>
-    <button class="btn primary wide" onclick="newThread()"><i data-i="plus"></i>新对话</button>
+    <button class="btn primary wide" onclick="newTaskMode()"><i data-i="plus"></i>新建任务</button>
     <div class="navs">
-      <button data-view="chat" onclick="go('chat')"><i data-i="chat"></i>对话</button>
+      <button data-view="home" onclick="go('home')"><i data-i="chat"></i>聊天<span class="badge" id="chatBadge"></span></button>
+      <button data-view="tasks" onclick="go('tasks')"><i data-i="bolt"></i>任务</button>
       <button data-view="activity" onclick="go('activity')"><i data-i="activity"></i>活动<span class="badge" id="needBadge"></span></button>
       <button data-view="tracking" onclick="go('tracking')"><i data-i="target"></i>追踪</button>
       <button data-view="routines" onclick="go('routines')"><i data-i="clock"></i>例程</button>
       <button data-view="computer" onclick="go('computer')"><i data-i="monitor"></i>电脑</button>
       <button data-view="settings" onclick="go('settings')"><i data-i="settings"></i>设置</button>
     </div>
-    <div class="label pad">对话</div>
-    <div id="threadList" class="threads"></div>
-    <button class="link small pad" onclick="toggleArchived()" id="archToggle">查看已归档</button>
+    <!-- the old conversation list now lives on the 任务 page; kept hidden so app.js/ui.js can still fill it -->
+    <div id="threadList" class="threads" hidden></div>
+    <button id="archToggle" hidden></button>
   </nav>
 
   <!-- main column -->
   <section id="main">
     <header id="top">
-      <button class="icon only-mobile" onclick="openDrawer()" aria-label="对话列表"><i data-i="menu"></i></button>
+      <button class="icon" id="backBtn" onclick="backToChat()" aria-label="返回聊天" title="返回聊天" hidden><i data-i="back"></i></button>
+      <button class="icon only-mobile" id="menuBtn" onclick="openDrawer()" aria-label="菜单"><i data-i="menu"></i></button>
       <img class="logo sm only-mobile" src="logo.svg" alt="Aiw" />
       <div class="ttl"><div class="heading" id="viewTitle">对话</div><div class="small" id="viewSub"></div></div>
       <span class="chip" id="pillAgent">Agent …</span>
+      <button class="btn sm primary" id="newTaskBtn" onclick="newTaskMode()" title="新建任务"><i data-i="plus"></i><span>新建任务</span></button>
       <button class="icon" id="bell" onclick="toggleNotes()" aria-label="通知"><i data-i="bell"></i><span class="dot" id="bellDot"></span></button>
       <button class="icon only-wide" id="deskToggle" onclick="toggleDeskPane()" aria-label="桌面" title="显示/隐藏桌面"><i data-i="monitor"></i></button>
     </header>
     <div id="notes" class="pop"></div>
 
-    <!-- CHAT -->
+    <!-- HOME: the persistent chat (main screen; home.js) -->
+    <div class="view" id="v-home">
+      <div id="hmsgs" class="scroll"></div>
+      <button id="hToLatest" class="fab" onclick="hScrollLatest(true)">↓ 最新</button>
+      <div class="composer-wrap">
+        <div id="hmode" class="hmode" hidden></div>
+        <div id="hattach" class="attachments"></div>
+        <form class="composer" onsubmit="hSend(event)">
+          <button type="button" class="icon soft" onclick="$('hfile').click()" aria-label="附件"><i data-i="clip"></i></button>
+          <input type="file" id="hfile" hidden multiple onchange="hUpload(this.files)" />
+          <textarea id="hprompt" rows="1" placeholder="和我聊聊，或者让电脑去办件事…" oninput="autoGrow(this); localStorage.setItem('aiw_hdraft', this.value)" onkeydown="hKey(event)"></textarea>
+          <button class="send" id="hSendBtn" aria-label="发送"><i data-i="up"></i></button>
+        </form>
+      </div>
+    </div>
+
+    <!-- TASKS: every task (was the sidebar conversation list) -->
+    <div class="view scroll" id="v-tasks">
+      <div class="page">
+        <div class="row gap wrap tk-bar">
+          <div class="seg" id="tkFilter">
+            <button data-f="all" class="on">全部</button><button data-f="live">进行中</button><button data-f="need">需要你</button>
+            <button data-f="failed">没完成</button><button data-f="done">已完成</button><button data-f="arch">已归档</button>
+          </div>
+          <input id="tkSearch" class="grow" placeholder="搜索任务…" oninput="renderTasksPage()" />
+        </div>
+        <div id="tkList" class="list"></div>
+      </div>
+    </div>
+
+    <!-- TASK VIEW (a task's steps; opened from a task card or the 任务 page) -->
     <div class="view" id="v-chat">
       <div id="msgs" class="scroll"></div>
       <button id="toLatest" class="fab" onclick="scrollLatest(true)">↓ 最新</button>
@@ -162,9 +196,9 @@
 
   <!-- mobile tab bar -->
   <nav id="tabs">
-    <button data-view="chat" onclick="go('chat')"><i data-i="chat"></i><span>对话</span></button>
+    <button data-view="home" onclick="go('home')"><i data-i="chat"></i><span>聊天</span></button>
+    <button data-view="tasks" onclick="go('tasks')"><i data-i="bolt"></i><span>任务</span></button>
     <button data-view="activity" onclick="go('activity')"><i data-i="activity"></i><span>活动</span></button>
-    <button data-view="tracking" onclick="go('tracking')"><i data-i="target"></i><span>追踪</span></button>
     <button data-view="computer" onclick="go('computer')"><i data-i="monitor"></i><span>电脑</span></button>
     <button data-view="settings" onclick="go('settings')"><i data-i="settings"></i><span>更多</span></button>
   </nav>
@@ -188,5 +222,6 @@
 <script src="vendor/emotionball/engine.js"></script>
 <script src="mate-map.js"></script>
 <script src="mate.js"></script>
+<script src="home.js"></script>
 </body>
 </html>

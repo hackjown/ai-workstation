@@ -116,35 +116,56 @@ struct DesktopPane: View {
 }
 
 /// Full screen desktop you can drive (noVNC from the Aiw server), with a bar to hand control back.
+/// 3.7: the desktop is the takeover page (apps/web/takeover.html + takeover.js, bundled, loaded with the Aiw server as
+/// its origin so the noVNC iframe inside is same-origin) and touches go through its touch layer: 触控板 mode (default:
+/// a cursor moved relatively with acceleration, tap = click, two-finger tap = right click, long press / tap-then-drag =
+/// drag, two-finger drag = scroll), 直点 mode (a loupe with a crosshair, click on release), pinch zoom + pan, and a
+/// toolbar (mode, keyboard, Esc / Tab / Ctrl / Enter / arrows, 横屏). 横屏 turns this view (and only this view, see
+/// OrientationLock) to landscape and shows the desktop full screen; 退出横屏 in the toolbar brings it back.
 struct TakeoverView: View {
     @EnvironmentObject var api: API
     let liveSession: String?
     let done: () -> Void
     @State private var url: URL?
     @State private var err = ""
+    @State private var landscape = false
     @ObservedObject private var bus = TakeoverBus.shared
     var asked: JSON? { (bus.pending?.s("session_id") ?? "") == (liveSession ?? "-") ? bus.pending : nil }
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Circle().fill(Color.red).frame(width: 8, height: 8)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(liveSession != nil ? "你在操作桌面，Aiw 已暂停" : "你在操作桌面").font(.subheadline.weight(.semibold))
-                    if let a = asked {   // what the agent asked for, so the user knows what to do here
-                        Text(a.s("steps").isEmpty ? a.s("title") : a.s("steps")).font(.caption).foregroundColor(.secondary).lineLimit(2)
+            if !landscape {
+                HStack {
+                    Circle().fill(Color.red).frame(width: 8, height: 8)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(liveSession != nil ? "你在操作桌面，Aiw 已暂停" : "你在操作桌面").font(.subheadline.weight(.semibold))
+                        if let a = asked {   // what the agent asked for, so the user knows what to do here
+                            Text(a.s("steps").isEmpty ? a.s("title") : a.s("steps")).font(.caption).foregroundColor(.secondary).lineLimit(2)
+                        }
                     }
-                }
-                Spacer()
-                Button(asked != nil ? "完成，交还给 Aiw" : liveSession != nil ? "交还给 Aiw" : "结束操作") { done() }.buttonStyle(.borderedProminent)
-            }.padding(.horizontal, 14).padding(.vertical, 10).background(.bar)
+                    Spacer()
+                    Button(asked != nil ? "完成，交还给 Aiw" : liveSession != nil ? "交还给 Aiw" : "结束操作") { leave() }.buttonStyle(.borderedProminent)
+                }.padding(.horizontal, 14).padding(.vertical, 10).background(.bar)
+            }
             ZStack {
                 Color.black
-                if let u = url { WebDesk(url: u) }
+                if let u = url { TakeoverWeb(url: u, server: api.server) { op in setLandscape(op == "landscape") } }
                 else if !err.isEmpty { Text(err).foregroundColor(.white).padding() }
                 else { ProgressView().tint(.white) }
             }
+            .ignoresSafeArea(edges: landscape ? .all : [])
         }
+        .statusBarHidden(landscape)
+        .persistentSystemOverlays(landscape ? .hidden : .automatic)
         .task { await load() }
+        .onDisappear { if landscape { OrientationLock.set(landscape: false) } }
+    }
+    func setLandscape(_ on: Bool) {
+        withAnimation(.easeInOut(duration: 0.2)) { landscape = on }
+        OrientationLock.set(landscape: on)
+    }
+    func leave() {
+        if landscape { setLandscape(false) }
+        done()
     }
     func load() async {
         do {
@@ -157,16 +178,86 @@ struct TakeoverView: View {
     }
 }
 
-struct WebDesk: UIViewRepresentable {
+/// Only the takeover view turns to landscape (its 横屏 button): the rest of the app stays portrait on a phone.
+/// AppDelegate.supportedInterfaceOrientationsFor reads `mask`; iOS 16+ rotates with requestGeometryUpdate.
+enum OrientationLock {
+    static var pad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+    static var mask: UIInterfaceOrientationMask = UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait
+    static func set(landscape: Bool) {
+        mask = landscape ? .landscape : (pad ? .all : .portrait)
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return }
+        var vc = scene.keyWindow?.rootViewController
+        while let c = vc {   // the root and the full-screen cover on top of it re-read the mask
+            c.setNeedsUpdateOfSupportedInterfaceOrientations()
+            vc = c.presentedViewController
+        }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: landscape ? .landscapeRight : (pad ? .all : .portrait))) { e in
+            print("Aiw rotate:", e.localizedDescription)
+        }
+    }
+}
+
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        OrientationLock.mask
+    }
+}
+
+/// The takeover page in a WKWebView: the bundled takeover.html with takeover.js inlined, loaded with the Aiw server as
+/// its base URL (so the noVNC iframe is same-origin and the touch layer can reach its canvas). A server copy
+/// (/takeover.html) is the fallback when the bundle has none. `op` gets the page's 横屏 / 退出横屏.
+struct TakeoverWeb: UIViewRepresentable {
     let url: URL
+    let server: String
+    let op: (String) -> Void
+
+    final class Coord: NSObject, WKScriptMessageHandler {
+        var op: (String) -> Void = { _ in }
+        func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+            guard let b = m.body as? [String: Any], let o = b["op"] as? String else { return }
+            DispatchQueue.main.async { self.op(o) }
+        }
+    }
+    /// WKUserContentController keeps its handlers strongly: this breaks the cycle
+    final class Weak: NSObject, WKScriptMessageHandler {
+        weak var to: Coord?
+        init(_ c: Coord) { to = c }
+        func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) { to?.userContentController(c, didReceive: m) }
+    }
+    func makeCoordinator() -> Coord { Coord() }
+
     func makeUIView(context: Context) -> WKWebView {
         let c = WKWebViewConfiguration()
         c.allowsInlineMediaPlayback = true
+        c.userContentController.add(Weak(context.coordinator), name: "aiwTakeover")
         let w = WKWebView(frame: .zero, configuration: c)
         w.isOpaque = false; w.backgroundColor = .black
         w.scrollView.isScrollEnabled = false
-        w.load(URLRequest(url: url))
+        w.scrollView.bounces = false
+        w.scrollView.contentInsetAdjustmentBehavior = .never
+        context.coordinator.op = op
+        if let html = TakeoverWeb.page(src: url.absoluteString), let base = URL(string: server.hasSuffix("/") ? server : server + "/") {
+            w.loadHTMLString(html, baseURL: base)
+        } else if var u = URLComponents(string: server + "/takeover.html") {
+            u.queryItems = [URLQueryItem(name: "src", value: url.absoluteString), URLQueryItem(name: "native", value: "1")]
+            if let full = u.url { w.load(URLRequest(url: full)) } else { w.load(URLRequest(url: url)) }
+        } else { w.load(URLRequest(url: url)) }
         return w
     }
-    func updateUIView(_ w: WKWebView, context: Context) {}
+    func updateUIView(_ w: WKWebView, context: Context) { context.coordinator.op = op }
+    static func dismantleUIView(_ w: WKWebView, coordinator: Coord) {
+        w.configuration.userContentController.removeScriptMessageHandler(forName: "aiwTakeover")
+    }
+    /// takeover.html from the bundle with takeover.js inlined and the desktop address set
+    static func page(src: String) -> String? {
+        guard let h = Bundle.main.url(forResource: "takeover", withExtension: "html", subdirectory: "takeover"),
+              let j = Bundle.main.url(forResource: "takeover", withExtension: "js", subdirectory: "takeover"),
+              var html = try? String(contentsOf: h, encoding: .utf8), let js = try? String(contentsOf: j, encoding: .utf8),
+              let data = try? JSONSerialization.data(withJSONObject: [src]), let arr = String(data: data, encoding: .utf8) else { return nil }
+        let lit = String(arr.dropFirst().dropLast())   // the JSON string literal of src
+        let tag = "<script src=\"takeover.js\"></script>"
+        guard html.contains(tag) else { return nil }
+        html = html.replacingOccurrences(of: tag, with: "<script>window.AIW_TAKEOVER_SRC=\(lit);window.AIW_TAKEOVER_NATIVE=true;</script>\n<script>\(js)</script>")
+        return html
+    }
 }

@@ -29,9 +29,11 @@ async def download(url: str, path: str | None = None) -> dict:
     return {"path": str(target), "size": size, "url": url}
 
 
-def upload(path: str, content_b64: str) -> dict:
+def upload(path: str, content_b64: str, append: bool = False) -> dict:
+    """``append``: one more piece of a big file (the API sends videos in 16 MB pieces); size is the whole file's."""
     p = safe_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     data = base64.b64decode(content_b64)
-    p.write_bytes(data)
-    return {"path": str(p), "size": len(data)}
+    with open(p, "ab" if append else "wb") as f:
+        f.write(data)
+    return {"path": str(p), "size": p.stat().st_size, "piece": len(data)}

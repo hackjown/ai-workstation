@@ -255,12 +255,15 @@ function renderTask(t) {
     status = last.type === "agent.observation" ? "正在看屏幕…" : last.type === "agent.thinking" ? ((last.data || {}).phase === "vision" ? "视觉模型在看屏幕…" : "正在思考…") : `正在${toolName(d.tool)}…`;
   } else if (liveNow) status = "启动中…";
   const dur = startTs ? Math.round(((endTs || Date.now() / 1000) - startTs)) : null;
-  let html = `<div class="a"><div class="work">
+  // 3.7: the agent's side looks like the chat's: the small 球球 head + the shared task card (home.css .tcard)
+  let html = `<div class="a hwa nm tview"><span class="mate amber hav" aria-hidden="true">${typeof hAvSvg === "function" ? hAvSvg() : ""}</span><div class="work tcard st-${esc(t.status)}">
     <div class="head">${liveNow && t.status === "running" ? '<span class="spin"></span>' : chip(t.status)}
       <div class="grow">${esc(status || (dur != null ? `用时 ${dur}s · ${steps.length} 步` : ""))}</div>
       ${liveNow ? `<button class="btn sm" onclick="ctl('${t.session_id}','${t.status === "paused" || t.status === "takeover" ? "resume" : "pause"}')">${t.status === "paused" || t.status === "takeover" ? "继续" : "暂停"}</button>` : ""}</div>`;
   const th = liveNow && last && last.type === "agent.thinking" ? S.think[t.id] : null;
   if (th && th.text) html += `<div class="thinklive"><div class="tl">${icon("bulb")}思考过程<em>${th.chars || th.text.length} 字</em></div><div class="tt"><div>${esc(th.text)}</div></div></div>`;
+  const barPct = plan ? 100 * new Set(plan.done || []).size / Math.max(1, plan.steps.length) : t.status === "succeeded" ? 100 : 0;
+  if (barPct) html += `<div class="hc-bar tc-bar"><i style="width:${Math.max(3, Math.min(100, Math.round(barPct)))}%"></i></div>`;
   if (plan) {
     const done = new Set(plan.done || []); const firstOpen = plan.steps.findIndex((_, i) => !done.has(i));
     html += `<div class="plan">${plan.steps.map((s, i) => `<div class="st ${done.has(i) ? "done" : i === firstOpen && liveNow ? "cur" : ""}"><span class="ck">${done.has(i) ? icon("check") : ""}</span><span class="tx">${esc(s)}</span></div>`).join("")}</div>`;
@@ -298,7 +301,7 @@ function renderTask(t) {
     html += `<a class="filecard" href="${artUrl(f.artifact, true)}" download="${esc(f.name)}"><span class="iconbox">${icon("file")}</span><span class="grow"><b>${esc(f.name)}</b><div class="small">${size(f.size)}${f.truncated ? " · 超过 40MB 已截断" : ""} · 点击下载</div></span></a>`;
     if (zip) html += `<div class="zipgal" data-art="${esc(f.artifact)}"></div>`;
   }
-  if (t.result && !liveNow) html += `<div class="bubble result" style="max-width:100%;background:${t.status === "succeeded" ? "var(--sky)" : "var(--dangerBg)"}">${esc(t.result)}</div>`;
+  if (t.result && !liveNow) html += `<div class="bubble result ${t.status === "succeeded" ? "ok" : "bad"}" style="max-width:100%">${esc(t.result)}</div>`;
   html += `<div class="foot">`;
   if (liveNow) html += `<button class="btn sm" onclick="go('computer')">${icon("monitor")}看桌面</button><button class="btn sm danger" onclick="ctl('${t.session_id}','stop')">${icon("stop")}停止</button>`;
   if (t.session_id) html += `<button class="btn sm" onclick="replay('${t.session_id}')">${icon("play")}回放</button><button class="btn sm" onclick="receipts('${t.id}')">${icon("receipt")}收据</button><button class="btn sm" onclick="exportTask('${t.id}')">导出</button>`;
@@ -596,8 +599,20 @@ async function loadDesktop() {
     if (target === "big") { $("desk").src = "about:blank"; deskLoaded.small = null; } else if (S.view !== "computer") { $("deskBig").src = "about:blank"; deskLoaded.big = null; }
   } catch (e) { toast("桌面：" + e.message); }
   $("deskMode").textContent = S.take ? "你正在操作桌面 · 鼠标键盘已接通" : "观看模式 · 只看不操作";
+  deskTouch();
 }
 function liveTask() { return busyTask || (S.thread && S.thread.tasks.find((t) => LIVE.includes(t.status))); }
+/* 3.7: on a touch screen, taking over puts the touch layer (takeover.js: 触控板 / 直点, pinch zoom, toolbar, 横屏)
+   over the desktop iframe that is on screen; handing back removes it. A mouse keeps driving noVNC directly. */
+const deskTouchCtl = {};
+function deskTouch() {
+  const touch = window.AiwTouch && (matchMedia("(pointer: coarse)").matches || "ontouchstart" in window);
+  ["desk", "deskBig"].forEach((id) => {
+    const f = $(id), on = !!(touch && S.take && f && f.offsetParent && f.src && f.src !== "about:blank");
+    if (on && !deskTouchCtl[id]) deskTouchCtl[id] = AiwTouch.attach(f.parentElement, f, {});
+    else if (!on && deskTouchCtl[id]) { deskTouchCtl[id].detach(); delete deskTouchCtl[id]; }
+  });
+}
 function setTake(on, quiet) {
   const was = !!S.take; S.take = on;
   const live = liveTask();
@@ -614,6 +629,7 @@ function setTake(on, quiet) {
     el.appendChild(b);
   });
   if (was !== on) { deskLoaded = { small: null, big: null }; loadDesktop(); }
+  deskTouch();
   if (!quiet && was !== on) toast(on ? (live ? "已接管：Agent 已暂停，你可以直接操作桌面" : "已接管：你可以直接操作桌面") : (live ? "已交还给 Agent，回到观看模式" : "已回到观看模式"));
 }
 async function toggleTakeover() {

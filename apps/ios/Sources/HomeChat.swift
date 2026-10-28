@@ -210,8 +210,8 @@ struct HomeChatView: View {
     @State private var showPhotos = false
     @State private var showFiles = false
     @State private var preview: Preview?
-    @State private var keepTop: String? = nil
-    @State private var atBottom = true
+    @StateObject private var pin = BottomPin()
+    @Environment(\.colorScheme) private var cs
     @FocusState private var focused: Bool
     @Environment(\.scenePhase) private var phase
     @AppStorage("hdraft") private var draft = ""
@@ -244,18 +244,38 @@ struct HomeChatView: View {
                     if let s = m.stream { streamRow(s) }
                     if !m.err.isEmpty { Text(m.err).font(.footnote).foregroundColor(.red) }
                     Color.clear.frame(height: 1).id("end")
-                        .onAppear { atBottom = true }.onDisappear { atBottom = false }
                 }.padding(.horizontal, 14).padding(.vertical, 10)
+                .reportsScrollMetrics()
             }
             .scrollDismissesKeyboard(.interactively)
-            .onChange(of: m.bottomTick) { _ in
-                if atBottom || m.sending { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("end", anchor: .bottom) } }
+            .onPreferenceChange(ScrollMetricsKey.self) { mm in pin.metrics(mm, live: m.sending) }
+            // 3.6: new messages / streaming keep the chat at the newest message unless you scrolled up (then ↓ 最新消息)
+            .onChange(of: m.bottomTick) { _ in pin.newContent() }
+            .onChange(of: m.loaded) { ok in if ok { pin.toEnd(follow: 2.5) } }
+            .onAppear {
+                pin.jumpAction = { animated in
+                    if animated { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("end", anchor: .bottom) } }
+                    else { proxy.scrollTo("end", anchor: .bottom) }
+                }
+                // opening the chat (or leaving 球球's stage) starts at the newest message; back from a task keeps
+                // the place you were reading unless you were at the end
+                if !pin.opened || pin.pinned { pin.toEnd(follow: 2.5) }
             }
-            .onChange(of: m.loaded) { ok in if ok { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { proxy.scrollTo("end", anchor: .bottom) } } }
-            .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { proxy.scrollTo("end", anchor: .bottom) } }
             }
           }
-          .safeAreaInset(edge: .bottom) { composer }
+          .safeAreaInset(edge: .bottom) {
+            composer
+                .reportsComposerTop()
+                .overlay(alignment: .topTrailing) {
+                    if !m.staged && pin.showJump {
+                        JumpToLatest { pin.toEnd(animated: true) }
+                            .alignmentGuide(VerticalAlignment.top) { d in d[VerticalAlignment.bottom] + 10 }
+                            .padding(.trailing, 22)
+                    }
+                }
+                .animation(.easeOut(duration: 0.18), value: pin.showJump)
+          }
+          .onPreferenceChange(ComposerTopKey.self) { pin.composer($0) }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -280,7 +300,9 @@ struct HomeChatView: View {
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .refreshable { await m.load() }
         .onReceive(hub.events) { e in m.onEvent(e) }
-        .onChange(of: phase) { p in if p == .active { Task { await m.sync() } } }
+        .onChange(of: phase) { p in   // back in the foreground: what came in meanwhile, then the newest message
+            if p == .active { Task { await m.sync(); if !m.staged { pin.toEnd(follow: 2) } } }
+        }
         .onChange(of: text) { t in draft = t; onText(t) }
         .onChange(of: m.staged) { on in if on { Task { await m.loadGreeting() } } }
         .onChange(of: photos) { items in
@@ -291,7 +313,7 @@ struct HomeChatView: View {
         .photosPicker(isPresented: $showPhotos, selection: $photos, maxSelectionCount: 9, matching: .any(of: [.images, .videos]))
         .sheet(isPresented: $showAttach, onDismiss: runPending) {
             AttachSheet { k in pending = k; showAttach = false }
-                .presentationDetents([.height(250)]).presentationDragIndicator(.hidden)
+                .presentationDetents([.height(AttachSheet.height)]).presentationDragIndicator(.hidden)
         }
         .fullScreenCover(item: $camera) { md in
             HomeCamera(mode: md) { u, img in camera = nil; Task { await gotCamera(u, img) } }.ignoresSafeArea()
@@ -330,7 +352,7 @@ struct HomeChatView: View {
             }
         }
     }
-    /// 球球's messages carry a small 球球 on the left (a still frame, see MateAvatar)
+    /// 球球's messages, task cards and questions carry the small 球球 head on the left (a still frame, see MateAvatar)
     @ViewBuilder func withAvatar<C: View>(meta: Bool, @ViewBuilder _ c: () -> C) -> some View {
         HStack(alignment: .bottom, spacing: 8) {
             MateAvatar().padding(.bottom, meta ? 18 : 2)
@@ -369,14 +391,13 @@ struct HomeChatView: View {
         let ok = d.s("status") == "succeeded"
         withAvatar(meta: true) {
             VStack(alignment: .leading, spacing: 6) {
-                RichText(text: msg.s("text"), strong: hHL)
-                    .foregroundColor(Color(white: 0.93))
+                RichText(text: msg.s("text"), strong: hStrong(cs))
+                    .foregroundColor(hBubbleText(cs))
                     .padding(.leading, 16).padding(.trailing, 13).padding(.vertical, 10)
-                    .background(BubbleShape.aiw.fill(hDark))
+                    .background(BubbleShape.aiw.fill(hBubbleFill(cs)))
                     .overlay(alignment: .leading) { Rectangle().fill(ok ? okGreen : Color.red).frame(width: 3) }
                     .clipShape(BubbleShape.aiw)
-                    .overlay(BubbleShape.aiw.stroke(hAmber.opacity(0.67), lineWidth: 1.5))
-                    .environment(\.colorScheme, .dark)
+                    .overlay(BubbleShape.aiw.stroke(hAmber.opacity(cs == .dark ? 0.67 : 0.85), lineWidth: 1.5))
                 ForEach(d.a("files").indices, id: \.self) { i in
                     let f = d.a("files")[i]
                     Button { Task { await openFile(f.s("path"), f.s("name")) } } label: {
@@ -407,21 +428,7 @@ struct HomeChatView: View {
     var composer: some View {
         VStack(spacing: 8) {
             if let q = slashQ { SkillPicker(rows: skillRows(q), query: q) { chooseSkill($0) } }
-            if m.staged && !m.chips.isEmpty && slashQ == nil {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(m.chips.indices, id: \.self) { i in
-                            let c = m.chips[i]
-                            Button { runAction(c.o("action")) } label: {
-                                Text(c.s("label")).font(.footnote).foregroundColor(.primary).lineLimit(1)
-                                    .padding(.horizontal, 12).padding(.vertical, 7)
-                                    .background(Capsule().fill(Color(.secondarySystemBackground)))
-                                    .overlay(Capsule().stroke(Color(.separator)))
-                            }.buttonStyle(.plain)
-                        }
-                    }.padding(.horizontal, 2).padding(.vertical, 1)
-                }
-            }
+            // 3.6: no quick-action chips above the input (tapping a briefing bubble already runs its action)
             if mode == "task" {
                 HStack(spacing: 6) {
                     Image(systemName: "desktopcomputer")
@@ -560,6 +567,7 @@ struct HomeChatView: View {
         let t = sk.isEmpty ? body : "【技能：\(sk.joined(separator: "、"))】\n" + body
         let files = attach, md = mode
         text = ""; attach = []; mode = "auto"; draft = ""; picked = []
+        pin.toEnd(follow: 2)   // your own message: always to the end
         if !(await m.send(t, attachments: files, mode: md)) { text = body; attach = files; mode = md; picked = sk }
     }
     func open(_ msg: JSON, takeover: Bool) {

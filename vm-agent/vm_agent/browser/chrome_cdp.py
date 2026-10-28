@@ -21,6 +21,11 @@ What this does
              an autostart entry, so a Chrome the user opens by hand has the port too and this cannot break again.
   open-url / close-tab   the last-resort path without CDP: open a link as a new tab of the visible browser and close
              it again (only when the active window's title says it is that page).
+  front      bring one DevTools page to the front of the screen: its tab selected in its window and that window on
+             top, checked by the active window's title. BrowserOS neo ignores every DevTools activation for the tabs
+             its agents own (/json/activate, Target.activateTarget and Page.bringToFront all answer OK and change
+             nothing, checked live 2026-10-28), so when the title does not match, the tab is selected the way a person
+             would: Ctrl+PageDown in the browser window until its title is the page's.
 
 Runs from the vm-agent (computer.open_app "chrome") and is also shipped by the API to ~/.config/aiw/chrome_cdp.py
 and run over the shell, so a computer whose vm-agent is not updated yet still gets it. Every command prints one JSON.
@@ -38,7 +43,7 @@ import sys
 import time
 import urllib.request
 
-VERSION = "1"
+VERSION = "2"
 HOME = CFG = AIW_DIR = CONF = FLAGS = LOCK = WRAPPER = ""
 
 
@@ -686,6 +691,104 @@ def close_tab(title_has: list[str]) -> dict:
     return {"ok": True, "title": t}
 
 
+# ----------------------------------------------------------------------------- bring a page to the front
+BROWSER_CLASSES = "browserclaw|BrowserOS|browseros|chromium|Chromium|google-chrome|Google-chrome"
+
+
+def _http_get(port: int, path: str, timeout: float = 3) -> bytes:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # DevTools is local: never via a proxy
+    with opener.open(f"http://127.0.0.1:{int(port)}{path}", timeout=timeout) as r:  # noqa: S310
+        return r.read()
+
+
+def page_targets(port: int) -> list[dict]:
+    try:
+        return [t for t in json.loads(_http_get(port, "/json/list").decode()) if t.get("type") == "page"]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _xdo(args: list[str], env: dict, timeout: float = 5) -> str:
+    try:
+        return subprocess.run(["xdotool", *args], env=env, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def active_title(env: dict) -> str:
+    return _xdo(["getactivewindow", "getwindowname"], env).strip()
+
+
+def title_matches(active: str, title: str) -> bool:
+    """Chrome names its window '<tab title> - Google Chrome' (BrowserOS: '<tab title> - BrowserOS neo')."""
+    a, t = " ".join((active or "").split()), " ".join((title or "").split())
+    return bool(a and t) and (a.startswith(t[:40]) or t[:30] in a)
+
+
+def _windows(env: dict, title: str = "") -> list[str]:
+    """Browser windows on screen: the ones whose name holds the page's title first, then the rest."""
+    ids = _xdo(["search", "--onlyvisible", "--class", BROWSER_CLASSES], env).split()
+    first = []
+    if title:
+        named = set(_xdo(["search", "--onlyvisible", "--name", _re_escape(title[:40])], env).split())
+        first = [w for w in ids if w in named]
+    return first + [w for w in ids if w not in first]
+
+
+def _re_escape(s: str) -> str:
+    import re
+    return re.escape(s)
+
+
+def front(port: int, target_id: str = "", url: str = "", env: dict | None = None, keys: bool = True,
+          max_tabs: int = 40, pause: float = 0.12) -> dict:
+    """Select a DevTools page's tab in its window and raise that window. One JSON-able dict, never raises.
+
+    verified = the active X window's title is now the page's title. how = already | cdp | window | keys.
+    keys=False never touches the keyboard (for a caller that must not move the user's tabs)."""
+    env = _launch_env(env or {})
+    pages = page_targets(port)
+    t = next((p for p in pages if target_id and p.get("id") == target_id), None)
+    if not t and url:
+        t = next((p for p in pages if p.get("url") == url), None) or \
+            next((p for p in pages if url.rstrip("/") and url.rstrip("/") in (p.get("url") or "")), None)
+    if not t:
+        return {"ok": False, "verified": False, "error": f"no DevTools page {target_id or url} on port {port}"}
+    title, tid = (t.get("title") or t.get("url") or "").strip(), t.get("id")
+    res = {"ok": True, "verified": False, "id": tid, "url": t.get("url"), "title": title, "how": ""}
+    if not shutil.which("xdotool"):
+        with contextlib.suppress(Exception):
+            _http_get(port, f"/json/activate/{tid}")
+        return {**res, "how": "cdp", "error": "xdotool missing: the tab is activated but the window is not checked"}
+    if title_matches(active_title(env), title):
+        return {**res, "verified": True, "how": "already", "window": active_title(env)}
+    with contextlib.suppress(Exception):
+        _http_get(port, f"/json/activate/{tid}")
+        time.sleep(0.25)
+    wins = _windows(env, title)
+    for w in wins[:6]:   # a plain Chrome selected the tab: only its window has to come up
+        _xdo(["windowmap", w], env)
+        _xdo(["windowactivate", "--sync", w], env)
+        if title_matches(active_title(env), title):
+            return {**res, "verified": True, "how": "window" if not res["how"] else res["how"], "window": active_title(env)}
+    if keys:
+        n = max(2, min(max_tabs, len(pages) + 1))
+        for w in wins[:4]:   # BrowserOS (or a Chrome that ignored the activation): select the tab like a person would
+            _xdo(["windowactivate", "--sync", w], env)
+            start = active_title(env)
+            seen = 0
+            for _ in range(n):
+                _xdo(["key", "--clearmodifiers", "ctrl+Next"], env)
+                time.sleep(pause)
+                now = active_title(env)
+                if title_matches(now, title):
+                    return {**res, "verified": True, "how": "keys", "window": now}
+                seen += 1
+                if now == start and seen > 1:
+                    break   # back where we began: the page is not in this window
+    return {**res, "how": "cdp", "window": active_title(env)}
+
+
 def status(port: int = DEFAULT_PORT) -> dict:
     ps = procs()
     return {"version": VERSION, "endpoints": discover((port,), ps=ps),
@@ -713,6 +816,11 @@ def main():
     c.add_argument("--title-has", action="append", default=[])
     s = sub.add_parser("status")
     s.add_argument("--port", type=int, default=DEFAULT_PORT)
+    f = sub.add_parser("front")
+    f.add_argument("--port", type=int, default=DEFAULT_PORT)
+    f.add_argument("--id", default="")
+    f.add_argument("--url", default="")
+    f.add_argument("--no-keys", action="store_true")
     sub.add_parser("version")
     a = ap.parse_args()
     try:
@@ -730,6 +838,9 @@ def main():
             say(close_tab(a.title_has))
         if a.cmd == "status":
             say(status(a.port))
+        if a.cmd == "front":
+            r = front(a.port, a.id, a.url, keys=not a.no_keys)
+            say(r, 0 if r.get("ok") else 3)
         say({"version": VERSION})
     except SystemExit:
         raise

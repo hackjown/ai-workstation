@@ -31,6 +31,18 @@ say "这台电脑上报的 BrowserOS"
 ( cd "$R" && PYTHONPATH="$R/protocols:$R/vm-agent" "$V/bin/python" -c \
   'import json; from vm_agent.heartbeat.heartbeat import health; print("   " + json.dumps(health("x11").get("browseros")))' ) || true
 
+say "Chrome 调试端口（价格监控 / 浏览器工具读已登录的网页）"
+# every launcher (menu, panel, desktop icon, autostart) now starts Chrome with --remote-debugging-port=9222
+python3 "$R/vm-agent/vm_agent/browser/chrome_cdp.py" install-launchers --port "${AIW_CDP_PORT:-9222}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("   launcher", d.get("wrapper"), "| changed", len(d.get("changed") or []))' \
+  || echo "   WARN: could not write the Chrome launchers"
+if [ "${AIW_CHROME_RELAUNCH:-1}" = 1 ]; then
+  # a Chrome already open without the port is closed cleanly and reopened on the same profile (tabs + logins kept)
+  python3 "$R/vm-agent/vm_agent/browser/chrome_cdp.py" ensure --port "${AIW_CDP_PORT:-9222}" --also 0 --no-start \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print("   CDP", "ok port %s (%s)" % (d.get("port"), d.get("how")) if d.get("ok") else "not open: %s" % (d.get("error") or d.get("reason")))' \
+    || true
+fi
+
 say "重启 vm-agent（用上新代码）"
 if [ -f "$S/aiw-cloud.sh" ] && [ -f "$S/vm-agent.env" ] && ! systemctl --user cat vm-agent >/dev/null 2>&1; then
   cp -f "$R/deploy/cloud/aiw-cloud.sh" "$S/aiw-cloud.sh"

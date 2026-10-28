@@ -14,7 +14,7 @@ from vm_agent.computer.desktop import MockBackend
 from vm_agent.server.router import Router
 from vm_agent.server.websocket import serve
 
-PORT = 18791
+PORT = 18795
 
 
 @pytest.fixture

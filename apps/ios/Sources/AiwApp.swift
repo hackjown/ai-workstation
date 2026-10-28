@@ -4,6 +4,7 @@ import UserNotifications
 
 @main
 struct AiwApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate   // orientation: OrientationLock (DesktopView.swift)
     @StateObject private var api = API.shared
     @StateObject private var hub = Hub.shared
     @AppStorage("appearance") private var appearance = "system"

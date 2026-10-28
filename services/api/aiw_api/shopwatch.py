@@ -55,7 +55,9 @@ OFF_SHELF = re.compile(r"商品已下柜|该商品已下柜|商品已下架|宝�
 BUY_BTN = re.compile(r"^(立即购买|立即抢购|马上抢|领券购买|加入购物车|加入购物袋|立即预约|去购买|抢购)$")
 CAPTCHA_RE = re.compile(r"滑块|拖动.*?验证|安全验证|请完成验证|验证码|访问受限|人机验证|异常流量|punish|x5sec|nocaptcha")
 LOGIN_HOSTS = ("passport.jd.com", "login.taobao.com", "login.tmall.com", "login.m.jd.com", "plogin.m.jd.com", "havanalogin.taobao.com")
-CAPTCHA_HOSTS = ("sec.taobao.com", "cfe.m.jd.com", "risk", "punish", "x5sec")
+CAPTCHA_HOSTS = ("sec.taobao.com", "cfe.m.jd.com", "iv.jd.com", "safe.jd.com", "risk", "punish", "x5sec")
+# 京东 shows these instead of a number before a product is priced (预售/新品) or while its price is withheld
+PENDING_RE = re.compile(r"价格待发布|暂无报价|价格待定")
 ORDER_HOSTS = ("trade.jd.com", "buy.taobao.com", "buy.tmall.com", "h5.m.taobao.com/cart/order", "trade.m.jd.com")
 PAY_HOSTS = ("pay.jd.com", "cashier", "alipay.com", "pcashier", "payc.m.jd.com")
 
@@ -171,16 +173,25 @@ def parse_snapshot(snap: dict) -> dict:
         res.update(status="off_shelf", in_stock=False, note="商品已下架")
         return res
 
-    finals, mains = [], []
+    finals, mains, plus = [], [], []
     for s in snap.get("sel") or []:
         v, rng = parse_price(s.get("t") or "")
         if v is None:
             v, rng = _bare_number(s.get("t") or ""), False
+        if s.get("role") == "plus":         # PLUS 会员价: only for PLUS members, never the price we judge by
+            if v is not None:
+                plus.append(v)
+            continue
         if v is None or NOT_PRICE_RE.search(s.get("t") or "") or NOT_PRICE_RE.search(_label_before(s.get("ctx") or "", s.get("t") or "")):
             continue
         label = f"{s.get('t', '')} {s.get('ctx', '')}"
         is_final = s.get("role") == "final" or bool(FINAL_RE.search(s.get("t") or ""))
         (finals if is_final else mains).append((v, rng, float(s.get("fs") or 0), int(s.get("y") or 0), label))
+    pm = PENDING_RE.search(" ".join([text[:2000]] + [str(s.get("t") or "") for s in snap.get("sel") or []]))
+    if pm and not mains and not finals:
+        # no price element of its own: any ¥ on the page belongs to recommended items, not to this one
+        res.update(status="price_pending", note=f"商品页显示「{pm.group(0)}」，还没有开价", plus_price=min(plus) if plus else None)
+        return res
     cands = []
     for c in snap.get("cand") or []:
         t = c.get("t") or ""
@@ -211,6 +222,8 @@ def parse_snapshot(snap: dict) -> dict:
         if res["price"] is None or (res["price"] * 0.3 <= f <= res["price"]):
             res["final_price"] = f
     res["effective"] = res["final_price"] if res["final_price"] is not None else res["price"]
+    if plus:
+        res["plus_price"] = min(plus)
 
     btns = snap.get("btn") or []
     buy = [b for b in btns if BUY_BTN.match((b.get("t") or "").strip())]
@@ -297,36 +310,123 @@ def watch_fields(d: dict, default_machine: Optional[str] = None) -> dict:
 
 
 # ----------------------------------------------------------------------------- running the probe on the computer
-def probe_command(sub: str, **kw) -> str:
-    src = PROBE_SRC.read_bytes()
-    b64 = base64.b64encode(src).decode()
-    digest = hashlib.sha1(src).hexdigest()
-    args = " ".join(f"--{k} {_q(str(v))}" for k, v in kw.items() if v not in (None, "", False) and v is not True)
-    args += "".join(f" --{k}" for k, v in kw.items() if v is True)
-    return (f'mkdir -p "$HOME/.config/aiw/shop" && f="{REMOTE}" && '
+# chrome_cdp.py (stdlib, in the vm-agent package) keeps a DevTools port open on the computer's own logged-in Chrome.
+# The API ships it over the shell like the probe, so it works before the computer's vm-agent is updated.
+CDP_TOOL_SRC = Path(__file__).resolve().parents[3] / "vm-agent" / "vm_agent" / "browser" / "chrome_cdp.py"
+CDP_TOOL_REMOTE = "$HOME/.config/aiw/chrome_cdp.py"
+UPDATE_CMD = "curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/update-agent.sh | bash"
+OPT_RETRY, OPT_PAUSE = "立即重试", "暂停这个监控"
+
+
+def ship_command(src: Path, remote: str, sub: str, **kw) -> str:
+    """Write src to remote on the computer (only when its sha1 differs) and run `python3 remote sub --k v ...`."""
+    data = src.read_bytes()
+    b64 = base64.b64encode(data).decode()
+    digest = hashlib.sha1(data).hexdigest()
+    args = " ".join(f"--{k.replace('_', '-')} {_q(str(v))}" for k, v in kw.items()
+                    if v not in (None, "", False) and v is not True and not isinstance(v, (list, tuple)))
+    for k, v in kw.items():
+        if isinstance(v, (list, tuple)):
+            args += "".join(f" --{k.replace('_', '-')} {_q(str(x))}" for x in v)
+    args += "".join(f" --{k.replace('_', '-')}" for k, v in kw.items() if v is True)
+    d = remote.rsplit("/", 1)[0]
+    return (f'mkdir -p "{d}" && f="{remote}" && '
             f'if [ "$(sha1sum "$f" 2>/dev/null | cut -d" " -f1)" != "{digest}" ]; then '
             f"echo '{b64}' | base64 -d > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; fi && python3 \"$f\" {sub} {args}")
+
+
+def probe_command(sub: str, **kw) -> str:
+    return ship_command(PROBE_SRC, REMOTE, sub, **kw)
 
 
 def _q(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
-async def run_probe(computer, sub: str, timeout: float = 60, **kw) -> dict:
-    from . import browseros as _bos   # BrowserOS on: read pages over its DevTools port, where the user is logged in
-    r = await computer.execute("shell.exec", {"command": _bos.probe_env(computer) + probe_command(sub, **kw),
-                                              "timeout": timeout}, timeout=timeout + 15)
+def _last_json(r) -> Optional[dict]:
     res = getattr(r, "result", None) or {}
-    out = (res.get("stdout") or "").strip().splitlines()
-    for line in reversed(out):
+    for line in reversed((res.get("stdout") or "").strip().splitlines()):
         line = line.strip()
         if line.startswith("{"):
             try:
                 return json.loads(line)
             except ValueError:
-                break
-    err = res.get("stderr") or getattr(r, "error", None) or "no output"
-    return {"error": f"probe failed: {str(err)[-300:]}"}
+                return None
+    return None
+
+
+def _err_of(r) -> str:
+    res = getattr(r, "result", None) or {}
+    return str(res.get("stderr") or getattr(r, "error", None) or "no output")[-300:]
+
+
+def _store():
+    from . import browseros as _bos
+    return _bos._STORE
+
+
+def known_port(mid: Optional[str]) -> Optional[int]:
+    """The DevTools port chrome_cdp last found or opened on this computer (kv shop_cdp_port {mid: port})."""
+    st = _store()
+    if not st or not mid:
+        return None
+    try:
+        return int((st.kv_get("shop_cdp_port", {}) or {}).get(mid) or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def remember_port(mid: Optional[str], port: Optional[int]) -> None:
+    st = _store()
+    if not st or not mid:
+        return
+    d = dict(st.kv_get("shop_cdp_port", {}) or {})
+    if port:
+        d[mid] = int(port)
+    else:
+        d.pop(mid, None)
+    st.kv_set("shop_cdp_port", d)
+
+
+def cdp_env(computer, port: Optional[int] = None) -> str:
+    from . import browseros as _bos   # BrowserOS on: read pages over its DevTools port, where the user is logged in
+    if port:
+        return f"VM_AGENT_CDP=http://127.0.0.1:{int(port)} "
+    env = _bos.probe_env(computer)
+    if env:
+        return env
+    p = known_port(getattr(computer, "machine_id", None))
+    return f"VM_AGENT_CDP=http://127.0.0.1:{p} " if p and p != 9222 else ""
+
+
+async def run_probe(computer, sub: str, timeout: float = 60, cdp_port: Optional[int] = None, **kw) -> dict:
+    r = await computer.execute("shell.exec", {"command": cdp_env(computer, cdp_port) + probe_command(sub, **kw),
+                                              "timeout": timeout}, timeout=timeout + 15)
+    got = _last_json(r)
+    if got is not None:
+        return got
+    return {"error": f"probe failed: {_err_of(r)}"}
+
+
+async def run_cdp_tool(computer, sub: str, timeout: float = 150, **kw) -> dict:
+    """chrome_cdp.py on the computer: ensure / open-url / close-tab / status. Never raises."""
+    try:
+        r = await computer.execute("shell.exec", {"command": ship_command(CDP_TOOL_SRC, CDP_TOOL_REMOTE, sub, **kw),
+                                                  "timeout": timeout}, timeout=timeout + 15)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": "tool_failed", "error": f"{type(e).__name__}: {e}"[:300]}
+    got = _last_json(r)
+    if got is not None:
+        return got
+    return {"ok": False, "reason": "tool_failed", "error": _err_of(r)}
+
+
+async def ensure_cdp(computer, mid: Optional[str], port: int = 9222) -> dict:
+    """Find a DevTools endpoint on the computer, or reopen the user's Chrome with one (keeping its login)."""
+    res = await run_cdp_tool(computer, "ensure", timeout=150, port=port, also=[9110])
+    if res.get("ok") and res.get("port"):
+        remember_port(mid, res["port"])
+    return res
 
 
 async def _computer(sessions, mid: str):
@@ -337,13 +437,15 @@ async def _computer(sessions, mid: str):
 
 
 async def vision_read(vision, shot_b64: str, site: str) -> Optional[dict]:
-    """OCR/vision fallback when the DOM gave no price."""
+    """OCR/vision fallback when the DOM gave no price (or there is no DOM: the screen-only path)."""
     if not vision or not shot_b64:
         return None
     raw = await vision.describe(
         "你在读电商商品页截图。只输出 JSON。",
-        f"这是{SITE_NAMES.get(site, '电商')}商品详情页。读出售价和到手价/券后价（没有就 null）以及是否有货。"
-        '输出：{"price": 数字或null, "final_price": 数字或null, "in_stock": true/false/null}', shot_b64, max_tokens=200)
+        f"这是{SITE_NAMES.get(site, '电商')}商品详情页的截图。读出售价和到手价/券后价（没有就 null）以及是否有货；"
+        "PLUS 会员价、划线价、运费不算。page 说明截图里是什么页面。"
+        '输出：{"price": 数字或null, "final_price": 数字或null, "in_stock": true/false/null, '
+        '"page": "product" | "login" | "captcha" | "other", "title": "商品名或空"}', shot_b64, max_tokens=250)
     m = re.search(r"\{.*\}", raw or "", re.S)
     if not m:
         return None
@@ -358,37 +460,126 @@ async def vision_read(vision, shot_b64: str, site: str) -> Optional[dict]:
         except (TypeError, ValueError):
             out[k] = None
     out["in_stock"] = d.get("in_stock") if isinstance(d.get("in_stock"), bool) else None
+    out["page"] = str(d.get("page") or "product").lower()
+    out["title"] = str(d.get("title") or "")[:120]
     return out
+
+
+SCREEN_WAIT = 9     # seconds for the page to render in the visible browser before the screenshot
+
+
+async def desktop_read(computer, sessions, w: dict) -> Optional[dict]:
+    """Last resort without any DevTools port: open the link as a tab of the browser on screen, screenshot the desktop,
+    let the vision model read it, and close that tab again. None when there is no vision model or it read nothing."""
+    vision = sessions._vision_llm() if hasattr(sessions, "_vision_llm") else None
+    if not vision:
+        return None
+    site = w.get("site") or site_of(w["url"]) or ""
+    opened = await run_cdp_tool(computer, "open-url", timeout=40, url=w["url"])
+    if not opened.get("ok"):
+        return None
+    await asyncio.sleep(SCREEN_WAIT)
+    shot = None
+    try:
+        s = await computer.screenshot()
+        shot = getattr(s, "screenshot", None)
+    except Exception as e:  # noqa: BLE001
+        log.info("desktop_read screenshot: %s", e)
+    v = await vision_read(vision, shot or "", site) if shot else None
+    marks = {"jd": ["京东", "JD"], "taobao": ["淘宝", "taobao"], "tmall": ["天猫", "tmall"]}.get(site, [])
+    if v and v.get("title"):
+        marks.append(v["title"][:12])
+    await run_cdp_tool(computer, "close-tab", timeout=20, title_has=marks)
+    if not v:
+        return None
+    base = {"price": None, "final_price": None, "effective": None, "in_stock": v.get("in_stock"),
+            "title": v.get("title") or "", "url": w["url"], "via": "screen"}
+    if v["page"] == "login":
+        return {**base, "status": "login", "note": "需要登录（从屏幕截图看到的是登录页）"}
+    if v["page"] == "captcha":
+        return {**base, "status": "captcha", "note": "出现了滑块/安全验证（从屏幕截图看到）"}
+    eff = v.get("final_price") or v.get("price")
+    if not eff:
+        return None
+    return {**base, "status": "ok", "price": v.get("price"), "final_price": v.get("final_price"), "effective": eff,
+            "note": "浏览器调试端口不可用，价格由屏幕截图读出"}
 
 
 # ----------------------------------------------------------------------------- the scheduled check
 LIVE_TASK = ("queued", "running", "paused", "takeover", "waiting_confirm", "waiting_input")
+FAIL_STATES = ("error", "no_price", "no_browser")
 
 
 def _backoff(interval_s: int, fails: int) -> int:
     return min(interval_s * (2 ** min(fails, 4)), 6 * 3600)
 
 
-async def check(sched, w: dict, now: Optional[float] = None) -> dict:
+REASON_CN = {
+    "port_not_opened": "Chrome 已经按带调试端口的方式重新打开，但端口一直没有响应",
+    "port_not_answering": "Chrome 带着调试端口在运行，但端口不响应（可能卡住了）",
+    "profile_locked": "Chrome 关掉后它的用户配置一直被占用，没法重新打开",
+    "no_browser_installed": "这台电脑上没有安装 Chrome / Chromium",
+    "no_display": "这台电脑的桌面（DISPLAY）没有运行，浏览器开不起来",
+    "not_running": "Chrome 没有在运行",
+    "tool_failed": "在这台电脑上检查浏览器的脚本没能运行",
+}
+
+
+def no_browser_text(machine: str, bname: str, ens: Optional[dict], raw_note: str = "") -> str:
+    """What the user reads when no page could be opened at all: what is wrong and what fixes it (never a raw urlopen error)."""
+    ens = ens or {}
+    why = REASON_CN.get(str(ens.get("reason") or ""), "")
+    detail = str(ens.get("error") or raw_note or "").strip()
+    lines = [f"「{machine}」上的 {bname} 读不了网页，这次没能检查价格。"]
+    lines.append("原因：" + (why or "浏览器的调试端口（9222）连不上") + (f"（{detail[:160]}）" if detail and detail not in why else ""))
+    if ens.get("reason") == "no_browser_installed":
+        lines.append(f"解决：在这台电脑上安装 Chromium（sudo apt install chromium），然后运行：\n{UPDATE_CMD}")
+    elif ens.get("reason") == "no_display":
+        lines.append("解决：在 AIW 里打开这台电脑的接管桌面确认桌面在运行（或重启这台电脑），然后点「立即重试」。")
+    else:
+        lines.append(f"解决：在这台电脑的终端里（用户 aiw）运行下面这行，它会让 Chrome 以后总是带着调试端口启动，"
+                     f"登录状态会保留：\n{UPDATE_CMD}\n运行完点「立即重试」。也可以先在接管桌面里把 Chrome 关掉再点重试。")
+    return "\n".join(lines)
+
+
+async def check(sched, w: dict, now: Optional[float] = None, manual: bool = False) -> dict:
     store, sessions, notifier = sched.store, sched.sessions, sched.notifier
     ensure_columns(store)
     now = now or time.time()
     interval = max(MIN_INTERVAL, int(w.get("interval_min") or DEFAULT_INTERVAL)) * 60
     mid = w.get("machine_id") or (sessions.settings.machines[0].id if getattr(sessions.settings, "machines", None) else "ai-linux-001")
     _sync_order_status(store, w)
+    ens = None
     try:
         computer = await _computer(sessions, mid)
         raw = await run_probe(computer, "probe", timeout=70, url=w["url"], sku=w.get("sku") or "")
         if str(raw.get("error", "")).startswith("NO_CDP"):
-            # Chrome is closed (or was started without the debugging port): open it the way the agent does
-            await computer.execute("computer.open_app", {"name": "browseros" if _bname(store, mid) == "BrowserOS" else "chrome"}, timeout=30)
-            await asyncio.sleep(6)
-            raw = await run_probe(computer, "probe", timeout=70, url=w["url"], sku=w.get("sku") or "")
+            # (1) any other answering endpoint, (2) or the user's own Chrome reopened with the port, login kept
+            ens = await ensure_cdp(computer, mid)
+            if not ens.get("ok") and _bname(store, mid) == "BrowserOS":
+                await computer.execute("computer.open_app", {"name": "browseros"}, timeout=30)
+                await asyncio.sleep(6)
+                ens = await ensure_cdp(computer, mid)
+            if ens.get("ok"):
+                raw = await run_probe(computer, "probe", timeout=70, cdp_port=ens.get("port"), url=w["url"], sku=w.get("sku") or "")
+                if ens.get("how") in ("relaunched", "launched"):
+                    await notifier.notify("watch", f"已重新打开 Chrome（带调试端口）：{w['name']}",
+                                          f"「{(store.machine(mid) or {}).get('name') or mid}」上的 Chrome 之前没开调试端口，"
+                                          "AIW 已把它关掉再按原来的配置重新打开（标签页和登录状态保留），以后会一直带着端口启动。",
+                                          link=w["url"], push=False)
         r = parse_snapshot(raw)
-        if r["status"] == "no_price":
+        if r["status"] == "no_browser":
+            # (3) no DevTools at all: read the visible browser through the screen
+            seen = await desktop_read(computer, sessions, w)
+            if seen:
+                r = {**r, **seen, "range": False}
+            else:
+                r["note"] = no_browser_text((store.machine(mid) or {}).get("name") or mid, _bname(store, mid), ens, r.get("note") or "")
+        elif r["status"] == "no_price":
             vision = sessions._vision_llm() if hasattr(sessions, "_vision_llm") else None
             if vision:
-                raw2 = await run_probe(computer, "probe", timeout=80, url=w["url"], sku=w.get("sku") or "", shot=True)
+                raw2 = await run_probe(computer, "probe", timeout=80, cdp_port=(ens or {}).get("port"), url=w["url"],
+                                       sku=w.get("sku") or "", shot=True)
                 v = await vision_read(vision, raw2.get("screenshot") or "", w.get("site") or site_of(w["url"]) or "")
                 if v and (v.get("final_price") or v.get("price")):
                     r.update(price=v.get("price"), final_price=v.get("final_price"), status="ok", note="价格由视觉模型读出",
@@ -398,10 +589,11 @@ async def check(sched, w: dict, now: Optional[float] = None) -> dict:
     except Exception as e:  # noqa: BLE001
         r = {"status": "error", "note": f"{type(e).__name__}: {e}"[:300], "price": None, "final_price": None,
              "effective": None, "in_stock": None, "title": ""}
-    return await apply_result(store, sessions, notifier, w, r, now, interval, mid)
+    return await apply_result(store, sessions, notifier, w, r, now, interval, mid, manual=manual)
 
 
-async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, interval: int, mid: str) -> dict:
+async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, interval: int, mid: str,
+                       manual: bool = False) -> dict:
     prev_status = w.get("shop_status")
     site_name = SITE_NAMES.get(w.get("site") or site_of(w["url"]) or "", "电商")
     machine = (store.machine(mid) or {}).get("name") or mid
@@ -418,6 +610,12 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
         if hit:
             fields["triggered_at"] = now
         store.update("watches", w["id"], **fields)
+        if prev_status and prev_status != "ok" or manual:
+            resolve_asks(w["id"], "已恢复正常")
+        if manual or (prev_status in FAIL_STATES + ("login", "captcha")):
+            label = "到手价" if r.get("final_price") is not None else "现价"
+            say_chat(f"价格监控「{w['name']}」恢复了：{label} ¥{r['effective']:g}（目标 ¥{float(w.get('value') or 0):g}）。"
+                     + ("（这次是从屏幕截图读的）" if r.get("via") == "screen" else ""))
         if hit:
             w2 = store.get("watches", w["id"])
             title = w2.get("item_title") or w2["name"]
@@ -433,26 +631,120 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
     fails = int(w.get("fail_count") or 0) + 1
     if r["status"] == "off_shelf":
         fields.update(in_stock=0, below=0, fail_count=0, next_check=now + interval * 4, last_error=None)
+    elif r["status"] == "price_pending":     # not a failure: keep looking at the normal pace until it is priced
+        fields.update(below=0, fail_count=0, next_check=now + interval, last_error=None)
     else:
         fields.update(fail_count=fails, next_check=now + _backoff(interval, fails), last_error=(r.get("note") or r["status"])[:300])
     store.update("watches", w["id"], **fields)
-    if r["status"] != prev_status:
+    bname = _bname(store, mid)
+    changed = r["status"] != prev_status
+    if changed:
         if r["status"] == "login":
             await notifier.notify("watch_error", f"需要登录{site_name}：{w['name']}",
-                                  f"「{machine}」上的 {_bname(store, mid)} 还没登录{site_name}。请在 AIW 里打开这台电脑的接管桌面，"
-                                  f"在 {_bname(store, mid)} 里登录一次（扫码即可），之后价格会自动读取。\n{w['url']}", link=w["url"])
+                                  f"「{machine}」上的 {bname} 还没登录{site_name}。请在 AIW 里打开这台电脑的接管桌面，"
+                                  f"在 {bname} 里登录一次（扫码即可），之后价格会自动读取。\n{w['url']}", link=w["url"])
         elif r["status"] == "captcha":
             await notifier.notify("watch_error", f"{site_name}要求验证：{w['name']}",
                                   f"读取价格时遇到滑块/安全验证。请在「{machine}」的接管桌面里完成一次验证；"
                                   f"检查频率已自动放慢。\n{w['url']}", link=w["url"])
         elif r["status"] == "off_shelf":
             await notifier.notify("watch_error", f"商品已下架：{w['name']}", w["url"], link=w["url"])
+        elif r["status"] == "price_pending":
+            await notifier.notify("watch", f"还没开价：{w['name']}", f"{r.get('note')}。开价后会接着按目标价盯着。\n{w['url']}",
+                                  link=w["url"], push=False)
         elif r["status"] == "no_browser":
-            await notifier.notify("watch_error", f"价格监控打不开浏览器：{w['name']}",
-                                  f"「{machine}」上的 Chrome 调试端口连不上（{r.get('note')}）。", link=w["url"])
-    if r["status"] in ("error", "no_price", "no_browser") and fails == 3:
+            await notifier.notify("watch_error", f"价格监控打不开浏览器：{w['name']}", f"{r.get('note')}\n{w['url']}", link=w["url"])
+    # no silent failure (escalate.py): anything the user must fix becomes a chat question with one-tap 立即重试
+    if r["status"] in FAIL_STATES + ("login", "captcha") and (changed or manual or fails == 3):
+        what = {"login": f"「{machine}」上的 {bname} 还没登录{site_name}：请在接管桌面里登录一次（扫码即可），再点「{OPT_RETRY}」。",
+                "captcha": f"{site_name}弹出了滑块/安全验证：请在「{machine}」的接管桌面里完成一次，再点「{OPT_RETRY}」。"
+                }.get(r["status"]) or str(r.get("note") or r["status"])
+        if r["status"] in ("error", "no_price"):
+            what = f"价格监控「{w['name']}」这次没读到价格：{what}" + ("（已连续 3 次）" if fails >= 3 else "")
+        post_ask(w, what)
+    if r["status"] in FAIL_STATES and fails == 3:
         await notifier.notify("watch_error", f"价格监控失败：{w['name']}", f"连续 3 次读取失败：{r.get('note')}", link=w["url"])
     return {"ok": False, "error": r.get("note") or r["status"], "result": r}
+
+
+# ----------------------------------------------------------------------------- chat questions (one-tap retry)
+SCHED = None    # the Scheduler, for 立即重试 (bind() in main.py)
+CHAT = None     # chat.Chat: where the question shows up (web home + iOS)
+
+
+def bind(scheduler=None, chat=None) -> None:
+    global SCHED, CHAT
+    if scheduler is not None:
+        SCHED = scheduler
+    if chat is not None:
+        CHAT = chat
+
+
+def _asks(wid: str) -> list[dict]:
+    if not CHAT:
+        return []
+    from .chat import _row
+    rows = CHAT.store._x("SELECT * FROM chat_messages WHERE kind='ask' AND data LIKE ? ORDER BY seq DESC LIMIT 20",
+                         (f'%"watch_id": "{wid}"%',))
+    return [m for m in (_row(x) for x in rows) if not (m.get("data") or {}).get("resolved")]
+
+
+def resolve_asks(wid: str, answer: str) -> None:
+    for m in _asks(wid):
+        CHAT.update(m["id"], data={"resolved": {"answer": answer, "by": "watch", "at": time.time()}})
+
+
+def say_chat(text: str) -> None:
+    if CHAT:
+        try:
+            CHAT.add("assistant", "text", text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("shopwatch chat: %s", e)
+
+
+def post_ask(w: dict, text: str) -> Optional[dict]:
+    """One open question per watch: the older one is closed when a newer one is posted."""
+    if not CHAT:
+        return None
+    try:
+        resolve_asks(w["id"], "有了新的情况，见下一条")
+        return CHAT.add("assistant", "ask", text, {"watch_id": w["id"], "ask_kind": "question",
+                                                   "title": f"价格监控 · {w['name']}", "question": text,
+                                                   "options": [OPT_RETRY, OPT_PAUSE]})
+    except Exception as e:  # noqa: BLE001
+        log.warning("shopwatch ask: %s", e)
+        return None
+
+
+async def answer_ask(chat, m: dict, ans: str) -> dict:
+    """The user's tap on a watch question: 立即重试 (any free text counts as that too) or 暂停这个监控."""
+    d = m.get("data") or {}
+    store = chat.store
+    w = store.get("watches", d.get("watch_id") or "")
+    if not w:
+        chat.update(m["id"], data={"stale": True})
+        raise ValueError("这个价格监控已经删除了")
+    a = str(ans or "").strip()
+    m = chat.update(m["id"], data={"resolved": {"answer": a, "by": "chat", "at": time.time()}})
+    if a == OPT_PAUSE or "暂停" in a or a in ("停止", "停", "取消"):
+        store.update("watches", w["id"], enabled=0)
+        chat.add("assistant", "text", f"已暂停价格监控「{w['name']}」。在「追踪」页可以重新打开。")
+        return {"ok": True, "message": m, "open_task": False}
+    store.update("watches", w["id"], enabled=1, next_check=None)
+    chat.add("assistant", "text", f"好的，正在重新检查「{w['name']}」…（如果要重开 Chrome，大约需要 1 分钟）")
+    sched = SCHED
+
+    async def _go():
+        try:
+            if sched is None:
+                raise RuntimeError("调度器没有启动")
+            await check(sched, store.get("watches", w["id"]) or w, manual=True)
+        except Exception as e:  # noqa: BLE001
+            post_ask(w, f"重试价格监控「{w['name']}」时出错了：{type(e).__name__}: {e}"[:300])
+    task = asyncio.get_running_loop().create_task(_go())
+    getattr(chat, "jobs", set()).add(task)
+    task.add_done_callback(lambda t: getattr(chat, "jobs", set()).discard(t))
+    return {"ok": True, "message": m, "open_task": False}
 
 
 def _bname(store, mid) -> str:

@@ -45,6 +45,7 @@ from pydantic import BaseModel
 from websockets.asyncio.client import connect as ws_connect
 
 from . import cron
+from . import uploads as _uploads
 from .config import Settings
 from .crypto import SecretBox
 from .integrations import load_tools, openapi_to_tools
@@ -225,6 +226,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     sessions.memory = mem
     app.state.memory = mem
     _memory.mount(app, mem, auth)
+    from . import greeting as _greeting   # 球球播报 on the home screen (/api/greeting)
+    _greeting.mount(app, store, chat, mem, auth)
 
     # ------------------------------------------------------------- tasks
 
@@ -991,30 +994,57 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     # ------------------------------------------------------------- uploads (document workflow)
     @app.post("/api/uploads", dependencies=[Depends(auth)])
     async def upload(body: UploadIn):
-        name = os.path.basename(body.name).replace("/", "_")[:120] or "upload.bin"
+        name = _uploads.clean_name(body.name)
         try:
             raw = base64.b64decode(body.content_b64)
         except ValueError:
             raise HTTPException(400, "bad base64")
-        if len(raw) > 40 * 1024 * 1024:
-            raise HTTPException(413, "max 40 MB")
-        d = os.path.join(settings.artifacts_dir, "uploads")
-        os.makedirs(d, exist_ok=True)
-        local = os.path.join(d, f"{int(time.time())}-{name}")
+        if len(raw) > _uploads.JSON_MAX_MB * _uploads.MB:
+            raise HTTPException(413, f"max {_uploads.JSON_MAX_MB} MB here; send big files (videos) to /api/uploads/raw")
+        local = _uploads.local_path(settings.artifacts_dir, name)
         with open(local, "wb") as f:
             f.write(raw)
-        if body.local_only:
-            return {"name": name, "size": len(raw), "vm_path": None, "artifact": local}
-        if cloud.is_cloud(body.machine_id):
+        return await _upload_done(name, local, len(raw), body.machine_id, body.local_only)
+
+    # the + sheet's photos / videos / files: the body IS the file (no base64), streamed to disk
+    @app.post("/api/uploads/raw", dependencies=[Depends(auth)])
+    async def upload_raw(request: Request, name: str, machine_id: str = "ai-linux-001", local_only: bool = False):
+        name = _uploads.clean_name(name)
+        cap = _uploads.RAW_MAX_MB * _uploads.MB
+        local = _uploads.local_path(settings.artifacts_dir, name)
+        size = 0
+        try:
+            with open(local, "wb") as f:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > cap:
+                        raise HTTPException(413, f"max {_uploads.RAW_MAX_MB} MB")
+                    f.write(chunk)
+        except BaseException:
             try:
-                await cloud.wake(body.machine_id)
+                os.remove(local)
+            except OSError:
+                pass
+            raise
+        if not size:
+            os.remove(local)
+            raise HTTPException(400, "empty file")
+        return await _upload_done(name, local, size, machine_id, local_only)
+
+    async def _upload_done(name: str, local: str, size: int, machine_id: str, local_only: bool) -> dict:
+        kind = "video" if name.lower().endswith(_uploads.VIDEO_EXT) else ""
+        if local_only:
+            return {"name": name, "size": size, "vm_path": None, "artifact": local, "kind": kind}
+        if cloud.is_cloud(machine_id):
+            try:
+                await cloud.wake(machine_id)
             except CloudError as e:
                 raise HTTPException(503, str(e))
-        r = await sessions.computer(body.machine_id).execute("files.upload", {"path": f"uploads/{name}", "content_b64": body.content_b64},
-                                                            observe=False, timeout=120)
-        if not r.success:
-            raise HTTPException(502, f"VM upload failed: {r.error}")
-        return {"name": name, "size": len(raw), "vm_path": f"~/workspace/uploads/{name}", "artifact": local}
+        try:
+            await _uploads.push_to_vm(sessions.computer(machine_id), local, f"uploads/{name}")
+        except _uploads.PushError as e:
+            raise HTTPException(502, f"VM upload failed: {e}")
+        return {"name": name, "size": size, "vm_path": f"~/workspace/uploads/{name}", "artifact": local, "kind": kind}
 
     # ------------------------------------------------------------- machines
     @app.get("/api/machines", dependencies=[Depends(auth)])

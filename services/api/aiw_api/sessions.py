@@ -473,7 +473,8 @@ class SessionManager:
             await self._notify("input", "需要你填写资料" if kind == "form" else
                                (extra.get("title") or "需要你接管桌面") if kind == "takeover" else "Agent 在问你",
                                ((extra.get("steps") or question) + (f"（{extra['machine']}）" if extra.get("machine") else ""))
-                               if kind == "takeover" else question, task)
+                               if kind == "takeover" else question, task,
+                               deep=f"takeover/{task.machine_id}?task={task.id}" if kind == "takeover" else None)
             try:
                 # filling a form or passing a captcha takes longer than answering a question
                 wait = float(self.settings.ask_timeout_s) * (3 if extra else 1)
@@ -678,10 +679,10 @@ class SessionManager:
             await cleanup()
             raise
 
-    async def _notify(self, kind: str, title: str, body: str, task: Task):
+    async def _notify(self, kind: str, title: str, body: str, task: Task, deep: Optional[str] = None):
         if self.notifier:
             try:
-                await self.notifier.notify(kind, title, body, task_id=task.id, thread_id=task.thread_id)
+                await self.notifier.notify(kind, title, body, task_id=task.id, thread_id=task.thread_id, deep=deep)
             except Exception as e:  # noqa: BLE001
                 log.warning("notify failed: %s", e)
 

@@ -724,13 +724,26 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.put("/api/settings/notify", dependencies=[Depends(auth)])
     async def put_notify(body: dict):
-        cfg = {k: (str(body.get(k) or "").strip() or None) for k in ("bark_url", "ntfy_url", "webhook_url")}
+        cfg = {k: (str(body.get(k) or "").strip() or None) for k in ("bark_url", "ntfy_url", "webhook_url", "public_url", "link_mode")}
+        if cfg["link_mode"] not in (None, "app", "web"):
+            raise HTTPException(400, "link_mode is app or web")
+        if cfg["public_url"] and not cfg["public_url"].startswith(("http://", "https://")):
+            raise HTTPException(400, "public_url must start with http:// or https://")
         store.kv_set("notify", cfg)
         return cfg
 
+    @app.get("/open/{path:path}")
+    async def open_link(path: str, request: Request):
+        """Web fallback of a push deep link (<public url>/open/task/<id> …): the web app routes ?open=<path>."""
+        from urllib.parse import quote as _q
+        from fastapi.responses import RedirectResponse
+        q = str(request.url.query)
+        target = path.strip("/") + (("?" + q) if q else "")
+        return RedirectResponse("/?open=" + _q(target, safe=""), status_code=302)
+
     @app.post("/api/settings/notify/test", dependencies=[Depends(auth)])
     async def test_notify():
-        return await notifier.notify("test", "AI Workstation", "通知测试成功")
+        return await notifier.notify("test", "Aiw", "通知测试成功：点这条会打开 Aiw 的聊天")
 
     # ------------------------------------------------------------- secrets (encrypted, masked)
     @app.get("/api/secrets", dependencies=[Depends(auth)])

@@ -116,8 +116,40 @@ final class HomeChat: ObservableObject {
         Task { _ = try? await API.shared.call("POST", "/api/chat/read", ["seq": seq]) }
     }
 
-    /// POST /api/chat/send as an event stream: user → route → delta… → message | task → done.
+    // 3.8 outbox: a message sent while 球球 is still answering waits here (shown as 排队中 under the chat) and goes
+    // out by itself when the reply ends. Before 3.8 the send button was 停止 during a reply and send() returned at
+    // once when a reply was running, so a message typed meanwhile could never be sent.
+    @Published var outbox: [JSON] = []
+
     @MainActor func send(_ text: String, attachments: [JSON], mode: String) async -> Bool {
+        if sending {
+            outbox.append(["id": "q-\(UUID().uuidString.prefix(8))", "text": text, "attachments": attachments, "mode": mode])
+            leaveStage(); bottomTick += 1
+            return true
+        }
+        let ok = await sendNow(text, attachments: attachments, mode: mode)
+        await flushOutbox()
+        return ok
+    }
+    /// The queued messages, oldest first, one after the other (the server answers one message at a time).
+    @MainActor func flushOutbox() async {
+        while !sending, !outbox.isEmpty {
+            let q = outbox.removeFirst()
+            if !(await sendNow(q.s("text"), attachments: q.a("attachments"), mode: q.s("mode"))) {
+                outbox.insert(q, at: 0); break   // the error is shown; it stays queued (立即发送 retries it)
+            }
+        }
+    }
+    /// 立即发送 on a queued message: it goes first; a reply still being written is stopped (what streamed is kept).
+    @MainActor func sendQueuedNow(_ id: String) async {
+        guard let i = outbox.firstIndex(where: { $0.s("id") == id }) else { return }
+        let q = outbox.remove(at: i); outbox.insert(q, at: 0)
+        if sending { await cancel() } else { await flushOutbox() }
+    }
+    @MainActor func dropQueued(_ id: String) { outbox.removeAll { $0.s("id") == id } }
+
+    /// POST /api/chat/send as an event stream: user → route → delta… → message | task → done.
+    @MainActor func sendNow(_ text: String, attachments: [JSON], mode: String) async -> Bool {
         guard !sending else { return false }
         sending = true; err = ""
         leaveStage()
@@ -215,6 +247,8 @@ struct HomeChatView: View {
     @FocusState private var focused: Bool
     @Environment(\.scenePhase) private var phase
     @AppStorage("hdraft") private var draft = ""
+    @StateObject private var voice = SpeechInput()
+    @State private var queuedPick: JSON? = nil
 
     var liveStatus: String {
         m.msgs.last(where: { $0.s("kind") == "task" && isLive($0.o("data").s("status")) })?.o("data").s("status") ?? ""
@@ -242,7 +276,9 @@ struct HomeChatView: View {
                         row(m.msgs[i]).id(m.msgs[i].s("id"))
                     }
                     if let s = m.stream { streamRow(s) }
+                    ForEach(m.outbox.indices, id: \.self) { i in queuedRow(m.outbox[i]).id(m.outbox[i].s("id")) }
                     if !m.err.isEmpty { Text(m.err).font(.footnote).foregroundColor(.red) }
+                    if !voice.error.isEmpty { Text(voice.error).font(.footnote).foregroundColor(.orange) }
                     Color.clear.frame(height: 1).id("end")
                 }.padding(.horizontal, 14).padding(.vertical, 10)
                 .reportsScrollMetrics()
@@ -298,10 +334,12 @@ struct HomeChatView: View {
             }
         }
         .task { if !m.loaded { await m.load() }; if text.isEmpty { text = draft } }
+        .onDisappear { voice.stop() }
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .refreshable { await m.load() }
         .onReceive(hub.events) { e in m.onEvent(e) }
         .onChange(of: phase) { p in   // back in the foreground: what came in meanwhile, then the newest message
+            if p != .active { voice.stop() }
             if p == .active { Task { await m.sync(); if !m.staged { pin.toEnd(follow: 2) } } }
         }
         .onChange(of: text) { t in draft = t; onText(t) }
@@ -387,6 +425,26 @@ struct HomeChatView: View {
             }
         }.id("stream")
     }
+    /// A message waiting for the reply to end (3.8): tap for 立即发送 / 删除.
+    @ViewBuilder func queuedRow(_ q: JSON) -> some View {
+        HStack { Spacer(minLength: 48)
+            VStack(alignment: .trailing, spacing: 3) {
+                Button { queuedPick = q } label: {
+                    UserBubbleV2(text: q.s("text").isEmpty ? "（附件）" : q.s("text"), attachments: q.a("attachments"), skillTitle: skillTitle)
+                        .opacity(0.6)
+                }.buttonStyle(.plain)
+                Button { queuedPick = q } label: {
+                    Label("排队中 · 回复完自动发送 · 点一下立即发送或删除", systemImage: "clock").font(.caption2)
+                }.buttonStyle(.plain).foregroundColor(hAmber)
+            }
+        }
+        .confirmationDialog("这条还在排队", isPresented: Binding(get: { queuedPick?.s("id") == q.s("id") }, set: { if !$0 { queuedPick = nil } }),
+                            titleVisibility: .visible) {
+            Button(m.sending ? "立即发送（停止当前回复）" : "立即发送") { let id = q.s("id"); queuedPick = nil; Task { await m.sendQueuedNow(id) } }
+            Button("删除", role: .destructive) { m.dropQueued(q.s("id")); queuedPick = nil }
+            Button("取消", role: .cancel) { queuedPick = nil }
+        } message: { Text(m.sending ? "球球还在回复上一条，回复完会自动发出。" : "马上就发。") }
+    }
     @ViewBuilder func resultRow(_ msg: JSON) -> some View {
         let d = msg.o("data")
         let ok = d.s("status") == "succeeded"
@@ -464,11 +522,23 @@ struct HomeChatView: View {
                     TextField(placeholder, text: $text, axis: .vertical)
                         .lineLimit(1...6).focused($focused).padding(.vertical, 8)
                 }
-                Button { if m.sending { Task { await m.cancel() } } else { Task { await send() } } } label: {
-                    Image(systemName: m.sending ? "stop.fill" : "arrow.up").font(.system(size: m.sending ? 13 : 16, weight: .bold))
-                        .foregroundColor(m.sending ? hAmber : hInk)
-                        .frame(width: 36, height: 36).background(m.sending ? Color(white: 0.2) : (canSend ? hAmber : Color.gray.opacity(0.4))).clipShape(Circle())
-                }.disabled(!m.sending && !canSend).accessibilityLabel(m.sending ? "停止" : "发送")
+                // 3.8: listening -> stop the mic; text -> send (queued while 球球 answers); a reply with nothing typed
+                // -> 停止; otherwise the mic (voice input, Speech.swift)
+                if voice.active {
+                    MicButton(voice: voice) { voice.stop() }
+                } else if canSend {
+                    Button { Task { await send() } } label: {
+                        Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold)).foregroundColor(hInk)
+                            .frame(width: 36, height: 36).background(hAmber).clipShape(Circle())
+                    }.accessibilityLabel(m.sending ? "排队发送" : "发送")
+                } else if m.sending {
+                    Button { Task { await m.cancel() } } label: {
+                        Image(systemName: "stop.fill").font(.system(size: 13, weight: .bold)).foregroundColor(hAmber)
+                            .frame(width: 36, height: 36).background(Color(white: 0.2)).clipShape(Circle())
+                    }.accessibilityLabel("停止")
+                } else {
+                    MicButton(voice: voice) { voice.toggle(current: text) { text = $0 } }
+                }
             }
             .padding(.leading, 4).padding(.trailing, 6).padding(.vertical, 5)
             .background(Color(.systemBackground))
@@ -478,7 +548,7 @@ struct HomeChatView: View {
         .padding(.horizontal, 12).padding(.top, 6).padding(.bottom, 8)
         .background(.bar)
     }
-    var canSend: Bool { !m.sending && !uploading && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attach.isEmpty) }
+    var canSend: Bool { !uploading && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attach.isEmpty) }
 
     // MARK: "/" skills (the same list and the same 【技能：…】 marker the old + menu used)
     func skillTitle(_ id: String) -> String {
@@ -562,6 +632,7 @@ struct HomeChatView: View {
     }
 
     func send() async {
+        if voice.active { voice.stop() }
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.isEmpty && attach.isEmpty { if !picked.isEmpty { m.err = "说说要用这个技能做什么" }; return }
         let sk = picked
@@ -710,6 +781,7 @@ struct TaskCardRow: View {
         if !line.isEmpty && line != statusText[st] { parts.append(line) }
         if d.d("plan_total") > 0 { parts.append("\(Int(d.d("plan_done")))/\(Int(d.d("plan_total"))) 项") }
         if isLive(st) && d.d("step") > 0 { parts.append("第 \(Int(d.d("step")))\(d.d("max_steps") > 0 ? "/\(Int(d.d("max_steps")))" : "") 步") }
+        if st == "queued" { parts.append("点开可立即发送或删除") }   // 3.8: the task view has 立即发送 / 删除
         return parts.isEmpty ? "交给电脑的任务" : parts.joined(separator: " · ")
     }
 }

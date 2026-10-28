@@ -250,6 +250,104 @@ class OpenAIProvider(LLMProvider):
             return strip_think((await self._post(c, body))["choices"][0]["message"].get("content") or "")
 
 
+    async def chat(self, messages: list[dict], tools: list[dict] | None = None, max_tokens: int = 1500,
+                   on_delta=None) -> dict:
+        """Multi-turn chat with optional tools; streams the visible answer to on_delta (reasoning is never passed
+        on: the chat shows no thinking). A gateway that rejects or ignores streaming gets the plain request."""
+        body = {"model": self.model, "max_tokens": max_tokens, "messages": messages}
+        if tools:
+            body["tools"] = [{"type": "function", "function": t} for t in tools]
+            body["tool_choice"] = "auto"
+        wait = float(os.environ.get("AIW_CHAT_TIMEOUT_S", "120"))
+        async with httpx.AsyncClient(timeout=wait) as c:
+            data = None
+            if on_delta and self._stream_ok:
+                try:
+                    data = await self._chat_stream(c, body, on_delta)
+                except (httpx.HTTPStatusError, ValueError, KeyError, TypeError):
+                    self._stream_ok = False
+                    data = None
+            streamed = data is not None and data.get("_streamed")
+            if data is None:
+                data = await self._post(c, body)
+            msg = ((data.get("choices") or [{}])[0].get("message")) or {}
+        content = strip_think(msg.get("content") or "")
+        if on_delta and content and not streamed:
+            await on_delta(content)
+        calls = []
+        for i, tc in enumerate(msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                calls.append({"id": tc.get("id") or f"call_{i}", "name": fn["name"], "args": parse_args(fn.get("arguments"))})
+        return {"content": content, "tool_calls": calls}
+
+    async def _chat_stream(self, c: httpx.AsyncClient, body: dict, on_delta) -> dict:
+        content, calls, think = [], {}, {"in": False, "buf": ""}
+        payload = {**body, **self._extras(), "stream": True}
+        async with c.stream("POST", self.url, json=payload, headers={"Authorization": f"Bearer {self.key}"}) as r:
+            if r.status_code == 400 and self._extras():   # the thinking switches are rejected: plain request instead
+                self._extras_ok = False
+                raise ValueError("stream rejected")
+            r.raise_for_status()
+            if "event-stream" not in (r.headers.get("content-type") or ""):
+                return json.loads(await r.aread())  # gateway ignored stream=true
+            async for line in r.aiter_lines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk == "[DONE]":
+                    break
+                ev = json.loads(chunk)
+                for ch in ev.get("choices") or []:
+                    d = ch.get("delta") or {}
+                    piece = d.get("content") or ""
+                    if piece:
+                        content.append(piece)
+                        vis = _visible(think, piece)
+                        if vis:
+                            try:
+                                await on_delta(vis)
+                            except Exception:  # noqa: BLE001  a closed client never breaks the reply
+                                pass
+                    for tc in d.get("tool_calls") or []:
+                        slot = calls.setdefault(tc.get("index", 0), {"id": None, "type": "function",
+                                                                       "function": {"name": "", "arguments": ""}})
+                        slot["id"] = tc.get("id") or slot["id"]
+                        fn = tc.get("function") or {}
+                        slot["function"]["name"] += fn.get("name") or ""
+                        a = fn.get("arguments")
+                        slot["function"]["arguments"] += a if isinstance(a, str) else (json.dumps(a) if a else "")
+        msg = {"role": "assistant", "content": "".join(content) or None, "tool_calls": [calls[i] for i in sorted(calls)] or None}
+        return {"choices": [{"message": msg}], "_streamed": True}
+
+
+def _visible(state: dict, piece: str) -> str:
+    """Streamed content without <think>…</think> blocks some gateways put inside the answer."""
+    out = ""
+    buf = state["buf"] + piece
+    state["buf"] = ""
+    while buf:
+        if state["in"]:
+            j = buf.find("</think>")
+            if j < 0:
+                state["buf"] = buf[-8:]
+                return out
+            buf, state["in"] = buf[j + 8:], False
+        else:
+            j = buf.find("<think>")
+            if j < 0:
+                k = buf.rfind("<")
+                if k >= 0 and "<think>".startswith(buf[k:]) and len(buf) - k < 7:
+                    out += buf[:k]
+                    state["buf"] = buf[k:]
+                    return out
+                return out + buf
+            out += buf[:j]
+            buf, state["in"] = buf[j + 7:], True
+    return out
+
+
 def reasoning_of(msg: dict) -> str:
     """The model's thinking: reasoning_content (DeepSeek, Qwen, GLM gateways), reasoning (OpenRouter), or a
     <think> block inside content."""

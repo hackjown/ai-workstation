@@ -198,10 +198,36 @@ def plan(task: str) -> list[str]:
     return steps + ["确认结果并汇报" if re.search(r"[\u4e00-\u9fff]", task or "") else "Verify and report"]
 
 
+PLAN_CONTEXT_TAIL = 1500    # chars of the (thread / chat) background the planner sees
+PLAN_MEMORY_MAX = 1200     # chars of the user's long-term memory block, kept in front of that tail
+
+
+def plan_context(context: str | None) -> str:
+    """The planner's background: the [MEMORY] … [/MEMORY] block (memory.py) always survives, then the last
+    PLAN_CONTEXT_TAIL chars of everything else. The memory block sits at the top of a task's context, so a plain
+    context[-1500:] used to cut it off whenever the chat or the thread was long."""
+    if not context:
+        return ""
+    import re
+    mem = ""
+    m = re.search(r"\[MEMORY\].*?\[/MEMORY\]", context, re.S)
+    rest = context
+    if m:
+        mem = m.group(0)
+        if len(mem) > PLAN_MEMORY_MAX:   # keep the head (profile + best matches come first) and close the block
+            mem = mem[:PLAN_MEMORY_MAX - 12].rsplit("\n", 1)[0] + "\n[/MEMORY]"
+        # the header line right before the block belongs to it
+        rest = re.sub(r"USER MEMORY \([^\n]*\):\s*$", "", context[:m.start()]).rstrip() + "\n" + context[m.end():].lstrip()
+        rest = rest.strip()
+    tail = rest[-PLAN_CONTEXT_TAIL:] if rest else ""
+    return "\n\n".join(p for p in (mem, tail) if p)
+
+
 async def make_plan(llm, task: str, context: str | None = None) -> list[str]:
     """Ask the model for a short checklist; fall back to the offline split."""
     try:
-        text = await llm.complete(PLAN_PROMPT, (f"背景：\n{context[-1500:]}\n\n" if context else "") + f"请求：{task}", 1200)
+        bg = plan_context(context)
+        text = await llm.complete(PLAN_PROMPT, (f"背景：\n{bg}\n\n" if bg else "") + f"请求：{task}", 1200)
         steps = parse_plan(text, task)
         if len(steps) >= 2:
             return steps

@@ -349,12 +349,12 @@ matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { i
 S.skills = [];
 async function loadSkillList() { try { S.skillList = await api("GET", "/api/skills"); } catch (e) { S.skillList = S.skillList || []; } return S.skillList; }
 (function setupPlus() {
-  const clip = document.querySelector('.composer button[aria-label="附件"]'); if (!clip) return;
+  const clip = document.querySelector('#v-chat .composer button[aria-label="附件"]'); if (!clip) return;
   clip.innerHTML = icon("plus"); clip.setAttribute("aria-label", "添加"); clip.title = "上传文件或选择技能";
   clip.setAttribute("onclick", "togglePlus(event)");
   clip.insertAdjacentHTML("afterend", '<div class="plusmenu" id="plusMenu" role="menu"></div>');
   $("attach").insertAdjacentHTML("afterend", '<div class="skillchips" id="skillChips"></div>');
-  document.addEventListener("click", (e) => { const m = $("plusMenu"); if (m && m.classList.contains("open") && !e.target.closest("#plusMenu") && !e.target.closest('.composer button[aria-label="添加"]')) m.classList.remove("open"); });
+  document.addEventListener("click", (e) => { const m = $("plusMenu"); if (m && m.classList.contains("open") && !e.target.closest("#plusMenu") && !e.target.closest('#v-chat .composer button[aria-label="添加"]')) m.classList.remove("open"); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") { const m = $("plusMenu"); if (m) m.classList.remove("open"); } });
 })();
 async function togglePlus(e) {
@@ -680,7 +680,8 @@ function mobileViewfinder() {
   const chat = $("v-chat"); if (!chat) return;
   let vf = $("mvf");
   const live = liveTask();
-  const want = NARROW.matches && S.view === "chat" && !!live;
+  // the task view on a phone: the computer on top, the steps below (always, not only while the task runs)
+  const want = NARROW.matches && S.view === "chat" && !!(live || (S.thread && S.thread.id));
   const frame = document.querySelector("#deskPane .deskframe, #mvf .deskframe");
   if (!want) {
     if (vf) { if (frame && frame.parentNode !== $("deskPane")) { $("deskPane").appendChild(frame); deskLoaded.small = null; if (S.view === "chat") loadDesktop(); } vf.remove(); }
@@ -696,7 +697,7 @@ function mobileViewfinder() {
     deskLoaded.small = null; loadDesktop();
   }
   // folded (just the slim status bar) unless the user opened the screen, or is driving it
-  const fold = localStorage.getItem("aiw_mvf_fold") !== "0" && !S.take;
+  const fold = localStorage.getItem("aiw_mvf_fold") === "1" && !S.take;
   vf.classList.toggle("fold", fold);
   vf.classList.toggle("taking", !!S.take);
   vf.querySelector(".tk").textContent = S.take ? "交还" : "接管";
@@ -704,13 +705,13 @@ function mobileViewfinder() {
   vf.querySelector(".mvf-eye").setAttribute("aria-label", fold ? "显示电脑画面" : "隐藏电脑画面");
   const c = document.querySelector("#msgs .curcard .st.cur .tx");
   const lastS = document.querySelector("#msgs .work:last-of-type .steplist .s:last-child") || [...document.querySelectorAll("#msgs .steplist .s")].pop();
-  const st = (S.evs[live.id] || []).find((e) => e.type === "task.started");
+  const st = live ? (S.evs[live.id] || []).find((e) => e.type === "task.started") : null;
   vf.querySelector(".mvf-now small").textContent = (lastS ? lastS.querySelector("b").textContent + " · " : "") + (st ? mmss(Date.now() / 1000 - st.ts) : "");
-  vf.querySelector(".mvf-now span").textContent = c ? c.textContent : (document.querySelector("#msgs .work .head .grow") || { textContent: "工作中…" }).textContent;
+  vf.querySelector(".mvf-now span").textContent = c ? c.textContent : live ? (document.querySelector("#msgs .work .head .grow") || { textContent: "工作中…" }).textContent : "电脑画面 · 任务没在运行";
 }
 // taking over needs the screen: open it first
 function mvfTake() { if (!S.take) localStorage.setItem("aiw_mvf_fold", "0"); toggleTakeover(); setTimeout(mobileViewfinder, 50); }
-function mvfFold() { localStorage.setItem("aiw_mvf_fold", localStorage.getItem("aiw_mvf_fold") === "0" ? "1" : "0"); mobileViewfinder(); }
+function mvfFold() { localStorage.setItem("aiw_mvf_fold", localStorage.getItem("aiw_mvf_fold") === "1" ? "0" : "1"); mobileViewfinder(); }
 const _patchChatVF = patchChat;
 patchChat = function () { _patchChatVF(); mobileViewfinder(); };
 NARROW.addEventListener("change", mobileViewfinder);

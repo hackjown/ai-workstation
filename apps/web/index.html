@@ -63,12 +63,12 @@
     <div class="view" id="v-home">
       <div id="hstage" class="hstage" aria-live="polite">
         <button class="hhist" id="hHistBtn" onclick="hShowChat()" hidden>↑ 聊天记录</button>
-        <div class="hst-core"><span class="mate hst-orb" id="hstOrb" role="img" aria-label="球球"></span><div id="hbbs"></div></div>
+        <div class="hst-core"><span class="mate hst-orb" id="hstOrb" role="img" aria-label="球球"></span></div>
+        <div id="hbbs"></div>
       </div>
       <div id="hmsgs" class="scroll"></div>
-      <button id="hToLatest" class="fab" onclick="hScrollLatest(true)">↓ 最新</button>
+      <button id="hToLatest" class="fab" onclick="hScrollLatest(true)">↓ 最新消息</button>
       <div class="composer-wrap hcw">
-        <div id="hchips" class="hchips"></div>
         <div id="hskills" class="hskills" role="listbox" aria-label="技能" hidden></div>
         <div id="hmode" class="hmode" hidden></div>
         <div id="hattach" class="attachments"></div>
@@ -87,15 +87,16 @@
       <div id="hsheet" class="hsheet" role="dialog" aria-label="添加" aria-hidden="true">
         <div class="hs-grab"></div>
         <div class="hs-grid">
-          <button class="hs-it" onclick="hPick('hcam')"><span class="hs-ic hl">📷</span>拍照</button>
-          <button class="hs-it" onclick="hPick('hvid')"><span class="hs-ic hl">🎥</span>录视频</button>
-          <button class="hs-it" onclick="hPick('hlib')"><span class="hs-ic">🖼</span>照片/视频</button>
-          <button class="hs-it" onclick="hPick('hfile')"><span class="hs-ic">📁</span>文件</button>
-          <button class="hs-it" onclick="hSheet(false);newTaskMode()"><span class="hs-ic">🖥</span>新建任务</button>
-          <button class="hs-it" id="hVoiceIt" onclick="hSheet(false);hVoice()"><span class="hs-ic">🎙</span>语音</button>
-          <button class="hs-it" onclick="hSheet(false);hLink()"><span class="hs-ic">🔗</span>链接</button>
-          <button class="hs-it" onclick="hSheet(false);hSlash()"><span class="hs-ic">✨</span>技能 /</button>
+          <button class="hs-it" onclick="hPick('hcam')"><span class="hs-ic" data-hi="camera"></span>拍照</button>
+          <button class="hs-it" onclick="hPick('hvid')"><span class="hs-ic" data-hi="video"></span>录视频</button>
+          <button class="hs-it" onclick="hPick('hlib')"><span class="hs-ic" data-hi="image"></span>照片/视频</button>
+          <button class="hs-it" onclick="hPick('hfile')"><span class="hs-ic" data-hi="folder"></span>文件</button>
+          <button class="hs-it" onclick="hSheet(false);newTaskMode()"><span class="hs-ic" data-hi="monitor"></span>新建任务</button>
+          <button class="hs-it" id="hVoiceIt" onclick="hSheet(false);hVoice()"><span class="hs-ic" data-hi="mic"></span>语音</button>
+          <button class="hs-it" onclick="hSheet(false);hLink()"><span class="hs-ic" data-hi="link"></span>链接</button>
+          <button class="hs-it" onclick="hSheet(false);hSlash()"><span class="hs-ic" data-hi="sparkle"></span>技能 /</button>
         </div>
+        <div class="hs-dots" id="hsDots" hidden></div>
       </div>
     </div>
 

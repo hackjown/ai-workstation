@@ -8,6 +8,7 @@ REST (see README "API" for the full list)
   GET  /api/threads | /api/threads/{id}  conversations with their tasks, plans, files
   /api/routines  /api/watches  /api/memories  /api/profile  /api/settings/*  /api/secrets  /api/integrations
   /api/notifications  /api/uploads  /api/agent/answer
+  /api/chat (history) · POST /api/chat/send (SSE: user/route/delta/message/task/done) · /api/chat/messages/{id}/answer|to_task
   GET  /api/tasks/{id}
   POST /api/sessions                   {task_id}
   GET  /api/sessions/{id}              session + events + artifacts
@@ -104,6 +105,7 @@ class UploadIn(BaseModel):
     name: str
     content_b64: str
     machine_id: str = "ai-linux-001"
+    local_only: bool = False      # a chat attachment: kept on the API host only (the chat reads it; a task uploads it)
 
 class OpenAPIIn(BaseModel):
     url: Optional[str] = None
@@ -213,6 +215,10 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     xhs.mount(app, store, sessions, notifier, auth)
     from . import browseros   # BrowserOS neo per computer (/api/browseros*)
     browseros.mount(app, store, sessions, auth)
+    from . import chat as _chat   # the persistent 小秘 chat (/api/chat*): routing, task cards, escalations in the chat
+    chat = _chat.Chat(store, sessions, notifier, settings, secrets)
+    app.state.chat = chat
+    _chat.mount(app, chat, auth)
 
     # ------------------------------------------------------------- tasks
 
@@ -560,7 +566,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.put("/api/settings/models", dependencies=[Depends(auth)])
     async def put_models(body: dict):
         m = {k: (str(body.get(k) or "").strip() or None)
-             for k in ("model", "vision_model", "fallback", "subagent_model", "image_model", "video_model", "base_url", "thinking")}
+             for k in ("model", "vision_model", "fallback", "subagent_model", "image_model", "video_model", "base_url", "thinking",
+                       "chat_model", "small_model", "embed_model")}
         store.kv_set("models", m)
         return m
 
@@ -1006,6 +1013,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         local = os.path.join(d, f"{int(time.time())}-{name}")
         with open(local, "wb") as f:
             f.write(raw)
+        if body.local_only:
+            return {"name": name, "size": len(raw), "vm_path": None, "artifact": local}
         if cloud.is_cloud(body.machine_id):
             try:
                 await cloud.wake(body.machine_id)

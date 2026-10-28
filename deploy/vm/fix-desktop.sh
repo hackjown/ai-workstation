@@ -56,3 +56,6 @@ sudo journalctl -u aiw-xvnc -n 5 --no-pager
 # Chrome policy: no translate bubble on foreign pages, no password-save prompts
 sudo mkdir -p /etc/opt/chrome/policies/managed /etc/chromium/policies/managed
 echo '{"TranslateEnabled": false, "PasswordManagerEnabled": false}' | sudo tee /etc/opt/chrome/policies/managed/aiw.json /etc/chromium/policies/managed/aiw.json >/dev/null
+
+# Chrome always with the DevTools port 9222 (the price watch reads the logged-in pages through it)
+[ -f "$H/ai-workstation/deploy/vm/chrome-cdp-setup.sh" ] && bash "$H/ai-workstation/deploy/vm/chrome-cdp-setup.sh" install || true

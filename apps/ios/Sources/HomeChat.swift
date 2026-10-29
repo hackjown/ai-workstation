@@ -269,7 +269,46 @@ struct HomeChatView: View {
         m.msgs.last(where: { $0.s("kind") == "task" && isLive($0.o("data").s("status")) })?.o("data").s("status") ?? ""
     }
 
-    var body: some View {
+    // 3.8.2: split so the type checker copes (one body with the dialogs timed out in CI)
+    var body: some View { withDialogs(main) }
+
+    var queuedNote: String { m.sending ? "球球还在回复上一条，回复完会自动发出。" : "马上就发。" }
+    func deleteTitle(_ d: JSON) -> String {
+        d.s("kind") == "task" && d.o("data").s("status") == "queued" ? "删除（这个排队的任务不再执行）" : "删除"
+    }
+    func deleteNote(_ d: JSON) -> String {
+        let st = d.o("data").s("status")
+        if d.s("kind") == "task" && isLive(st) && st != "queued" { return "这个任务还在进行，要先进去停止它才能删除。" }
+        return "只删除这一条，其他聊天记录不受影响。"
+    }
+    /// opening the chat (or leaving 球球's stage) starts at the newest message; back from a task keeps the place you were
+    /// reading unless you were at the end. 3.8.2: "↑ 聊天记录" always lands on the newest message.
+    func openedChat() {
+        if !pin.opened || pin.pinned || m.openAtEnd {
+            m.openAtEnd = false
+            olderOK = false
+            pin.toEnd(follow: 2.5)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { olderOK = true }
+        } else { olderOK = true }
+    }
+    func withDialogs<C: View>(_ c: C) -> some View {
+        c
+        // 3.8.2: one dialog for the queued message you tapped (a dialog per row inside the lazy list did not always
+        // run its 删除), and one for deleting a chat message
+        .confirmationDialog("这条还在排队", isPresented: Binding(get: { queuedPick != nil }, set: { if !$0 { queuedPick = nil } }),
+                            titleVisibility: .visible, presenting: queuedPick) { q in
+            Button(m.sending ? "立即发送（停止当前回复）" : "立即发送") { let id = q.s("id"); queuedPick = nil; Task { await m.sendQueuedNow(id) } }
+            Button("删除", role: .destructive) { let id = q.s("id"); queuedPick = nil; m.dropQueued(id) }
+            Button("取消", role: .cancel) { queuedPick = nil }
+        } message: { _ in Text(queuedNote) }
+        .confirmationDialog("删除这条消息？", isPresented: Binding(get: { deletePick != nil }, set: { if !$0 { deletePick = nil } }),
+                            titleVisibility: .visible, presenting: deletePick) { d in
+            Button(deleteTitle(d), role: .destructive) { let id = d.s("id"); deletePick = nil; Task { await m.deleteMessage(id) } }
+            Button("取消", role: .cancel) { deletePick = nil }
+        } message: { d in Text(deleteNote(d)) }
+    }
+
+    var main: some View {
         ScrollViewReader { proxy in
           Group {
             if m.staged {
@@ -288,17 +327,7 @@ struct HomeChatView: View {
                         Text("· 聊天从这里开始 ·").font(.caption2).foregroundColor(.secondary).frame(maxWidth: .infinity)
                     }
                     if m.loaded && m.msgs.isEmpty { HomeChatEmpty(agent: m.agent) { text = $0; focused = true } }
-                    // 3.8.2: rows keyed by message id (index keys mixed rows up after a delete)
-                    ForEach(m.msgs.indices.map { HRowKey(i: $0, id: m.msgs[$0].s("id")) }, id: \.id) { k in
-                        let msg = m.msgs[k.i]
-                        row(msg).id(k.id)
-                            .environment(\.aiwDeleteMessage, delAction(msg))
-                    }
-                    if let s = m.stream { streamRow(s) }
-                    ForEach(m.outbox.indices.map { HRowKey(i: $0, id: m.outbox[$0].s("id")) }, id: \.id) { k in
-                        queuedRow(m.outbox[k.i]).id(k.id)
-                            .environment(\.aiwDeleteMessage, { let id = k.id; Task { @MainActor in m.dropQueued(id) } })
-                    }
+                    messageRows
                     if !m.err.isEmpty { Text(m.err).font(.footnote).foregroundColor(.red) }
                     if !voice.error.isEmpty { Text(voice.error).font(.footnote).foregroundColor(.orange) }
                     Color.clear.frame(height: 1).id("end")
@@ -315,15 +344,7 @@ struct HomeChatView: View {
                     if animated { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("end", anchor: .bottom) } }
                     else { proxy.scrollTo("end", anchor: .bottom) }
                 }
-                // opening the chat (or leaving 球球's stage) starts at the newest message; back from a task keeps
-                // the place you were reading unless you were at the end
-                // 3.8.2: "↑ 聊天记录" always lands on the newest message
-                if !pin.opened || pin.pinned || m.openAtEnd {
-                    m.openAtEnd = false
-                    olderOK = false
-                    pin.toEnd(follow: 2.5)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { olderOK = true }
-                } else { olderOK = true }
+                openedChat()
             }
             }
           }
@@ -366,21 +387,6 @@ struct HomeChatView: View {
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .refreshable { await m.load() }
         .onReceive(hub.events) { e in m.onEvent(e) }
-        // 3.8.2: one dialog for the queued message you tapped (a dialog per row inside the lazy list did not always
-        // run its 删除), and one for deleting a chat message
-        .confirmationDialog("这条还在排队", isPresented: Binding(get: { queuedPick != nil }, set: { if !$0 { queuedPick = nil } }),
-                            titleVisibility: .visible, presenting: queuedPick) { q in
-            Button(m.sending ? "立即发送（停止当前回复）" : "立即发送") { let id = q.s("id"); queuedPick = nil; Task { await m.sendQueuedNow(id) } }
-            Button("删除", role: .destructive) { let id = q.s("id"); queuedPick = nil; m.dropQueued(id) }
-            Button("取消", role: .cancel) { queuedPick = nil }
-        } message: { _ in Text(m.sending ? "球球还在回复上一条，回复完会自动发出。" : "马上就发。") }
-        .confirmationDialog("删除这条消息？", isPresented: Binding(get: { deletePick != nil }, set: { if !$0 { deletePick = nil } }),
-                            titleVisibility: .visible, presenting: deletePick) { d in
-            Button(d.s("kind") == "task" && d.o("data").s("status") == "queued" ? "删除（这个排队的任务不再执行）" : "删除",
-                   role: .destructive) { let id = d.s("id"); deletePick = nil; Task { await m.deleteMessage(id) } }
-            Button("取消", role: .cancel) { deletePick = nil }
-        } message: { d in Text(isLive(d.o("data").s("status")) && d.s("kind") == "task" && d.o("data").s("status") != "queued"
-                               ? "这个任务还在进行，要先进去停止它才能删除。" : "只删除这一条，其他聊天记录不受影响。") }
         // 3.8 aiw://chat (a push): the chat itself, at the newest message
         .onReceive(NotificationCenter.default.publisher(for: .aiwShowChat)) { _ in
             Task { await m.sync(); m.leaveStage(); pin.toEnd(follow: 2) }
@@ -419,6 +425,23 @@ struct HomeChatView: View {
     }
 
     // MARK: rows
+    /// 3.8.2: rows keyed by message id (index keys mixed rows up after a delete)
+    @ViewBuilder var messageRows: some View {
+        ForEach(m.msgs.indices.map { HRowKey(i: $0, id: m.msgs[$0].s("id")) }, id: \.id) { k in
+            msgRow(m.msgs[k.i], id: k.id)
+        }
+        if let s = m.stream { streamRow(s) }
+        ForEach(m.outbox.indices.map { HRowKey(i: $0, id: m.outbox[$0].s("id")) }, id: \.id) { k in
+            outRow(m.outbox[k.i], id: k.id)
+        }
+    }
+    func msgRow(_ msg: JSON, id: String) -> some View {
+        row(msg).id(id).environment(\.aiwDeleteMessage, delAction(msg))
+    }
+    func outRow(_ q: JSON, id: String) -> some View {
+        let drop: () -> Void = { Task { @MainActor in m.dropQueued(id) } }
+        return queuedRow(q).id(id).environment(\.aiwDeleteMessage, drop)
+    }
     @ViewBuilder func row(_ msg: JSON) -> some View {
         let d = msg.o("data")
         if msg.s("role") == "user" {

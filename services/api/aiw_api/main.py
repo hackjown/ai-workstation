@@ -1368,13 +1368,16 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         return Response(base64.b64decode(r.screenshot), media_type="image/png")
 
     @app.get("/api/machines/{mid}/desktop", dependencies=[Depends(auth)])
-    async def desktop(mid: str, view_only: bool = True):
+    async def desktop(mid: str, view_only: bool = True, wake: bool = False):
         if not store.machine(mid):
             raise HTTPException(404)
         if cloud.is_cloud(mid):
             # InstaBox's own viewer: a short-lived link, view-only enforced by its server
             try:
                 st = await cloud.state(mid)
+                if st.get("state") != "running" and wake:   # 3.8.6: iOS 电脑 › 查看 opens a sleeping one too
+                    await cloud.wake(mid)
+                    st = await cloud.state(mid)
                 if st.get("state") != "running":
                     return {"novnc_url": None, "paused": True, "external": True}
                 return {"novnc_url": await cloud.desktop_url(mid, view_only), "external": True}

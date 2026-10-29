@@ -129,7 +129,16 @@ struct DesktopPane: View {
 struct TakeoverView: View {
     @EnvironmentObject var api: API
     let liveSession: String?
+    /// 3.8.6: 电脑 › 查看 opens one computer's desktop on its own (no task): that machine, a cloud one woken first
+    let machineId: String?
+    let wake: Bool
+    let title: String
     let done: () -> Void
+    init(liveSession: String?, machineId: String? = nil, wake: Bool = false, title: String = "", done: @escaping () -> Void) {
+        self.liveSession = liveSession; self.machineId = machineId; self.wake = wake; self.title = title; self.done = done
+    }
+    var standalone: Bool { machineId != nil && liveSession == nil }
+    @State private var waking = false
     @State private var url: URL?
     @State private var err = ""
     @State private var landscape = false
@@ -142,13 +151,19 @@ struct TakeoverView: View {
                 HStack {
                     Circle().fill(Color.red).frame(width: 8, height: 8)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(liveSession != nil ? "你在操作桌面，Aiw 已暂停" : "你在操作桌面").font(.subheadline.weight(.semibold))
+                        Text(liveSession != nil ? "你在操作桌面，Aiw 已暂停" : standalone ? "查看「\(title.isEmpty ? mid : title)」" : "你在操作桌面")
+                            .font(.subheadline.weight(.semibold)).lineLimit(1)
+                        if standalone { Text("可以直接操作，不会开始任务").font(.caption).foregroundColor(.secondary) }
                         if let a = asked {   // what the agent asked for, so the user knows what to do here
                             Text(a.s("steps").isEmpty ? a.s("title") : a.s("steps")).font(.caption).foregroundColor(.secondary).lineLimit(2)
                         }
                     }
                     Spacer()
-                    Button(asked != nil ? "完成，交还给 Aiw" : liveSession != nil ? "交还给 Aiw" : "结束操作") { leave() }.buttonStyle(.borderedProminent)
+                    if standalone {
+                        Button { leave() } label: { Label("关闭", systemImage: "xmark") }.buttonStyle(.borderedProminent)
+                    } else {
+                        Button(asked != nil ? "完成，交还给 Aiw" : liveSession != nil ? "交还给 Aiw" : "结束操作") { leave() }.buttonStyle(.borderedProminent)
+                    }
                 }.padding(.horizontal, 14).padding(.vertical, 10).background(.bar)
             }
             ZStack {
@@ -157,7 +172,20 @@ struct TakeoverView: View {
                     TakeoverWeb(url: u, server: api.server, mid: mid, token: api.token) { op in setLandscape(op == "landscape") }
                 }
                 else if !err.isEmpty { Text(err).foregroundColor(.white).padding() }
-                else { ProgressView().tint(.white) }
+                else {
+                    VStack(spacing: 10) {
+                        ProgressView().tint(.white)
+                        if waking { Text("正在唤醒云电脑…").font(.footnote).foregroundColor(.white.opacity(0.8)) }
+                    }
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if standalone && (landscape || url == nil) {   // 横屏 hides the bar: still a way out
+                    Button { leave() } label: {
+                        Image(systemName: "xmark").font(.system(size: 15, weight: .bold)).foregroundColor(.white)
+                            .frame(width: 34, height: 34).background(Color.black.opacity(0.55)).clipShape(Circle())
+                    }.padding(10).accessibilityLabel("关闭")
+                }
             }
             .ignoresSafeArea(.container, edges: landscape ? .all : [])   // the keyboard still shrinks it (you see what you type)
         }
@@ -176,10 +204,12 @@ struct TakeoverView: View {
     }
     func load() async {
         do {
-            mid = api.machine
-            let d = try await api.obj("GET", "/api/machines/\(mid)/desktop?view_only=false")
+            mid = machineId ?? api.machine
+            waking = wake
+            let d = try await api.obj("GET", "/api/machines/\(mid)/desktop?view_only=false" + (wake ? "&wake=1" : ""))
+            waking = false
             let raw = d.s("novnc_url")
-            if raw.isEmpty { err = d.b("paused") ? "云电脑暂停中，发个任务会自动唤醒" : "这台电脑没有桌面"; return }
+            if raw.isEmpty { err = d.b("paused") ? (wake ? "云电脑没能唤醒，稍后再试" : "云电脑暂停中，发个任务会自动唤醒") : "这台电脑没有桌面"; return }
             let full = d.b("external") ? raw : api.server + raw + "&token=" + (api.token.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
             url = URL(string: full)
         } catch { err = error.localizedDescription }

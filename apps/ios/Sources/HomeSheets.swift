@@ -466,6 +466,7 @@ struct ComputerSheet: View {
     @State private var bos: [JSON] = []
     @State private var error = ""
     @State private var renaming: JSON? = nil
+    @State private var viewing: DiagTarget? = nil   // 3.8.6: 查看 = this computer's desktop full screen, no task
     @State private var newName = ""
 
     var locals: [JSON] { machines.filter { $0.s("provider") != "instabox" } }
@@ -504,6 +505,10 @@ struct ComputerSheet: View {
             .refreshable { await load() }
         }
         .task { await load() }
+        .fullScreenCover(item: $viewing) { t in
+            TakeoverView(liveSession: nil, machineId: t.id, wake: true, title: machineTitle(t.id)) { viewing = nil }
+                .environmentObject(api)
+        }
         .alert("重命名电脑", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField(renaming?.s("default_name") ?? "名称", text: $newName)
             Button("取消", role: .cancel) { renaming = nil }
@@ -541,6 +546,10 @@ struct ComputerSheet: View {
                 HStack(spacing: 8) {
                     Text(spec(m, cloud)).font(.subheadline).foregroundColor(.secondary).lineLimit(1)
                     Spacer(minLength: 4)
+                    if cloud || hasDesktop(m) {
+                        Button("查看") { viewing = DiagTarget(id: id) }
+                            .buttonStyle(.bordered).controlSize(.small).tint(amber)
+                    }
                     Button(cur ? "使用中" : "使用") { use(id) }
                         .buttonStyle(.bordered).controlSize(.small).tint(amber).disabled(cur)
                     Button("重命名") { newName = m.s("custom_name") == "<null>" ? "" : m.s("custom_name"); renaming = m }
@@ -552,6 +561,16 @@ struct ComputerSheet: View {
         }
         .padding(.vertical, 4)
         .listRowBackground(cur ? amber.opacity(0.07) : Color(.secondarySystemGroupedBackground))
+    }
+
+    /// a local VM has a desktop when the server knows its noVNC address (desktop_endpoint)
+    func hasDesktop(_ m: JSON) -> Bool {
+        let d = m.s("desktop_endpoint")
+        return !d.isEmpty && d != "<null>"
+    }
+    func machineTitle(_ id: String) -> String {
+        let m = machines.first { $0.s("id") == id } ?? [:]
+        return m.s("name").isEmpty ? id : m.s("name")
     }
 
     @ViewBuilder func connChip(_ c: Conn) -> some View {

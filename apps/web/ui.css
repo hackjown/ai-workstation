@@ -534,13 +534,13 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 .ffsheet .ff-in{position:relative}
 .ffsheet .ff-eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:0;background:none;color:var(--mute);cursor:pointer}
 .ffsheet .ff-sub{justify-content:center;border-radius:999px;padding:12px}
-/* Aiw brand: the amber robot logo + wordmark, the agent's name and state on the line under it */
-.brand .logo{width:40px;height:40px;border-radius:11px;flex:0 0 40px;display:block}
+/* Aiw brand: the 球球 orb logo (logo.png, transparent) + wordmark, the agent's name and state on the line under it */
+.brand .logo{width:40px;height:40px;border-radius:50%;flex:0 0 40px;display:block}
 .brand .heading{font-size:17px;font-weight:700;letter-spacing:.2px}
 .brand .small{display:flex;align-items:center;gap:4px;white-space:nowrap;overflow:hidden}
 .sdot{width:7px;height:7px;border-radius:50%;background:var(--dim);display:inline-block;margin-right:2px}
 .sdot.on{background:#3BA55D;box-shadow:0 0 0 3px rgba(59,165,93,.18)}
-#top .logo.sm{width:30px;height:30px;border-radius:8px}
+#top .logo.sm{width:30px;height:30px;border-radius:50%}
 
 /* ---------- send / stop: glyph dead-centre (iOS Safari adds button padding) */
 .send{padding:0;line-height:0;display:grid;place-items:center}

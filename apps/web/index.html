@@ -12,7 +12,8 @@
 <link rel="manifest" href="manifest.json" />
 <link rel="apple-touch-icon" href="icon-180.png" />
 <title>Aiw</title>
-<link rel="icon" type="image/svg+xml" href="logo.svg" />
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
+<link rel="icon" href="favicon.ico" sizes="any" />
 <link rel="stylesheet" href="app.css" />
 <link rel="stylesheet" href="ui.css" />
 <link rel="stylesheet" href="mate.css" />
@@ -25,7 +26,7 @@
   <!-- sidebar (desktop) -->
   <nav id="side">
     <div class="brand">
-      <img class="logo" src="logo.svg" alt="Aiw" />
+      <img class="logo" src="logo.png" alt="Aiw" />
       <div class="grow"><div class="heading">Aiw</div><div class="small"><span class="sdot" id="agentDot"></span><span id="agentName">小秘</span> · <span id="agentStatus">空闲</span></div></div>
       <span id="sideAvatar" hidden></span>
     </div>
@@ -49,7 +50,7 @@
     <header id="top">
       <button class="icon" id="backBtn" onclick="backToChat()" aria-label="返回聊天" title="返回聊天" hidden><i data-i="back"></i></button>
       <button class="icon only-mobile" id="menuBtn" onclick="openDrawer()" aria-label="菜单"><i data-i="menu"></i></button>
-      <img class="logo sm only-mobile" src="logo.svg" alt="Aiw" />
+      <img class="logo sm only-mobile" src="logo.png" alt="Aiw" />
       <div class="ttl"><div class="heading" id="viewTitle">对话</div><div class="small" id="viewSub"></div></div>
       <span class="chip" id="pillAgent">Agent …</span>
       <button class="btn sm primary" id="newTaskBtn" onclick="newTaskMode()" title="新建任务"><i data-i="plus"></i><span>新建任务</span></button>

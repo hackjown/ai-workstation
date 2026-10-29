@@ -8,8 +8,8 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>AIW</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>3.8.2</string>
-  <key>CFBundleVersion</key><string>23</string>
+  <key>CFBundleShortVersionString</key><string>3.8.3</string>
+  <key>CFBundleVersion</key><string>24</string>
   <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
   <key>MinimumOSVersion</key><string>16.0</string>
   <key>LSRequiresIPhoneOS</key><true/>
@@ -23,10 +23,12 @@
     <string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
   <key>UISupportedInterfaceOrientations~ipad</key><array>
     <string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationPortraitUpsideDown</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+  <!-- App icon: Assets.xcassets/AppIcon (1024 master, the 球球 face). build-ipa.sh writes the loose PNGs below from it
+       and, when actool works, also Assets.car (CFBundleIconName is added then). -->
   <key>CFBundleIcons</key><dict><key>CFBundlePrimaryIcon</key><dict>
-    <key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array></dict></dict>
+    <key>CFBundleIconFiles</key><array><string>AppIcon20x20</string><string>AppIcon29x29</string><string>AppIcon40x40</string><string>AppIcon60x60</string></array></dict></dict>
   <key>CFBundleIcons~ipad</key><dict><key>CFBundlePrimaryIcon</key><dict>
-    <key>CFBundleIconFiles</key><array><string>AppIcon60x60</string><string>AppIcon76x76</string></array></dict></dict>
+    <key>CFBundleIconFiles</key><array><string>AppIcon20x20</string><string>AppIcon29x29</string><string>AppIcon40x40</string><string>AppIcon60x60</string><string>AppIcon76x76</string><string>AppIcon83.5x83.5</string></array></dict></dict>
   <!-- 微信「用其他应用打开」/ Open In: Aiw takes any file as a copy (Documents/Inbox) and attaches it to a new chat -->
   <key>CFBundleDocumentTypes</key><array>
     <dict><key>CFBundleTypeName</key><string>图片</string><key>CFBundleTypeRole</key><string>Viewer</string>

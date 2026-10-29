@@ -1,27 +1,38 @@
 /* 球球 expression assistant (mate.js). Engine: vendor/emotionball (SVG, sized by its host; visuals non-commercial).
-   3.8: amber ring, white face, black eyes in both themes (the dark theme gets a brighter ring and a near-white face). */
+   3.8: white face, black eyes in an amber ring; 3.8.1: the ring is the thick pre-3.8 amber disc again, in both themes. */
 .mate {
-  /* 3.8 look (user's request): an amber ring, a white face, black eyes (engine body white via AiwMood.LOOK). The ring is
-     a radial gradient in % of the radius, so it keeps its proportion at every size; the old dark / amber discs are gone. */
+  /* 3.8.1: the amber ring is the thick pre-3.8 amber disc again (user: the 3.8 ring was too thin). Same thickness,
+     gradient and glow as the old .mate.amber disc: #c87618 with a warm glow from the top (50% 36%) and a faint white
+     rim; the white ball (engine body white, AiwMood.LOOK) sits inside it at 72.4 % of the radius, so the band is 27.6 %
+     of the radius (measured from the old render: the old 9 % inset x the engine's ball at 88.26 % of its viewBox).
+     It stays proportional at every size, never thinner than 2.5px (--mate-ring-w, % of the side = half of 27.6 %). */
   --mate-fill: #ffffff; --mate-ring: #c87618;
+  --mate-ring-w: max(13.8%, 2.5px);
   display: inline-block; flex: none; position: relative; line-height: 0; pointer-events: auto; box-sizing: border-box;
   border-radius: 50%; color-scheme: light;
-  background: radial-gradient(circle closest-side, var(--mate-fill) 0, var(--mate-fill) 89.5%, var(--mate-ring) 91.5%, var(--mate-ring) 100%, transparent 100.5%);
-  box-shadow: 0 1px 3px rgba(90, 50, 0, 0.18);
+  background:
+    radial-gradient(circle closest-side, var(--mate-fill) 0, var(--mate-fill) calc(100% - max(27.6%, 2.5px) - 0.5px), transparent calc(100% - max(27.6%, 2.5px))),
+    radial-gradient(circle at 50% 36%, rgba(255, 214, 150, 0.38), rgba(255, 190, 110, 0.10) 50%, transparent 72%),
+    var(--mate-ring);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), 0 1px 3px rgba(90, 50, 0, 0.25);
   --sketch-ink: rgba(26, 26, 26, 0.85);
 }
-html[data-theme="dark"] .mate { --mate-fill: #f7f4ee; --mate-ring: #e8a050; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45); }
-/* inset (not padding: a % padding follows the parent's width) keeps the ball inside the ring at any size */
-.mate > svg { position: absolute; left: var(--mate-pad, 10%); top: var(--mate-pad, 10%); width: calc(100% - 2 * var(--mate-pad, 10%)) !important;
-  height: calc(100% - 2 * var(--mate-pad, 10%)) !important; overflow: visible; display: block; filter: drop-shadow(0 1.5px 2px rgba(120, 70, 10, 0.22)); }
+/* dark theme: the same thick amber disc and glow (as before 3.8); the face is a touch warmer white */
+html[data-theme="dark"] .mate { --mate-fill: #f7f4ee; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16), 0 1px 4px rgba(0, 0, 0, 0.45); }
+/* the engine's ball is 88.26 % of its SVG, so the SVG inset follows the ring: the ball's edge is the ring's inner edge.
+   inset (not padding: a % padding follows the parent's width) keeps it right at any size. --mate-pad still overrides. */
+.mate > svg { --mate-auto-pad: calc(50% - (50% - var(--mate-ring-w)) / 0.8826);
+  position: absolute; left: var(--mate-pad, var(--mate-auto-pad)); top: var(--mate-pad, var(--mate-auto-pad));
+  width: calc(100% - 2 * var(--mate-pad, var(--mate-auto-pad))) !important; height: calc(100% - 2 * var(--mate-pad, var(--mate-auto-pad))) !important;
+  overflow: visible; display: block; filter: drop-shadow(0 2px 3px rgba(90, 40, 0, 0.45)); }
 .mate-head { width: 36px; height: 36px; margin: -4px 4px -4px 0; cursor: default; }
 body:not(.mate-chat) .mate-head, body.mate-off .mate { display: none; }
 @media (max-width: 760px) { .mate-head { width: 30px; height: 30px; margin: -2px 2px -2px 0; } }
 /* mini 球球 replaces the monitor icon of a computer card */
 .has-mate { position: relative; }
 .iconbox.has-mate > :not(.mate), .mach .ic.has-mate > :not(.mate) { visibility: hidden; }
-.mate-mini { position: absolute; inset: 0; width: auto; height: auto; border-radius: inherit; --mate-pad: 11%; }
-.mate-mini.inline { width: 22px; height: 22px; vertical-align: -6px; margin-left: 6px; position: relative; display: inline-block; border-radius: 50%; --mate-pad: 6%; }
+.mate-mini { position: absolute; inset: 0; width: auto; height: auto; border-radius: inherit; }
+.mate-mini.inline { width: 22px; height: 22px; vertical-align: -6px; margin-left: 6px; position: relative; display: inline-block; border-radius: 50%; }
 .iconbox.has-mate, .mach .ic.has-mate { background: transparent; overflow: hidden; }
 .mate-slot { position: relative; width: 34px; height: 34px; flex: none; margin-left: 8px; border-radius: 50%; background: transparent; overflow: hidden; }
 /* .amber: kept for old markup; since 3.8 every 球球 has the same amber ring and white face */

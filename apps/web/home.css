@@ -215,7 +215,7 @@ html[data-theme=light] #hmsgs .a .bubble.hdots-b { color:#b8680c; }
 .hwa { display:flex; gap:8px; align-items:flex-end; }
 .hwa > .hbody, .hwa > .hres { min-width:0; }
 /* the small 球球 head (amber disc, the real ball inside), the same beside replies, task cards, questions and thinking */
-.hav { width:30px; height:30px; flex:none; margin-bottom:22px; --mate-pad:10%; border-radius:50%; overflow:hidden; }
+.hav { width:30px; height:30px; flex:none; margin-bottom:22px; border-radius:50%; overflow:hidden; }
 .hwa.nm > .hav { margin-bottom:2px; }
 body.mate-off .hav, body.mate-off .hst-orb { display:inline-block; }
 /* task card: amber accent on the left, status in amber, progress bar */

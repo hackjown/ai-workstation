@@ -11,20 +11,28 @@
        aiwMate.status("running")    a task's stored status
        aiwMate.set("33", true)      an emotion id directly (+ burst)
        aiwMate.active(false)        stop the animation loop (app in background)
-     ?static=1 renders single frames only (Reduce Motion). 3.8: amber ring + white face + black eyes everywhere. -->
+     ?static=1 renders single frames only (Reduce Motion). 3.8: amber ring + white face + black eyes everywhere (3.8.1: the thick pre-3.8 ring). -->
 <style>
   html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; -webkit-user-select: none; user-select: none; }
-  /* 3.8 look (user's request, replaces the "keep the orb unchanged" rule): an amber ring, a white face, black eyes. The
-     ring is a radial gradient in % of the radius, so it keeps its proportion at every size (112 pt home orb, 30 pt head).
+  /* 3.8 look (user's request, replaces the "keep the orb unchanged" rule): a white face and black eyes in an amber ring.
+     3.8.1: the ring is the thick pre-3.8 amber disc again (the 3.8 ring was too thin): #C87618 with the warm glow from the
+     top and the faint white rim, the white ball inside it at 72.4 % of the radius (band 27.6 % of the radius, at least
+     2.5px), the same at every size (112 pt home orb, 30 pt head) and in dark mode (face a touch warmer).
      The engine's body is white (AiwMood.LOOK), so the red / pink emotion bodies are gone; expressions are unchanged.
-     Dark mode: the same white face (a touch warmer) and a brighter amber ring, so it stays legible on a dark page.
      ?ring=amber is kept for old callers (same look); ?bg=0: no ring or fill. */
   #m { --mate-fill: #FFFFFF; --mate-ring: #C87618; --sketch-ink: rgba(26,26,26,.85);
-       position: absolute; inset: 0; box-sizing: border-box; border-radius: 50%; padding: 10%; color-scheme: light;
-       background: radial-gradient(circle closest-side, var(--mate-fill) 0, var(--mate-fill) 90.5%, var(--mate-ring) 92%, var(--mate-ring) 100%, transparent 100.5%); }
-  @media (prefers-color-scheme: dark) { #m { --mate-fill: #F7F4EE; --mate-ring: #E8A050; } }
-  #m.nobg { background: transparent; padding: 0; }
-  #m > svg { filter: drop-shadow(0 1.5px 2px rgba(120,70,10,.22)); }
+       --mate-ring-w: max(13.8%, 2.5px);
+       position: absolute; inset: 0; box-sizing: border-box; border-radius: 50%; color-scheme: light;
+       /* the engine's ball is 88.26 % of its SVG: this padding puts the ball's edge on the ring's inner edge */
+       padding: calc(50% - (50% - var(--mate-ring-w)) / 0.8826);
+       background:
+         radial-gradient(circle closest-side, var(--mate-fill) 0, var(--mate-fill) calc(100% - max(27.6%, 2.5px) - .5px), transparent calc(100% - max(27.6%, 2.5px))),
+         radial-gradient(circle at 50% 36%, rgba(255,214,150,.38), rgba(255,190,110,.10) 50%, transparent 72%),
+         var(--mate-ring);
+       box-shadow: inset 0 0 0 1px rgba(255,255,255,.16); }
+  @media (prefers-color-scheme: dark) { #m { --mate-fill: #F7F4EE; } }
+  #m.nobg { background: transparent; box-shadow: none; padding: 0; }
+  #m > svg { filter: drop-shadow(0 2px 3px rgba(90,40,0,.45)); }
 </style>
 </head>
 <body>

@@ -71,3 +71,30 @@ def test_ios_mate_head_is_white_with_amber_ring():
     head = swift[swift.index("struct MateHead"):]
     assert "strokeBorder" in head and "Color.white" in head and "MateHead.eye" in head
     assert "0xF6 / 255" not in head   # the old cream ball on the amber disc
+
+
+def test_381_ring_is_the_thick_pre_38_disc():
+    """3.8.1: the 3.8 ring (~9 % of the radius) was too thin; the band is the old amber disc again: 27.6 % of the radius
+    (the ball at 72.4 %: old 9 % inset x the engine's ball at 88.26 % of its SVG), at least 2.5px, with the old glow."""
+    css = (WEB / "mate.css").read_text(encoding="utf-8")
+    page = (WEB / "mate.html").read_text(encoding="utf-8")
+    for src in (css, page):
+        assert "max(13.8%, 2.5px)" in src and "max(27.6%, 2.5px)" in src and "/ 0.8826" in src
+        assert "rgba(255, 214, 150, 0.38)" in src or "rgba(255,214,150,.38)" in src   # the old disc's warm glow
+        assert "89.5%" not in src and "90.5%" not in src   # the thin 3.8 ring stops
+    assert "--mate-pad: 6%" not in css and "--mate-pad: 11%" not in css   # every size follows the ring
+    home = (WEB / "home.css").read_text(encoding="utf-8")
+    assert "--mate-pad:10%" not in home
+    swift = (ROOT / "apps" / "ios" / "Sources" / "MateView.swift").read_text(encoding="utf-8")
+    head = swift[swift.index("struct MateHead"):]
+    assert "max(2.5, s * 0.138)" in head and "s - 2 * MateHead.ringWidth(s)" in head
+    assert "s * 0.05" not in head and "ringDark" not in head   # the thin 3.8 stroke and its dark variant are gone
+    # the engine's blob ball really is 88.26 % of its viewBox (114.27 of 129.5), so the ball edge meets the ring
+    rings = (WEB / "vendor" / "emotionball" / "rings.js").read_text(encoding="utf-8")
+    assert "viewBox" in (WEB / "vendor" / "emotionball" / "ball.js").read_text(encoding="utf-8") and "[228.54,114.27]" in rings
+
+
+def test_381_ios_version():
+    for p in ("Info.plist", "Share/Info.plist"):
+        pl = (ROOT / "apps" / "ios" / p).read_text(encoding="utf-8")
+        assert "<string>3.8.1</string>" in pl and "<key>CFBundleVersion</key><string>22</string>" in pl

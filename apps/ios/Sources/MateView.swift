@@ -167,33 +167,41 @@ struct MateAvatar: View {
     }
 }
 
-/// The 球球 head as the bundled mate.html draws it (3.8 look, still idle face e=02): an amber ring, a white face, the two
-/// black eyes of the idle face up and to the right. The ring is 9 % of the radius (mate.html: the fill ends at 90.5 % of
-/// the radius); the ball inside is white with the engine's light-from-the-upper-left shading (#FFF → #FFF → #E0E0E0) and
-/// a soft warm shadow; eyes at 57 % / 36 % and 71 % / 33 % of the side, tilted about 25° (measured from the page's render).
-/// Dark mode keeps it white (a touch warmer) with a brighter ring, so it stays legible on a dark background.
+/// The 球球 head as the bundled mate.html draws it (still idle face e=02): a white face with the two black eyes of the
+/// idle face up and to the right, in an amber ring. 3.8.1: the ring is the thick pre-3.8 amber disc again (the user found
+/// the thin 3.8 ring too thin): #C87618 with the warm glow from the top (50 % / 36 %), a faint white rim, and the white
+/// ball (engine shading #FFF → #FFF → #E0E0E0, light from the upper left) at 72.4 % of the radius with the old warm drop
+/// shadow, so the band is 27.6 % of the radius (`ringWidth`, never under 2.5 pt) at every size, like mate.html / mate.css.
+/// Eyes at 57 % / 36 % and 71 % / 33 % of the side, tilted about 25° (measured from the page's render). Dark mode: the same
+/// ring and glow, the face a touch warmer white. `face: false` (球球 turned off) is the ring with a plain face.
 struct MateHead: View {
     var size: CGFloat
     var face = true
     @Environment(\.colorScheme) private var cs
-    static let ringLight = Color(red: 0xC8 / 255, green: 0x76 / 255, blue: 0x18 / 255)
-    static let ringDark = Color(red: 0xE8 / 255, green: 0xA0 / 255, blue: 0x50 / 255)
+    static let ring = Color(red: 0xC8 / 255, green: 0x76 / 255, blue: 0x18 / 255)
     static let eye = Color(red: 0x1A / 255, green: 0x1A / 255, blue: 0x1A / 255)
+    /// band width: 27.6 % of the radius (13.8 % of the side), at least 2.5 pt
+    static func ringWidth(_ s: CGFloat) -> CGFloat { max(2.5, s * 0.138) }
     var body: some View {
         let s = size
+        let ball = s - 2 * MateHead.ringWidth(s)
         let fill = cs == .dark ? Color(red: 0xF7 / 255, green: 0xF4 / 255, blue: 0xEE / 255) : Color.white
         ZStack {
-            Circle().fill(fill)
-            Circle().strokeBorder(cs == .dark ? MateHead.ringDark : MateHead.ringLight, lineWidth: max(1.5, s * 0.05))
+            Circle().fill(MateHead.ring)
+            Circle().fill(RadialGradient(colors: [Color(red: 1, green: 214 / 255, blue: 150 / 255).opacity(0.38),
+                                                  Color(red: 1, green: 190 / 255, blue: 110 / 255).opacity(0.10), .clear],
+                                         center: UnitPoint(x: 0.5, y: 0.36), startRadius: 0, endRadius: s * 0.62))
+            Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: max(0.5, s / 96))
+            Circle()
+                .fill(face ? AnyShapeStyle(RadialGradient(stops: [.init(color: fill, location: 0),
+                                                                  .init(color: fill, location: 0.62),
+                                                                  .init(color: Color(white: 0xE0 / 255), location: 1)],
+                                                          center: UnitPoint(x: 0.38, y: 0.32), startRadius: 0, endRadius: ball * 0.75))
+                                : AnyShapeStyle(fill))
+                .frame(width: ball, height: ball)
+                .shadow(color: Color(red: 90 / 255, green: 40 / 255, blue: 0).opacity(0.45), radius: max(0.5, s * 0.03), y: s * 0.02)
+                .position(x: s * 0.5, y: s * 0.5)
             if face {
-                Circle()
-                    .fill(RadialGradient(stops: [.init(color: .white, location: 0),
-                                                 .init(color: .white, location: 0.62),
-                                                 .init(color: Color(white: 0xE0 / 255), location: 1)],
-                                         center: UnitPoint(x: 0.38, y: 0.32), startRadius: 0, endRadius: s * 0.78 * 0.75))
-                    .frame(width: s * 0.78, height: s * 0.78)
-                    .shadow(color: Color(red: 120 / 255, green: 70 / 255, blue: 10 / 255).opacity(0.22), radius: max(0.5, s * 0.025), y: s * 0.015)
-                    .position(x: s * 0.5, y: s * 0.5)
                 Capsule().fill(MateHead.eye)
                     .frame(width: s * 0.105, height: s * 0.235)
                     .rotationEffect(.degrees(-26))

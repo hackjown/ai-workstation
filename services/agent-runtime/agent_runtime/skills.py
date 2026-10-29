@@ -80,7 +80,22 @@ CATALOG: list[dict] = [
     {"id": "librecad", "title": "LibreCAD 制图", "icon": "ruler",
      "desc": "按设计图和报价单画施工图，导出 DXF / PDF",
      "path": "", "setup": "bash ~/ai-workstation/deploy/vm/librecad-setup.sh",
-     "note": "Use the built-in cad_draw / cad tools for the drawing; LibreCAD is only for viewing."},
+     "note": ("New drawings follow the cad-drawing method: read each dimension chain with drawing_read, write "
+              "cad/spec.json, generate with drawing_build. LibreCAD (cad_command) is the viewer and the editor for "
+              "small manual tweaks only.")},
+    {"id": "cad-drawing", "title": "照图出图 CAD", "icon": "ruler",
+     "desc": "照着照片或描述画技术图纸（户型/施工图、零件、接线/流程图）：精读尺寸 → 结构化 spec → 自动生成 DXF/PNG → 叠图核对",
+     "path": "~/.claude/skills/cad-drawing",
+     "auto": (r"施工图|装修图|平面图|立面图|户型图|剖面图|大样图|节点图|零件图|机械图|接线图|电气图|电路图|天花图|"
+              r"(?<![a-z])cad(?![a-z])|librecad|\.dxf|(画|绘|出|重画|照着)[^，。,\n]{0,8}(图纸|流程图|框图|示意图)"),
+     "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/cad-drawing-setup.sh "
+               "-o /tmp/cds.sh && bash /tmp/cds.sh"),
+     "note": ("drawing_build installs the kit by itself (~/workspace/.aiw/cad-drawing/drawkit.py, ezdxf and a Chinese "
+              "font) on first use. Follow its checklist A-E: drawing_read one chain at a time (two reads must agree, "
+              "opposite chains must add up, `drawkit.py fit` checks each number against its tick spacing), the spec in "
+              "cad/spec.json (rooms from the image labels, never a template), drawing_build to regenerate the whole "
+              "drawing (never ERASE patches), the overlay + report checks, at most 3 fix rounds, then report what is "
+              "uncertain.")},
     {"id": "photocraft", "title": "PhotoCraft 修图", "icon": "image",
      "desc": "不用 AI 的精确修图：裁剪、改尺寸、调色、曲线、锐化、模糊、文字、PSD，可批量",
      "path": "", "auto": r"photocraft",

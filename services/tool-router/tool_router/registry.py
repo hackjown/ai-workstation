@@ -134,8 +134,32 @@ TOOLS: list[ToolSpec] = [
               "keep": {"type": "boolean", "description": "keep working on the documents already open"},
               "info": {"type": "boolean", "description": "return documents and layers (after the script)"},
               "timeout": {"type": "integer", "description": "seconds per step, default 90"}}, []),
+    ToolSpec("drawing_read", None,
+             "Read ONE region of a source drawing/photo rigorously: it is cropped and enlarged (a vertical dimension chain "
+             "is turned to read left->right) and read by the vision model TWICE, asked two ways; a third larger read only "
+             "when they disagree. kind='chain' returns the dimension numbers in reading order (left->right, or top->bottom "
+             "for a vertical chain) with the total, or a CONFLICT to re-read; kind='text' returns the labels both reads "
+             "saw. Use one call per dimension chain (top, bottom, left, right, inner rows), never a whole-photo question.",
+             {"path": {"type": "string", "description": "source image relative to ~/workspace, e.g. uploads/photo.jpg"},
+              "box": {"type": "array", "items": {"type": "number"},
+                      "description": "[x0,y0,x1,y1] in the image's pixels: just the chain (its line, ticks and numbers) or one room"},
+              "kind": {"type": "string", "enum": ["chain", "text"]},
+              "question": {"type": "string", "description": "optional extra hint, e.g. '共 6 段'"}}, ["path", "box"]),
+    ToolSpec("drawing_build", None,
+             "Generate the WHOLE drawing deterministically from a structured spec (JSON, schema in the cad-drawing skill: "
+             "floor_plan rooms/doors/windows/furniture/dimension chains, diagram nodes/edges, or generic entities/dims). "
+             "Writes <out>/<name>.dxf (+ a LibreCAD viewing copy, opened on the desktop), <name>.png, overlay.png (the "
+             "result drawn on the source photo with the pixel->mm fit of the dimension ticks) and report.json, and returns "
+             "the automatic checks: opposite chains add up, each written number fits its measured tick spacing, no text "
+             "overlap (computed from text boxes), every room labelled, walls closed, doors/windows on walls. To change "
+             "the drawing, change the spec and call again (at most 3 fix rounds); never ERASE or retype it.",
+             {"spec": {"type": "string", "description": "spec path relative to ~/workspace (default cad/spec.json)"},
+              "content": {"type": "string", "description": "optional: the full spec JSON, saved to `spec` first"},
+              "name": {"type": "string", "description": "output file name without extension (default plan)"},
+              "out": {"type": "string", "description": "output folder (default the spec's folder)"},
+              "source": {"type": "string", "description": "optional source image, overrides spec.source.image"}}, []),
     ToolSpec("cad_command", None,
-             "Draw in the LibreCAD window on the desktop, like a draftsman typing at its command line. Each item of "
+             "Manual edits in the LibreCAD window (NEW drawings: write a spec and use drawing_build), typed like a draftsman at its command line. Each item of "
              "`commands` is typed into LibreCAD's command line and followed by Enter, in order; the user watches it. "
              "Units are mm at 1:1. Examples: ['line','0,0','6000,0','6000,10000','0,10000','0,0','ESC'], "
              "['rectangle','0,0','@1500,150'], ['circle','3000,750','350'], ['polyline','0,0','@1000,0','@0,500','ESC'], "
@@ -144,7 +168,7 @@ TOOLS: list[ToolSpec] = [
              "'FRAME|n|图名|图号|1:50|工程名称' (A3 frame + title block of sheet n at x=n*25000; the points after it may be "
              "sheet-local 0..21000 and are moved onto sheet n), 'SHEET|n' (continue on sheet n), 'NOTE|x,y|175|行1;行2', "
              "'DIMH|y_measured|y_dimline|x1,x2,...' / 'DIMV|x_measured|x_dimline|y1,y2,...' (dimension chains), "
-             "'LEADER|x1,y1|x2,y2|175|材料', (drawing area sheet-local x 1250..20500, y 500..14350; title block x>11500,y<2500; a batch with points outside, in the title block, overlapping texts or unknown commands is sent back untyped), 'SAVE|cad/name.dxf', 'PDF|cad/name.dxf|cad/name.pdf' (LibreCAD dxf2pdf, a page "
+             "'LEADER|x1,y1|x2,y2|175|材料', (drawing area sheet-local x 1250..20500, y 500..14350; title block x>11500,y<2500; a batch with points outside the border, in the title block or with unknown commands is sent back untyped; text overlaps are reported as warnings), 'SAVE|cad/name.dxf', 'PDF|cad/name.dxf|cad/name.pdf' (LibreCAD dxf2pdf, a page "
              "per sheet). Send a whole sheet (100-200 items) per call. Items already drawn in this task are skipped, so resending a failed sheet only types what is missing. Never type a bare 'text'.",
              {"commands": {"type": "array", "items": {"type": "string"}},
               "open": {"type": "string", "description": "optional .dxf path relative to ~/workspace to open first"}},
@@ -279,7 +303,7 @@ BY_NAME = {t.name: t for t in TOOLS}
 BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "read_image", "photopea", "image_edit"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "read_image", "photopea", "image_edit"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

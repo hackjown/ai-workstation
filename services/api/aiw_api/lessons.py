@@ -67,6 +67,23 @@ EXTRACT_PROMPT = """你是 Aiw 的经验整理员（LESSONS）。Aiw 是在用�
 没有值得记的就输出 {{"lessons": []}}。"""
 
 
+# 3.8.7: drawing lessons from task-a12 (a floor plan redrawn from a sales photo, 187 steps, stopped by the user)
+SEED_MARK = "lessons_seeded_v1"
+SEED = [
+    ("skill", "cad-drawing", "照片读尺寸：一次问整张图的所有尺寸，两次答案不同（9300/9500），还编出九宫格布局",
+     "drawing_read 一条尺寸链一条链地放大读两遍，两遍一致才用；对边链总和必须相等；drawkit.py fit 用刻度像素核对每段"),
+    ("skill", "cad-drawing", "小图上的数字容易看错：3900 像 3000、1000 像 1600、两段 600 被当成一段",
+     "竖向链旋转成横排放大 6–10 倍再读；fit 报某段写的数与量出的长度差 >20% 就只重读那一段"),
+    ("skill", "cad-drawing", "用户转述的尺寸链与原图不一致",
+     "以原图为准（两遍读 + 刻度核对），交付时列出与用户所给数字不同之处"),
+    ("skill", "cad-drawing", "每一版布局都不一样，房间位置来回变",
+     "房间只取图上的文字标签和像素位置，按拟合比例换成 mm 吸附到轴线，写进 cad/spec.json；之后只改 spec 里那一项"),
+    ("skill", "cad-drawing", "在 LibreCAD 里逐批手打坐标，几十步在挪文字、用 ERASE 打补丁留下孤立图元",
+     "写 spec，用 drawing_build 整张重新生成（文字位置自动避让、缩字号）；LibreCAD 只用来看和小改"),
+    ("skill", "cad-drawing", "核对只靠视觉模型说“基本一致”",
+     "看 drawing_build 的 report.json（errors 必须为空）和 overlay.png 叠图，再用 read_image 针对性问一次；最多 3 轮，之后报告不确定项"),
+]
+
 SECRET_VALUE_RE = re.compile(
     r"((密码|口令|passw(or)?d|pwd|验证码|校验码|动态码|token|api[ _-]?key|secret|私钥|cvv|cvc|支付密码)\s*(是|为|[:：=])\s*\S{3,}|"
     r"sk-[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{10,}|xox[abp]-|AKIA[0-9A-Z]{12,}|-----BEGIN|"
@@ -130,6 +147,24 @@ class Lessons:
         self.llm = llm          # role -> router (chat.Chat.llm); "small" extracts
         self._lock = asyncio.Lock()
         ensure_table(store)
+        try:
+            self.seed()
+        except Exception as e:  # noqa: BLE001
+            log.warning("seeding lessons failed: %s", e)
+
+    def seed(self) -> int:
+        """Built-in lessons, written once (kv lessons_seeded_v1), so the user may delete them for good."""
+        try:
+            if self.store.kv_get(SEED_MARK):
+                return 0
+        except Exception:  # noqa: BLE001
+            return 0
+        n = 0
+        for scope, key, problem, fix in SEED:
+            if self.add(scope, key, problem, fix, "auto"):
+                n += 1
+        self.store.kv_set(SEED_MARK, {"at": time.time(), "n": n})
+        return n
 
     # ------------------------------------------------------------------ rows
     def items(self, scope: Optional[str] = None, q: Optional[str] = None, limit: int = 300) -> list[dict]:

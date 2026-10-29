@@ -23,6 +23,7 @@ from tool_router import ToolExecutor, tool_schemas
 from tool_router.registry import BOS_TOOLS, SUBAGENT_TOOLS
 
 from . import cad as _cad
+from . import drawing as _draw
 from . import video as _video
 from . import image_edit as _ie
 from . import image_brief as _ib
@@ -74,6 +75,9 @@ class AgentLoop:
         self.control = control or AgentControl()
         self.cfg = config or LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s)
         self._cad_mode = _cad.cad_mode(task.prompt, task.context)  # fresh | revise | None
+        self._draw_rounds = 0          # drawing_build runs (3.8.7 pipeline; at most _draw.MAX_ROUNDS fix rounds)
+        self._drawkit_ready = None     # kit version installed on the computer this task
+        self._drawkit_built = False    # the drawing in cad/ was generated from a spec (layout check bypassed)
         self._cad_task = self._cad_mode is not None
         self._cad_file: Optional[str] = None  # the DXF this task saves to (a revision edits it in place)
         if self._cad_task and config is None:  # drawing a set in the GUI takes hundreds of steps
@@ -434,7 +438,22 @@ class AgentLoop:
 
     async def _cad_revise_start(self):
         """A follow-up in a drawing thread fixes the drawing that exists: open the newest DXF in cad/ in LibreCAD,
-        remember its texts for the layout check, and tell the model to change only what the user named."""
+        remember its texts for the layout check, and tell the model to change only what the user named.
+        3.8.7: when the drawing was generated from a spec (cad/*spec*.json), a revision edits the spec and regenerates."""
+        try:
+            r = await self.tools.run("shell", {"command": 'cd "${VM_AGENT_FILES_ROOT:-$HOME/workspace}" 2>/dev/null && ls -t '
+                                               + _cad.CAD_DIR + '/*spec*.json 2>/dev/null | head -1', "timeout": 20},
+                                     intent="find the drawing spec to revise")
+            spec = ((r.result or {}).get("stdout") or "").strip() if isinstance(r.result, dict) else ""
+        except Exception:  # noqa: BLE001
+            spec = ""
+        if spec:
+            self.history.append(
+                f"0. REVISION of a GENERATED drawing: its spec is {spec}. files_read it, change only what the user named "
+                "(re-read the source with drawing_read where they say it does not match the photo), files_write the "
+                f"corrected spec, then drawing_build spec={spec}: the whole drawing is regenerated and checked. Never "
+                "ERASE or retype on the canvas. Then send_file the PNG and DXF and done listing each change.")
+            return
         find = ('cd "${VM_AGENT_FILES_ROOT:-$HOME/workspace}" 2>/dev/null && ls -t ' + _cad.CAD_DIR +
                 '/*.dxf 2>/dev/null | grep -v -e "_view" -e "/_" | head -1')
         try:
@@ -461,7 +480,10 @@ class AgentLoop:
             pass
         self.history.append(
             f"0. REVISION of the existing drawing {self._cad_file} (now open in LibreCAD, {len(texts)} texts on it). "
-            "Change ONLY what the user asked; never redraw a sheet or a FRAME. Per fix: cad_command ['SHEET|n', "
+            "If the user says it does not match the source / the layout or dimensions are wrong / many overlaps, do NOT "
+            "patch it: redo it with the drawing pipeline (drawing_read each dimension chain, write cad/spec.json, "
+            "drawing_build) and deliver the regenerated drawing. Only for a small named fix (move one label, change "
+            "one text) edit in place: change ONLY what the user asked; never redraw a sheet or a FRAME. Per fix: cad_command ['SHEET|n', "
             "'LIST|x1,y1|x2,y2'] to see what is there, then ['SHEET|n', 'ERASE|x1,y1|x2,y2' (deletes everything lying "
             "fully inside the window: check the ERASED list it returns) or 'ERASETEXT|exact whole text|x1,y1|x2,y2' (one "
             "label; the window is needed when the text occurs more than once), then the corrected items]. Labels, walls "
@@ -679,9 +701,9 @@ class AgentLoop:
                 await self.emit(EventType.VALIDATION, success=False, change=0.0,
                                 message="拒绝 done：图纸还没画完/没保存发送")
                 self.history.append(f"{self.step}. done REJECTED: the drawing set is not finished, saved and sent")
-                note = ("REJECTED: the drawings are not finished. Every sheet the user listed must be drawn in LibreCAD, "
-                        "saved as DXF via File > Save As, and sent with send_file before done. Continue with the next "
-                        "unfinished sheet in cad/plan.md now (cad_command). If you have no plan yet, write it first.")
+                note = ("REJECTED: the drawings are not finished. Every sheet the user asked for must be generated "
+                        "(cad/spec.json -> drawing_build) and its PNG + DXF sent with send_file before done. Continue with "
+                        "the next unfinished sheet now. If you have no spec yet, read the source and write it first.")
                 continue
             if (decision.tool == "done" and self._cad_task and self._sent_file and self._done_rejects < 6
                     and self.step < self._cap() - 3 and (not self._cad_pdf_ok or self._sheet_audit.get("thin"))):
@@ -695,8 +717,9 @@ class AgentLoop:
                         "full content from cad/plan.md: geometry, every panel/component, dimension chains (DIMH/DIMV), "
                         "material leaders (LEADER), notes (NOTE), view title. Draw what is missing, then SAVE, PDF and "
                         "send_file both again." if thin else
-                        "REJECTED: export the PDF with cad_command ['SAVE|cad/<name>.dxf', 'PDF|cad/<name>.dxf|cad/<name>.pdf'] "
-                        "(LibreCAD's own dxf2pdf, one A3 page per sheet); soffice mangles DXF. Then send_file the PDF.")
+                        "REJECTED: the drawing was not generated and checked. Generate it with drawing_build from "
+                        "cad/spec.json (or, for a drawing typed in LibreCAD, export with cad_command ['SAVE|cad/<name>.dxf', "
+                        "'PDF|cad/<name>.dxf|cad/<name>.pdf']; soffice mangles DXF). Then send_file the result.")
                 self._after_send = 0
                 continue
             if (decision.tool == "fail" and str(decision.args.get("reason") or "").startswith("model returned no tool call")
@@ -994,9 +1017,13 @@ class AgentLoop:
         if t == "cad_draw":
             if not _cad.script_drawing_allowed(self.task.prompt):
                 await self.emit(EventType.ACTION_RESULT, tool=t, success=False, error="script drawing not allowed", result={})
-                return ("REFUSED: the user did not ask for a script. Draw in the LibreCAD window instead: cad_command "
-                        "with LibreCAD commands (line, rectangle, circle, dimhorizontal...), text/layers/save via its dialogs.")
+                return ("REFUSED: cad_draw is only for a script the user asked for. Write the drawing as a spec "
+                        "(cad/spec.json, schema in the cad-drawing skill) and generate it with drawing_build.")
             return await self._cad_draw(a, decision.thought)
+        if t == "drawing_read":
+            return await self._drawing_read(a)
+        if t == "drawing_build":
+            return await self._drawing_build(a, decision.thought)
         if t == "cad_command":
             return await self._cad_command(a, decision.thought)
         if t == "shell" and self._cad_task and _LIBRECAD_PROC.search(str(a.get("command") or "")):
@@ -1394,8 +1421,16 @@ class AgentLoop:
             drawn = [d for d in drawn if d[1] not in dup]
         bad = [c[5:] for c in cmds if c.startswith("#BAD ")]
         issues, boxes = _cad.layout_issues(drawn, self._cad_text_boxes)
+        if self._drawkit_built:
+            # a generated drawing already passed drawkit's geometric checks; a manual tweak on it is the user's call
+            issues = [i for i in issues if any(h in i for h in _cad._HARD)]
+        # 3.8.7: only commands LibreCAD cannot take and geometry off the sheet / in the title block send a batch back.
+        # Text overlap and the like are warnings: in task-a12, 35 of 122 batches were rejected for label overlap and
+        # the agent spent dozens of steps nudging labels instead of drawing.
+        hard = [i for i in issues if any(h in i for h in _cad._HARD)]
         key = self._cad_sheet
-        if (bad or issues) and self._cad_rejects.get(key, 0) < int(os.environ.get("AIW_CAD_MAX_REJECTS", "2")):
+        if (bad or hard) and self._cad_rejects.get(key, 0) < int(os.environ.get("AIW_CAD_MAX_REJECTS", "2")):
+            issues = hard + [i for i in issues if i not in hard]
             # checked before typing: a misplaced or unreadable batch is cheaper to fix in the plan than on the canvas
             self._cad_rejects[key] = self._cad_rejects.get(key, 0) + 1
             self._cad_sheet = sheet_before
@@ -2030,6 +2065,167 @@ class AgentLoop:
                         result={"path": path, "chars": len(text or "")})
         self._images_read[path] = (self.step, (text or "").strip(), q0)
         return f"image {path} reads:\n{(text or '').strip()[:3500]}"
+
+    # ---- 3.8.7 drawing pipeline: drawing_read (one region, read twice) and drawing_build (spec -> whole drawing) ----
+    async def _load_ws_image(self, path: str):
+        f = await self.tools.run("send_file", {"path": path})
+        if not f.success or not isinstance(f.result, dict) or not f.result.get("content_b64"):
+            return None, f"cannot read {path} ({f.error})"
+        try:
+            return Image.open(io.BytesIO(base64.b64decode(f.result["content_b64"]))).convert("RGB"), None
+        except Exception as e:  # noqa: BLE001
+            return None, f"{path} is not an image ({e})"
+
+    async def _drawing_read(self, a: dict) -> str:
+        """Zoom one region of the source (a dimension chain, a room, a label) and read it with the vision model TWICE,
+        asked two different ways; a third, larger read only when they disagree. Never a guess: a disagreement comes
+        back as a conflict to re-read. In task-a12 whole-photo questions gave 9300 one time and 9500 the next."""
+        path = _ws_rel((a.get("path") or "").strip().lstrip("/"))
+        box = a.get("box") or a.get("region")
+        kind = str(a.get("kind") or "chain")
+        if not path or not (isinstance(box, (list, tuple)) and len(box) == 4):
+            await self.emit(EventType.ACTION_RESULT, tool="drawing_read", success=False, error="missing path/box", result={})
+            return ("FAILED: drawing_read needs `path` (the source image) and `box` [x0,y0,x1,y1] in the image's pixels "
+                    "(one dimension chain, one room or one label; read_image grid=true shows pixel coordinates).")
+        img, err = await self._load_ws_image(path)
+        if img is None:
+            await self.emit(EventType.ACTION_RESULT, tool="drawing_read", success=False, error=err, result={})
+            return "FAILED: " + err
+        try:
+            crop, vertical, k = _draw.crop_zoom(img, [float(v) for v in box], kind)
+        except ValueError as e:
+            await self.emit(EventType.ACTION_RESULT, tool="drawing_read", success=False, error=str(e), result={})
+            return f"FAILED: {e}"
+        eyes = self.vision_llm or self.llm
+        sysmsg = "你是严谨的工程制图读图员。只读图上真实存在的内容，不推测，只输出要求的 JSON。"
+        extra = (" " + str(a.get("question")).strip()) if a.get("question") else ""
+
+        async def ask(q, im):
+            try:
+                return await _retry_once(lambda: asyncio.wait_for(eyes.describe(sysmsg, q + extra, _draw.jpeg_b64(im), 600),
+                                                                  self.cfg.vision_timeout_s * 2))
+            except Exception as e:  # noqa: BLE001
+                return f"(read failed: {type(e).__name__})"
+        if kind == "chain":
+            t1, t2 = await asyncio.gather(ask(_draw.CHAIN_Q[0], crop), ask(_draw.CHAIN_Q[1], crop))
+            reads = [_draw.numbers_from(t1), _draw.numbers_from(t2)]
+            v = _draw.chain_verdict(reads, vertical)
+            if not v.get("ok"):
+                big, _, _ = _draw.crop_zoom(img, [float(x) for x in box], kind, target=2600)
+                reads.append(_draw.numbers_from(await ask(_draw.CHAIN_Q[2], big)))
+                v = _draw.chain_verdict(reads, vertical)
+            self._acted = True
+            await self.emit(EventType.ACTION_RESULT, tool="drawing_read", success=bool(v.get("ok")), error=None,
+                            result={"path": path, "box": list(box), "zoom": k, "vertical": vertical, **v})
+            order = "top->bottom" if vertical else "left->right"
+            self.history.append(f"{self.step}. drawing_read {path} {list(box)}: {v.get('reads')} -> "
+                                f"{'AGREED ' + str(v.get('values')) if v.get('ok') else 'CONFLICT'}")
+            if v.get("ok"):
+                return (f"chain {list(box)} ({order}, zoom x{k}): values {v['values']}, total {v['total']} mm. "
+                        f"Independent reads agree: {v['reads']}. Put them in the spec chain with reads={v['reads'][:2]} "
+                        "and box_px set to this box; then check opposite chains add up to the same total.")
+            return (f"CONFLICT on chain {list(box)} ({order}, zoom x{k}): the reads differ {v['reads']}"
+                    + (f" at positions {v['differ_at']}" if v.get("differ_at") else "") +
+                    ". Do NOT pick one. Re-read with a tighter box around the differing segment(s) (a few tick marks "
+                    "only), and let `drawkit.py fit` measure the segment lengths from the tick pixels: a number that "
+                    "does not fit its measured length is the misread one.")
+        qs = _draw.TEXT_Q
+        t1, t2 = await asyncio.gather(ask(qs[0], crop), ask(qs[1], crop))
+        r1, r2 = _draw.texts_from(t1), _draw.texts_from(t2)
+        both = [t for t in r1 if t in r2]
+        only = sorted(set(r1) ^ set(r2))
+        self._acted = True
+        await self.emit(EventType.ACTION_RESULT, tool="drawing_read", success=True, error=None,
+                        result={"path": path, "box": list(box), "texts": both, "unsure": only})
+        return (f"texts in {list(box)} (zoom x{k}), read twice: agreed {both}"
+                + (f"; seen in only one read (check again before using): {only}" if only else ""))
+
+    async def _ensure_drawkit(self) -> str | None:
+        ver = _draw.kit_version()
+        if self._drawkit_ready == ver:
+            return None
+        files = _draw.kit_files()
+        if "drawkit.py" not in files:
+            return f"drawkit.py is missing on the server ({_draw.KIT_DIR})"
+        r = await self.tools.run("shell", {"command": _draw.version_probe(), "timeout": 20}, intent="check the drawing kit")
+        have = ((r.result or {}).get("stdout") or "").strip() if isinstance(r.result, dict) else ""
+        if have != ver:
+            for rel, txt in files.items():
+                w = await self.tools.run("files_write", {"path": f"{_draw.REMOTE}/{rel}", "content": txt},
+                                         intent="install the drawing kit")
+                if not w.success:
+                    return f"could not write {rel} on the computer ({w.error})"
+        r = await self.tools.run("shell", {"command": _draw.install_command(ver), "timeout": 900},
+                                 intent="install the drawing kit dependencies (ezdxf, Chinese font) if missing")
+        if not r.success:
+            res = r.result if isinstance(r.result, dict) else {}
+            return f"drawing kit setup failed: {(res.get('stderr') or res.get('stdout') or r.error or '')[-400:]}"
+        self._drawkit_ready = ver
+        return None
+
+    async def _drawing_build(self, a: dict, intent: str) -> str:
+        """Regenerate the WHOLE drawing from its spec with drawkit.py (DXF + LibreCAD view copy + PNG + overlay on the
+        source + report.json with the geometric checks), then show it in LibreCAD. Never a patch on the canvas."""
+        spec = str(a.get("spec") or "cad/spec.json").strip().lstrip("/")
+        spec = _ws_rel(spec)
+        out = str(a.get("out") or (str(Path(spec).parent) if "/" in spec else "cad"))
+        name = _cad.safe_name(a.get("name") or "plan")
+        content = a.get("content")
+        if content is not None:
+            if isinstance(content, (dict, list)):
+                content = json.dumps(content, ensure_ascii=False, indent=1)
+            try:
+                json.loads(content)
+            except ValueError as e:
+                await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=False, error="spec is not JSON", result={})
+                return f"FAILED: `content` is not valid JSON ({e}). Fix it and call drawing_build again."
+            w = await self.tools.run("files_write", {"path": spec, "content": content}, intent="save the drawing spec")
+            if not w.success:
+                return f"FAILED: could not save {spec} ({w.error})"
+        err = await self._ensure_drawkit()
+        if err:
+            await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=False, error=err[:200], result={})
+            return f"FAILED: {err}"
+        r = await self.tools.run("shell", {"command": _draw.build_command(spec, out, name, a.get("source")), "timeout": 600},
+                                 intent=intent or "generate the drawing from the spec")
+        res = r.result if isinstance(r.result, dict) else {}
+        rep = _draw.parse_result(res.get("stdout") or "")
+        if not rep:
+            tail = ((res.get("stderr") or "") + (res.get("stdout") or ""))[-1500:]
+            await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=False, error=tail[-200:], result={})
+            return f"FAILED: drawkit could not build {spec}:\n{tail}\nFix the spec (see `drawkit.py schema`) and call again."
+        self._draw_rounds += 1
+        self._drawkit_built = True
+        self._acted = True
+        files = rep.get("files") or {}
+        rel = lambda f: f if (f.startswith(out + "/") or f.startswith("/")) else f"{out}/{f}"   # noqa: E731
+        self._cad_file = rel(files.get("dxf") or name + ".dxf")
+        if rep.get("ok") or self._draw_rounds >= _draw.MAX_ROUNDS:
+            self._cad_pdf_ok = True      # the deliverable is the generated set; no LibreCAD-typed PDF required
+            self._sheet_audit = {}
+        if self._cad_task and files.get("view_dxf"):
+            try:   # show it to the user in LibreCAD (the viewer / small-tweak editor, not the drawing engine)
+                await self._type_cad([], rel(files["view_dxf"]), "open the generated drawing in LibreCAD")
+            except Exception:  # noqa: BLE001
+                pass
+        await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=bool(rep.get("ok")), error=None,
+                        result={k: rep.get(k) for k in ("ok", "scale", "errors", "warnings", "overlay_score", "files")})
+        text = _draw.summary(rep, self._draw_rounds, out)
+        png, ov = rel(files.get("png") or name + ".png"), (rel(files["overlay"]) if files.get("overlay") else None)
+        if rep.get("ok"):
+            nxt = (f"\nNEXT: " + (f"read_image path={ov} once with a pointed question (红色墙线与照片的墙哪里没对上？哪个房间名放错了？"
+                                    f"有没有漏掉的门窗/房间？). " if ov and self._draw_rounds <= _draw.MAX_ROUNDS else "")
+                   + f"If it matches, send_file {png} and {self._cad_file} and finish with done (chains read, any numbers "
+                   "that differ from what the user said, the checks, what is still uncertain). If something is off, fix "
+                   "cad/spec.json and call drawing_build again (the whole drawing is regenerated; never ERASE).")
+        elif self._draw_rounds >= _draw.MAX_ROUNDS:
+            nxt = (f"\nSTOP ITERATING ({self._draw_rounds} rounds): send_file {png} and {self._cad_file} and finish with done, "
+                   "listing the remaining check errors and what is uncertain. Do not loop further.")
+        else:
+            nxt = ("\nNEXT: fix these in cad/spec.json (a misread chain number: re-read that chain with drawing_read; a text "
+                   "overlap: move or shorten that item, or give the room label_at), then drawing_build again.")
+        self.history.append(f"{self.step}. drawing_build {spec}: {'ok' if rep.get('ok') else str(len(rep.get('errors') or [])) + ' errors'}")
+        return text + nxt
 
     def _hidden_tools(self) -> tuple:
         hide = [] if _cad.script_drawing_allowed(self.task.prompt) else ["cad_draw"]

@@ -321,7 +321,8 @@ _SCRIPT_DRAW = re.compile(r"cad_draw|用[^，。；,;\n]{0,15}(脚本|代码|scr
                           r"|(script|python|ezdxf)[^，。；,;.\n]{0,10}(draw|generate)", re.I)
 
 
-_CAD_TASK = re.compile(r"施工图|装修图|平面图|立面图|librecad|(?<![a-z])cad(?![a-z])|dxf", re.I)
+_CAD_TASK = re.compile(r"施工图|装修图|平面图|立面图|户型图|剖面图|大样图|节点图|零件图|机械图|接线图|电气图|电路图|天花图|"
+                       r"librecad|(?<![a-z])cad(?![a-z])|dxf", re.I)
 
 
 def is_cad_task(prompt: str) -> bool:

@@ -505,7 +505,7 @@ def _raise_window():
 
 def _abs(p: str) -> str:
     p = str(p).strip()
-    for pre in ("/home/aiw/workspace/", "home/aiw/workspace/", "~/workspace/", "workspace/"):
+    for pre in ("/data/home/workspace/", "/home/user/workspace/", "/home/aiw/workspace/", "home/aiw/workspace/", "~/workspace/", "$HOME/workspace/", "workspace/"):
         if p.startswith(pre):
             p = p[len(pre):]
     p = os.path.expanduser(p)

@@ -285,6 +285,7 @@ loadSettings = async function () {
     </form>
     <div class="rows">
       ${row("记忆", "聊天和每个任务都会参考；在聊天里说「记住…」「忘掉…」也行", `<span class="small">${mems.length} 条</span>`, `<button type="button" class="btn sm" onclick="go('memory')">管理记忆 ›</button>`)}
+      ${row("Aiw 学到的经验", "做过的任务里遇到的问题和解决办法，下次直接用", "", `<button type="button" class="btn sm" onclick="go('lessons')">查看经验 ›</button>`)}
     </div>
   </section>
 

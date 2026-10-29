@@ -78,6 +78,15 @@ class TaskIn(BaseModel):
     max_steps: Optional[int] = None   # None = AIW_TASK_MAX_STEPS (default 0: no step budget)
     timeout_s: Optional[float] = None  # None = AIW_TASK_TIMEOUT (default 0: no time budget)
     isolated: bool = False
+    new_task: bool = False             # 3.8.5: a message in a thread continues its task unless this is set
+
+class ContinueIn(BaseModel):          # 3.8.5: 继续 / 我已经上传了 / 补充要求 / 修改任务
+    text: str = ""
+    attachments: list = []
+    machine_id: Optional[str] = None
+
+class EditIn(BaseModel):
+    prompt: str
 
 class Answer(BaseModel):
     session_id: str
@@ -121,6 +130,8 @@ class UploadIn(BaseModel):
     content_b64: str
     machine_id: str = "ai-linux-001"
     local_only: bool = False      # a chat attachment: kept on the API host only (the chat reads it; a task uploads it)
+    thread_id: Optional[str] = None   # 3.8.5: which conversation / task the file is for (kept with the upload)
+    task_id: Optional[str] = None
 
 class OpenAPIIn(BaseModel):
     url: Optional[str] = None
@@ -242,6 +253,13 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     sessions.memory = mem
     app.state.memory = mem
     _memory.mount(app, mem, auth)
+    from . import lessons as _lessons   # 3.8.5 self-evolution: Aiw 学到的经验 (/api/lessons)
+    # a test's scripted llm_factory has no small model: lessons then learn by the built-in rules only
+    lessons = _lessons.Lessons(store, llm=None if llm_factory else chat.llm)
+    sessions.lessons = lessons
+    app.state.lessons = lessons
+    _lessons.mount(app, lessons, auth)
+    _uploads.ensure_table(store)
     from . import greeting as _greeting   # 球球播报 on the home screen (/api/greeting)
     _greeting.mount(app, store, chat, mem, auth)
 
@@ -255,7 +273,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             raise HTTPException(404, "machine not found")
         try:
             return await sessions.submit(body.prompt.strip(), body.machine_id, body.thread_id, max_steps=body.max_steps,
-                                         timeout_s=body.timeout_s, isolated=body.isolated)
+                                         timeout_s=body.timeout_s, isolated=body.isolated, link_thread=not body.new_task)
         except RuntimeError as e:
             raise HTTPException(409, str(e))
 
@@ -284,6 +302,54 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             return await sessions.retry(task_id)
         except KeyError:
             raise HTTPException(404)
+
+    @app.post("/api/tasks/{task_id}/continue", dependencies=[Depends(auth)])
+    async def continue_task(task_id: str, body: ContinueIn = Body(default=ContinueIn())):
+        """继续 the SAME task (3.8.5): its plan, steps done, files and attachments go with it. While it runs, the
+        words are an added instruction (or the answer to its open question)."""
+        if body.machine_id and not store.machine(body.machine_id):
+            raise HTTPException(404, "machine not found")
+        try:
+            return await sessions.continue_task(task_id, body.text, body.attachments, body.machine_id)
+        except KeyError:
+            raise HTTPException(404)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+
+    @app.post("/api/tasks/{task_id}/instruct", dependencies=[Depends(auth)])
+    async def instruct_task(task_id: str, body: ContinueIn):
+        """补充要求 while the task runs (a stopped task is continued with the words)."""
+        if not store.task(task_id):
+            raise HTTPException(404)
+        try:
+            res = await sessions.instruct(task_id, body.text)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        sessions._link_attachments(body.attachments, task_id, (store.task(task_id) or {}).get("thread_id"))
+        return res
+
+    @app.post("/api/tasks/{task_id}/edit", dependencies=[Depends(auth)])
+    async def edit_task(task_id: str, body: EditIn):
+        """修改任务: new instructions for the same task, re-run with its history, files and attachments."""
+        try:
+            return await sessions.edit_task(task_id, body.prompt)
+        except KeyError:
+            raise HTTPException(404)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/api/tasks/{task_id}/runs", dependencies=[Depends(auth)])
+    async def task_runs(task_id: str):
+        """Every run of one task (root first) + its attachments: the task page shows them as one task."""
+        from . import continuation as _cont
+        if not store.task(task_id):
+            raise HTTPException(404)
+        runs = _cont.chain(store, task_id)
+        root = runs[0] if runs else store.task(task_id)
+        ups = _uploads.for_task(store, [r["id"] for r in runs], root.get("thread_id"), [r.get("prompt") or "" for r in runs])
+        return {"root": root["id"], "instructions": _cont.instructions(store, root), "runs": runs,
+                "attachments": [{"name": u["name"], "size": u["size"], "vm_path": f"~/workspace/uploads/{u['name']}",
+                                 "kind": u.get("kind")} for u in ups]}
 
     @app.delete("/api/tasks/{task_id}", dependencies=[Depends(auth)])
     async def cancel_task(task_id: str):
@@ -346,6 +412,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             raise HTTPException(404)
         tasks = store.thread_tasks(tid)
         for t in tasks:
+            if t.get("continues"):   # 3.8.5: a 继续 / 修改 run of the task above (shown as the same task)
+                t["run_mode"] = (store.kv_get(f"task_run:{t['id']}", {}) or {}).get("mode") or "continue"
             sid = t.get("session_id")
             t["files"] = [a for a in store.artifacts(sid) if a["kind"] == "file"] if sid else []
             live = sessions.live.get(sid) if sid else None
@@ -360,7 +428,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if th.get("parent_thread_id"):
             pt = store.thread(th["parent_thread_id"]) or {}
             th["parent_title"] = pt.get("title")
-        return {**th, "tasks": tasks, "queue_held": tid in sessions.held_threads}
+        roots = [t for t in tasks if not t.get("continues")]
+        instr = {r["id"]: store.kv_get(f"task_instructions:{r['id']}") for r in roots}
+        ups = [{"name": u["name"], "size": u["size"], "vm_path": f"~/workspace/uploads/{u['name']}", "task_id": u.get("task_id")}
+               for u in _uploads.thread_uploads(store, tid)]
+        return {**th, "tasks": tasks, "queue_held": tid in sessions.held_threads, "attachments": ups,
+                "instructions": {k: v for k, v in instr.items() if v}}   # 修改任务: the task's current instructions
 
     @app.get("/api/threads", dependencies=[Depends(auth)])
     async def threads(archived: bool = False):
@@ -1068,11 +1141,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         local = _uploads.local_path(settings.artifacts_dir, name)
         with open(local, "wb") as f:
             f.write(raw)
-        return await _upload_done(name, local, len(raw), body.machine_id, body.local_only)
+        return await _upload_done(name, local, len(raw), body.machine_id, body.local_only, body.thread_id, body.task_id)
 
     # the + sheet's photos / videos / files: the body IS the file (no base64), streamed to disk
     @app.post("/api/uploads/raw", dependencies=[Depends(auth)])
-    async def upload_raw(request: Request, name: str, machine_id: str = "ai-linux-001", local_only: bool = False):
+    async def upload_raw(request: Request, name: str, machine_id: str = "ai-linux-001", local_only: bool = False,
+                         thread_id: Optional[str] = None, task_id: Optional[str] = None):
         name = _uploads.clean_name(name)
         cap = _uploads.RAW_MAX_MB * _uploads.MB
         local = _uploads.local_path(settings.artifacts_dir, name)
@@ -1093,12 +1167,16 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if not size:
             os.remove(local)
             raise HTTPException(400, "empty file")
-        return await _upload_done(name, local, size, machine_id, local_only)
+        return await _upload_done(name, local, size, machine_id, local_only, thread_id, task_id)
 
-    async def _upload_done(name: str, local: str, size: int, machine_id: str, local_only: bool) -> dict:
+    async def _upload_done(name: str, local: str, size: int, machine_id: str, local_only: bool,
+                           thread_id: Optional[str] = None, task_id: Optional[str] = None) -> dict:
         kind = "video" if name.lower().endswith(_uploads.VIDEO_EXT) else ""
+        # 3.8.5: every upload stays on the API host and is recorded, so any later run on any computer gets it
+        rec = _uploads.record(store, name, local, size, kind, thread_id or None, task_id or None,
+                              machine_id=None if local_only else machine_id)
         if local_only:
-            return {"name": name, "size": size, "vm_path": None, "artifact": local, "kind": kind}
+            return {"name": name, "size": size, "vm_path": None, "artifact": local, "kind": kind, "upload_id": rec["id"]}
         if cloud.is_cloud(machine_id):
             try:
                 await cloud.wake(machine_id)
@@ -1108,7 +1186,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             await _uploads.push_to_vm(sessions.computer(machine_id), local, f"uploads/{name}")
         except _uploads.PushError as e:
             raise HTTPException(502, f"VM upload failed: {e}")
-        return {"name": name, "size": size, "vm_path": f"~/workspace/uploads/{name}", "artifact": local, "kind": kind}
+        return {"name": name, "size": size, "vm_path": f"~/workspace/uploads/{name}", "artifact": local, "kind": kind,
+                "upload_id": rec["id"]}
 
     # ------------------------------------------------------------- machines
     @app.get("/api/machines", dependencies=[Depends(auth)])

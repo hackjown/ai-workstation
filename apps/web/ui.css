@@ -608,3 +608,6 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 /* BrowserOS: the one-line command for the computer's own terminal */
 .bos-cmd{display:flex;align-items:center;gap:8px;margin:6px 0 2px}
 .bos-cmd code{flex:1;min-width:0;font:500 12px var(--mono);color:var(--text);background:var(--panel2);padding:6px 8px;border-radius:6px;word-break:break-all;user-select:all}
+
+/* 3.8.5: a 继续 / 修改 run of the task above */
+.chip.run-tag { font-size: 11px; padding: 1px 7px; margin-right: 4px; background: rgba(232,160,80,.18); color: var(--accent, #c87618); border-radius: 999px; }

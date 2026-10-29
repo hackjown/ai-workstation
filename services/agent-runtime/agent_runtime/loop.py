@@ -128,6 +128,32 @@ class AgentLoop:
         self._fresh: Optional[str] = None  # post-action screenshot, reused as the next observation
         self._full: Optional[Image.Image] = None  # latest full-resolution screen, for click_element zooming
         self._eyes_mode = coord_mode(model_name(vision_llm)) if vision_llm else "pixel"
+        # 3.8.5
+        self.home: Optional[str] = None       # $HOME on this computer (set by the session manager): fixes guessed paths
+        self.lesson_hint: Optional[Callable[..., Awaitable[Optional[str]]]] = None   # (error, tool, domain) -> note
+        self._user_notes: list[str] = []      # 补充要求 the user sent while the task runs
+
+    def inject(self, text: str) -> None:
+        """An instruction the user added while the task runs (修改任务 / 补充要求): read at the next step."""
+        if (text or "").strip():
+            self._user_notes.append(text.strip()[:2000])
+
+    def _fix_paths(self, tool: str, args: dict) -> tuple[dict, bool]:
+        """A guessed home (/home/user/workspace on a computer whose home is /data/home) becomes the real one.
+        task-7bd: the model hard-coded /home/user/workspace in a python-docx script and the save failed."""
+        home = (self.home or "").rstrip("/")
+        if not home or tool not in ("shell", "files_write", "files_read", "files_list", "send_file") or not isinstance(args, dict):
+            return args, False
+        changed = False
+        out = dict(args)
+        for k in ("command", "content", "path"):
+            v = out.get(k)
+            if not isinstance(v, str):
+                continue
+            nv = _GUESSED_HOME.sub(lambda m: home + "/workspace" if not home.startswith(m.group(1).rstrip("/")) else m.group(0), v)
+            if nv != v:
+                out[k], changed = nv, True
+        return out, changed
 
     @property
     def task_text(self) -> str:
@@ -344,7 +370,9 @@ class AgentLoop:
         self.task.status = TaskStatus.RUNNING
         await self.emit(EventType.TASK_STARTED, prompt=self.task.prompt)
         plan_job = None
-        if self.cfg.make_plan and _needs_action(self.task.prompt):
+        if self.plan_steps:   # a continuation: the plan and its ticks come from the earlier run
+            await self.emit(EventType.PLAN, plan=self.plan_steps, done=sorted(self.plan_done))
+        elif self.cfg.make_plan and _needs_action(self.task.prompt):
             plan_job = asyncio.create_task(self._plan())  # plan in parallel with the first step, not before it
         if self._cad_mode == "revise":
             await self._cad_revise_start()
@@ -384,7 +412,7 @@ class AgentLoop:
 
     def _cad_resuming(self) -> bool:
         src = str(getattr(self.task, "source", "") or "").lower()
-        return src in ("retry", "resume") or bool(_CAD_RESUME.search(self.task.prompt or ""))
+        return src in ("retry", "resume", "continue", "edit") or bool(_CAD_RESUME.search(self.task.prompt or ""))
 
     async def _cad_fresh_start(self):
         """A new drawing task starts from an empty cad/ folder and a fresh LibreCAD. The 2026-10-19 run found the
@@ -522,6 +550,14 @@ class AgentLoop:
                         "Re-assess from the current screenshot; do not assume earlier state."
                         if self.control.resumed_after_takeover else "Agent was paused and resumed.")
                 await self.emit(EventType.RESUMED, takeover=self.control.resumed_after_takeover)
+            if self._user_notes:   # 3.8.5: words the user added while the task runs
+                adds = "\n".join(f"- {t}" for t in self._user_notes)
+                self._user_notes = []
+                self.history.append(f"{self.step}. USER ADDED (mid-task): {adds[:600]}")
+                self._mark_progress()
+                note = ((note + "\n") if note else "") + (
+                    "THE USER JUST ADDED TO THIS TASK (follow it from now on; it changes or extends the request, it is "
+                    "not a new task):\n" + adds)
             self.step += 1
             blind = self._last_tool in _NO_SCREEN_TOOLS and self.step > 1
             # shell/file work (analyse a video, convert a file, write a script) needs no first look at the desktop:
@@ -751,8 +787,12 @@ class AgentLoop:
                 continue
 
             outcome = None
+            run_args, fixed = self._fix_paths(decision.tool, decision.args)
+            if fixed:
+                self.history.append(f"{self.step}. (path fixed: /home/user/workspace → {self.home}/workspace; "
+                                    "write ~/workspace next time)")
             for attempt in range(self.cfg.action_retries + 1):
-                outcome = await self.tools.run(decision.tool, self._fill_secrets(decision.tool, decision.args), intent=decision.thought)
+                outcome = await self.tools.run(decision.tool, self._fill_secrets(decision.tool, run_args), intent=decision.thought)
                 await self.emit(EventType.POLICY, level=int(outcome.decision.level), reason=outcome.decision.reason)
                 retryable = (not outcome.success and outcome.decision.allowed and outcome.control is None
                              and _transient(outcome.error))
@@ -867,6 +907,9 @@ class AgentLoop:
                     continue
                 note = await self.recovery.recover(failures, outcome.action)
                 await self.emit(EventType.RECOVERY, attempt=failures, note=note)
+                hint = await self._lesson_for(decision.tool, outcome)
+                if hint:
+                    note = ((note + "\n") if note else "") + hint
             if stall_note:
                 note = ((note + "\n") if note else "") + stall_note
 
@@ -940,7 +983,12 @@ class AgentLoop:
             await self.emit(EventType.INPUT_ANSWERED, answer=reply)
             await self.emit(EventType.ACTION_RESULT, tool=t, success=reply is not None, error=None if reply else "no answer",
                             result={"answer": reply})
-            return f"user answered: {reply!r}" if reply else "user did not answer within the time limit; decide yourself (never give up silently)"
+            if reply:
+                return f"user answered: {reply!r}"
+            # 3.8.5: never "我按最实用的默认方案" — an unanswered question is asked again or the task waits
+            return ("NO ANSWER from the user yet. Do NOT decide yourself and do NOT pick a default option: call ask_user "
+                    "again with the same question (it waits until the user answers), or stop if nothing can be done "
+                    "without the answer.")
         if t == "click_element":
             return await self._click_element(a, decision.thought)
         if t == "cad_draw":
@@ -1002,6 +1050,28 @@ class AgentLoop:
             text = str(res)[:int(getattr(fn, "max_result", 600))] if ok else f"FAILED ({err})"
             return text
         return None
+
+    async def _lesson_for(self, tool: str, outcome) -> Optional[str]:
+        """3.8.5: a lesson from earlier tasks that matches this error (by error text, tool, site, computer)."""
+        if not self.lesson_hint:
+            return None
+        res = outcome.result if isinstance(outcome.result, dict) else {}
+        err = " ".join(str(x) for x in (outcome.error, res.get("stderr"), res.get("stdout") if not outcome.success else "") if x)
+        if not err.strip():
+            return None
+        dom = ""
+        try:
+            from urllib.parse import urlparse
+            dom = urlparse(str((getattr(self, "_last_page", None) or {}).get("url") or "")).hostname or ""
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            hint = await self.lesson_hint(err[-1500:], tool, dom)
+        except Exception:  # noqa: BLE001
+            return None
+        if hint:
+            await self.emit(EventType.MESSAGE, text="用上了以前学到的经验", lesson=hint[:600])
+        return hint
 
     # ------------------------------------------------- forms the user fills (sign-ups, profiles)
     def _cap(self) -> int:
@@ -1720,9 +1790,7 @@ class AgentLoop:
         """AI image edit through the gateway's image model, then size restore + pasting original regions back."""
         def rel(p):
             p = str(p or "").strip().lstrip("/")
-            for pre in ("home/aiw/workspace/", "workspace/", "~/workspace/"):
-                if p.startswith(pre):
-                    p = p[len(pre):]
+            p = _ws_rel(p)
             return p
         src, prompt = rel(a.get("path")), str(a.get("prompt") or "").strip()
         boxes = a.get("restore") or []
@@ -1875,9 +1943,7 @@ class AgentLoop:
         imgs = []
         for p in paths:
             rp = p.strip().lstrip("/")
-            for pre in ("home/aiw/workspace/", "workspace/", "~/workspace/"):
-                if rp.startswith(pre):
-                    rp = rp[len(pre):]
+            rp = _ws_rel(rp)
             f = await self.tools.run("send_file", {"path": rp})
             if not f.success or not isinstance(f.result, dict) or not f.result.get("content_b64"):
                 return f"FAILED: cannot read {rp} ({f.error})"
@@ -1913,9 +1979,7 @@ class AgentLoop:
     async def _read_image_one(self, a: dict) -> str:
         """Read an image (or one PDF page) from ~/workspace and have the vision model describe it for drafting."""
         path = (a.get("path") or "").strip().lstrip("/")
-        for pre in ("home/aiw/workspace/", "workspace/", "~/workspace/"):
-            if path.startswith(pre):
-                path = path[len(pre):]
+        path = _ws_rel(path)
         if not path:
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error="missing args ['path']", result={})
             return "FAILED: read_image needs `path` or `paths` (relative to ~/workspace)"
@@ -2224,6 +2288,17 @@ def _side_by_side(imgs: list, height: int = 900, zoom: tuple | None = None) -> b
     return buf.getvalue()
 
 
+_WS_PREFIX = re.compile(r"^(?:~/|\$HOME/|\$\{HOME\}/|/?(?:data/home|home/[^/]+|root)/)?workspace/")
+
+
+def _ws_rel(p: str) -> str:
+    """A path relative to ~/workspace, whatever home the model wrote (/data/home, /home/user, /home/aiw, ~, $HOME)."""
+    p = str(p or "").strip()
+    q = _WS_PREFIX.sub("", p, count=1)
+    return q.lstrip("/") if q != p else p.lstrip("/")
+
+
+_GUESSED_HOME = re.compile(r"(/home/(?:user|aiw|ubuntu|debian)/)workspace(?=/|\b)")
 _NO_SCREEN_TOOLS = {"read_image", "image_edit", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch"}
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "dispatch", "open_app"}
 

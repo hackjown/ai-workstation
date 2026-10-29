@@ -14,7 +14,7 @@ import json
 import re
 from typing import Optional
 
-_IMG = re.compile(r"(?:~/workspace/|/home/aiw/workspace/)?([^\s\n'\"]+?\.(?:png|jpe?g|webp|bmp))\b", re.I)
+_IMG = re.compile(r"(?:~/workspace/|\$HOME/workspace/|/(?:data/home|home/[\w.-]+)/workspace/)?([^\s\n'\"]+?\.(?:png|jpe?g|webp|bmp))\b", re.I)
 _ATTACH = re.compile(r"\n*附件（已放到电脑上）：.*", re.S)
 _EDIT = re.compile(r"加高|降低|抬高|升高|变高|变矮|压低|齐平|对齐|一样高|移到|挪|换成|替换|改成|变成|去掉|删掉|删除|去除|"
                    r"抹掉|P掉|p掉|加上|添加|放上|摆上|改色|颜色|调整|放大|缩小|拉长|拉宽|加宽|变宽|变窄|修图|改图|美化|"

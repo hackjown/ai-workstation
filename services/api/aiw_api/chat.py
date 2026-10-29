@@ -20,6 +20,7 @@ No thinking and no agent steps ever go into the chat.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -169,8 +170,15 @@ def files_of(paths: list[str]) -> list[dict]:
     return out
 
 
+ROUTE_TASKS = """
+最近交给电脑的任务（编号: 状态 · 标题）：
+{tasks}
+如果最新消息是在接着其中某个任务说（继续、我上传了、改一下、补充要求、回答它的问题、"就用第二个"），输出 {{"route": "continue", "task": 编号}}。
+拿不准是哪个任务就输出 {{"route": "continue", "task": 0}}（会问用户）。是新的事就照常输出 chat 或 task。"""
+
+
 def parse_route(text: str) -> dict:
-    """{"route": chat|task, "title"} from the classifier's answer; anything unclear is chat."""
+    """{"route": chat|task|continue, "title"[, "task"]} from the classifier's answer; anything unclear is chat."""
     t = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
     for m in reversed(list(re.finditer(r"\{[^{}]*\}", t, re.S))):
         try:
@@ -178,7 +186,14 @@ def parse_route(text: str) -> dict:
         except ValueError:
             continue
         if isinstance(d, dict):
-            route = "task" if str(d.get("route") or "").strip().lower() == "task" else "chat"
+            r = str(d.get("route") or "").strip().lower()
+            if r == "continue":
+                try:
+                    n = int(d.get("task") or 0)
+                except (TypeError, ValueError):
+                    n = 0
+                return {"route": "continue", "title": "", "task": n}
+            route = "task" if r == "task" else "chat"
             return {"route": route, "title": str(d.get("title") or "").strip()[:30]}
     return {"route": "chat", "title": ""}
 
@@ -441,12 +456,16 @@ class Chat:
             self._compacting = False
 
     # ------------------------------------------------------------------ routing
-    async def classify(self, text: str) -> dict:
+    async def classify(self, text: str, cands: Optional[list] = None) -> dict:
         recent = "\n".join(f"{'用户' if r['role'] == 'user' else '助理'}：{(self.render(r) or '')[:160]}"
                            for r in self.window(3)[:-1])
         user = (f"最近的聊天：\n{recent}\n\n" if recent else "") + f"最新消息：{text[:1500]}"
+        system = ROUTE_PROMPT
+        if cands:   # 3.8.5: the classifier may also say "this continues task n"
+            system += ROUTE_TASKS.format(tasks="\n".join(
+                f"{i + 1}: {STATUS_CN.get(c['run']['status'], c['run']['status'])} · {c['title']}" for i, c in enumerate(cands[:5])))
         try:
-            out = await asyncio.wait_for(self.llm("small").complete(ROUTE_PROMPT, user, 200), 30)
+            out = await asyncio.wait_for(self.llm("small").complete(system, user, 200), 30)
             return parse_route(out)
         except Exception as e:  # noqa: BLE001  unsure (or no model) means chat
             log.warning("route failed: %s", e)
@@ -478,12 +497,33 @@ class Chat:
                     await say("route", {"route": "memory"})
                     await say("message", m)
                     return {"route": "memory", "user": user, "messages": [m]}
+            cands = self.recent_tasks() if mode == "auto" and not SKILL_RE.match(text) else []
+            if cands:   # 3.8.5: a follow-up about an earlier task goes to THAT task, never to a new one
+                fu = await self.followup(text, attachments, user, cands)
+                if fu is not None:
+                    await say("route", {"route": fu["route"]})
+                    for m in fu["messages"]:
+                        await say("task" if m["kind"] == "task" else "message", m)
+                    self.background(self.after_exchange(user, fu["messages"]))
+                    return {"user": user, **fu}
             if mode in ("chat", "task"):
                 route = {"route": mode, "title": ""}
             elif SKILL_RE.match(text):   # a skill picked with "/" (or the + menu) runs on the computer, like the old skills menu
                 route = {"route": "task", "title": "", "skill": True}
             else:
-                route = await self.classify(text)
+                route = await self.classify(text, [c for c in cands if c["run"]["status"] not in ("succeeded",)] or cands)
+            if route.get("route") == "continue":
+                pool = [c for c in cands if c["run"]["status"] not in ("succeeded",)] or cands
+                n = int(route.get("task") or 0)
+                if 1 <= n <= len(pool):
+                    msgs = await self.continue_card(pool[n - 1], text, attachments, user)
+                else:
+                    msgs = [self.pick_task_ask(pool, text, attachments)]
+                await say("route", {"route": "continue"})
+                for m in msgs:
+                    await say("task" if m["kind"] == "task" else "message", m)
+                self.background(self.after_exchange(user, msgs))
+                return {"route": "continue", "user": user, "messages": msgs}
             await say("route", route)
             if route["route"] == "task":
                 card = await self.start_task(text, route.get("title") or "", machine_id, attachments, origin=user["id"])
@@ -722,6 +762,120 @@ class Chat:
                     for r in self.store.all("routines", order="created_at ASC", limit=30)]
         return json.dumps({"tasks": tasks, "routines": routines}, ensure_ascii=False)
 
+    # ------------------------------------------------------------------ 3.8.5: follow-ups go to their task
+    def recent_tasks(self, hours: float = 24.0, limit: int = 6) -> list[dict]:
+        """Tasks the chat started recently, newest first, one per task (its latest run): {card, run, root, title}."""
+        from . import continuation as _cont
+        out, seen = [], set()
+        now = time.time()
+        for r in self.store._x("SELECT * FROM chat_messages WHERE conv=? AND kind='task' ORDER BY seq DESC LIMIT 30", (CONV,)):
+            m = _row(r)
+            tid = m.get("task_id") or (m["data"] or {}).get("task_id")
+            if not tid or not self.store.task(tid):
+                continue
+            root = _cont.root_id(self.store, tid)
+            if root in seen:
+                continue
+            seen.add(root)
+            run = _cont.latest(self.store, root) or self.store.task(tid)
+            if now - float(run.get("updated_at") or run.get("created_at") or 0) > hours * 3600:
+                continue
+            if run.get("status") == "cancelled":
+                continue
+            out.append({"card": m, "run": run, "root": root, "title": (m["data"] or {}).get("title") or m.get("text") or ""})
+            if len(out) >= limit:
+                break
+        return out
+
+    def _open_ask(self) -> Optional[dict]:
+        """The newest question of a task that is still waiting for the user in this chat."""
+        for r in self.store._x("SELECT * FROM chat_messages WHERE conv=? AND kind='ask' ORDER BY seq DESC LIMIT 10", (CONV,)):
+            m = _row(r)
+            d = m["data"] or {}
+            if d.get("resolved") or d.get("stale") or d.get("watch_id") or d.get("pick_task") or d.get("ask_kind") == "form":
+                continue
+            live = self.sessions.live.get(d.get("session_id") or "")
+            if live and live.question_info:
+                return m
+        return None
+
+    async def followup(self, text: str, attachments: list, user: dict, cands: list) -> Optional[dict]:
+        """A message that answers a waiting task or continues an earlier one. None = route it as usual."""
+        from . import continuation as _cont
+        ask = self._open_ask()
+        opts = [str(o) for o in ((ask or {}).get("data") or {}).get("options") or []]
+        answers = bool(ask) and (bool(attachments) or _cont.is_followup(text) or any(o and (o in text or text in o) for o in opts)
+                                 or (len(text) <= 40 and not re.search(r"[？?]\s*$", text)))
+        if ask and answers and len(text) <= 300 and not _cont.NEW_TASK_RE.search(text) and (text or attachments):
+            # the task asked the user something: a plain reply in the chat is the answer (task-7bd waited 600 s
+            # on its question card while the user wrote in the chat, then went on alone)
+            d = ask["data"]
+            ans = text or "已上传附件"
+            if attachments:
+                ans += "\n附件：" + "、".join(str(a.get("name") or "") for a in attachments)
+                self.sessions._link_attachments(attachments, d.get("task_id"), d.get("thread_id"))
+                live = self.sessions.live.get(d.get("session_id") or "")
+                if live:   # the files go to the computer the task runs on, now
+                    with contextlib.suppress(Exception):
+                        from .uploads import sync_files
+                        await sync_files(self.sessions.computer(live.task.machine_id), [
+                            {"local": a["artifact"], "rel": f"uploads/{a.get('name')}"} for a in attachments if a.get("artifact")])
+            try:
+                ok = self.sessions.answer_question(d.get("session_id") or "", ans)
+            except KeyError:
+                ok = False
+            if ok:
+                m = self.update(ask["id"], data={"resolved": {"answer": ans[:200], "text": answer_text(ans), "by": "chat_text",
+                                                              "at": time.time()}})
+                return {"route": "answer", "messages": [m]}
+        if not _cont.is_followup(text, bool(attachments)):
+            return None
+        open_ = [c for c in cands if c["run"]["status"] not in ("succeeded",)]
+        if len(open_) == 1:
+            target = open_[0]
+        elif not open_:
+            fresh = [c for c in cands if time.time() - float(c["run"].get("updated_at") or 0) < 3 * 3600]
+            if not fresh:
+                return None
+            target = fresh[0]
+        else:
+            # two or more unfinished tasks: a word from one title decides, else ask (never guess)
+            hits = [c for c in open_ if any(w and w in text for w in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z]{3,}", c["title"]))]
+            if len(hits) == 1:
+                target = hits[0]
+            else:
+                return {"route": "continue", "messages": [self.pick_task_ask(open_, text, attachments)]}
+        return {"route": "continue", "messages": await self.continue_card(target, text, attachments, user)}
+
+    def pick_task_ask(self, cands: list, text: str, attachments: list) -> dict:
+        opts = [f"{c['title'][:24]}（{STATUS_CN.get(c['run']['status'], c['run']['status'])}）" for c in cands[:4]] + ["这是新任务"]
+        return self.add("assistant", "ask", "你说的是哪个任务？", {
+            "pick_task": True, "ask_kind": "question", "question": "你说的是哪个任务？", "options": opts,
+            "task_ids": [c["root"] for c in cands[:4]], "pending": {"text": text[:2000], "attachments": attachments[:10]}})
+
+    async def continue_card(self, c: dict, text: str, attachments: list, user: Optional[dict]) -> list[dict]:
+        """Continue the task of card c with the user's words; its progress shows on a fresh card at the bottom."""
+        run = c["run"]
+        st = run.get("status")
+        try:
+            res = await self.sessions.continue_task(c["root"], text, attachments)
+        except Exception as e:  # noqa: BLE001  never silent
+            return [self.add("assistant", "text", f"没能接着做这个任务：{type(e).__name__}: {str(e)[:160]}", {"error": True})]
+        title = c["title"] or _short_title(run.get("prompt") or "")
+        if res.get("instructed") or res.get("answered"):
+            return [self.add("assistant", "text", ("已把你的回答交给正在做的任务「" if res.get("answered") else
+                                                    "已把补充要求交给正在做的任务「") + title + "」", {"task_id": run["id"]})]
+        t = res["task"]
+        if res.get("queued") and t["id"] == run["id"]:
+            return [self.add("assistant", "text", f"「{title}」还在排队，你的补充已经加进去了", {"task_id": t["id"]})]
+        self.update(c["card"]["id"], data={"continued_by": t["id"], "status_line": "已接着做 ↓"}, push=True)
+        st2 = t.get("status") or ("queued" if res.get("queued") else "running")
+        card = self.add("assistant", "task", title, {
+            "task_id": t["id"], "thread_id": res.get("thread_id") or t.get("thread_id"), "session_id": t.get("session_id"),
+            "machine_id": t.get("machine_id"), "title": title, "status": st2, "status_line": "接着做 · " + STATUS_CN.get(st2, st2),
+            "step": 0, "continues": c["root"], "origin": (user or {}).get("id")}, task_id=t["id"])
+        return [card]
+
     # ------------------------------------------------------------------ tasks from the chat
     async def start_task(self, prompt: str, title: str = "", machine_id: Optional[str] = None,
                          attachments: Optional[list] = None, origin: Optional[str] = None, source: str = "chat") -> dict:
@@ -738,6 +892,7 @@ class Chat:
             return self.add("assistant", "text", f"没能把任务交给电脑：{type(e).__name__}: {str(e)[:160]}",
                             {"error": True, "offer_task": prompt[:500]})
         t = res["task"]
+        self.sessions._link_attachments(attachments, t["id"], res.get("thread_id") or t.get("thread_id"))
         st = t.get("status") or ("queued" if res.get("queued") else "running")
         return self.add("assistant", "task", title, {
             "task_id": t["id"], "thread_id": res.get("thread_id") or t.get("thread_id"), "session_id": t.get("session_id"),
@@ -896,6 +1051,23 @@ class Chat:
         if d.get("watch_id"):           # a price watch's question (立即重试 / 暂停), not a task's
             from . import shopwatch
             return await shopwatch.answer_ask(self, m, (choice if choice is not None else text) or OPT_RETRY_WATCH)
+        if d.get("pick_task"):          # 3.8.5: which task a follow-up was for
+            pick = (choice if choice is not None else text) or ""
+            opts = d.get("options") or []
+            ids = d.get("task_ids") or []
+            pend = d.get("pending") or {}
+            m = self.update(mid, data={"resolved": {"answer": pick[:200], "text": pick[:200], "by": "chat", "at": time.time()}})
+            if pick in opts and opts.index(pick) < len(ids):
+                root = ids[opts.index(pick)]
+                c = next((x for x in self.recent_tasks(hours=24 * 7, limit=20) if x["root"] == root), None)
+                if c is None:
+                    from . import continuation as _cont
+                    run = _cont.latest(self.store, root) or self.store.task(root) or {}
+                    c = {"card": m, "run": run, "root": root, "title": pick.split("（")[0]}
+                msgs = await self.continue_card(c, pend.get("text") or "", pend.get("attachments") or [], None)
+            else:
+                msgs = [await self.start_task(pend.get("text") or pick, "", None, pend.get("attachments") or [], origin=mid)]
+            return {"ok": True, "message": m, "messages": msgs}
         sid = d.get("session_id") or ""
         try:
             if m["kind"] == "confirm":

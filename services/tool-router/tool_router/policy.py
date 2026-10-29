@@ -85,7 +85,7 @@ def scratch_delete(cmd: str) -> bool:
     if not hits or re.search(r"\$\(|`|\.\.", cmd):
         return False
     cds = re.findall(r"\bcd\s+([^;&|\s]+)", cmd)
-    rel_ok = bool(cds) and all(c.rstrip("/") in ("~/workspace", "$HOME/workspace", "/data/home/workspace", "/home/aiw/workspace") for c in cds)
+    rel_ok = bool(cds) and all(re.fullmatch(r"(~|\$HOME|\$\{HOME\}|/data/home|/home/[\w.-]+|/root)/workspace", c.rstrip("/")) for c in cds)
     for m in hits:
         for t in m.group(2).split():
             t = t.strip("'\"")
@@ -96,13 +96,13 @@ def scratch_delete(cmd: str) -> bool:
                 head, _, last = t.rstrip("/").rpartition("/")
                 if "*" in head or last.strip("*.") == "" or not (
                         re.match(r"^/tmp/[\w.@%+-]+$", head)
-                        or (re.match(r"^(~|\$HOME|/data/home|/home/aiw)/workspace/[\w.@%+-]+(/[\w.@%+-]+)*$", head)
+                        or (re.match(r"^(~|\$HOME|/data/home|/home/[\w.-]+)/workspace/[\w.@%+-]+(/[\w.@%+-]+)*$", head)
                             and head.count("/") >= 2)):
                     return False
                 continue
             if re.match(r"^/tmp/[\w.@%+-]", t):
                 continue
-            if re.match(r"^(~|\$HOME|/data/home|/home/aiw)/workspace/[\w.@%+-]", t) and \
+            if re.match(r"^(~|\$HOME|/data/home|/home/[\w.-]+)/workspace/[\w.@%+-]", t) and \
                     t.rstrip("/").split("/")[-1] not in _PROTECTED and t.rstrip("/").count("/") >= 2:
                 continue
             if rel_ok and not t.startswith(("/", "~", "$")) and first not in _PROTECTED and re.match(r"^[\w@%+-][\w.@%+-]*$", first):

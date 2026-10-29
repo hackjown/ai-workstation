@@ -58,6 +58,7 @@ class LiveSession:
     executor: Optional[object] = None   # its ToolExecutor: the policy knows which folders this task made
     allow_task: bool = False            # the user said 本任务内都允许 (never covers payments or posts)
     last_thought: str = ""              # the agent's stated reason for the step being confirmed (为什么)
+    pending_notes: list = field(default_factory=list)   # 补充要求 sent before the loop existed (3.8.5)
 
 
 class SessionManager:
@@ -78,6 +79,8 @@ class SessionManager:
         # the end): the persistent chat (chat.py) keeps its task cards and escalation messages up to date from these
         self.listeners: list = []
         self.memory = None   # memory.Memory (set by main.build_app): profile + top memories for every task
+        self.lessons = None  # lessons.Lessons (set by main.build_app): what earlier tasks learned (3.8.5 self-evolution)
+        self.jobs: set = set()   # background jobs (lesson extraction) kept referenced until they finish
 
     # ------------------------------------------------------------------ factories
     def _default_computer(self, machine: dict) -> Computer:
@@ -178,7 +181,7 @@ class SessionManager:
 
     # ------------------------------------------------------------------ context
     def build_context(self, thread_id: Optional[str], exclude_task: Optional[str] = None,
-                      query: Optional[str] = None) -> Optional[str]:
+                      query: Optional[str] = None, exclude: Optional[set] = None) -> Optional[str]:
         parts = []
         prof = self.store.kv_get("profile", {}) or {}
         if prof.get("tone"):
@@ -202,7 +205,7 @@ class SessionManager:
                                                                                       if not m.get("superseded")))
         if thread_id:
             turns = [t for t in self.store.thread_tasks(thread_id) if t["id"] != exclude_task
-                     and t["status"] not in ("queued", "cancelled")][-6:]
+                     and t["id"] not in (exclude or set()) and t["status"] not in ("queued", "cancelled")][-6:]
             if turns:
                 parts.append("EARLIER IN THIS CONVERSATION (oldest first):\n" + "\n".join(
                     f"- user: {t['prompt'][:400]}\n  result ({t['status']}): {(t['result'] or '')[:400]}" for t in turns))
@@ -217,14 +220,22 @@ class SessionManager:
 
     async def submit(self, prompt: str, machine_id: Optional[str] = None, thread_id: Optional[str] = None,
                      source: str = "chat", max_steps: Optional[int] = None, timeout_s: Optional[float] = None, title: Optional[str] = None,
-                     isolated: bool = False, context_extra: Optional[str] = None) -> dict:
+                     isolated: bool = False, context_extra: Optional[str] = None, continues: Optional[str] = None,
+                     link_thread: bool = True) -> dict:
         """context_extra: background the task gets on top of its thread and memory (the chat turns before a task
-        the persistent chat started); kept in kv so a queued task still has it when it starts."""
+        the persistent chat started); kept in kv so a queued task still has it when it starts.
+        continues: the root task this run continues (3.8.5). A message in a task's thread (source chat, the task
+        view's composer, iOS ChatView) continues the thread's latest task unless link_thread=False."""
         machine_id = machine_id or (self.settings.machines[0].id if self.settings.machines else "ai-linux-001")
         if not self.store.machine(machine_id):
             raise KeyError(machine_id)
         if not thread_id or not self.store.thread(thread_id):
             thread_id = self.store.create_thread(title or _title(prompt))["id"]
+        elif continues is None and link_thread and source == "chat":
+            prev = [t for t in self.store.thread_tasks(thread_id)
+                    if not t.get("parent_id") and t.get("status") != "cancelled"]
+            if prev:
+                continues = prev[-1].get("continues") or prev[-1]["id"]
         max_steps = _es.step_cap() if max_steps is None else max_steps
         timeout_s = _es.time_cap() if timeout_s is None else timeout_s
         max_steps, timeout_s = _budget(prompt, max_steps, timeout_s)
@@ -232,7 +243,17 @@ class SessionManager:
                     thread_id=thread_id, source=source)
         row = task.model_dump()
         row["status"] = "queued"
+        if continues and self.store.task(continues):
+            row["continues"] = (self.store.task(continues) or {}).get("continues") or continues
         self.store.create_task(row)
+        if row.get("continues"):
+            mode = source if source in ("retry", "edit", "resume") else "continue"
+            self.store.kv_set(f"task_run:{task.id}", {"mode": mode})
+        try:   # uploads named in the prompt (the 附件 block) belong to this task and its thread from now on
+            from . import uploads as _up
+            _up.link_prompt(self.store, prompt, task.id, thread_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("link uploads: %s", e)
         if isolated:
             self.store.kv_set(f"isolated:{task.id}", True)
         if context_extra:
@@ -261,18 +282,43 @@ class SessionManager:
                 await self.memory.prepare(row.get("prompt") or "")
             except Exception as e:  # noqa: BLE001
                 log.warning("memory prepare: %s", e)
-        ctx = self.build_context(row.get("thread_id"), exclude_task=row["id"], query=row.get("prompt"))
+        from . import continuation as _cont
+        run_prompt, resume, chain_ids = row["prompt"], "", set()
+        if row.get("continues"):   # 3.8.5: a 继续 / 修改 run of an earlier task picks up where it stopped
+            try:
+                chain_ids = {r["id"] for r in self.store.continuations(row["continues"])}
+                run_prompt = _cont.run_prompt(self.store, row) or row["prompt"]
+                mname = (self.store.machine(row["machine_id"]) or {}).get("name")
+                resume = _cont.resume_block(self.store, row, mname)
+                plan = _cont.last_plan([r for r in self.store.continuations(row["continues"]) if r["id"] != row["id"]])
+                if plan and (self.store.kv_get(f"task_run:{row['id']}", {}) or {}).get("mode") != "edit":
+                    self.store.kv_set(f"task_seed_plan:{row['id']}", plan)
+            except Exception as e:  # noqa: BLE001  a broken history never blocks the run
+                log.warning("resume context: %s", e)
+        ctx = self.build_context(row.get("thread_id"), exclude_task=row["id"], query=run_prompt, exclude=chain_ids)
         extra_ctx = self.store.kv_get(f"task_ctx:{row['id']}")
         if extra_ctx:
             ctx = (ctx + "\n\n" if ctx else "") + extra_ctx
+        if resume:
+            ctx = resume + ("\n\n" + ctx if ctx else "")
+        if self.lessons is not None:   # 3.8.5: what earlier tasks learned on this computer / site / skill
+            try:
+                from agent_runtime import skills as _skills
+                sk = _skills.picked(run_prompt) + _skills.mentioned(run_prompt) + _skills.auto(run_prompt)
+                block, ids = self.lessons.for_task(row["machine_id"], run_prompt, sk)
+                if block:
+                    ctx = (ctx + "\n\n" if ctx else "") + block
+                    self.store.kv_set(f"task_lessons:{row['id']}", ids)
+            except Exception as e:  # noqa: BLE001
+                log.warning("lessons block: %s", e)
         if row.get("parent_id"):
             ctx = _child_note(self.store.task(row["parent_id"]) or {}) + ("\n\n" + ctx if ctx else "")
         steps, secs = row.get("max_steps"), row.get("timeout_s")
         if row.get("source") not in ("xhs", "watch_order"):
             # 3.8.2: tasks have no step / time budget (rows saved before carry the old 40 steps / 900 s)
             steps, secs = _es.step_cap(), _es.time_cap()
-        steps, secs = _budget(row["prompt"], int(steps or 0), float(secs or 0), ctx)
-        task = Task(id=row["id"], prompt=row["prompt"], machine_id=row["machine_id"], thread_id=row.get("thread_id"),
+        steps, secs = _budget(run_prompt, int(steps or 0), float(secs or 0), ctx)
+        task = Task(id=row["id"], prompt=run_prompt, machine_id=row["machine_id"], thread_id=row.get("thread_id"),
                     source=row.get("source") or "chat", max_steps=steps, timeout_s=secs)
         task.context = ctx
         return await self.start(task, allow_busy=allow_busy)
@@ -362,10 +408,91 @@ class SessionManager:
                 "queue": self.queue_info(now) if now.get("status") == "queued" else None}
 
     async def retry(self, task_id: str) -> dict:
+        """继续 / 重试 on a task card (3.8.5): a continuation of the SAME task, not the bare prompt again."""
+        return await self.continue_task(task_id, "", mode="retry")
+
+    async def continue_task(self, task_id: str, text: str = "", attachments: Optional[list] = None,
+                            machine_id: Optional[str] = None, mode: str = "continue") -> dict:
+        """Resume a task: its prompt, plan, steps done, files and attachments go with it (continuation.py).
+        A run that is still going takes the words as an added instruction instead (instruct)."""
+        from . import continuation as _cont
         t = self.store.task(task_id)
         if not t:
             raise KeyError(task_id)
-        return await self.submit(t["prompt"], t["machine_id"], t.get("thread_id"), source="retry")
+        root = self.store.task(t.get("continues") or task_id) or t
+        last = _cont.latest(self.store, root["id"]) or t
+        live = self.live_for_task(last["id"])
+        text = (text or "").strip()
+        if attachments:
+            text = (text + "\n\n" if text else "") + "附件：\n" + "\n".join(
+                "- ~/workspace/uploads/" + str(a.get("name") or os.path.basename(str(a.get("artifact") or "")).split("-", 1)[-1])
+                for a in attachments if isinstance(a, dict))
+        if live and live.runner and not live.runner.done():
+            if mode == "edit":
+                await self.control(live.id, "stop")
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(asyncio.shield(live.runner), 15)
+            else:
+                res = await self.instruct(last["id"], text or "继续")
+                self._link_attachments(attachments, last["id"], last.get("thread_id"))
+                return {**res, "task": self.store.task(last["id"]), "thread_id": last.get("thread_id"),
+                        "session_id": last.get("session_id"), "queued": False, "continued": root["id"]}
+        if last.get("status") == "queued" and mode != "edit":
+            # not started yet: the words join it (one queued run per task, never two)
+            if text:
+                self.store._x("UPDATE tasks SET prompt=? WHERE id=?", ((last.get("prompt") or "") + "\n" + text, last["id"]))
+            self._link_attachments(attachments, last["id"], last.get("thread_id"))
+            return {"task": self.store.task(last["id"]), "thread_id": last.get("thread_id"), "queued": True,
+                    "session_id": None, "continued": root["id"]}
+        mid = machine_id or last.get("machine_id") or root.get("machine_id")
+        if not self.store.machine(mid):
+            mid = None
+        if mode == "edit" and text:
+            self.store.kv_set(f"task_instructions:{root['id']}", text)
+        shown = text or {"retry": "继续", "resume": "（继续之前被中断的任务）"}.get(mode, "继续")
+        res = await self.submit(shown, mid, root.get("thread_id"), source=mode if mode in ("retry", "edit", "resume") else "continue",
+                                continues=root["id"])
+        self._link_attachments(attachments, res["task"]["id"], res.get("thread_id"))
+        return {**res, "continued": root["id"]}
+
+    def _link_attachments(self, attachments: Optional[list], task_id: str, thread_id: Optional[str]) -> None:
+        if not attachments:
+            return
+        from . import uploads as _up
+        for a in attachments:
+            if isinstance(a, dict) and a.get("artifact"):
+                with contextlib.suppress(Exception):
+                    _up.link(self.store, a["artifact"], task_id, thread_id, a.get("name"))
+
+    async def instruct(self, task_id: str, text: str) -> dict:
+        """Words for a task that is running (3.8.5 补充要求): the answer to its open question, else an instruction
+        the agent reads at its next step. A task that is not running is continued instead."""
+        live = self.live_for_task(task_id)
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("empty instruction")
+        if not (live and live.runner and not live.runner.done()):
+            return await self.continue_task(task_id, text)
+        if live.question and not live.question.done():
+            live.question.set_result(text)
+            return {"answered": True, "task_id": task_id}
+        loop = getattr(live, "loop", None)
+        if loop is None or not hasattr(loop, "inject"):
+            live.pending_notes = getattr(live, "pending_notes", []) + [text]
+        else:
+            loop.inject(text)
+        ev = AgentEvent(session_id=live.id, type=EventType.MESSAGE, data={"text": f"收到补充要求：{text[:300]}", "instruction": text[:2000]})
+        self.store.add_event(ev.model_dump(mode="json"))
+        await self._broadcast(live, {"kind": "event", "task_id": task_id, "thread_id": live.task.thread_id, **ev.model_dump(mode="json")})
+        return {"instructed": True, "task_id": task_id}
+
+    async def edit_task(self, task_id: str, prompt: str) -> dict:
+        """修改任务 (3.8.5): new instructions for the same task; a running run stops and the task re-runs with them,
+        keeping its history, files and attachments."""
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("empty instructions")
+        return await self.continue_task(task_id, prompt, mode="edit")
 
     async def recover_interrupted(self, requeue: bool = True) -> list[str]:
         """Called at startup: no session survives a restart, so finish the bookkeeping and re-queue."""
@@ -377,8 +504,8 @@ class SessionManager:
             if t.get("parent_id"):
                 continue   # a child is re-dispatched by its parent's resume, never on its own
             if requeue and time.time() - (t.get("updated_at") or 0) < 1800:   # only recent work; stale runs just get marked
-                res = await self.submit(f"（继续之前被中断的任务）{t['prompt']}", t["machine_id"], t.get("thread_id"),
-                                        source="resume")
+                res = await self.submit("（继续之前被中断的任务）", t["machine_id"], t.get("thread_id"),
+                                        source="resume", continues=t.get("continues") or t["id"])
                 out.append(res["task"]["id"])
         for t in self.store.tasks_by_status(("queued",)):
             if t.get("parent_id"):   # its parent died with the restart: nobody waits for this piece any more
@@ -417,7 +544,7 @@ class SessionManager:
             if ev.type == EventType.PLAN:
                 plan_state.update(steps=ev.data.get("plan") or [], done=[])
                 self.store.set_task_plan(task.id, plan_state)
-            if ev.type == EventType.PLAN_UPDATE:
+            if ev.type == EventType.PLAN_UPDATE and plan_state.get("steps"):   # ticks without a plan keep nothing
                 plan_state["done"] = ev.data.get("done") or []
                 self.store.set_task_plan(task.id, plan_state)
             if ev.type == EventType.MEMORY and ev.data.get("text"):
@@ -500,6 +627,15 @@ class SessionManager:
                     return await live.question
                 # filling a form or passing a captcha takes longer than answering a question
                 wait = float(self.settings.ask_timeout_s) * (3 if extra else 1)
+                if os.environ.get("AIW_ASK_WAIT_FOREVER", "1") != "0":
+                    # 3.8.5: an unanswered question keeps the task paused (task-7bd: after 600 s the agent went on
+                    # with "我按最实用的默认方案"). One reminder push after the old timeout, then it keeps waiting.
+                    try:
+                        return await asyncio.wait_for(asyncio.shield(live.question), wait)
+                    except asyncio.TimeoutError:
+                        with contextlib.suppress(Exception):
+                            await self._notify("input", "还在等你回答", (question or "")[:200] + "（任务已暂停，回答后接着做）", task)
+                        return await live.question
                 return await asyncio.wait_for(live.question, wait)
             except asyncio.TimeoutError:
                 return None
@@ -590,6 +726,17 @@ class SessionManager:
                 except Exception as e:  # noqa: BLE001
                     log.warning("xhs tools unavailable: %s", e)
                 async with hold:
+                    home = None
+                    try:   # 3.8.5: the task's attachments + earlier runs' files onto THIS computer, real paths in the prompt
+                        block, home = await self._sync_task_files(task, computer)
+                        if block:
+                            task.context = (task.context + "\n\n" if task.context else "") + block
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("sync task files: %s", e)
+                    if home:
+                        sx += (f"\nTHIS COMPUTER: home folder {home}, workspace {home}/workspace (uploads in "
+                               f"{home}/workspace/uploads). Write paths as ~/workspace/... or $HOME/workspace/... "
+                               "(Python: os.path.expanduser). Never write /home/user/... or any other guessed home.")
                     llm, routed = self._task_llm(task.prompt)
                     if routed:
                         await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": f"视频任务，改用视频模型 {routed}"}))
@@ -601,6 +748,16 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    loop.home = home
+                    seed = self.store.kv_get(f"task_seed_plan:{task.id}")
+                    if seed and seed.get("steps"):   # a continuation keeps the plan and its ticks
+                        loop.plan_steps = list(seed["steps"])
+                        loop.plan_done = set(int(i) for i in seed.get("done") or [])
+                        loop.cfg.make_plan = False
+                    for n in getattr(live, "pending_notes", []) or []:
+                        loop.inject(n)
+                    if self.lessons is not None:
+                        loop.lesson_hint = self._lesson_hook(task)
                     bos_on = False
                     try:   # BrowserOS neo on this computer (设置 › 电脑): element-level bos_* tools, one tab group per task
                         from . import browseros as _bos
@@ -650,6 +807,8 @@ class SessionManager:
                     await cleanup()
                 except Exception as e:  # noqa: BLE001
                     log.warning("isolated cleanup: %s", e)
+            if status == "succeeded" and self.lessons is not None and not parent_id:
+                self._background(self._learn(task.id, getattr(getattr(live, "loop", None), "home", None)))
             if status == "succeeded":
                 await self._notify("done", "任务完成", result or "", task)
             elif status == "stopped":
@@ -662,6 +821,72 @@ class SessionManager:
 
         live.runner = asyncio.create_task(runner())
         return live
+
+    # ------------------------------------------------------------------ 3.8.5: files, lessons
+    async def _sync_task_files(self, task: Task, computer) -> tuple[str, Optional[str]]:
+        """Put the task's attachments (every upload of its runs and its thread) and the files its earlier runs sent
+        into ~/workspace on the computer this run uses; returns the prompt block and the computer's $HOME."""
+        from . import continuation as _cont
+        from . import uploads as _up
+        row = self.store.task(task.id) or {}
+        runs = self.store.continuations(row["continues"]) if row.get("continues") else [row]
+        ups = _up.for_task(self.store, [r["id"] for r in runs], task.thread_id, [r.get("prompt") or "" for r in runs])
+        made = _cont.files_made(self.store, [r for r in runs if r["id"] != task.id]) if row.get("continues") else []
+        made = [f for f in made if f.get("local") and os.path.isfile(f["local"])]
+        items = [{"local": u["path"], "rel": f"uploads/{u['name']}", "name": u["name"]} for u in ups]
+        items += [{"local": f["local"], "rel": f["rel"], "name": f["name"]} for f in made
+                  if f"uploads/{f['name']}" not in {i["rel"] for i in items}]
+        if not items:
+            info = await _up.sync_files(computer, [])
+            return "", info.get("home")
+        info = await _up.sync_files(computer, items)
+        n_up = len(ups)
+        a = _up.prompt_block({"files": info["files"][:n_up]}, "ATTACHMENTS")
+        b = _up.prompt_block({"files": info["files"][n_up:]}, "FILES")
+        return "\n\n".join(x for x in (a, b) if x), info.get("home")
+
+    def _lesson_hook(self, task: Task):
+        shown: set = set(self.store.kv_get(f"task_lessons:{task.id}") or [])
+
+        async def hint(error: str, tool: str = "", domain: str = "") -> Optional[str]:
+            from agent_runtime import skills as _skills
+            sk = _skills.picked(task.prompt) + _skills.mentioned(task.prompt)
+            text, ids = self.lessons.hint(error, tool, task.machine_id, [domain] if domain else [], sk, exclude=shown)
+            shown.update(ids)
+            return text or None
+        return hint
+
+    def _background(self, coro):
+        job = asyncio.ensure_future(coro)
+        self.jobs.add(job)
+        job.add_done_callback(self.jobs.discard)
+        return job
+
+    async def _learn(self, task_id: str, home: Optional[str] = None) -> list:
+        """After a task ended well: extract lessons from it (and from the runs it continued)."""
+        try:
+            from agent_runtime import skills as _skills
+            row = self.store.task(task_id) or {}
+            runs = self.store.continuations(row["continues"]) if row.get("continues") else [row]
+            events, user_texts = [], []
+            for r in runs:
+                if r.get("session_id"):
+                    events += self.store.events(r["session_id"], limit=2000)
+                if r is not runs[0] and (r.get("prompt") or "").strip():
+                    user_texts.append(r["prompt"])
+            for e in events:
+                d = e.get("data") or {}
+                if e.get("type") == "agent.input_answered" and isinstance(d.get("answer"), str):
+                    user_texts.append(d["answer"])
+                if e.get("type") == "agent.message" and d.get("instruction"):
+                    user_texts.append(d["instruction"])
+            prompt = runs[0].get("prompt") or ""
+            sk = _skills.picked(prompt) + _skills.mentioned(prompt)
+            task = {**row, "prompt": prompt, "machine_id": row.get("machine_id")}
+            return await self.lessons.learn_from_task(task, events, user_texts, home, sk)
+        except Exception as e:  # noqa: BLE001
+            log.warning("learn lessons: %s", e)
+            return []
 
     async def _isolated_computer(self, task: Task, emit, sid):
         """Full clone of the machine's VM from snapshot AIW_CLONE_SNAPSHOT, started, used once, destroyed."""

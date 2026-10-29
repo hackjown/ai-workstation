@@ -47,7 +47,8 @@ class Store:
             self.db.executescript(SCHEMA)
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(tasks)")}
             for col, typ in (("thread_id", "TEXT"), ("source", "TEXT"), ("plan", "TEXT"), ("session_id", "TEXT"),
-                             ("max_steps", "INTEGER"), ("timeout_s", "REAL"), ("parent_id", "TEXT")):
+                             ("max_steps", "INTEGER"), ("timeout_s", "REAL"), ("parent_id", "TEXT"),
+                             ("continues", "TEXT")):
                 if col not in cols:
                     self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typ}")
             # a child thread holds one piece of a request the agent split across computers (dispatch)
@@ -56,6 +57,9 @@ class Store:
                 if col not in tcols:
                     self.db.execute(f"ALTER TABLE threads ADD COLUMN {col} TEXT")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_tasks_parent ON tasks(parent_id)")
+            # 3.8.5: a continuation (继续 / 我已经上传了 / 改一下 / 修改任务) is a new run of the SAME task: `continues`
+            # names the first run (the root); the UI shows the chain as one task
+            self.db.execute("CREATE INDEX IF NOT EXISTS ix_tasks_continues ON tasks(continues)")
             self.db.execute("CREATE INDEX IF NOT EXISTS ix_tasks_thread ON tasks(thread_id, created_at)")
             self.db.commit()
 
@@ -120,10 +124,10 @@ class Store:
     def create_task(self, t: dict):
         now = time.time()
         self._x("""INSERT INTO tasks (id, user_id, prompt, machine_id, status, result, created_at, updated_at,
-                   thread_id, source, max_steps, timeout_s, parent_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   thread_id, source, max_steps, timeout_s, parent_id, continues) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (t["id"], t.get("user_id"), t["prompt"], t["machine_id"], t["status"], None, now, now,
                  t.get("thread_id"), t.get("source", "chat"), t.get("max_steps", 40), t.get("timeout_s", 600),
-                 t.get("parent_id")))
+                 t.get("parent_id"), t.get("continues")))
         if t.get("thread_id"):
             self.touch_thread(t["thread_id"])
 
@@ -139,6 +143,13 @@ class Store:
 
     def thread_tasks(self, thread_id: str, limit: int = 200) -> list[dict]:
         rows = self._x("SELECT * FROM tasks WHERE thread_id=? ORDER BY created_at LIMIT ?", (thread_id, limit))
+        for r in rows:
+            r["plan"] = json.loads(r["plan"]) if r.get("plan") else None
+        return rows
+
+    def continuations(self, root_id: str) -> list[dict]:
+        """The runs of one task, oldest first: the root and every 继续 / 修改 run that continues it (3.8.5)."""
+        rows = self._x("SELECT * FROM tasks WHERE id=? OR continues=? ORDER BY created_at", (root_id, root_id))
         for r in rows:
             r["plan"] = json.loads(r["plan"]) if r.get("plan") else None
         return rows

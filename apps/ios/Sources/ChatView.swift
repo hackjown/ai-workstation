@@ -443,7 +443,7 @@ struct ChatView: View {
         defer { uploading = false; upName = "" }
         if data.count > 40 * 1024 * 1024 { m.err = "\(name) 超过 40MB，请先剪短或压缩"; return false }
         do {
-            let r = try await API.shared.postWithProgress("/api/uploads", ["name": name, "content_b64": data.base64EncodedString(), "machine_id": API.shared.machine]) { f in
+            let r = try await API.shared.postWithProgress("/api/uploads", ["name": name, "content_b64": data.base64EncodedString(), "machine_id": API.shared.machine, "thread_id": m.threadId ?? ""]) { f in
                 upProgress = f
             }
             attach.append(r)
@@ -583,6 +583,36 @@ struct TaskBlock: View {
     @State private var queueBusy = false
     @State private var queueErr = ""
     @State private var busyPrompt = ""
+    @State private var textSheet: TaskTextAsk? = nil   // 3.8.5: 修改任务 / 补充要求
+    /// 3.8.5: this run continues the task above (tasks.continues): the same task, labelled 接着上次继续 / 修改后接着做
+    var runTag: String {
+        if t.s("continues").isEmpty { return "" }
+        switch t.s("run_mode") { case "edit": return "修改后接着做"; case "resume": return "自动接着做"; default: return "接着上次继续" }
+    }
+    /// 3.8.5 actions: 继续 a stopped / failed task, 修改任务, 补充要求 while it runs
+    @ViewBuilder var taskActions: some View {
+        if running {
+            Button("补充") { textSheet = TaskTextAsk(kind: .instruct, text: "") }.font(.caption.weight(.semibold))
+        } else if ["failed", "stopped", "interrupted"].contains(live.status) {
+            Button("继续") { Task { _ = try? await API.shared.call("POST", "/api/tasks/\(t.s("id"))/retry"); await reload() } }
+                .font(.caption.weight(.semibold))
+        }
+        if !queued && !running {
+            Menu {
+                Button { textSheet = TaskTextAsk(kind: .edit, text: t.s("continues").isEmpty ? t.s("prompt") : "") } label: { Label("修改任务", systemImage: "pencil") }
+                Button { textSheet = TaskTextAsk(kind: .instruct, text: "") } label: { Label("补充要求后接着做", systemImage: "text.badge.plus") }
+            } label: { Image(systemName: "ellipsis.circle").font(.system(size: 17)) }
+                .accessibilityLabel("修改任务")
+        }
+    }
+    func sendText(_ a: TaskTextAsk, _ text: String) async -> String? {
+        let id = t.s("continues").isEmpty ? t.s("id") : t.s("continues")
+        do {
+            if a.kind == .edit { _ = try await API.shared.obj("POST", "/api/tasks/\(id)/edit", ["prompt": text]) }
+            else { _ = try await API.shared.obj("POST", "/api/tasks/\(t.s("id"))/instruct", ["text": text]) }
+            await reload(); return nil
+        } catch { return error.localizedDescription }
+    }
     /// 3.8: a follow-up waiting in the server's queue (sent while a task ran, or after 停止)
     var queued: Bool { live.status == "queued" }
     /// Why it waits (server: tasks[].queue from GET /api/threads/{id})
@@ -631,9 +661,14 @@ struct TaskBlock: View {
         VStack(alignment: .leading, spacing: 10) {
             // the user's message
             HStack { Spacer(minLength: 56)
-                if queued {   // 3.8: tap a queued message for 立即发送 / 删除
-                    Button { askNow = true } label: { UserBubble(prompt: t.s("prompt")).opacity(0.65) }.buttonStyle(.plain)
-                } else { UserBubble(prompt: t.s("prompt")) }
+                VStack(alignment: .trailing, spacing: 3) {
+                    if !runTag.isEmpty {
+                        Text("↻ " + runTag).font(.caption2.weight(.semibold)).foregroundColor(amber)
+                    }
+                    if queued {   // 3.8: tap a queued message for 立即发送 / 删除
+                        Button { askNow = true } label: { UserBubble(prompt: t.s("prompt")).opacity(0.65) }.buttonStyle(.plain)
+                    } else { UserBubble(prompt: t.s("prompt")) }
+                }
             }
             // the agent's side (3.7): the small 球球 head on the left and the shared task card (CardStyle.swift), the
             // same look as the task cards in the chat
@@ -651,11 +686,12 @@ struct TaskBlock: View {
                         Button(role: .destructive) { Task { await dropQueued() } } label: { Image(systemName: "trash").font(.system(size: 15)) }
                             .accessibilityLabel("删除这条排队消息").disabled(queueBusy)
                     } else if running {
+                        taskActions
                         Button(role: .destructive) { Task { _ = try? await API.shared.call("DELETE", "/api/tasks/\(t.s("id"))"); await reload() } } label: {
                             Image(systemName: "stop.circle.fill").font(.system(size: 20))
                         }
-                    } else if ["failed", "stopped", "interrupted"].contains(live.status) {
-                        Button("重试") { Task { _ = try? await API.shared.call("POST", "/api/tasks/\(t.s("id"))/retry"); await reload() } }.font(.caption)
+                    } else {
+                        taskActions
                     }
                 }
                 if queued { Text(queueLine).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true) }
@@ -752,6 +788,9 @@ struct TaskBlock: View {
             Button("等它做完，第一个发") {}
             Button("取消", role: .cancel) {}
         } message: { Text("一台电脑一次只做一个任务。这条已经排到最前面。") }
+        .sheet(item: $textSheet) { a in
+            TaskTextSheet(ask: a) { text in await sendText(a, text) }
+        }
     }
 
     /// The pieces this task dispatched: machine, live status, tap to open that piece's own conversation.
@@ -899,6 +938,57 @@ struct PickedMovie: Transferable {
             let dst = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "." + (f.file.pathExtension.isEmpty ? "mov" : f.file.pathExtension))
             try FileManager.default.copyItem(at: f.file, to: dst)
             return PickedMovie(url: dst)
+        }
+    }
+}
+
+
+/// 3.8.5: 修改任务 (new instructions, the same task re-runs with its history and files) or 补充要求 (read at the next step).
+struct TaskTextAsk: Identifiable {
+    enum Kind { case edit, instruct }
+    let kind: Kind
+    let text: String
+    var id: String { kind == .edit ? "edit" : "instruct" }
+}
+
+struct TaskTextSheet: View {
+    let ask: TaskTextAsk
+    let send: (String) async -> String?
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @State private var err = ""
+    @State private var busy = false
+    var title: String { ask.kind == .edit ? "修改任务" : "补充要求" }
+    var hint: String {
+        ask.kind == .edit ? "改完后同一个任务接着做：做过的步骤、文件和附件都保留，只重做改动涉及的部分。"
+            : "任务不会重来：正在做就下一步照做，已停下就带着这句接着做。"
+    }
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(footer: Text(hint)) {
+                    TextField(ask.kind == .edit ? "新的要求" : "例如：顺便把 PDF 也转成 Word", text: $text, axis: .vertical).lineLimit(3...10)
+                }
+                if !err.isEmpty { Section { Text(err).foregroundColor(.red).font(.footnote) } }
+            }
+            .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(ask.kind == .edit ? "重新做" : "发送") { submit() }
+                        .disabled(busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .onAppear { if text.isEmpty { text = ask.text } }
+        }
+        .presentationDetents([.medium, .large])
+    }
+    func submit() {
+        busy = true
+        Task {
+            let e = await send(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            busy = false
+            if let e = e { err = e } else { dismiss() }
         }
     }
 }

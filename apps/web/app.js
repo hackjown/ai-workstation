@@ -227,7 +227,9 @@ function renderChat(scroll) {
 }
 function renderTask(t) {
   const evs = S.evs[t.id] || [];
-  const user = `<div class="u"><div><div class="bubble">${esc(t.prompt)}</div><div class="meta">${when(t.created_at)}${t.source && t.source !== "chat" ? " · " + ({ routine: "例程", retry: "重试", resume: "自动恢复", dispatch: "主任务分派" }[t.source] || t.source) : ""}</div></div></div>`;
+  // 3.8.5: a 继续 / 修改 run of the task above is the same task (tasks.continues), labelled as such
+  const runTag = t.continues ? ({ edit: "修改后接着做", retry: "接着上次继续", resume: "自动接着做" }[t.run_mode] || "接着上次继续") : "";
+  const user = `<div class="u"><div><div class="bubble">${runTag ? `<span class="chip run-tag">↻ ${runTag}</span> ` : ""}${esc(t.prompt)}</div><div class="meta">${when(t.created_at)}${!t.continues && t.source && t.source !== "chat" ? " · " + ({ routine: "例程", retry: "重试", resume: "自动恢复", dispatch: "主任务分派" }[t.source] || t.source) : ""}</div></div></div>`;
   if (t.status === "sending") return user + `<div class="a"><div class="small" style="margin-left:8px">正在发送…</div></div>`;
   if (t.status === "queued") return user + `<div class="a"><div class="small" style="margin-left:8px">排队中，前面的任务完成后自动开始</div></div>`;
   let plan = t.plan && t.plan.steps && t.plan.steps.length ? t.plan : null;
@@ -303,9 +305,10 @@ function renderTask(t) {
   }
   if (t.result && !liveNow) html += `<div class="bubble result ${t.status === "succeeded" ? "ok" : "bad"}" style="max-width:100%">${esc(t.result)}</div>`;
   html += `<div class="foot">`;
-  if (liveNow) html += `<button class="btn sm" onclick="go('computer')">${icon("monitor")}看桌面</button><button class="btn sm danger" onclick="ctl('${t.session_id}','stop')">${icon("stop")}停止</button>`;
+  if (liveNow) html += `<button class="btn sm" onclick="go('computer')">${icon("monitor")}看桌面</button><button class="btn sm" onclick="taskInstruct('${t.id}')">补充要求</button><button class="btn sm danger" onclick="ctl('${t.session_id}','stop')">${icon("stop")}停止</button>`;
   if (t.session_id) html += `<button class="btn sm" onclick="replay('${t.session_id}')">${icon("play")}回放</button><button class="btn sm" onclick="receipts('${t.id}')">${icon("receipt")}收据</button><button class="btn sm" onclick="exportTask('${t.id}')">导出</button>`;
-  if (["failed", "stopped", "interrupted"].includes(t.status)) html += `<button class="btn sm primary" onclick="retry('${t.id}')">${icon("retry")}重试</button>`;
+  if (["failed", "stopped", "interrupted"].includes(t.status)) html += `<button class="btn sm primary" onclick="retry('${t.id}')">${icon("retry")}继续</button>`;
+  if (!["queued", "sending"].includes(t.status)) html += `<button class="btn sm" onclick="taskEdit('${t.id}')">修改任务</button>`;
   if (!liveNow && t.result && ("speechSynthesis" in window || NATIVE)) html += `<button class="btn sm" onclick="speak(${esc(JSON.stringify(t.result))})">${icon("speaker")}朗读</button>`;
   html += `</div></div></div>`;
   return user + html;
@@ -398,7 +401,7 @@ async function uploadFiles(list) {
     if (f.size > 40 * 1048576) { toast(f.name + " 超过 40MB"); continue; }
     toast("上传 " + f.name + "…");
     const b64 = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",")[1]); r.onerror = rej; r.readAsDataURL(f); });
-    try { S.attach.push(await api("POST", "/api/uploads", { name: f.name, content_b64: b64, machine_id: MID })); renderAttach(); }
+    try { S.attach.push(await api("POST", "/api/uploads", { name: f.name, content_b64: b64, machine_id: MID, thread_id: S.threadId || null })); renderAttach(); }
     catch (e) { toast("上传失败：" + e.message); }
   }
   $("file").value = "";
@@ -480,6 +483,38 @@ async function takeoverDone(sid) {
 async function answerQ(sid, text) { clearPend(sid, "question"); await api("POST", "/api/agent/answer", { session_id: sid, text }); refreshThread(); }
 function answerQForm(e, sid) { e.preventDefault(); const v = e.target.a.value.trim(); if (v) answerQ(sid, v); }
 async function retry(id) { const r = await api("POST", `/api/tasks/${id}/retry`); S.threadId = r.thread_id; await refreshThread(true); }
+/* 3.8.5 修改任务: change the task's instructions and re-run the SAME task (history, files, attachments kept) */
+function taskEdit(id) {
+  const root = (S.thread && S.thread.tasks || []).find((x) => x.id === id) || {};
+  const rid = root.continues || id;
+  const first = (S.thread && S.thread.tasks || []).find((x) => x.id === rid) || root;
+  const cur = (S.thread && S.thread.instructions || {})[rid] || first.prompt || "";
+  modal(`<div class="card"><div class="heading">修改任务</div>
+    <div class="muted">改完后同一个任务接着做：做过的步骤、文件和附件都保留，只重做改动涉及的部分。</div>
+    <textarea id="editPrompt" rows="7" style="width:100%;margin-top:10px">${esc(cur)}</textarea>
+    <div class="row gap" style="justify-content:flex-end;margin-top:10px"><button class="btn sm" onclick="closeOverlays()">取消</button>
+    <button class="btn sm primary" onclick="taskEditGo('${rid}')">改好了，重新做</button></div></div>`);
+}
+async function taskEditGo(id) {
+  const p = ($("editPrompt").value || "").trim();
+  if (!p) return toast("要求不能是空的");
+  try { const r = await api("POST", `/api/tasks/${id}/edit`, { prompt: p }); closeOverlays(); toast("已修改，接着做"); S.threadId = r.thread_id || S.threadId; await refreshThread(true); }
+  catch (e) { toast("没能修改：" + e.message); }
+}
+/* 3.8.5 补充要求 while the task runs: the agent reads it at its next step (or it answers the open question) */
+function taskInstruct(id) {
+  modal(`<div class="card"><div class="heading">补充要求</div>
+    <div class="muted">任务不会重来，Aiw 下一步就会照着做。</div>
+    <textarea id="instrText" rows="4" style="width:100%;margin-top:10px" placeholder="例如：顺便把 PDF 也转成 Word"></textarea>
+    <div class="row gap" style="justify-content:flex-end;margin-top:10px"><button class="btn sm" onclick="closeOverlays()">取消</button>
+    <button class="btn sm primary" onclick="taskInstructGo('${id}')">发送</button></div></div>`);
+}
+async function taskInstructGo(id) {
+  const t = ($("instrText").value || "").trim();
+  if (!t) return;
+  try { const r = await api("POST", `/api/tasks/${id}/instruct`, { text: t }); closeOverlays(); toast(r.answered ? "已作为回答交给任务" : r.instructed ? "已交给正在做的任务" : "已接着做"); refreshThread(true); }
+  catch (e) { toast("没能发送：" + e.message); }
+}
 async function cancelQueued(id) { await api("DELETE", `/api/tasks/${id}`); refreshThread(); }
 async function sendQueuedNow(id) {
   try {

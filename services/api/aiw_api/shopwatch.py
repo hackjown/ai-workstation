@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
+from .shop_probe import is_risk_limit, normalize_jd, parse_api_price
+
 log = logging.getLogger("aiw.shopwatch")
 
 MODE = "shop"
@@ -48,7 +50,12 @@ SITE_NAMES = {"jd": "京东", "taobao": "淘宝", "tmall": "天猫"}
 URL_RE = re.compile(r"https?://[^\s，。；;、\"'<>（）()【】\[\]]+")
 NUM = r"([0-9]{1,7}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)"
 PRICE_IN = re.compile(r"[¥￥]\s*" + NUM + r"(?:\s*[-~～至]\s*[¥￥]?\s*" + NUM + r")?|" + NUM + r"\s*元")
-FINAL_RE = re.compile(r"到手价|券后价|券后|预估到手|到手|折后价|补贴后|活动价后|优惠后|final|coupon|aftercoupon|estimate", re.I)
+FINAL_RE = re.compile(r"到手价|券后价|券后|用券后|领券后|预估到手|预估价|到手|折后价|补贴后|活动价后|优惠后|final|coupon|aftercoupon|estimate", re.I)
+# a 券后/到手 label right in front of a price ('满150减50 券后¥137'): final, even when 满减 text sits before it
+FINAL_NEAR = re.compile(r"(到手价?|券后价?|用券后|领券后|预估到手价?|预估价|折后价?|优惠后)[：:\s]*$")
+# '¥137券后 ¥187': a label glued to the price before it belongs to that price, not to the next one
+GLUED_BEFORE = re.compile(r"[¥￥]?\d[\d.,]*(到手价?|券后价?)[：:\s]*$")
+FINAL_AFTER = re.compile(r"^(券后价?|到手价?)")
 NOT_PRICE_RE = re.compile(r"运费|邮费|满\s*\d|减\s*\d|省\s*[¥￥]|已省|节省|立省|返\s*[¥￥]|定金|月供|分期|起/期|x\s*\d+期|×\s*\d+期|积分|赠|红包|"
                           r"plus会员|PLUS|会员价|划线|原价|参考价|市场价|门店价|京东价.*?对比|销量|评价|关注", re.I)
 OUT_OF_STOCK = re.compile(r"无货|暂时无货|已售罄|售罄|已抢光|缺货|库存不足|该地区暂不支持配送|到货通知|暂不销售|已下柜|商品已下架|宝贝已下架|此商品已下架|已下架")
@@ -92,14 +99,9 @@ def site_of(url: str) -> Optional[str]:
 
 
 def normalize_url(url: str) -> str:
-    url = extract_url(url)
-    m = re.match(r"https?://item\.m\.jd\.com/product/(\d+)\.html", url)
-    if m:
-        return f"https://item.jd.com/{m.group(1)}.html"
-    m = re.match(r"https?://item\.m\.jd\.com/ware/view\.action\?wareId=(\d+)", url)
-    if m:
-        return f"https://item.jd.com/{m.group(1)}.html"
-    return url
+    """Share text or any JD item link (item.m.jd.com/product/<sku>.html?utm_user=..., m.jd.com, wareId=) ->
+    https://item.jd.com/<sku>.html; other links unchanged."""
+    return normalize_jd(extract_url(url))
 
 
 def is_shop_url(url: str) -> bool:
@@ -107,7 +109,7 @@ def is_shop_url(url: str) -> bool:
 
 
 def is_order_url(url: str) -> bool:
-    return any(h in (url or "") for h in ORDER_HOSTS)
+    return any(h in (url or "") for h in ORDER_HOSTS) and "/common/limit.html" not in (url or "")
 
 
 def is_pay_url(url: str) -> bool:
@@ -138,6 +140,41 @@ def _bare_number(text: str) -> Optional[float]:
     return float(t) if m and float(t) > 0 else None
 
 
+def _label_after(ctx: str, t: str) -> str:
+    t = (t or "").strip()
+    if not ctx or not t or t not in ctx:
+        return ""
+    return ctx.split(t, 1)[1][:8]
+
+
+def _final_label(pre: str, after: str) -> Optional[bool]:
+    """True: a 券后/到手 label belongs to this price; False: the label in front belongs to the price before it."""
+    if FINAL_AFTER.search(after or ""):
+        return True
+    if GLUED_BEFORE.search(pre or ""):
+        return False
+    return True if FINAL_NEAR.search(pre or "") else None
+
+
+def price_line(r: dict, target=None) -> str:
+    """'原价 ¥187 · 券后 ¥137 · 目标 ¥120' (or '现价 ¥187 · 目标 ¥120' when the page has no coupon price)."""
+    def y(v):
+        return f"¥{float(v):g}"
+    parts = []
+    if r.get("final_price") is not None:
+        if r.get("price") is not None and abs(float(r["price"]) - float(r["final_price"])) > 1e-9:
+            parts.append(f"原价 {y(r['price'])}")
+        parts.append(f"券后 {y(r['final_price'])}")
+    elif r.get("price") is not None:
+        parts.append(f"现价 {y(r['price'])}")
+    if target not in (None, ""):
+        try:
+            parts.append(f"目标 {y(target)}")
+        except (TypeError, ValueError):
+            pass
+    return " · ".join(parts)
+
+
 def _label_before(ctx: str, t: str) -> str:
     """The few characters in front of a price inside its context ('运费 ¥5' -> '运费 '): its label."""
     t = (t or "").strip()
@@ -149,7 +186,7 @@ def _label_before(ctx: str, t: str) -> str:
 def parse_snapshot(snap: dict) -> dict:
     """Raw probe snapshot -> {status, price, final_price, effective, in_stock, title, url, note}.
 
-    status: ok | login | captcha | off_shelf | no_price | error
+    status: ok | login | need_login | captcha | risk_limit | off_shelf | price_pending | no_price | error
     price is the shown selling price, final_price the 到手价/券后价 when the page shows one,
     effective = final_price or price (what the order would cost per item before shipping)."""
     if not isinstance(snap, dict) or snap.get("error"):
@@ -167,8 +204,15 @@ def parse_snapshot(snap: dict) -> dict:
     prof = snap.get("profile") if isinstance(snap.get("profile"), dict) else {}
     if prof.get("dir"):
         res["profile"] = str(prof["dir"])[:120]
-    fresh = prof.get("cookies") == 0
+    fresh = prof.get("cookies") == 0 or prof.get("logged_in") is False
+    if "logged_in" in prof:
+        res["logged_in"] = prof.get("logged_in")
     frames = " ".join(snap.get("frames") or [])
+    if snap.get("risk_limit") or is_risk_limit(url, text):
+        # 活动火爆 请选购其他商品 (trade.m.jd.com/common/limit.html): JD refuses this computer for now; not a captcha
+        res.update(status="risk_limit", note="京东风控限制了这台电脑的访问（活动火爆页）。这不是验证码，没有可以完成的验证"
+                   + ("；读价用的浏览器也没有登录京东" if prof.get("logged_in") is False else ""))
+        return res
     if any(h in host for h in LOGIN_HOSTS) or (snap.get("password_input") and re.search(r"登录|login", text[:800] + title, re.I)) \
             or any(h in frames for h in ("login.taobao.com", "passport.jd.com", "havanalogin")):
         res.update(status="login", note="需要登录" + (f"（读价用的浏览器配置 {prof['dir']} 里没有登录信息）" if fresh else ""))
@@ -190,10 +234,13 @@ def parse_snapshot(snap: dict) -> dict:
             if v is not None:
                 plus.append(v)
             continue
-        if v is None or NOT_PRICE_RE.search(s.get("t") or "") or NOT_PRICE_RE.search(_label_before(s.get("ctx") or "", s.get("t") or "")):
+        pre = _label_before(s.get("ctx") or "", s.get("t") or "")
+        lab = _final_label(pre, _label_after(s.get("ctx") or "", s.get("t") or ""))
+        near_final = lab is True
+        if v is None or NOT_PRICE_RE.search(s.get("t") or "") or (NOT_PRICE_RE.search(pre) and not near_final):
             continue
         label = f"{s.get('t', '')} {s.get('ctx', '')}"
-        is_final = s.get("role") == "final" or bool(FINAL_RE.search(s.get("t") or ""))
+        is_final = s.get("role") == "final" or bool(FINAL_RE.search(s.get("t") or "")) or near_final
         (finals if is_final else mains).append((v, rng, float(s.get("fs") or 0), int(s.get("y") or 0), label))
     pm = PENDING_RE.search(" ".join([text[:2000]] + [str(s.get("t") or "") for s in snap.get("sel") or []]))
     if pm and not mains and not finals:
@@ -207,10 +254,12 @@ def parse_snapshot(snap: dict) -> dict:
         if v is None or c.get("strike") or NOT_PRICE_RE.search(t):
             continue
         pre = _label_before(c.get("ctx") or "", t)
-        if NOT_PRICE_RE.search(pre):
+        lab = _final_label(pre, _label_after(c.get("ctx") or "", t))
+        near_final = lab is True
+        if NOT_PRICE_RE.search(pre) and not near_final:
             continue
         own_final = bool(FINAL_RE.search(t) or FINAL_RE.search(c.get("cls") or ""))
-        ctx_final = bool(FINAL_RE.search(pre))
+        ctx_final = near_final or (lab is None and bool(FINAL_RE.search(pre)))
         cands.append((v, rng, float(c.get("fs") or 0), int(c.get("y") or 0), own_final or ctx_final))
     if not finals:
         finals = [(v, r, f, y, "") for (v, r, f, y, fin) in cands if fin]
@@ -229,9 +278,29 @@ def parse_snapshot(snap: dict) -> dict:
         # a 到手价 above the shown price is a different thing (PLUS, bundles); a tiny one is a coupon amount
         if res["price"] is None or (res["price"] * 0.3 <= f <= res["price"]):
             res["final_price"] = f
+    api = snap.get("api_price") if isinstance(snap.get("api_price"), dict) else None
+    if api is None:
+        for att in snap.get("api") or []:
+            got = parse_api_price(att.get("body") or "") if isinstance(att, dict) and att.get("body") else None
+            if got and (got.get("price") or got.get("final_price")):
+                api = {**got, "src": att.get("src")}
+                break
+    if res["price"] is None and res["final_price"] is None and api:
+        # v5: no price element rendered: JD's own price API, read inside the logged-in page
+        res["price"] = api.get("price")
+        f = api.get("final_price")
+        if f is not None and (res["price"] is None or res["price"] * 0.3 <= f <= res["price"] + 1e-9):
+            res["final_price"] = f
+        if api.get("plus_price"):
+            plus.append(float(api["plus_price"]))
+        res["via"] = "api"
+        res["note"] = f"页面没显示价格，价格由京东价格接口读出（{api.get('src') or 'api'}）"
+    # compare by the after-coupon price (券后/到手价, never PLUS-only); the list price only when there is none
     res["effective"] = res["final_price"] if res["final_price"] is not None else res["price"]
     if plus:
         res["plus_price"] = min(plus)
+    if api and api.get("in_stock") is not None and not (snap.get("btn") or []):
+        res["in_stock"] = bool(api["in_stock"])
 
     btns = snap.get("btn") or []
     buy = [b for b in btns if BUY_BTN.match((b.get("t") or "").strip())]
@@ -243,7 +312,12 @@ def parse_snapshot(snap: dict) -> dict:
     if res["in_stock"] is None and OUT_OF_STOCK.search(text[:3000]) and not buy:
         res["in_stock"] = False
     if res["effective"] is None:
-        res.update(status="no_price", note="页面上没有读到价格")
+        res.update(status="no_price", note="页面上没有读到价格" + (
+            "（京东价格接口也没有返回价格）" if snap.get("api") else ""))
+    if prof.get("logged_in") is False and (site_of(url) == "jd" or snap.get("jd_sku")):
+        # v5: the DevTools cookie store has no pt_key / thor: this Chrome is not the logged-in one (到手价 needs login)
+        res.update(status="need_login", note="读价用的浏览器没有登录京东（没有 pt_key / thor 登录 Cookie）"
+                   + (f"，配置目录 {prof['dir']}" if prof.get("dir") else ""))
     return res
 
 
@@ -256,8 +330,7 @@ def evaluate(w: dict, r: dict) -> tuple[bool, bool, str]:
     eff = r.get("effective")
     below = r.get("status") == "ok" and eff is not None and eff <= target + 1e-9 and r.get("in_stock") is not False
     hit = below and not int(w.get("below") or 0)
-    label = "到手价" if r.get("final_price") is not None else "现价"
-    msg = f"{label} ¥{eff:g}，已到目标 ¥{target:g}" if eff is not None else ""
+    msg = (price_line(r, target) + " · 已到目标") if eff is not None else ""
     return hit, below, msg
 
 
@@ -366,7 +439,10 @@ OPT_RETRY, OPT_PAUSE = "立即重试", "暂停这个监控"
 
 def ship_command(src: Path, remote: str, sub: str, **kw) -> str:
     """Write src to remote on the computer (only when its sha1 differs) and run `python3 remote sub --k v ...`."""
-    data = src.read_bytes()
+    try:
+        data = src.read_bytes()
+    except OSError:   # an image without the file: say so as JSON instead of failing the whole check
+        return f"echo {_q(json.dumps({'ok': False, 'reason': 'tool_missing', 'error': f'{src.name} is not in this AIW server image'}))}"
     b64 = base64.b64encode(data).decode()
     digest = hashlib.sha1(data).hexdigest()
     args = " ".join(f"--{k.replace('_', '-')} {_q(str(v))}" for k, v in kw.items()
@@ -467,6 +543,13 @@ async def run_cdp_tool(computer, sub: str, timeout: float = 150, **kw) -> dict:
     return {"ok": False, "reason": "tool_failed", "error": _err_of(r)}
 
 
+async def install_cdp_tool(computer) -> bool:
+    """Put chrome_cdp.py at ~/.config/aiw/chrome_cdp.py (probe.py submit uses it to bring the order tab to the
+    front). Best effort: a computer without it still works, the tab is just not raised."""
+    res = await run_cdp_tool(computer, "version", timeout=20)
+    return res.get("reason") not in ("tool_failed", "tool_missing")
+
+
 async def ensure_cdp(computer, mid: Optional[str], port: int = 9222) -> dict:
     """Find a DevTools endpoint on the computer, or reopen the user's Chrome with one (keeping its login)."""
     res = await run_cdp_tool(computer, "ensure", timeout=150, port=port, also=[9110])
@@ -554,6 +637,12 @@ async def desktop_read(computer, sessions, w: dict) -> Optional[dict]:
 # ----------------------------------------------------------------------------- the scheduled check
 LIVE_TASK = ("queued", "running", "paused", "takeover", "waiting_confirm", "waiting_input")
 FAIL_STATES = ("error", "no_price", "no_browser")
+PROBE_TIMEOUT = 90          # v5 waits up to ~24 s for the JD price block, then tries 3 price APIs
+RISK_BACKOFF_MIN = 2 * 3600  # JD's 活动火爆 page: look again much later, more checks only keep it on
+
+
+def risk_backoff(interval_s: int, fails: int) -> int:
+    return min(max(interval_s * 4, RISK_BACKOFF_MIN) * (2 ** min(max(fails - 1, 0), 2)), 12 * 3600)
 
 
 def _backoff(interval_s: int, fails: int) -> int:
@@ -588,6 +677,15 @@ def no_browser_text(machine: str, bname: str, ens: Optional[dict], raw_note: str
     return "\n".join(lines)
 
 
+USER_STATES = ("login", "need_login", "captcha", "risk_limit")   # the user (or time) has to clear these
+
+
+def risk_text(machine: str, bname: str = "Chrome") -> str:
+    return (f"京东风控限制了「{machine}」的访问（活动火爆页：“活动火爆 请选购其他商品”）。这不是验证码，没有要完成的验证。"
+            f"检查已自动放慢（至少 2 小时一次）。可以在「{machine}」的接管桌面里用 {bname} 手动打开一次这个商品看看，"
+            "或者等几个小时再试；频繁刷新只会让限制更久。")
+
+
 async def check(sched, w: dict, now: Optional[float] = None, manual: bool = False) -> dict:
     store, sessions, notifier = sched.store, sched.sessions, sched.notifier
     ensure_columns(store)
@@ -607,10 +705,14 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
     wait = await _machine_wait(sessions, mid)
     if wait:
         return await _defer(store, notifier, w, mid, wait, now, manual)
+    url = normalize_url(w.get("url") or "")
+    if url and url != w.get("url"):   # an old watch saved with a mobile / share link: probe the desktop item page
+        store.update("watches", w["id"], url=url)
+        w = {**w, "url": url}
     ens = None
     try:
         computer = await _computer(sessions, mid)
-        raw = await run_probe(computer, "probe", timeout=70, url=w["url"], sku=w.get("sku") or "")
+        raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, url=w["url"], sku=w.get("sku") or "")
         if str(raw.get("error", "")).startswith("NO_CDP"):
             # (1) any other answering endpoint, (2) or the user's own Chrome reopened with the port, login kept
             ens = await ensure_cdp(computer, mid)
@@ -619,13 +721,19 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
                 await asyncio.sleep(6)
                 ens = await ensure_cdp(computer, mid)
             if ens.get("ok"):
-                raw = await run_probe(computer, "probe", timeout=70, cdp_port=ens.get("port"), url=w["url"], sku=w.get("sku") or "")
+                raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, cdp_port=ens.get("port"), url=w["url"],
+                                     sku=w.get("sku") or "")
                 if ens.get("how") in ("relaunched", "launched"):
                     await notifier.notify("watch", f"已重新打开 Chrome（带调试端口）：{w['name']}",
                                           f"「{(store.machine(mid) or {}).get('name') or mid}」上的 Chrome 之前没开调试端口，"
                                           "AIW 已把它关掉再按原来的配置重新打开（标签页和登录状态保留），以后会一直带着端口启动。",
                                           link=w["url"], push=False)
         r = parse_snapshot(raw)
+        mname = (store.machine(mid) or {}).get("name") or mid
+        if r["status"] == "need_login":
+            r["note"] = f"「{mname}」上的 {_bname(store, mid)} " + r["note"].replace("读价用的浏览器", "")
+        elif r["status"] == "risk_limit":
+            r["note"] = r["note"].replace("这台电脑", f"「{mname}」")
         if r["status"] == "no_browser":
             # (3) no DevTools at all: read the visible browser through the screen
             seen = await desktop_read(computer, sessions, w)
@@ -636,7 +744,7 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
         elif r["status"] == "no_price":
             vision = sessions._vision_llm() if hasattr(sessions, "_vision_llm") else None
             if vision:
-                raw2 = await run_probe(computer, "probe", timeout=80, cdp_port=(ens or {}).get("port"), url=w["url"],
+                raw2 = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT + 10, cdp_port=(ens or {}).get("port"), url=w["url"],
                                        sku=w.get("sku") or "", shot=True)
                 v = await vision_read(vision, raw2.get("screenshot") or "", w.get("site") or site_of(w["url"]) or "")
                 if v and (v.get("final_price") or v.get("price")):
@@ -707,9 +815,9 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
         store.update("watches", w["id"], **fields)
         if prev_status and prev_status != "ok" or manual:
             resolve_asks(w["id"], "已恢复正常")
-        if manual or (prev_status in FAIL_STATES + ("login", "captcha")):
-            label = "到手价" if r.get("final_price") is not None else "现价"
-            say_chat(f"价格监控「{w['name']}」恢复了：{label} ¥{r['effective']:g}（目标 ¥{float(w.get('value') or 0):g}）。"
+        if manual or (prev_status in FAIL_STATES + USER_STATES):
+            say_chat(f"价格监控「{w['name']}」恢复了：{price_line(r, w.get('value') or 0)}。"
+                     + ("（页面没显示价格，这次是从京东价格接口读的）" if r.get("via") == "api" else "")
                      + ("（这次是从屏幕截图读的）" if r.get("via") == "screen" else ""))
         if hit:
             w2 = store.get("watches", w["id"])
@@ -728,13 +836,22 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
         fields.update(in_stock=0, below=0, fail_count=0, next_check=now + interval * 4, last_error=None)
     elif r["status"] == "price_pending":     # not a failure: keep looking at the normal pace until it is priced
         fields.update(below=0, fail_count=0, next_check=now + interval, last_error=None)
+    elif r["status"] == "risk_limit":       # JD's 活动火爆 page: back off for hours, more checks only keep it on
+        fields.update(fail_count=fails, next_check=now + risk_backoff(interval, fails), last_error=(r.get("note") or "")[:300])
     else:
         fields.update(fail_count=fails, next_check=now + _backoff(interval, fails), last_error=(r.get("note") or r["status"])[:300])
     store.update("watches", w["id"], **fields)
     bname = _bname(store, mid)
     changed = r["status"] != prev_status
     if changed:
-        if r["status"] == "login":
+        if r["status"] == "risk_limit":
+            await notifier.notify("watch_error", f"京东风控限制了访问（{machine}）：{w['name']}",
+                                  risk_text(machine, bname) + f"\n{w['url']}", link=w["url"], deep=f"takeover/{mid}")
+        elif r["status"] == "need_login":
+            await notifier.notify("watch_error", f"需要登录{site_name}（{machine}）：{w['name']}",
+                                  f"{r.get('note')}。请在 AIW 里打开「{machine}」的接管桌面，在 {bname} 里登录京东一次（扫码即可），"
+                                  f"之后价格（含券后价）会自动读取。\n{w['url']}", link=w["url"], deep=f"takeover/{mid}")
+        elif r["status"] == "login":
             await notifier.notify("watch_error", f"需要登录{site_name}：{w['name']}",
                                   f"「{machine}」上的 {bname} 还没登录{site_name}。请在 AIW 里打开这台电脑的接管桌面，"
                                   f"在 {bname} 里登录一次（扫码即可），之后价格会自动读取。\n{w['url']}", link=w["url"])
@@ -753,8 +870,10 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
         elif r["status"] == "no_browser":
             await notifier.notify("watch_error", f"价格监控打不开浏览器：{w['name']}", f"{r.get('note')}\n{w['url']}", link=w["url"])
     # no silent failure (escalate.py): anything the user must fix becomes a chat question with one-tap 立即重试
-    if r["status"] in FAIL_STATES + ("login", "captcha", "no_machine") and (changed or manual or fails == 3):
+    if r["status"] in FAIL_STATES + USER_STATES + ("no_machine",) and (changed or manual or fails == 3):
         what = {"login": f"「{machine}」上的 {bname} 还没登录{site_name}：请在接管桌面里登录一次（扫码即可），再点「{OPT_RETRY}」。",
+                "need_login": f"{r.get('note')}：请在「{machine}」的接管桌面里登录京东一次（扫码即可），再点「{OPT_RETRY}」。",
+                "risk_limit": risk_text(machine, bname),
                 "captcha": f"{site_name}弹出了滑块/安全验证：请在「{machine}」的接管桌面里完成一次，再点「{OPT_RETRY}」。"
                 }.get(r["status"]) or str(r.get("note") or r["status"])
         if r["status"] in ("error", "no_price"):
@@ -984,6 +1103,7 @@ def order_tool(store, notifier, task, computer, confirm: Callable[..., Awaitable
             word = "TIMEOUT: 30 分钟内没有确认" if timed_out else "REJECTED: 用户拒绝了这次下单"
             return f"{word}。确认订单页已关闭，订单没有提交。不要再操作，直接 done。"
         state["approved"] = True
+        await install_cdp_tool(computer)
         res = await run_probe(computer, "submit", timeout=40)
         if not res.get("ok"):
             store.update("watches", w["id"], order_status="submit_failed")

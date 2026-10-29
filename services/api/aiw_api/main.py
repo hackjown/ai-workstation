@@ -39,7 +39,7 @@ from typing import Optional
 
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from websockets.asyncio.client import connect as ws_connect
@@ -55,6 +55,20 @@ from .sessions import SessionManager
 from .store import Store
 
 log = logging.getLogger("aiw.api")
+CHECK_TIMEOUT_S = int(os.environ.get("AIW_WATCH_CHECK_TIMEOUT_S", "240"))
+
+
+def _json_safe(o):
+    """Anything -> plain JSON values (NaN/inf -> None, unknown types -> str): a response that can always be sent."""
+    if isinstance(o, dict):
+        return {str(k): _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple, set)):
+        return [_json_safe(v) for v in o]
+    if isinstance(o, float):
+        return o if o == o and o not in (float("inf"), float("-inf")) else None
+    if o is None or isinstance(o, (str, int, bool)):
+        return o
+    return str(o)
 
 
 class TaskIn(BaseModel):
@@ -550,8 +564,26 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         w = store.get("watches", wid)
         if not w:
             raise HTTPException(404)
-        res = await scheduler.check_watch(w)
-        return {**res, "watch": store.get("watches", wid)}
+        # always a JSON body (the user saw an empty reply from curl): a crash or a hang becomes {"ok": false, ...}
+        try:
+            res = await asyncio.wait_for(scheduler.check_watch(w, manual=True), timeout=CHECK_TIMEOUT_S)
+            status = (res.get("result") or {}).get("status") or ("ok" if res.get("ok") else res.get("waiting") or "error")
+            body = {**res, "status": status, "note": res.get("note") or (res.get("result") or {}).get("note") or res.get("error") or ""}
+            code = 200
+        except asyncio.TimeoutError:
+            log.warning("watch check %s timed out after %ss", wid, CHECK_TIMEOUT_S)
+            body = {"ok": False, "status": "timeout", "note": f"检查超过 {CHECK_TIMEOUT_S} 秒没有结束（电脑或浏览器没响应）",
+                    "error": "timeout"}
+            code = 200
+        except Exception as e:  # noqa: BLE001
+            log.exception("watch check %s failed", wid)
+            body = {"ok": False, "status": "error", "note": "检查时服务器出错，详情见服务器日志", "error": f"{type(e).__name__}: {e}"[:300]}
+            code = 500
+        try:
+            body["watch"] = store.get("watches", wid)
+        except Exception:  # noqa: BLE001
+            body["watch"] = None
+        return JSONResponse(_json_safe(body), status_code=code)
 
     # ------------------------------------------------------------- memory + profile
     # /api/memories* lives in memory.py (kinds, superseded, search); mounted next to the chat above

@@ -3,7 +3,7 @@
 "use strict";
 
 const SHOP_SITE = { jd: "京东", taobao: "淘宝", tmall: "天猫" };
-const SHOP_STATUS = { ok: ["正常", "ok"], machine_busy: ["等电脑空闲", "warn"], machine_offline: ["等电脑上线", "warn"], no_machine: ["电脑不在了", "bad"], login: ["需要登录", "warn"], captcha: ["需要验证", "warn"], off_shelf: ["已下架", "bad"],
+const SHOP_STATUS = { ok: ["正常", "ok"], machine_busy: ["等电脑空闲", "warn"], machine_offline: ["等电脑上线", "warn"], no_machine: ["电脑不在了", "bad"], login: ["需要登录", "warn"], need_login: ["需要登录京东", "warn"], captcha: ["需要验证", "warn"], risk_limit: ["京东风控限制", "warn"], price_pending: ["未开价", "warn"], off_shelf: ["已下架", "bad"],
   no_price: ["读不到价格", "warn"], error: ["出错", "bad"], no_browser: ["浏览器未就绪", "warn"] };
 const SHOP_ORDER = { running: ["下单中", "warn"], waiting_confirm: ["等你确认付款", "warn"], submitted: ["已提交订单", "ok"],
   rejected: ["已拒绝", ""], timeout: ["超时已取消", ""], above_target: ["实付超目标，未下单", "warn"], submit_failed: ["提交失败", "bad"],
@@ -60,7 +60,10 @@ function yuan(v) { return v == null ? "—" : "¥" + (+v).toFixed(2).replace(/\.
 
 function shopRow(w) {
   const site = SHOP_SITE[w.site] || "电商";
-  const price = w.final_price != null ? `到手 <b>${yuan(w.final_price)}</b>（标价 ${yuan(w.price)}）` : `现价 <b>${yuan(w.price)}</b>`;
+  // compared against the target: the after-coupon price (券后/到手), the list price only when there is none
+  const price = (w.final_price != null
+    ? (w.price != null && +w.price !== +w.final_price ? `原价 ${yuan(w.price)} · ` : "") + `券后 <b>${yuan(w.final_price)}</b>`
+    : `现价 <b>${yuan(w.price)}</b>`) + ` · 目标 ${yuan(w.value)}`;
   const stock = w.in_stock == null ? "" : w.in_stock ? " · 有货" : ' · <span style="color:var(--danger)">无货</span>';
   return `<div class="item"><div class="iconbox sm">${icon("target")}</div><div class="grow">
     <div><b>${esc(w.item_title || w.name)}</b> <span class="chip">${site} ≤ ¥${esc(w.value)}</span>
@@ -72,8 +75,10 @@ function shopRow(w) {
     ${w.shop_status === "login" ? `<div class="small" style="color:var(--warn,#c87618)">这台电脑的 Chrome 还没登录${site}：到「Agent 电脑」页点接管，在 Chrome 里登录一次（扫码即可）。</div>` : ""}
     <div class="small">在 <select class="sm" onchange='shopSetMachine(${esc(JSON.stringify(w))}, this.value)'>${(SHOP_MS.length ? SHOP_MS : [{ id: w.machine_id }]).map((m) => `<option value="${esc(m.id)}" ${m.id === w.machine_id ? "selected" : ""}>「${esc(m.name || m.id)}」</option>`).join("")}</select> 上检查（只用这台，不借别的电脑）</div>
     ${w.shop_status === "captcha" ? `<div class="small" style="color:var(--warn,#c87618)">「${esc(shopMachineName(w.machine_id))}」上遇到滑块验证：到这台电脑的桌面接管，完成一次验证。</div>` : ""}
+    ${w.shop_status === "risk_limit" ? `<div class="small" style="color:var(--warn,#c87618)">${esc(w.status_note || "京东风控限制了这台电脑的访问（活动火爆页）")}。这不是验证码：可以在「${esc(shopMachineName(w.machine_id))}」的桌面里手动打开一次这个商品，或等几个小时，检查已自动放慢。</div>` : ""}
+    ${w.shop_status === "need_login" ? `<div class="small" style="color:var(--warn,#c87618)">${esc(w.status_note || "")}：到「Agent 电脑」页点接管，在浏览器里登录京东一次（扫码即可）。</div>` : ""}
     ${["machine_busy", "machine_offline", "no_machine"].includes(w.shop_status) ? `<div class="small" style="color:var(--warn,#c87618)">${esc(w.status_note || "")}</div>` : ""}
-    ${w.last_error && !["login", "captcha", "machine_busy", "machine_offline", "no_machine"].includes(w.shop_status) ? `<div class="small" style="color:var(--danger)">${esc(w.last_error)}（已失败 ${w.fail_count} 次，自动退避）</div>` : ""}</div>
+    ${w.last_error && !["login", "need_login", "captcha", "risk_limit", "machine_busy", "machine_offline", "no_machine"].includes(w.shop_status) ? `<div class="small" style="color:var(--danger)">${esc(w.last_error)}（已失败 ${w.fail_count} 次，自动退避）</div>` : ""}</div>
     <div class="acts"><button class="btn sm" onclick="checkWatch('${w.id}')">立即检查</button>
     <button class="btn sm" onclick='toggleShop(${esc(JSON.stringify(w))})'>${w.enabled ? "暂停" : "启用"}</button>
     <button class="btn sm danger" onclick="delRow('watches','${w.id}',loadWatches)">删除</button></div></div>`;

@@ -10,6 +10,12 @@ The API ships this file to ~/.config/aiw/shop/probe.py and runs one command per 
   probe.py close-order                              close the 确认订单 tabs (cancel before an order exists)
   probe.py elem-at --x X --y Y                      what element sits under screen point X,Y (the confirm gate)
   probe.py url                                      the visible tab's URL
+  probe.py profile                                  which Chrome profile answers and whether it is logged in to JD
+
+v5 (2026-10-29): JD links are normalized to https://item.jd.com/<sku>.html; the probe waits for the JD price block
+(scrolling a little), falls back to JD's own price APIs fetched inside the page (the logged-in cookies apply),
+flags JD's 活动火爆 risk page (trade.m.jd.com/common/limit.html), and reports profile.dir / profile.logged_in
+from the DevTools cookie store (pt_key / thor) instead of guessing from the Cookies file.
 
 Every command prints one JSON object. Exit code 3 means Chrome's debugging port is not reachable.
 No price logic lives here: the API parses the raw snapshot (shopwatch.parse_snapshot), so it is unit-tested.
@@ -23,15 +29,171 @@ import os
 import socket
 import struct
 import sys
+import re
 import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "4"
+PROBE_VERSION = "5"
 CDP = os.environ.get("VM_AGENT_CDP", "http://127.0.0.1:9222")
 # DevTools is on 127.0.0.1: never through an http_proxy the desktop user may have set (it answers 404 / refuses)
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ORDER_HOSTS = ("trade.jd.com", "buy.taobao.com", "buy.tmall.com", "h5.m.taobao.com/cart/order", "trade.m.jd.com")
+
+# ----------------------------------------------------------------------------- pure helpers (unit-tested)
+_JD_SKU = (r"item\.jd\.com/(\d+)\.html", r"item\.m\.jd\.com/product/(\d+)\.html", r"item\.m\.jd\.com/(\d+)\.html",
+           r"(?:^|\.)m\.jd\.com/product/(\d+)\.html", r"jd\.com/product/(\d+)\.html",
+           r"item\.m\.jd\.com/ware/view\.action\?(?:.*&)?wareId=(\d+)", r"jd\.(?:com|hk)/.*?[?&](?:sku|skuId|wareId)=(\d+)")
+RISK_TEXT = ("活动火爆", "请选购其他商品")
+JD_LOGIN_COOKIES = ("pt_key", "thor")          # pt_pin alone (the account name) stays after a logout: not a session
+JD_ID_COOKIES = ("pt_key", "pt_pin", "thor")
+
+
+def jd_sku_of(url: str) -> str:
+    """The JD sku in a desktop, mobile or share link ('' when it is not a JD item link)."""
+    u = (url or "").strip()
+    host = (urlparse(u).hostname or "").lower()
+    if not (host == "jd.com" or host.endswith((".jd.com", ".jd.hk"))):
+        return ""
+    for pat in _JD_SKU:
+        m = re.search(pat, u)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def normalize_jd(url: str) -> str:
+    """item.m.jd.com/product/<sku>.html?utm_user=... (and other JD item links) -> https://item.jd.com/<sku>.html."""
+    sku = jd_sku_of(url)
+    return f"https://item.jd.com/{sku}.html" if sku else url
+
+
+def is_risk_limit(url: str, text: str = "") -> bool:
+    """JD's risk-control page (活动火爆 请选购其他商品 我知道了): not a captcha, nothing the user can solve there."""
+    return "/common/limit.html" in (url or "") or any(t in (text or "")[:3000] for t in RISK_TEXT)
+
+
+def jd_login_state(cookies: list, now: float | None = None) -> dict:
+    """Cookies from Storage.getCookies / Network.getAllCookies -> whether this profile is logged in to JD.
+    Only names and counts are reported, never a cookie value."""
+    now = time.time() if now is None else now
+    jd, names = [], set()
+    for c in cookies or []:
+        if not isinstance(c, dict):
+            continue
+        dom = str(c.get("domain") or "").lstrip(".").lower()
+        if not (dom == "jd.com" or dom.endswith(".jd.com")):
+            continue
+        exp = c.get("expires")
+        if isinstance(exp, (int, float)) and 0 < exp < now:
+            continue
+        jd.append(c)
+        if c.get("name") in JD_ID_COOKIES and c.get("value"):
+            names.add(c["name"])
+    return {"logged_in": any(n in names for n in JD_LOGIN_COOKIES), "jd_cookies": len(jd),
+            "login_cookies": sorted(names), "cookies_total": len([c for c in cookies or [] if isinstance(c, dict)])}
+
+
+def _jsonp(text: str):
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t[0] not in "{[":
+        m = re.match(r"^[\w$.]+\((.*)\)\s*;?\s*$", t, re.S)
+        if not m:
+            return None
+        t = m.group(1)
+    try:
+        return json.loads(t)
+    except ValueError:
+        return None
+
+
+def _num(v):
+    if isinstance(v, dict):
+        v = v.get("price") if v.get("price") is not None else v.get("value")
+    try:
+        f = float(str(v).replace(",", "").replace("¥", "").replace("￥", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return f if 0 < f < 10_000_000 else None
+
+
+def _walk(o, depth=0):
+    if depth > 12:
+        return
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from _walk(v, depth + 1)
+    elif isinstance(o, list):
+        for v in o[:200]:
+            yield from _walk(v, depth + 1)
+
+
+_FINAL_KEYS = ("finalPrice", "estimatedPrice", "estimatePrice", "afterCouponPrice", "couponAfterPrice", "toHandPrice",
+               "daoShouPrice", "preferencePrice", "promotionPrice", "finalPriceNum")
+_FINAL_WORD = re.compile(r"到手|券后|用券|领券后|预估|折后|优惠后")
+_PLUS_WORD = re.compile(r"plus|PLUS|会员")
+
+
+def parse_api_price(body) -> dict | None:
+    """A JD price API response (pc_detailpage_wareBusiness, item-soa getWareBusiness, p.3.cn prices/mgets; JSON or
+    JSONP) -> {price, final_price, plus_price, in_stock}; None when it holds no price. final_price is the price after
+    coupons / 到手价 (finalPrice, estimatedPrice, a {price, 到手价} pair inside couponInfo / preferenceVO ...);
+    PLUS-only prices go to plus_price and are never the price we judge by."""
+    data = _jsonp(body) if isinstance(body, str) else body
+    if data is None:
+        return None
+    price, finals, plus, stock = None, [], [], None
+    for d in _walk(data):
+        if price is None and "p" in d and any(k in d for k in ("op", "m", "id", "l", "tpp")):
+            price = _num(d.get("p"))
+            if _num(d.get("tpp")):
+                plus.append(_num(d.get("tpp")))
+        for k in ("plusPrice", "tpp"):
+            if _num(d.get(k)):
+                plus.append(_num(d.get(k)))
+        words = " ".join(str(v) for v in d.values() if isinstance(v, str))[:300]
+        for k in _FINAL_KEYS:
+            if d.get(k) not in (None, "", [], {}):
+                v = _num(d.get(k))
+                if v:
+                    sub = d.get(k)
+                    sw = " ".join(str(x) for x in sub.values() if isinstance(x, str)) if isinstance(sub, dict) else ""
+                    (plus if _PLUS_WORD.search(sw) else finals).append(v)
+        if "price" in d and not isinstance(d.get("price"), (dict, list)) and _FINAL_WORD.search(words):
+            v = _num(d.get("price"))
+            if v:
+                (plus if _PLUS_WORD.search(words) else finals).append(v)
+        if stock is None:
+            st = d.get("StockState", d.get("stockState"))
+            if isinstance(st, (int, str)) and str(st).isdigit():
+                stock = int(st) in (33, 39, 40)
+            elif isinstance(d.get("stockDesc"), str):
+                stock = None if not d["stockDesc"] else not re.search(r"无货|售罄|缺货", d["stockDesc"])
+    if price is None:
+        for d in _walk(data):     # {"price": {"p": ...}} handled above; a bare {"price": "199.00"} without labels
+            if not _FINAL_WORD.search(" ".join(str(v) for v in d.values() if isinstance(v, str))) and _num(d.get("jdPrice")):
+                price = _num(d.get("jdPrice"))
+                break
+    final = None
+    ok = [f for f in finals if price is None or price * 0.3 <= f <= price + 1e-9]
+    if ok:
+        final = min(ok)
+    if price is None and final is None:
+        return None
+    return {"price": price, "final_price": final,
+            "plus_price": min(plus) if plus else None, "in_stock": stock}
+
+
+def api_urls(sku: str) -> list[tuple[str, str]]:
+    body = json.dumps({"skuId": sku, "num": 1, "area": "1_72_2799_0"}, separators=(",", ":"))
+    from urllib.parse import quote
+    return [("pc_detailpage_wareBusiness", "https://api.m.jd.com/?appid=pc-item-soa&functionId=pc_detailpage_wareBusiness"
+             f"&client=pc&clientVersion=1.0.0&t={int(time.time() * 1000)}&body={quote(body)}"),
+            ("getWareBusiness", f"https://item-soa.jd.com/getWareBusiness?skuId={sku}&num=1&area=1_72_2799_0"),
+            ("p.3.cn", f"https://p.3.cn/prices/mgets?skuIds=J_{sku}")]
 
 
 # ----------------------------------------------------------------------------- tiny websocket client (RFC 6455)
@@ -167,32 +329,82 @@ def cdp_candidates(proc_root: str = "/proc") -> list[str]:
     return uniq
 
 
-def profile_of(base: str, proc_root: str = "/proc") -> dict:
+def _argv(proc_root: str, pid: str) -> list[str]:
+    """A process's argv. Chrome rewrites its own cmdline (setproctitle) into one space-joined string padded with NULs,
+    so a single element holding ' --' is split again; v4 missed --remote-debugging-port there (profile dir '')."""
+    with open(os.path.join(proc_root, pid, "cmdline"), "rb") as f:
+        raw = [x.decode(errors="replace") for x in f.read().split(b"\0") if x.strip()]
+    out = []
+    for x in raw:
+        out += x.split() if " --" in x else [x]
+    return out
+
+
+_DEFAULT_DIRS = (("google-chrome-beta", "~/.config/google-chrome-beta"), ("google-chrome", "~/.config/google-chrome"),
+                 ("chromium", "~/.config/chromium"), ("browseros", "~/.config/browser-os"), ("chrome", "~/.config/google-chrome"))
+
+
+def profile_of(base: str, proc_root: str = "/proc", home_dirs: tuple | None = None) -> dict:
     """Which browser profile answers on this DevTools endpoint (3.8.2: the card says where the price was read, and a
-    profile without cookies explains a login / captcha page)."""
+    profile without cookies explains a login / captcha page). dir: the --user-data-dir of the process listening with
+    that port (or the binary's default dir), else the dir whose DevToolsActivePort names the port. cookies: size of
+    the profile's Cookies file (0 = a fresh profile). logged_in is added by the probe from the DevTools cookie store."""
     port = (urlparse(base).port or 0) if base else 0
     out = {"port": port, "dir": "", "cookies": None}
     try:
         pids = [x for x in os.listdir(proc_root) if x.isdigit()]
     except OSError:
         pids = []
+    seen_dirs = []
     for pid in pids:
         try:
-            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as f:
-                argv = [x.decode(errors="replace") for x in f.read().split(b"\0") if x]
+            argv = _argv(proc_root, pid)
         except OSError:
             continue
         if not argv or any(x.startswith("--type=") for x in argv):
             continue
-        if f"--remote-debugging-port={port}" in argv:
-            d = next((x.split("=", 1)[1] for x in argv if x.startswith("--user-data-dir=")), "")
-            out["dir"] = d or "(default)"
+        d = next((x.split("=", 1)[1] for x in argv if x.startswith("--user-data-dir=")), "")
+        if d:
+            seen_dirs.append(os.path.expanduser(d))
+        has_port = f"--remote-debugging-port={port}" in argv or any(
+            argv[i] == "--remote-debugging-port" and i + 1 < len(argv) and argv[i + 1] == str(port) for i in range(len(argv)))
+        if port and has_port:
+            if not d:
+                exe = os.path.basename(argv[0]).lower()
+                d = next((os.path.expanduser(v) for k, v in _DEFAULT_DIRS if k in exe), "(default)")
+            out["dir"] = d
             break
+    if not out["dir"] and port:
+        dirs = list(home_dirs) if home_dirs is not None else [os.path.expanduser(x) for x in (
+            "~/.config/aiw-chrome", "~/.config/google-chrome", "~/.config/chromium", "~/.config/browser-os")]
+        for d in seen_dirs + dirs:
+            try:
+                with open(os.path.join(d, "DevToolsActivePort")) as f:
+                    if f.readline().strip() == str(port):
+                        out["dir"] = d
+                        break
+            except OSError:
+                pass
     if out["dir"] and out["dir"] != "(default)":
         ck = [os.path.join(os.path.expanduser(out["dir"]), "Default", n) for n in ("Cookies", os.path.join("Network", "Cookies"))]
         sizes = [os.path.getsize(c) for c in ck if os.path.exists(c)]
         out["cookies"] = max(sizes) if sizes else 0
     return out
+
+
+def read_cookies(bws, ws=None) -> list:
+    """Every cookie of the browser's default context (Storage.getCookies on the browser target), else
+    Network.getAllCookies on a page. None when neither answers."""
+    try:
+        return bws.call("Storage.getCookies", {}, 8).get("cookies") or []
+    except Exception:  # noqa: BLE001
+        pass
+    if ws is not None:
+        try:
+            return ws.call("Network.getAllCookies", {}, 8).get("cookies") or []
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 def find_cdp() -> str:
@@ -274,12 +486,30 @@ EXTRACT_JS = r"""
     ['main', 'span.price[class*="J-p-"]'], ['main', '.summary-price .price'], ['main', '#jd-price'],
     ['main', '#banner-miaosha .price'], ['main', '[class*="price_now"]'], ['main', '[class*="priceNow"]'],
     ['final', '.J-finalPrice'], ['final', '[class*="final-price-num"]'],
-    ['plus', '.p-price-plus .price'], ['plus', '.J-p-plus'], ['plus', '[class*="plus-price"]'], ['plus', '[class*="plusPrice"]']
+    ['plus', '.p-price-plus .price'], ['plus', '.J-p-plus'], ['plus', '[class*="plus-price"]'], ['plus', '[class*="plusPrice"]'],
+    // 京东 2025+ item page (v5): the price module, 券后/到手 blocks, data-price attributes
+    ['final', '[class*="coupon-price"]'], ['final', '[class*="couponAfter"]'], ['final', '[class*="after-coupon"]'],
+    ['final', '[class*="daoshou"]'], ['final', '[class*="toHand"]'],
+    ['main', '#J_StrPriceModule .price'], ['main', '.itemInfo-wrap .p-price .price'], ['main', '.itemInfo-wrap .summary-price .price'],
+    ['main', '#J_summary .p-price .price'], ['main', '[data-price]']
   ];
+  // broad fallbacks, only when none of the above matched (they also catch labels and PLUS blocks)
+  const BROAD = ['#J_StrPriceModule [class*="price"]', '#J_summary [class*="price"]', '.product-intro [class*="price"]',
+                 '.itemInfo-wrap [class*="price"]', '[class*="summary-price"] [class*="price"]'];
+  const isPlus = el => /plus/i.test(cls(el));
   const sel = [];
+  const add = (role, q, el, t) => { if (role !== 'plus' && role !== 'final' && isPlus(el)) role = 'plus';
+    sel.push({role, q, t, ctx: ctx(el), fs: fs(el), y: Math.round(el.getBoundingClientRect().top + scrollY)}); };
   for (const [role, q] of SEL) { let els = []; try { els = document.querySelectorAll(q); } catch (e) {}
-    for (const el of els) { if (!vis(el)) continue; const t = T(el); if (!/\d/.test(t) || t.length > 60) continue;
-      sel.push({role, q, t, ctx: ctx(el), fs: fs(el), y: Math.round(el.getBoundingClientRect().top + scrollY)}); if (sel.length > 30) break; } }
+    for (const el of els) { if (!vis(el)) continue; let t = T(el);
+      if (q === '[data-price]' && !/\d/.test(t)) t = el.getAttribute('data-price') || '';
+      if (!/\d/.test(t) || t.length > 60) continue;
+      add(role, q, el, t); if (sel.length > 30) break; } }
+  if (!sel.some(x => x.role === 'main' || x.role === 'final')) {
+    for (const q of BROAD) { let els = []; try { els = document.querySelectorAll(q); } catch (e) {}
+      for (const el of els) { if (!vis(el) || el.children.length > 3) continue; const t = T(el);
+        if (!/\d/.test(t) || t.length > 30) continue; add('any', q, el, t); if (sel.length > 40) break; } }
+  }
   const cand = [];
   const seen = new Set();
   for (const el of document.querySelectorAll('span,em,strong,b,i,div,p,dd,dt,label,ins,del,s')) {
@@ -301,11 +531,34 @@ EXTRACT_JS = r"""
   const frames = [...document.querySelectorAll('iframe')].filter(vis).map(f => f.src || '').filter(Boolean).slice(0, 10);
   const pw = [...document.querySelectorAll('input[type=password]')].some(vis);
   let jd_sku = ''; try { jd_sku = String((window.pageConfig && pageConfig.product && pageConfig.product.skuid) || ''); } catch (e) {}
+  if (!jd_sku) { const m = location.href.match(/item\.jd\.com\/(\d+)\.html/); if (m) jd_sku = m[1]; }
   const title = (document.querySelector('.sku-name, .itemInfo-wrap .sku-name, [class*="ItemTitle--mainTitle"], [class*="mainTitle"], .tb-main-title, .tb-detail-hd h1') || {}).innerText || document.title;
   return JSON.stringify({url: location.href, title: (title || '').trim().slice(0, 120), doc_title: document.title.slice(0, 120),
     text: (document.body ? document.body.innerText : '').slice(0, 6000), sel, cand, btn, frames, password_input: pw, jd_sku,
     ready: document.readyState});
 })()
+"""
+
+# one JD price API call from inside the item page: same site cookies (the logged-in session) apply. p.3.cn has no
+# CORS for item.jd.com, so it falls back to JSONP.
+API_JS = r"""
+(async (src, url) => {
+  const one = {src};
+  const jsonp = () => new Promise((ok, no) => { const cb = '__aiw_p' + Date.now(); const s = document.createElement('script');
+    const t = setTimeout(() => { delete window[cb]; s.remove(); no(new Error('jsonp timeout')); }, 6000);
+    window[cb] = d => { clearTimeout(t); delete window[cb]; s.remove(); ok(JSON.stringify(d)); };
+    s.onerror = () => { clearTimeout(t); s.remove(); no(new Error('jsonp load error')); };
+    s.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cb; (document.head || document.documentElement).appendChild(s); });
+  try {
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 6000);
+    const r = await fetch(url, {credentials: 'include', signal: ctl.signal}); clearTimeout(tm);
+    one.status = r.status; one.body = (await r.text()).slice(0, 40000);
+  } catch (e) {
+    one.error = String(e).slice(0, 160);
+    if (src === 'p.3.cn') { try { one.body = await jsonp(); one.jsonp = true; } catch (e2) { one.error += ' / ' + String(e2).slice(0, 100); } }
+  }
+  return JSON.stringify(one);
+})
 """
 
 PICK_SKU_JS = r"""
@@ -405,10 +658,53 @@ def visible_page() -> dict:
 
 
 def is_order_url(url: str) -> bool:
-    return any(h in (url or "") for h in ORDER_HOSTS)
+    return any(h in (url or "") for h in ORDER_HOSTS) and "/common/limit.html" not in (url or "")
+
+
+LOGIN_HOST_KEYS = ("passport.jd.com", "login.taobao.com", "login.tmall.com", "login.m.jd.com", "plogin.m.jd.com")
+
+
+def has_jd_price(snap: dict) -> bool:
+    return any(x.get("role") in ("main", "final", "any") and re.search(r"\d", str(x.get("t") or ""))
+               for x in snap.get("sel") or [])
+
+
+def jd_api_price(ws, sku: str) -> dict:
+    """JD's own price APIs, tried in order from inside the item page; the first that yields a price wins."""
+    tries = []
+    for src, url in api_urls(sku):
+        try:
+            one = json.loads(ws.eval(f"({API_JS})({json.dumps(src)}, {json.dumps(url)})", 15) or "{}")
+        except Exception as e:  # noqa: BLE001
+            one = {"src": src, "error": f"{type(e).__name__}: {e}"[:160]}
+        got = parse_api_price(one.get("body") or "") if one.get("body") else None
+        tries.append({k: (v[:300] if k == "body" and isinstance(v, str) else v) for k, v in one.items()})
+        if got and (got.get("price") or got.get("final_price")):
+            tries[-1]["body"] = (one.get("body") or "")[:20000]
+            return {"api": tries, "api_price": {**got, "src": src}}
+    return {"api": tries}
+
+
+def profile_dir_from_version_page(ws) -> str:
+    """chrome://version names the profile path: the last resort for profile.dir when /proc did not say."""
+    try:
+        ws.call("Page.navigate", {"url": "chrome://version"}, 10)
+        time.sleep(0.8)
+        pth = (ws.eval("(document.querySelector('#profile_path') || {}).innerText || ''", 5) or "").strip()
+        return os.path.dirname(pth) if pth else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def cmd_probe(a):
+    url = normalize_jd(a.url)
+    sku = jd_sku_of(url)
+    jd = bool(sku)
+    prof = {}
+    try:
+        prof = profile_of(CDP)
+    except Exception:  # noqa: BLE001
+        prof = {"port": urlparse(CDP).port or 0, "dir": "", "cookies": None}
     bws = browser_ws()
     tid = bws.call("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
     try:
@@ -426,23 +722,42 @@ def cmd_probe(a):
             ws.call("Emulation.setFocusEmulationEnabled", {"enabled": True}, 5)
         except Exception:  # noqa: BLE001
             pass
-        ws.call("Page.navigate", {"url": a.url}, 30)
+        if not prof.get("dir"):
+            prof["dir"] = profile_dir_from_version_page(ws)
+            if prof["dir"]:
+                prof["dir_from"] = "chrome://version"
+        ws.call("Page.navigate", {"url": url}, 30)
         end, snap = time.time() + float(a.wait), {}
-        picked, last_sig = None, None
+        picked, last_sig, i = None, None, 0
         while time.time() < end:
             time.sleep(1.2)
+            i += 1
             try:
                 snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
             except Exception:  # noqa: BLE001 - navigating; retry
                 continue
+            if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
+                snap["risk_limit"] = True     # 活动火爆: nothing renders later, stop here
+                break
+            host = urlparse(snap.get("url") or "").hostname or ""
+            if any(k in host for k in LOGIN_HOST_KEYS):
+                break
+            if jd and not has_jd_price(snap) and i % 3 == 0:
+                try:   # JD renders the price module lazily: nudge it with a little scroll, then back to the top
+                    ws.eval("window.scrollBy(0, 500); setTimeout(() => window.scrollTo(0, 0), 500); 1", 5)
+                except Exception:  # noqa: BLE001
+                    pass
             # prices render late (and timers run slow in a background tab): act only once two reads agree
             sig = json.dumps([x.get("t") for x in (snap.get("sel") or []) + (snap.get("cand") or [])], ensure_ascii=False)
             stable, last_sig = sig == last_sig, sig
             if not stable and time.time() < end - 3:
-                host = urlparse(snap.get("url") or "").hostname or ""
-                if not any(k in host for k in ("passport.jd.com", "login.taobao.com", "login.tmall.com", "login.m.jd.com")):
-                    continue
-            if snap.get("ready") == "complete" and (snap.get("sel") or snap.get("cand")) and picked is None and a.sku:
+                continue
+            complete = snap.get("ready") == "complete"
+            if jd:   # v5: a JD item page is done only when its own price element is there
+                found = complete and has_jd_price(snap)
+            else:
+                found = complete and (snap.get("sel") or len(snap.get("cand") or []) >= 2)
+            if found and picked is None and a.sku:
                 toks = [t for t in a.sku.replace("，", " ").replace(",", " ").replace("/", " ").split() if t]
                 try:
                     picked = json.loads(ws.eval(f"({PICK_SKU_JS})({json.dumps(toks, ensure_ascii=False)})") or "[]")
@@ -451,14 +766,22 @@ def cmd_probe(a):
                 time.sleep(2.5)
                 snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
                 break
-            if snap.get("ready") == "complete" and (snap.get("sel") or len(snap.get("cand") or []) >= 2) and not a.sku:
+            if found and not a.sku:
                 time.sleep(1.5)   # coupons / 到手价 load after the main price
                 snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
                 break
-            host = urlparse(snap.get("url") or "").hostname or ""
-            if any(k in host for k in ("passport.jd.com", "login.taobao.com", "login.tmall.com", "login.m.jd.com")):
-                break
         snap["sku_picked"] = picked
+        if jd:
+            snap["jd_sku"] = snap.get("jd_sku") or sku
+            if not snap.get("risk_limit") and not has_jd_price(snap) and "item.jd.com" in (snap.get("url") or url):
+                snap.update(jd_api_price(ws, snap["jd_sku"]))
+        cookies = read_cookies(bws, ws)
+        if cookies is not None:
+            st = jd_login_state(cookies)
+            prof.update(logged_in=st["logged_in"] if (jd or st["jd_cookies"]) else None, jd_cookies=st["jd_cookies"],
+                        login_cookies=st["login_cookies"], cookies_total=st["cookies_total"])
+            if prof.get("cookies") is None:
+                prof["cookies"] = st["cookies_total"]
         if a.shot:
             try:
                 bws.call("Target.activateTarget", {"targetId": tid})
@@ -475,11 +798,22 @@ def cmd_probe(a):
         bws.close()
     snap["probe_version"] = PROBE_VERSION
     snap["cdp"] = CDP
-    try:
-        snap["profile"] = profile_of(CDP)
-    except Exception:  # noqa: BLE001
-        pass
+    snap["asked_url"] = url
+    snap["profile"] = prof
     out(snap)
+
+
+def cmd_profile(_a):
+    """Which profile answers on the DevTools port and whether it is logged in to JD (no page is opened)."""
+    prof = profile_of(CDP)
+    bws = browser_ws()
+    try:
+        cookies = read_cookies(bws)
+    finally:
+        bws.close()
+    if cookies is not None:
+        prof.update(jd_login_state(cookies))
+    out({"probe_version": PROBE_VERSION, "cdp": CDP, "profile": prof})
 
 
 def order_pages() -> list[dict]:
@@ -563,7 +897,7 @@ def main():
     p.add_argument("--url", required=True)
     p.add_argument("--sku", default="")
     p.add_argument("--shot", action="store_true")
-    p.add_argument("--wait", default="18")
+    p.add_argument("--wait", default="24")
     sub.add_parser("order")
     sub.add_parser("submit")
     sub.add_parser("close-order")
@@ -571,6 +905,7 @@ def main():
     e.add_argument("--x", required=True)
     e.add_argument("--y", required=True)
     sub.add_parser("url")
+    sub.add_parser("profile")
     sub.add_parser("version")
     a = ap.parse_args()
     if a.cmd == "version":
@@ -580,7 +915,7 @@ def main():
         out({"error": f"NO_CDP: {why}"}, 3)
     try:
         {"probe": cmd_probe, "order": cmd_order, "submit": cmd_submit, "close-order": cmd_close_order,
-         "elem-at": cmd_elem_at, "url": cmd_url}[a.cmd](a)
+         "elem-at": cmd_elem_at, "url": cmd_url, "profile": cmd_profile}[a.cmd](a)
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001

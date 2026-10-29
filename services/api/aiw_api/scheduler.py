@@ -107,11 +107,11 @@ class Scheduler:
         self.store.update("routines", r["id"], last_task_id=res["task"]["id"], thread_id=res["task"]["thread_id"])
         return res
 
-    async def check_watch(self, w: dict, now: float | None = None) -> dict:
+    async def check_watch(self, w: dict, now: float | None = None, manual: bool = False) -> dict:
         now = now or time.time()
         if (w.get("mode") or "") == "shop":   # 京东/淘宝/天猫: read on an AIW computer's logged-in Chrome
             from . import shopwatch
-            return await shopwatch.check(self, w, now)
+            return await shopwatch.check(self, w, now, manual=manual)
         interval = max(5, int(w.get("interval_min") or 60)) * 60
         try:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent": UA}) as c:

@@ -574,7 +574,7 @@ async function addWatch(e) {
   try { await api("POST", "/api/watches", { name: f.name.value, url: f.url.value, mode: f.mode.value, value: f.value.value, interval_min: +f.interval_min.value });
     f.reset(); toast("已添加，首次检查会建立基线"); loadWatches(); } catch (err) { toast(err.message); }
 }
-async function checkWatch(id) { const r = await api("POST", `/api/watches/${id}/check`); toast(r.ok ? (r.triggered ? "触发提醒！" : "检查完成，没有新变化") : "失败：" + r.error); loadWatches(); }
+async function checkWatch(id) { const r = await api("POST", `/api/watches/${id}/check`); toast(r.ok ? (r.triggered ? "触发提醒！" : "检查完成，没有新变化") : "失败：" + (r.note || r.error || r.status)); loadWatches(); }
 async function toggleWatch(w) { await api("PUT", `/api/watches/${w.id}`, { ...w, enabled: !w.enabled }); loadWatches(); }
 async function delRow(kind, id, after) { if (!confirm("确定删除？")) return; await api("DELETE", `/api/${kind}/${id}`); after(); }
 

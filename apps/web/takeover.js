@@ -143,10 +143,16 @@
       ws.onmessage = function (m) {
         var d; try { d = JSON.parse(m.data); } catch (e) { return; }
         if (d.op === "hello") { if (d.width) { rx.w = d.width; rx.h = d.height; } paint(); }
-        else if (d.op === "error" && Date.now() - rx.errAt > 4000) { rx.errAt = Date.now(); say("电脑没收到操作：" + String(d.error || "").slice(0, 60)); }
+        else if (d.op === "error") oops("电脑没收到操作：" + String(d.error || "").slice(0, 60));
       };
       ws.onclose = function () { if (rx.ws === ws) { rx.open = false; rx.ws = null; retry(); } };
       ws.onerror = function () { /* onclose follows */ };
+    }
+    /** 3.8.7: one note per problem, not a toast for every failed batch (the same text stays quiet for 20 s) */
+    function oops(text) {
+      var now = Date.now();
+      if (now - rx.errAt < 6000 || (text === rx.errText && now - rx.errAt < 20000)) return;
+      rx.errAt = now; rx.errText = text; say(text);
     }
     function retry() {
       if (st.gone) return;
@@ -170,7 +176,7 @@
       win.fetch(root() + "api/machines/" + encodeURIComponent(opts.mid) + "/input", { method: "POST", headers: h, body: JSON.stringify({ ops: ops }) })
         .then(function (r) { if (r.ok) return r.json(); throw new Error("HTTP " + r.status); })
         .then(function (j) { if (j && j.width && !rx.w) { rx.w = j.width; rx.h = j.height; paint(); } },
-              function (e) { if (Date.now() - rx.errAt > 4000) { rx.errAt = Date.now(); say("连不上电脑：" + e.message); } });
+              function (e) { oops("连不上电脑：" + e.message); });
     }
     /** mouse moves: at most one per MOVE_MS (~60 a second); the latest position always wins */
     function moveTo(p) {

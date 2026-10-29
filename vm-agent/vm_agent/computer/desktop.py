@@ -213,19 +213,22 @@ class X11Backend(DesktopBackend):
         vals = dict(line.split("=") for line in out.strip().splitlines() if "=" in line)
         return int(vals["X"]), int(vals["Y"])
 
+    # 3.8.7: no `mousemove --sync`. xdotool 3.20160805 (Ubuntu 24.04, Debian 12/13, InstaBox) waits 15 s for a move
+    # that never comes when the pointer is already on the target pixel, so a click right after a move to the same spot
+    # (every takeover tap) hung until "timeout after 10.0s". The move and the button now go in ONE xdotool process,
+    # which the X server runs in order, so the pointer is always there before the click.
     async def move(self, x, y):
-        await self._xdo(f"mousemove --sync {int(x)} {int(y)}")
+        await self._xdo(f"mousemove {int(x)} {int(y)}")
 
     async def click(self, x, y, button=1, repeat=1):
-        await self.move(x, y)
-        await self._xdo(f"click --repeat {int(repeat)} --delay 80 {int(button)}")
+        await self._xdo(f"mousemove {int(x)} {int(y)} click --repeat {int(repeat)} --delay 80 {int(button)}")
 
     async def drag(self, x1, y1, x2, y2):
-        await self.move(x1, y1)
-        await self._xdo("mousedown 1")
+        await self._xdo(f"mousemove {int(x1)} {int(y1)} mousedown 1")
         await asyncio.sleep(0.05)
-        await self._xdo(f"mousemove --sync {int(x2)} {int(y2)}")
-        await self._xdo("mouseup 1")
+        await self._xdo(f"mousemove {int(x2)} {int(y2)}")
+        await asyncio.sleep(0.05)
+        await self._xdo(f"mousemove {int(x2)} {int(y2)} mouseup 1")
 
     async def type(self, text):
         # 3.8.4: xdotool types a character that is not on the keyboard map (Chinese, emoji) by remapping a spare
@@ -235,10 +238,10 @@ class X11Backend(DesktopBackend):
             await self._xdo(f"type --delay {70 if wide else 12} -- {shlex.quote(run)}")
 
     async def mouse_down(self, x, y, button=1):
-        await self._xdo(f"mousemove --sync {int(x)} {int(y)} mousedown {int(button)}")
+        await self._xdo(f"mousemove {int(x)} {int(y)} mousedown {int(button)}")
 
     async def mouse_up(self, x, y, button=1):
-        await self._xdo(f"mousemove --sync {int(x)} {int(y)} mouseup {int(button)}")
+        await self._xdo(f"mousemove {int(x)} {int(y)} mouseup {int(button)}")
 
     async def key(self, key):
         await self._xdo(f"key -- {shlex.quote(normalize_key(key))}")

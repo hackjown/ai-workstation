@@ -1,6 +1,6 @@
 """computer.input (3.8.4): the user's own takeover input, a batch of ops run in order on the VM display.
 
-See aiw_protocols/input_ops.py for the op language. Everything is absolute xdotool (X11Backend): mousemove --sync,
+See aiw_protocols/input_ops.py for the op language. Everything is absolute xdotool (X11Backend): mousemove (no --sync since 3.8.7),
 click / mousedown / mouseup, wheel buttons 4-7, `type` (non-ASCII runs typed slower so Chinese is not dropped) and
 `key`. The router holds the input lock for the whole batch, so the agent's own clicks never interleave with it.
 """
@@ -33,4 +33,5 @@ async def run(b: DesktopBackend, ops: list) -> dict:
         elif t == "key":
             await b.key(op["key"])
         done += 1
-    return {"applied": done, "width": size[0], "height": size[1]}
+    # v 2 (3.8.7): no `mousemove --sync` underneath; the API sends batches here only when it sees v >= 2
+    return {"applied": done, "width": size[0], "height": size[1], "v": 2}

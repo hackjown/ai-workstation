@@ -1,41 +1,47 @@
-"""The user's takeover input, straight to the VM (3.8.4).
+"""The user's takeover input, straight to the VM (3.8.4; 3.8.7 delivery fix).
 
 Before 3.8.4 the touch layer (apps/web/takeover.js) faked mouse and key DOM events inside the noVNC page. That could
 not reach a viewer on another origin (InstaBox 云电脑: every key and touch of the layer was dropped) and noVNC grabbed
 focus on each tap, so the phone keyboard closed. Now the phone sends small ops (aiw_protocols/input_ops.py) here:
 
   WS   /ws/input/{mid}?token=…    {"op": "hello", "width", "height"} first, then the client streams ops (JSON, one op
-                                  or {"ops": [...]}) and gets {"op": "error", "error"} back only when something failed.
+                                  or {"ops": [...]}) and gets {"op": "error", "error"} back only when something failed
+                                  (the same error at most once every ERR_QUIET seconds).
   POST /api/machines/{mid}/input  {"ops": [...]} -> {"ok", "applied"} (tests, and the client's fallback when a socket
                                   cannot be opened)
 
-A pump per connection keeps order, collapses back-to-back mouse moves into the last one (the phone already sends at
-most ~60 a second) and hands whatever is queued to the vm-agent as one `computer.input` batch: absolute xdotool on the
-VM display, so it works the same for local and cloud computers, portrait and landscape.
+A pump per connection keeps order, collapses back-to-back mouse moves into the last one and hands whatever is queued
+to the VM as one command per batch. The socket never waits for the VM (fire and forget, ordered by the pump).
 
-A vm-agent from before 3.8.4 answers "unknown action type": the pump then runs the same ops through the older
-actions (computer.move / click / double_click / scroll / type / hotkey) and shell.exec xdotool for button down / up and
-for non-ASCII text, so takeover works before update-agent.sh too (just a little slower).
+3.8.7, how a batch reaches the VM ("mode"), decided once per connection by a `computer.input` probe with no ops:
+  native   a vm-agent that answers v >= 2: `computer.input` (absolute xdotool, no --sync)
+  script   anything older (no computer.input before 3.8.4, or 3.8.4-3.8.6 whose X11 move used `mousemove --sync`):
+           ONE shell.exec running an xdotool chain (input_ops.xdotool_script), so update-agent.sh is not required.
+Root cause of 「电脑没收到操作：RuntimeError: timeout after 10.0s」 on 云电脑 1 (a 3.8.3 agent): the old path sent
+computer.move then computer.click; click = `mousemove --sync` to the pixel the pointer was already on, which
+xdotool 3.20160805 waits 15 s on; the agent gave up at 10 s. Moves worked, every click and double click failed.
 """
 from __future__ import annotations
 
 import asyncio
 import collections
 import logging
-import shlex
+import time
 from typing import Optional
 
-from aiw_protocols.input_ops import BUTTONS, clean, coalesce
+from aiw_protocols.input_ops import budget, clean, coalesce, xdotool_script
 from fastapi import WebSocket, WebSocketDisconnect
 
 log = logging.getLogger("aiw.input")
 BATCH = 40
+ERR_QUIET = 15.0      # seconds the same error stays quiet on the phone (no toast spam)
 
 
 class InputPump:
     def __init__(self, computer, legacy: Optional[bool] = None):
         self.c = computer
-        self.legacy = legacy           # None = not known yet (first batch tells)
+        # "native" | "script" | None (not known yet: the probe or the first batch tells)
+        self.mode: Optional[str] = None if legacy is None else ("script" if legacy else "native")
         self.size: Optional[tuple[int, int]] = None
         self.q: collections.deque = collections.deque()
         self.ev = asyncio.Event()
@@ -44,16 +50,36 @@ class InputPump:
         self.held: Optional[str] = None    # a mouse button the phone holds down (drag), released if it goes away
         self.at = (0, 0)
         self.busy = False
+        self._last_err = ("", 0.0)
+
+    @property
+    def legacy(self) -> Optional[bool]:
+        return None if self.mode is None else self.mode == "script"
 
     async def screen(self) -> Optional[tuple[int, int]]:
-        if self.size:
+        """The screen size, and (first call) which way batches go: a `computer.input` with no ops is harmless on
+        every agent and tells the version (v >= 2 since 3.8.7)."""
+        if self.size and self.mode:
             return self.size
-        try:
-            r = await self.c.execute("computer.screen_size", {}, timeout=8)
-            if r.success and r.result.get("width"):
-                self.size = (int(r.result["width"]), int(r.result["height"]))
-        except Exception as e:  # noqa: BLE001
-            log.info("screen size: %s", e)
+        if self.mode is None:
+            try:
+                r = await self.c.execute("computer.input", {"ops": []}, timeout=8)
+                if r.success:
+                    res = r.result or {}
+                    self.mode = "native" if int(res.get("v") or 0) >= 2 else "script"
+                    if res.get("width"):
+                        self.size = (int(res["width"]), int(res["height"]))
+                elif "unknown action type" in (r.error or ""):
+                    self.mode = "script"
+            except Exception as e:  # noqa: BLE001
+                log.info("input probe: %s", e)
+        if not self.size:
+            try:
+                r = await self.c.execute("computer.screen_size", {}, timeout=8)
+                if r.success and r.result.get("width"):
+                    self.size = (int(r.result["width"]), int(r.result["height"]))
+            except Exception as e:  # noqa: BLE001
+                log.info("screen size: %s", e)
         return self.size
 
     def push(self, raw) -> int:
@@ -80,12 +106,18 @@ class InputPump:
 
     async def drain(self) -> None:
         self.busy = True
+        first: Optional[BaseException] = None
         try:
-            while self.q:
+            while self.q:   # a failed batch does not strand the ops queued behind it
                 batch = []
                 while self.q and len(batch) < BATCH:
                     batch.append(self.q.popleft())
-                await self.apply(coalesce(batch))
+                try:
+                    await self.apply(coalesce(batch))
+                except Exception as e:  # noqa: BLE001
+                    first = first or e
+            if first:
+                raise first
         finally:
             self.busy = False
             self.ev.clear()
@@ -103,49 +135,44 @@ class InputPump:
             except Exception as e:  # noqa: BLE001 - one bad batch must not end the takeover
                 msg = f"{type(e).__name__}: {e}"[:300]
                 self.errors.append(msg)
-                if on_error:
+                last, at = self._last_err
+                now = time.monotonic()
+                if on_error and (msg != last or now - at > ERR_QUIET):
+                    self._last_err = (msg, now)
                     await on_error(msg)
+
+    async def _call(self, action: str, payload: dict, timeout: float):
+        """One command; a lost connection (nothing ran) is tried once more, a slow command is not (clicks are not
+        idempotent)."""
+        r = await self.c.execute(action, payload, timeout=timeout)
+        err = r.error or ""
+        if not r.success and ("ConnectionError" in err or "connection lost" in err or "ConnectionClosed" in err):
+            await asyncio.sleep(0.5)
+            r = await self.c.execute(action, payload, timeout=timeout)
+        return r
 
     async def apply(self, ops: list[dict]) -> None:
         if not ops:
             return
-        if self.legacy is not True:
-            r = await self.c.execute("computer.input", {"ops": ops}, timeout=20 + 2 * len(ops))
+        t = budget(ops)
+        if self.mode != "script":
+            r = await self._call("computer.input", {"ops": ops}, timeout=t)
             if r.success:
-                self.legacy = False
-                self.applied += int(r.result.get("applied") or 0)
+                if self.mode is None:   # no probe answer: this batch ran on whatever agent it is; pick for the rest
+                    self.mode = "native" if int((r.result or {}).get("v") or 0) >= 2 else "script"
+                self.applied += int((r.result or {}).get("applied") or 0)
                 return
             if "unknown action type" not in (r.error or ""):
                 raise RuntimeError(r.error or "input failed")
-            self.legacy = True   # a vm-agent before 3.8.4
-        for op in ops:
-            await self._one(op)
-            self.applied += 1
-
-    async def _one(self, op: dict) -> None:
-        t = op["t"]
-        if t == "move":
-            r = await self.c.execute("computer.move", {"x": op["x"], "y": op["y"]}, timeout=10)
-        elif t == "click":
-            if op["count"] == 2 and op["button"] == "left":
-                r = await self.c.execute("computer.double_click", {"x": op["x"], "y": op["y"]}, timeout=10)
-            else:
-                r = await self.c.execute("computer.click", {"x": op["x"], "y": op["y"], "button": op["button"]}, timeout=10)
-        elif t in ("down", "up"):
-            r = await self.c.execute("shell.exec", {"command": f"xdotool mousemove --sync {op['x']} {op['y']} "
-                                                               f"mouse{t} {BUTTONS[op['button']]}", "timeout": 8}, timeout=12)
-        elif t == "scroll":
-            r = await self.c.execute("computer.scroll", {"dx": op["dx"], "dy": op["dy"], "x": op["x"], "y": op["y"]}, timeout=10)
-        elif t == "text":
-            if all(ord(ch) < 127 for ch in op["text"]):
-                r = await self.c.execute("computer.type", {"text": op["text"]}, timeout=30)
-            else:   # the old agent types at --delay 12, which drops Chinese characters
-                r = await self.c.execute("shell.exec", {"command": "xdotool type --delay 70 -- " + shlex.quote(op["text"]),
-                                                        "timeout": 60}, timeout=65)
-        else:
-            r = await self.c.execute("computer.hotkey", {"keys": op["key"]}, timeout=10)
+            self.mode = "script"   # a vm-agent before 3.8.4
+        cmd = xdotool_script(ops)
+        if not cmd:
+            return
+        r = await self._call("shell.exec", {"command": cmd, "timeout": t}, timeout=t + 4)
         if not r.success:
-            raise RuntimeError(r.error or f"{t} failed")
+            res = r.result or {}
+            raise RuntimeError(r.error or (res.get("stderr") or "").strip()[:200] or f"xdotool exit {res.get('exit_code')}")
+        self.applied += len(ops)
 
 
 def mount(app, store, sessions, auth, ws_ok) -> None:
@@ -174,7 +201,7 @@ def mount(app, store, sessions, auth, ws_ok) -> None:
             await p.drain()
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f"input failed: {e}"[:300])
-        return {"ok": True, "accepted": n, "applied": p.applied, "legacy": bool(p.legacy),
+        return {"ok": True, "accepted": n, "applied": p.applied, "legacy": bool(p.legacy), "mode": p.mode,
                 "width": (p.size or (0, 0))[0], "height": (p.size or (0, 0))[1]}
 
     @app.websocket("/ws/input/{mid}")

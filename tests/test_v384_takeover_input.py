@@ -111,7 +111,7 @@ def test_x11_types_chinese_slower(monkeypatch):
     assert calls == ["type --delay 12 -- ab", "type --delay 70 -- " + shlex.quote("你好"), "type --delay 12 -- c"]
     calls.clear()
     asyncio.run(b.mouse_down(3, 4)); asyncio.run(b.mouse_up(5, 6, 3))
-    assert calls == ["mousemove --sync 3 4 mousedown 1", "mousemove --sync 5 6 mouseup 3"]
+    assert calls == ["mousemove 3 4 mousedown 1", "mousemove 5 6 mouseup 3"]   # 3.8.7: no --sync
 
 
 class OldAgent:
@@ -129,6 +129,7 @@ class OldAgent:
 
 
 async def test_old_agent_fallback():
+    """3.8.7: an old agent gets ONE shell.exec xdotool chain per batch (no computer.click, no --sync)."""
     c = OldAgent()
     p = InputPump(c)
     await p.screen()
@@ -137,16 +138,15 @@ async def test_old_agent_fallback():
             {"t": "key", "key": "ctrl+v"}, {"t": "click", "x": 5, "y": 5, "button": "right"}, {"t": "scroll", "x": 1, "y": 1, "dy": -2}])
     await p.drain()
     acts = [a for a, _ in c.calls]
-    assert acts[:2] == ["computer.screen_size", "computer.input"] and p.legacy is True
-    assert "computer.double_click" in acts and "computer.hotkey" in acts and "computer.scroll" in acts
-    sh = [pl["command"] for a, pl in c.calls if a == "shell.exec"]
-    assert sh[0] == "xdotool mousemove --sync 3 3 mousedown 1" and sh[1] == "xdotool mousemove --sync 4 4 mouseup 1"
-    assert sh[2].startswith("xdotool type --delay 70 -- ") and "中文" in sh[2]
-    assert ("computer.type", {"text": "hi"}) in c.calls
-    assert ("computer.click", {"x": 5, "y": 5, "button": "right"}) in c.calls
+    assert acts == ["computer.input", "computer.screen_size", "shell.exec"] and p.legacy is True and p.mode == "script"
+    sh = c.calls[-1][1]["command"]
+    assert "--sync" not in sh
+    assert "xdotool mousemove 1 1 mousemove 2 2 click --repeat 2 --delay 80 1 mousemove 3 3 mousedown 1 mousemove 4 4 mouseup 1" in sh
+    assert "xdotool type --delay 12 -- hi" in sh and "xdotool type --delay 70 -- '中文'" in sh and "xdotool key -- ctrl+v" in sh
+    assert "mousemove 5 5 click --repeat 1 --delay 80 3 mousemove 1 1 click --repeat 2 4" in sh
     # once known old, it never asks for computer.input again
     c.calls.clear(); p.push({"t": "key", "key": "Return"}); await p.drain()
-    assert [a for a, _ in c.calls] == ["computer.hotkey"]
+    assert [a for a, _ in c.calls] == ["shell.exec"]
 
 
 def test_ws_input(tmp_path):

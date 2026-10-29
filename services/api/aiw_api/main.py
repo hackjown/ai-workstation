@@ -46,6 +46,7 @@ from pydantic import BaseModel
 from websockets.asyncio.client import connect as ws_connect
 
 from . import cron
+from . import desktop_view
 from . import uploads as _uploads
 from .config import Settings
 from .crypto import SecretBox
@@ -1383,24 +1384,43 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                 return {"novnc_url": await cloud.desktop_url(mid, view_only), "external": True}
             except CloudError as e:
                 raise HTTPException(502, str(e))
-        path = f"ws/desktop/{mid}"
-        vnc_pw = os.environ.get("AIW_VNC_PASSWORD", "")
-        pw_q = f"&password={quote(vnc_pw, safe='')}" if vnc_pw else ""
-        return {"novnc_url": f"/desktop/{mid}/vnc.html?autoconnect=1&resize=scale&reconnect=1"
-                              f"&view_only={'1' if view_only else '0'}&path={path}{pw_q}",
-                "ws_path": f"/{path}"}
+        # 3.8.7: our own viewer on noVNC's RFB API (desktop_view.py): it puts the token on the websocket, answers
+        # credentialsrequired with the password, and shows styled notes instead of vnc.html's bare form
+        return {"novnc_url": desktop_view.view_url(mid, view_only, os.environ.get("AIW_VNC_PASSWORD", "")),
+                "ws_path": f"/ws/desktop/{mid}"}
 
-    # noVNC static files are served by the VM's websockify (--web); proxy them
-    # so the browser only ever talks to this API.
-    @app.get("/desktop/{mid}/{path:path}", dependencies=[Depends(auth)])
-    async def desktop_static(mid: str, path: str):
+    # noVNC static files are served by the VM's websockify (--web); proxy them so the browser only ever talks to
+    # this API. 3.8.7: noVNC's own css/js/images need no token (iOS loads them from an iframe that has no cookie,
+    # every one was a 401 and vnc.html showed its bare credentials form); pages do, and set the aiw_token cookie.
+    @app.get("/desktop/{mid}/{path:path}")
+    async def desktop_static(mid: str, path: str, request: Request):
         m = store.machine(mid)
         if not m:
             raise HTTPException(404)
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{m['desktop_endpoint']}/{path}")
-        return Response(r.content, status_code=r.status_code,
-                        media_type=r.headers.get("content-type", "application/octet-stream"))
+        h = request.headers.get("Authorization", "")
+        qtok = request.query_params.get("token")
+        tok = h[7:] if h.startswith("Bearer ") else request.cookies.get("aiw_token") or qtok
+        authed = _ok(tok)
+        if not authed and not desktop_view.public_asset(path):
+            raise HTTPException(401, "unauthorized")
+
+        def _cookie(resp):
+            if qtok and _ok(qtok) and request.cookies.get("aiw_token") != qtok:
+                resp.set_cookie("aiw_token", qtok, path="/", samesite="lax", secure=request.url.scheme == "https")
+            return resp
+        if path == desktop_view.VIEW_PAGE:
+            return _cookie(Response(desktop_view.VIEW_HTML, media_type="text/html; charset=utf-8",
+                                    headers={"Cache-Control": "no-store"}))
+        if not m.get("desktop_endpoint"):
+            raise HTTPException(404, "this computer has no desktop")
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(f"{m['desktop_endpoint']}/{path}")
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"desktop not reachable: {type(e).__name__}")
+        hdr = {"Cache-Control": "public, max-age=3600"} if r.status_code == 200 and desktop_view.public_asset(path) else {}
+        return _cookie(Response(r.content, status_code=r.status_code, headers=hdr,
+                                media_type=r.headers.get("content-type", "application/octet-stream")))
 
     @app.websocket("/ws/desktop/{mid}")
     async def ws_desktop(ws: WebSocket, mid: str):

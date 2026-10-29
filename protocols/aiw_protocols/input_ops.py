@@ -84,3 +84,86 @@ def coalesce(ops: list[dict]) -> list[dict]:
         else:
             out.append(op)
     return out
+
+
+# ---------------------------------------------------------------- 3.8.7: one shell command per batch
+# xdotool 3.20160805 (Ubuntu 24.04, Debian 12/13, the InstaBox image) has a bug in `mousemove --sync`: when the
+# pointer is already on the target pixel it waits for a move that never comes, 500 x 30 ms = 15 s. Takeover always
+# sends the final move and then the click at that same pixel, so every click hung (measured on 云电脑 1: the same
+# `mousemove --sync 700 400` twice took 3 ms, then 15078 ms) and the vm-agent answered "timeout after 10.0s".
+# Nothing here uses --sync: a chain inside ONE xdotool process (`mousemove x y click 1`) is ordered by the X server.
+
+KEY_ALIASES = {
+    "ENTER": "Return", "RETURN": "Return", "TAB": "Tab", "ESC": "Escape", "ESCAPE": "Escape",
+    "BACKSPACE": "BackSpace", "DELETE": "Delete", "SPACE": "space", "UP": "Up", "DOWN": "Down",
+    "LEFT": "Left", "RIGHT": "Right", "HOME": "Home", "END": "End", "PAGEUP": "Prior",
+    "PAGEDOWN": "Next", "CTRL": "ctrl", "CONTROL": "ctrl", "ALT": "alt", "SHIFT": "shift",
+    "SUPER": "super", "META": "super", "WIN": "super", "CMD": "super",
+}
+# the vm-agent's shell inherits its DISPLAY; a service started without one still finds the desktop (:1 = Xvnc, else :0)
+DISPLAY_GUARD = '[ -n "$DISPLAY" ] || { [ -e /tmp/.X11-unix/X1 ] && export DISPLAY=:1 || export DISPLAY=:0; }; '
+
+
+def xkey(key: str) -> str:
+    return "+".join(KEY_ALIASES.get(p.upper(), p) for p in key.replace(" ", "").split("+") if p)
+
+
+def text_runs(text: str) -> list[tuple[str, bool]]:
+    """(run, has non-ASCII) pieces in order: Chinese / emoji runs are typed slower so the app does not drop them."""
+    out: list[tuple[str, bool]] = []
+    for ch in text:
+        wide = ord(ch) > 126
+        if out and out[-1][1] == wide:
+            out[-1] = (out[-1][0] + ch, wide)
+        else:
+            out.append((ch, wide))
+    return out
+
+
+def xdotool_script(ops: list[dict]) -> str:
+    """Cleaned ops -> one shell command (xdotool chains joined by &&), for vm-agents whose computer.input is missing
+    or still uses `mousemove --sync`. Mouse ops chain in one process; text and keys get their own (they take the rest
+    of the arguments)."""
+    import shlex
+    cmds: list[str] = []
+    chain: list[str] = []
+
+    def flush():
+        if chain:
+            cmds.append("xdotool " + " ".join(chain))
+            chain.clear()
+    for op in ops:
+        t = op["t"]
+        if t == "move":
+            chain += ["mousemove", str(op["x"]), str(op["y"])]
+        elif t == "click":
+            chain += ["mousemove", str(op["x"]), str(op["y"]), "click", "--repeat", str(op.get("count") or 1),
+                      "--delay", "80", str(BUTTONS[op["button"]])]
+        elif t in ("down", "up"):
+            chain += ["mousemove", str(op["x"]), str(op["y"]), "mouse" + t, str(BUTTONS[op["button"]])]
+        elif t == "scroll":
+            chain += ["mousemove", str(op["x"]), str(op["y"])]
+            if op.get("dy"):
+                chain += ["click", "--repeat", str(abs(op["dy"])), "5" if op["dy"] > 0 else "4"]
+            if op.get("dx"):
+                chain += ["click", "--repeat", str(abs(op["dx"])), "7" if op["dx"] > 0 else "6"]
+        elif t == "text":
+            flush()
+            for run, wide in text_runs(op["text"]):
+                cmds.append(f"xdotool type --delay {70 if wide else 12} -- {shlex.quote(run)}")
+        elif t == "key":
+            flush()
+            cmds.append("xdotool key -- " + shlex.quote(xkey(op["key"])))
+    flush()
+    return DISPLAY_GUARD + " && ".join(cmds) if cmds else ""
+
+
+def budget(ops: list[dict]) -> float:
+    """Seconds one batch may take on the VM: a little per op, more for typed text (70 ms a Chinese character)."""
+    s = 6.0 + 0.25 * len(ops)
+    for op in ops:
+        if op["t"] == "text":
+            s += sum(len(r) * (0.09 if w else 0.02) for r, w in text_runs(op["text"]))
+        elif op["t"] == "click":
+            s += 0.1 * (op.get("count") or 1)
+    return min(120.0, s)

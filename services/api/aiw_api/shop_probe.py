@@ -4,13 +4,21 @@
 
 The API ships this file to ~/.config/aiw/shop/probe.py and runs one command per check:
 
-  probe.py probe --url URL [--sku TEXT] [--shot]   open URL in a background tab, pick the spec, read price/stock
+  probe.py probe --url URL [--sku TEXT] [--shot] [--progress FILE]   open URL in a background tab, pick the spec, read price/stock
   probe.py order                                    read the open 确认订单 page (payable amount, address, items)
   probe.py submit                                   click 提交订单 on that page (only after the user confirmed)
   probe.py close-order                              close the 确认订单 tabs (cancel before an order exists)
   probe.py elem-at --x X --y Y                      what element sits under screen point X,Y (the confirm gate)
   probe.py url                                      the visible tab's URL
   probe.py profile                                  which Chrome profile answers and whether it is logged in to JD
+
+v6 (2026-10-29): the item tab is brought to the front when it stays hidden without a price (a background tab never
+runs requestAnimationFrame / IntersectionObserver, so JD's client-rendered price module may never appear), waits with a
+MutationObserver (up to ~20 s, scrolling), reads open shadow roots and same-origin iframes, the price-keyword text
+blocks near the top (到手价 / 券后 / 京东价), JSON embedded in the page for this sku, and the page's OWN price API
+responses (Network domain; the page signs them itself, so h5st is no problem), then item.m.jd.com with the same
+cookies (ignored when it is the limit.html page). Every stage is timed (snap.stages) and written to --progress for the
+server to stream; a failed read carries a screenshot and a diagnosis (snap.diag).
 
 v5 (2026-10-29): JD links are normalized to https://item.jd.com/<sku>.html; the probe waits for the JD price block
 (scrolling a little), falls back to JD's own price APIs fetched inside the page (the logged-in cookies apply),
@@ -34,7 +42,7 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "5"
+PROBE_VERSION = "6"
 CDP = os.environ.get("VM_AGENT_CDP", "http://127.0.0.1:9222")
 # DevTools is on 127.0.0.1: never through an http_proxy the desktop user may have set (it answers 404 / refuses)
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -217,6 +225,7 @@ class WS:
             raise ConnectionError("websocket handshake refused: " + head.split(b"\r\n", 1)[0].decode(errors="replace"))
         self.buf = head.split(b"\r\n\r\n", 1)[1]
         self.ids = 0
+        self.on_event = None      # v6: DevTools events (Network.responseReceived) seen while waiting for answers
 
     def _read(self, n: int) -> bytes:
         while len(self.buf) < n:
@@ -269,6 +278,13 @@ class WS:
         end = time.time() + timeout
         while time.time() < end:
             msg = json.loads(self.recv())
+            if "method" in msg and "id" not in msg:
+                if self.on_event:
+                    try:
+                        self.on_event(msg)
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
             if msg.get("id") == mid:
                 if "error" in msg:
                     raise RuntimeError(f"{method}: {msg['error'].get('message')}")
@@ -474,6 +490,11 @@ EXTRACT_JS = r"""
     p.push(((e.id || '') + ' ' + (typeof e.className === 'string' ? e.className : '')).trim()); return p.join(' | ').slice(0, 200); };
   const ctx = el => { let e = el.parentElement; for (let i = 0; i < 3 && e; i++, e = e.parentElement) { const t = T(e);
     if (t.length > 4 && t.length < 90) return t; } return ''; };
+  // v6: open shadow roots and same-origin iframes too (a price module may live in either)
+  const ROOTS = [document];
+  try { for (const el of document.querySelectorAll('*')) { if (el.shadowRoot && ROOTS.length < 40) ROOTS.push(el.shadowRoot); } } catch (e) {}
+  for (const f of document.querySelectorAll('iframe')) { try { if (f.contentDocument && ROOTS.length < 50) ROOTS.push(f.contentDocument); } catch (e) {} }
+  const ALL = q => { const o = []; for (const r of ROOTS) { try { o.push(...r.querySelectorAll(q)); } catch (e) {} } return o; };
   const SEL = [
     ['final', '#J_FinalPrice'], ['final', '.finalPrice'], ['final', '[class*="finalPrice"]'], ['final', '[class*="final-price"]'],
     ['final', '[class*="couponPrice"]'], ['final', '[class*="afterCoupon"]'], ['final', '[class*="estimatePrice"]'],
@@ -500,19 +521,19 @@ EXTRACT_JS = r"""
   const sel = [];
   const add = (role, q, el, t) => { if (role !== 'plus' && role !== 'final' && isPlus(el)) role = 'plus';
     sel.push({role, q, t, ctx: ctx(el), fs: fs(el), y: Math.round(el.getBoundingClientRect().top + scrollY)}); };
-  for (const [role, q] of SEL) { let els = []; try { els = document.querySelectorAll(q); } catch (e) {}
+  for (const [role, q] of SEL) { const els = ALL(q);
     for (const el of els) { if (!vis(el)) continue; let t = T(el);
       if (q === '[data-price]' && !/\d/.test(t)) t = el.getAttribute('data-price') || '';
       if (!/\d/.test(t) || t.length > 60) continue;
       add(role, q, el, t); if (sel.length > 30) break; } }
   if (!sel.some(x => x.role === 'main' || x.role === 'final')) {
-    for (const q of BROAD) { let els = []; try { els = document.querySelectorAll(q); } catch (e) {}
+    for (const q of BROAD) { const els = ALL(q);
       for (const el of els) { if (!vis(el) || el.children.length > 3) continue; const t = T(el);
         if (!/\d/.test(t) || t.length > 30) continue; add('any', q, el, t); if (sel.length > 40) break; } }
   }
   const cand = [];
   const seen = new Set();
-  for (const el of document.querySelectorAll('span,em,strong,b,i,div,p,dd,dt,label,ins,del,s')) {
+  for (const el of ALL('span,em,strong,b,i,div,p,dd,dt,label,ins,del,s')) {
     if (cand.length > 80) break;
     const t = T(el); if (!t || t.length > 40 || !/[¥￥]\s*\d|\d+(\.\d{1,2})?\s*元/.test(t)) continue;
     if (el.children.length > 6 || !vis(el)) continue;
@@ -531,11 +552,33 @@ EXTRACT_JS = r"""
   const frames = [...document.querySelectorAll('iframe')].filter(vis).map(f => f.src || '').filter(Boolean).slice(0, 10);
   const pw = [...document.querySelectorAll('input[type=password]')].some(vis);
   let jd_sku = ''; try { jd_sku = String((window.pageConfig && pageConfig.product && pageConfig.product.skuid) || ''); } catch (e) {}
-  if (!jd_sku) { const m = location.href.match(/item\.jd\.com\/(\d+)\.html/); if (m) jd_sku = m[1]; }
-  const title = (document.querySelector('.sku-name, .itemInfo-wrap .sku-name, [class*="ItemTitle--mainTitle"], [class*="mainTitle"], .tb-main-title, .tb-detail-hd h1') || {}).innerText || document.title;
+  if (!jd_sku) { const m = location.href.match(/item\.(?:m\.)?jd\.com\/(?:product\/)?(\d+)\.html/); if (m) jd_sku = m[1]; }
+  const tEl = document.querySelector('.sku-name, .itemInfo-wrap .sku-name, [class*="ItemTitle--mainTitle"], [class*="mainTitle"], .tb-main-title, .tb-detail-hd h1, [class*="sku-title"], [class*="skuName"], [class*="goods-name"], [class*="itemName"]');
+  const title = (tEl && tEl.innerText) || document.title;
+  // v6: text blocks with a price keyword, with where they sit (the regex runs on the server, unit-tested)
+  const kw = []; const KW = /到手价|到手|券后|京东价|秒杀价|促销价|售价|价格|登录查看|登录后查看|PLUS|[¥￥]\s*\d/;
+  for (const r of ROOTS) { if (kw.length > 40) break; let tw; try { tw = document.createTreeWalker(r.body || r, NodeFilter.SHOW_TEXT); } catch (e) { continue; }
+    let n, k = 0; while ((n = tw.nextNode()) && kw.length <= 40 && k++ < 20000) { const v = (n.nodeValue || '').trim(); if (!v || v.length > 80 || !KW.test(v)) continue;
+      let e = n.parentElement, blk = ''; for (let i = 0; i < 4 && e; i++, e = e.parentElement) { const t = T(e); if (t.length > 120) break; blk = t; if (/\d/.test(t) && /[¥￥]|价/.test(t)) break; }
+      if (!blk || !n.parentElement || !vis(n.parentElement)) continue; const rr = n.parentElement.getBoundingClientRect(); const y = Math.round(rr.top + scrollY);
+      if (kw.some(x => x.t === blk && x.y === y)) continue; kw.push({t: blk, y, x: Math.round(rr.left), cls: cls(n.parentElement).slice(0, 80)}); } }
+  // v6: JSON the page carries for this sku (pageConfig, __INITIAL_STATE__, __NEXT_DATA__ ...)
+  const embedded = [];
+  try { const pc = window.pageConfig && pageConfig.product; if (pc) { const o = {}; for (const k of Object.keys(pc)) { const v = pc[k];
+      if (/price|sku|name|stock/i.test(k) && (v == null || typeof v !== 'object' || /price/i.test(k))) o[k] = v; }
+    embedded.push({src: 'pageConfig.product', body: JSON.stringify(o).slice(0, 4000)}); } } catch (e) {}
+  for (const g of ['__INITIAL_STATE__', '__NEXT_DATA__', '__NUXT__', '__INITIAL_DATA__', '__PRELOADED_STATE__', '__APOLLO_STATE__', 'pageData', '_itemInfo', '__DATA__']) {
+    try { const root = window[g]; if (!root || typeof root !== 'object' || !jd_sku) continue; const hits = [], seen = new Set(); let steps = 0;
+      const walk = (o, d) => { if (!o || typeof o !== 'object' || d > 10 || seen.has(o) || hits.length > 4 || steps++ > 30000) return; seen.add(o);
+        const id = String(o.skuId ?? o.skuid ?? o.sku ?? o.wareId ?? o.id ?? '');
+        if (id === jd_sku && Object.keys(o).some(k => /price/i.test(k))) { hits.push(o); return; }
+        for (const k in o) { try { walk(o[k], d + 1); } catch (e) {} } };
+      walk(root, 0); for (const h of hits) embedded.push({src: g, body: JSON.stringify(h).slice(0, 8000)}); } catch (e) {} }
   return JSON.stringify({url: location.href, title: (title || '').trim().slice(0, 120), doc_title: document.title.slice(0, 120),
+    title_from: tEl && tEl.innerText ? 'element' : 'document.title',
     text: (document.body ? document.body.innerText : '').slice(0, 6000), sel, cand, btn, frames, password_input: pw, jd_sku,
-    ready: document.readyState});
+    kw, embedded, ready: document.readyState, visibility: document.visibilityState, focus: document.hasFocus(),
+    n_elems: document.getElementsByTagName('*').length, shadow_roots: ROOTS.length - 1, scroll_y: Math.round(scrollY)});
 })()
 """
 
@@ -664,9 +707,204 @@ def is_order_url(url: str) -> bool:
 LOGIN_HOST_KEYS = ("passport.jd.com", "login.taobao.com", "login.tmall.com", "login.m.jd.com", "plogin.m.jd.com")
 
 
+_PRICE_T = re.compile(r"[¥￥]\s*\d|^\s*\d{1,7}(?:\.\d{1,2})?\s*(?:起|元)?\s*$")
+_NOT_T = re.compile(r"满\s*\d|减\s*\d|运费|\d+\s*期|积分|评价|条|关注|万\+|人")
+_KW_LABEL = re.compile(r"(到手价?|券后价?|京东价|秒杀价|促销价|售价)\s*[:：]?\s*[¥￥]\s*\d|[¥￥]\s*\d[\d.,]*\s*(到手价?|券后价?)")
+
+
 def has_jd_price(snap: dict) -> bool:
-    return any(x.get("role") in ("main", "final", "any") and re.search(r"\d", str(x.get("t") or ""))
-               for x in snap.get("sel") or [])
+    """v6: a price-looking text in a JD price element (v5 took any digit, so a stray number skipped every fallback)."""
+    return any(x.get("role") in ("main", "final", "any") and _PRICE_T.search(str(x.get("t") or ""))
+               and not _NOT_T.search(str(x.get("t") or "")) for x in snap.get("sel") or [])
+
+
+def kw_price(snap: dict) -> bool:
+    """A labelled price (到手价 ¥137 / 京东价 ¥187) in a text block near the top of the page."""
+    return any(_KW_LABEL.search(str(k.get("t") or "")) and int(k.get("y") or 0) < 1600 for k in snap.get("kw") or [])
+
+
+STAGE_CN = {"connect": "连接浏览器", "open": "打开商品页", "wait": "等待价格渲染", "front": "切到前台渲染", "read": "读取价格",
+            "net": "读取页面自己的价格接口", "api": "调用价格接口", "shot": "保存诊断截图", "mobile": "试移动版商品页",
+            "done": "完成"}
+
+
+class Stages:
+    """Timed stages of one probe run. With a path, the current stage is written there (atomically) so the API can
+    stream it to the card while the probe runs (shopwatch.run_probe polls it)."""
+
+    def __init__(self, path: str = ""):
+        self.t0, self.list, self.path = time.time(), [], path or ""
+
+    def __call__(self, key, **extra):
+        now_ms = int((time.time() - self.t0) * 1000)
+        if self.list and "ms" not in self.list[-1]:
+            self.list[-1]["ms"] = max(0, now_ms - self.list[-1]["at_ms"])
+        if key is None:
+            return
+        self.list.append({"stage": key, "label": STAGE_CN.get(key, key), "at_ms": now_ms, **extra})
+        self._write()
+
+    def _write(self):
+        if not self.path:
+            return
+        try:
+            cur = self.list[-1] if self.list else {}
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(json.dumps({"stage": cur.get("stage"), "label": cur.get("label"), "stages": self.list}, ensure_ascii=False))
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def finish(self):
+        self(None)
+        if self.path:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+
+
+WAIT_JS = r"""
+(ms => new Promise(ok => {
+  const Q = '#J_FinalPrice, .p-price .price, span.price[class*="J-p-"], .summary-price .price, [class*="finalPrice"], [class*="price_now"], [class*="priceNow"], [class*="coupon-price"]';
+  const has = () => { try { const e = document.querySelector(Q); return !!(e && /\d/.test(e.textContent || '')); } catch (x) { return false; } };
+  if (has()) return ok('has');
+  let done = false, mo = null;
+  const fin = v => { if (done) return; done = true; try { mo && mo.disconnect(); } catch (x) {} ok(v); };
+  try { mo = new MutationObserver(() => { if (has()) fin('has'); });
+        mo.observe(document.documentElement || document, {childList: true, subtree: true, characterData: true}); } catch (x) {}
+  setTimeout(() => fin('timeout'), ms);
+}))
+"""
+
+PRICE_NET_RE = re.compile(r"api\.m\.jd\.com|item-soa\.jd\.com|p\.3\.cn|pe\.3\.cn|cd\.jd\.com|[/?&]price", re.I)
+NET_SKIP = re.compile(r"recommend|similar|guess|hotsale|comment|shopInfo|pc_shop|getLegoWareDetail|club", re.I)
+NET_PRIO = re.compile(r"warebusiness|price|getWareBusiness|pc_item", re.I)
+IPHONE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+             "Version/17.5 Mobile/15E148 Safari/604.1")
+
+
+def net_name(u: str) -> str:
+    m = re.search(r"functionId=([\w.\-]+)", u or "")
+    if m:
+        return m.group(1)
+    p = urlparse(u or "")
+    return ((p.hostname or "") + p.path)[:80]
+
+
+def net_prices(ws, captured: dict, sku: str) -> tuple[list, dict | None]:
+    """The page's OWN price API responses (seen on the Network domain while it loaded; the page signed them itself)."""
+    tries, items = [], list(captured.items())
+    items.sort(key=lambda kv: 0 if NET_PRIO.search(net_name(kv[1].get("url", ""))) else 1)
+    for rid, info in items[:12]:
+        name = net_name(info.get("url", ""))
+        ent = {"src": "page:" + name, "status": info.get("status")}
+        tries.append(ent)
+        if NET_SKIP.search(name):
+            ent["skipped"] = True
+            continue
+        try:
+            b = ws.call("Network.getResponseBody", {"requestId": rid}, 6)
+            text = b.get("body") or ""
+            if b.get("base64Encoded"):
+                text = base64.b64decode(text).decode("utf-8", "replace")
+        except Exception as e:  # noqa: BLE001
+            ent["error"] = f"{type(e).__name__}: {e}"[:120]
+            continue
+        ent["size"] = len(text)
+        got = parse_api_price(text) if text else None
+        ent["price"] = bool(got)
+        if got and (got.get("price") or got.get("final_price")) and (sku in text or NET_PRIO.search(name)):
+            return tries, {**got, "src": ent["src"]}
+        if not got:
+            ent["head"] = re.sub(r"\s+", " ", text[:160])
+    return tries, None
+
+
+def prev_visible(exclude: str) -> str:
+    """The tab the user had in front (to give it back after the probe tab was brought forward)."""
+    try:
+        for p in pages()[:8]:
+            if p.get("id") == exclude:
+                continue
+            ws = WS(p["webSocketDebuggerUrl"], 4)
+            try:
+                v = ws.eval("document.visibilityState", 4)
+            finally:
+                ws.close()
+            if v == "visible":
+                return p.get("id") or ""
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def bring_front(ws, bws, tid: str) -> dict:
+    out = {"prev": prev_visible(tid)}
+    for how, fn in (("Page.bringToFront", lambda: ws.call("Page.bringToFront", {}, 5)),
+                    ("Target.activateTarget", lambda: bws.call("Target.activateTarget", {"targetId": tid}, 5))):
+        try:
+            fn()
+            out.setdefault("how", how)
+        except Exception as e:  # noqa: BLE001
+            out[how] = str(e)[:80]
+    return out
+
+
+def mobile_read(ws, sku: str, wait: float = 12) -> dict:
+    """item.m.jd.com/product/<sku>.html in the same tab (same cookies, iPhone UA). Its limit.html is not used."""
+    url = f"https://item.m.jd.com/product/{sku}.html"
+    res = {"asked_url": url}
+    try:
+        try:
+            ws.call("Emulation.setUserAgentOverride", {"userAgent": IPHONE_UA}, 5)
+            ws.call("Emulation.setDeviceMetricsOverride", {"width": 390, "height": 844, "deviceScaleFactor": 2, "mobile": True}, 5)
+        except Exception:  # noqa: BLE001
+            pass
+        ws.call("Page.navigate", {"url": url}, 20)
+        end, snap = time.time() + wait, {}
+        while time.time() < end:
+            time.sleep(1.0)
+            try:
+                snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
+            except Exception:  # noqa: BLE001
+                continue
+            if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
+                return {**res, "url": snap.get("url"), "risk_limit": True, "skipped": "limit.html"}
+            if any(k in (urlparse(snap.get("url") or "").hostname or "") for k in LOGIN_HOST_KEYS):
+                return {**res, "url": snap.get("url"), "login": True, "skipped": "login page"}
+            if snap.get("ready") == "complete" and (has_jd_price(snap) or kw_price(snap) or len(snap.get("cand") or []) >= 1):
+                time.sleep(1.0)
+                try:
+                    snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+        keep = {k: snap.get(k) for k in ("url", "title", "doc_title", "sel", "cand", "btn", "kw", "embedded", "ready",
+                                         "visibility", "jd_sku", "frames", "password_input")}
+        keep["text"] = (snap.get("text") or "")[:3000]
+        return {**res, **keep}
+    except Exception as e:  # noqa: BLE001
+        return {**res, "error": f"{type(e).__name__}: {e}"[:160]}
+    finally:
+        for m, p in (("Emulation.setUserAgentOverride", {"userAgent": ""}), ("Emulation.clearDeviceMetricsOverride", {})):
+            try:
+                ws.call(m, p, 5)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def snippets(snap: dict) -> list[str]:
+    """Short visible-text snippets around price keywords (for the diagnosis)."""
+    out = [str(k.get("t"))[:120] + f" @y{k.get('y')}" for k in (snap.get("kw") or [])[:10]]
+    if not out:
+        t = snap.get("text") or ""
+        for m in re.finditer(r"到手价|券后|京东价|[¥￥]\s*\d|登录查看", t):
+            out.append(t[max(0, m.start() - 30):m.end() + 30].replace("\n", " "))
+            if len(out) >= 6:
+                break
+    return out
 
 
 def jd_api_price(ws, sku: str) -> dict:
@@ -674,7 +912,7 @@ def jd_api_price(ws, sku: str) -> dict:
     tries = []
     for src, url in api_urls(sku):
         try:
-            one = json.loads(ws.eval(f"({API_JS})({json.dumps(src)}, {json.dumps(url)})", 15) or "{}")
+            one = json.loads(ws.eval(f"({API_JS})({json.dumps(src)}, {json.dumps(url)})", 12) or "{}")
         except Exception as e:  # noqa: BLE001
             one = {"src": src, "error": f"{type(e).__name__}: {e}"[:160]}
         got = parse_api_price(one.get("body") or "") if one.get("body") else None
@@ -697,6 +935,8 @@ def profile_dir_from_version_page(ws) -> str:
 
 
 def cmd_probe(a):
+    st = Stages(getattr(a, "progress", "") or "")
+    st("connect")
     url = normalize_jd(a.url)
     sku = jd_sku_of(url)
     jd = bool(sku)
@@ -705,6 +945,8 @@ def cmd_probe(a):
         prof = profile_of(CDP)
     except Exception:  # noqa: BLE001
         prof = {"port": urlparse(CDP).port or 0, "dir": "", "cookies": None}
+    front_mode = os.environ.get("AIW_SHOP_FRONT", "1") != "0"
+    fronted, snap, captured, prev = None, {}, {}, ""
     bws = browser_ws()
     tid = bws.call("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
     try:
@@ -717,7 +959,19 @@ def cmd_probe(a):
             time.sleep(0.2)
         if ws is None:
             raise RuntimeError("background tab did not appear")
+
+        def on_event(m):
+            if m.get("method") == "Network.responseReceived" and len(captured) < 40:
+                resp = (m.get("params") or {}).get("response") or {}
+                u = resp.get("url") or ""
+                if PRICE_NET_RE.search(u):
+                    captured[m["params"].get("requestId")] = {"url": u, "status": resp.get("status")}
+        ws.on_event = on_event
         ws.call("Page.enable")
+        try:   # v6: the page's own (signed) price API answers, read back if nothing renders
+            ws.call("Network.enable", {"maxTotalBufferSize": 20_000_000, "maxResourceBufferSize": 5_000_000}, 5)
+        except Exception:  # noqa: BLE001
+            pass
         try:   # a background tab otherwise looks unfocused/hidden: some prices render only for a focused page
             ws.call("Emulation.setFocusEmulationEnabled", {"enabled": True}, 5)
         except Exception:  # noqa: BLE001
@@ -726,15 +980,23 @@ def cmd_probe(a):
             prof["dir"] = profile_dir_from_version_page(ws)
             if prof["dir"]:
                 prof["dir_from"] = "chrome://version"
+        st("open")
         ws.call("Page.navigate", {"url": url}, 30)
-        end, snap = time.time() + float(a.wait), {}
+        st("wait")
+        t_wait = time.time()
+        end = t_wait + float(a.wait)
         picked, last_sig, i = None, None, 0
         while time.time() < end:
-            time.sleep(1.2)
+            try:   # v6: returns as soon as a price element appears (MutationObserver), else after 1.5 s
+                ws.eval(f"({WAIT_JS})(1500)", 5)
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.3)
             i += 1
             try:
                 snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
             except Exception:  # noqa: BLE001 - navigating; retry
+                time.sleep(0.9)
                 continue
             if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
                 snap["risk_limit"] = True     # 活动火爆: nothing renders later, stop here
@@ -742,9 +1004,19 @@ def cmd_probe(a):
             host = urlparse(snap.get("url") or "").hostname or ""
             if any(k in host for k in LOGIN_HOST_KEYS):
                 break
-            if jd and not has_jd_price(snap) and i % 3 == 0:
-                try:   # JD renders the price module lazily: nudge it with a little scroll, then back to the top
-                    ws.eval("window.scrollBy(0, 500); setTimeout(() => window.scrollTo(0, 0), 500); 1", 5)
+            priced = has_jd_price(snap) or kw_price(snap)
+            if jd and not priced and front_mode and fronted is None and time.time() - t_wait > 5 \
+                    and snap.get("visibility") != "visible":
+                # v6: a hidden background tab runs no requestAnimationFrame / IntersectionObserver: JD's
+                # client-rendered price module may never appear there
+                st("front")
+                fronted = bring_front(ws, bws, tid)
+                prev = fronted.get("prev") or ""
+                st("wait")
+                continue
+            if jd and not priced and i % 3 == 0:
+                try:   # JD renders the price module lazily: nudge it with a scroll, then back to the top
+                    ws.eval("window.scrollBy(0, 600); setTimeout(() => window.scrollTo(0, 0), 600); 1", 5)
                 except Exception:  # noqa: BLE001
                     pass
             # prices render late (and timers run slow in a background tab): act only once two reads agree
@@ -753,11 +1025,12 @@ def cmd_probe(a):
             if not stable and time.time() < end - 3:
                 continue
             complete = snap.get("ready") == "complete"
-            if jd:   # v5: a JD item page is done only when its own price element is there
-                found = complete and has_jd_price(snap)
+            if jd:   # a JD item page is done only when its own price is there
+                found = complete and priced
             else:
                 found = complete and (snap.get("sel") or len(snap.get("cand") or []) >= 2)
             if found and picked is None and a.sku:
+                st("read")
                 toks = [t for t in a.sku.replace("，", " ").replace(",", " ").replace("/", " ").split() if t]
                 try:
                     picked = json.loads(ws.eval(f"({PICK_SKU_JS})({json.dumps(toks, ensure_ascii=False)})") or "[]")
@@ -767,35 +1040,64 @@ def cmd_probe(a):
                 snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
                 break
             if found and not a.sku:
+                st("read")
                 time.sleep(1.5)   # coupons / 到手价 load after the main price
                 snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
                 break
         snap["sku_picked"] = picked
+        snap["fronted"] = fronted
+        host = urlparse(snap.get("url") or "").hostname or ""
+        page_ok = not snap.get("risk_limit") and not any(k in host for k in LOGIN_HOST_KEYS)
         if jd:
             snap["jd_sku"] = snap.get("jd_sku") or sku
-            if not snap.get("risk_limit") and not has_jd_price(snap) and "item.jd.com" in (snap.get("url") or url):
-                snap.update(jd_api_price(ws, snap["jd_sku"]))
-        cookies = read_cookies(bws, ws)
-        if cookies is not None:
-            st = jd_login_state(cookies)
-            prof.update(logged_in=st["logged_in"] if (jd or st["jd_cookies"]) else None, jd_cookies=st["jd_cookies"],
-                        login_cookies=st["login_cookies"], cookies_total=st["cookies_total"])
-            if prof.get("cookies") is None:
-                prof["cookies"] = st["cookies_total"]
-        if a.shot:
-            try:
-                bws.call("Target.activateTarget", {"targetId": tid})
+            if page_ok and not has_jd_price(snap) and not kw_price(snap):
+                st("net")
+                snap["net"], got = net_prices(ws, captured, snap["jd_sku"])
+                if got:
+                    snap["api_price"] = got
+                elif "jd.com" in (snap.get("url") or url):
+                    st("api")
+                    snap.update(jd_api_price(ws, snap["jd_sku"]))
+        priced = has_jd_price(snap) or kw_price(snap) or bool(snap.get("api_price")) if jd else \
+            bool(snap.get("sel") or len(snap.get("cand") or []) >= 1)
+        need_diag = not page_ok or not priced
+        if a.shot or need_diag:
+            st("shot")
+            try:   # a background tab produces no frames: bring it forward for the picture
+                if not fronted:
+                    prev = prev or prev_visible(tid)
+                    bws.call("Target.activateTarget", {"targetId": tid}, 5)
                 time.sleep(0.8)
-                snap["screenshot"] = ws.call("Page.captureScreenshot", {"format": "jpeg", "quality": 70}, 20).get("data")
+                snap["screenshot"] = ws.call("Page.captureScreenshot", {"format": "jpeg", "quality": 60}, 20).get("data")
             except Exception as e:  # noqa: BLE001
                 snap["shot_error"] = str(e)[:160]
+        if jd and page_ok and not priced:
+            st("mobile")
+            snap["mobile"] = mobile_read(ws, snap["jd_sku"])
+        cookies = read_cookies(bws, ws)
+        if cookies is not None:
+            stl = jd_login_state(cookies)
+            prof.update(logged_in=stl["logged_in"] if (jd or stl["jd_cookies"]) else None, jd_cookies=stl["jd_cookies"],
+                        login_cookies=stl["login_cookies"], cookies_total=stl["cookies_total"])
+            if prof.get("cookies") is None:
+                prof["cookies"] = stl["cookies_total"]
+        snap["snippets"] = snippets(snap)
+        snap["net_seen"] = len(captured)
         ws.close()
     finally:
         try:
             bws.call("Target.closeTarget", {"targetId": tid})
         except Exception:  # noqa: BLE001
             pass
+        if prev and prev != tid:   # give the user's tab back
+            try:
+                bws.call("Target.activateTarget", {"targetId": prev}, 5)
+            except Exception:  # noqa: BLE001
+                pass
         bws.close()
+        st("done")
+        st.finish()
+    snap["stages"] = st.list
     snap["probe_version"] = PROBE_VERSION
     snap["cdp"] = CDP
     snap["asked_url"] = url
@@ -897,7 +1199,8 @@ def main():
     p.add_argument("--url", required=True)
     p.add_argument("--sku", default="")
     p.add_argument("--shot", action="store_true")
-    p.add_argument("--wait", default="24")
+    p.add_argument("--wait", default="20")
+    p.add_argument("--progress", default="")
     sub.add_parser("order")
     sub.add_parser("submit")
     sub.add_parser("close-order")

@@ -44,6 +44,7 @@ struct TrackingSheet: View {
     @State private var items: [JSON] = []
     @State private var error = ""
     @State private var busy: String? = nil
+    @State private var stage = ""   // 3.8.6: the running 立即检查 stage
     @State private var showShop = false
     @State private var showPage = false
     @State private var loaded = false
@@ -104,6 +105,7 @@ struct TrackingSheet: View {
                     Chip(text: checkText(w), color: w.s("last_error").isEmpty ? .secondary : .red)
                     if busy == w.s("id") { ProgressView().controlSize(.mini) }
                 }
+                if busy == w.s("id") && !stage.isEmpty { Text(stage).font(.caption).foregroundColor(amber).lineLimit(1) }
             }
             Spacer(minLength: 6)
             Toggle("", isOn: Binding(get: { w.b("enabled") }, set: { on in Task { await setEnabled(w, on) } }))
@@ -159,8 +161,13 @@ struct TrackingSheet: View {
         loaded = true
     }
     func check(_ w: JSON) async {
-        busy = w.s("id")
-        do { _ = try await api.obj("POST", "/api/watches/\(w.s("id"))/check") } catch { self.error = error.localizedDescription }
+        let id = w.s("id")
+        if busy != nil { return }
+        busy = id
+        stage = "开始检查"
+        let res = await api.runWatchCheck(id) { s in stage = s }   // 3.8.6: live stage under the row
+        stage = ""
+        if !res.b("ok") { self.error = res.s("label").isEmpty ? res.s("note") : res.s("label") } else { self.error = "" }
         busy = nil
         await load()
     }

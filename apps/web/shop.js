@@ -78,8 +78,10 @@ function shopRow(w) {
     ${w.shop_status === "risk_limit" ? `<div class="small" style="color:var(--warn,#c87618)">${esc(w.status_note || "京东风控限制了这台电脑的访问（活动火爆页）")}。这不是验证码：可以在「${esc(shopMachineName(w.machine_id))}」的桌面里手动打开一次这个商品，或等几个小时，检查已自动放慢。</div>` : ""}
     ${w.shop_status === "need_login" ? `<div class="small" style="color:var(--warn,#c87618)">${esc(w.status_note || "")}：到「Agent 电脑」页点接管，在浏览器里登录京东一次（扫码即可）。</div>` : ""}
     ${["machine_busy", "machine_offline", "no_machine"].includes(w.shop_status) ? `<div class="small" style="color:var(--warn,#c87618)">${esc(w.status_note || "")}</div>` : ""}
-    ${w.last_error && !["login", "need_login", "captcha", "risk_limit", "machine_busy", "machine_offline", "no_machine"].includes(w.shop_status) ? `<div class="small" style="color:var(--danger)">${esc(w.last_error)}（已失败 ${w.fail_count} 次，自动退避）</div>` : ""}</div>
-    <div class="acts"><button class="btn sm" onclick="checkWatch('${w.id}')">立即检查</button>
+    ${w.last_error && !["login", "need_login", "captcha", "risk_limit", "machine_busy", "machine_offline", "no_machine"].includes(w.shop_status) ? `<div class="small" style="color:var(--danger)">${esc(w.last_error)}（已失败 ${w.fail_count} 次${w.fail_count > 1 ? "，自动退避；点「立即检查」会重新计数" : ""}）</div>` : ""}</div>
+    ${shopRunLine(w)}
+    <div class="acts"><button class="btn sm" id="shopBtn-${w.id}" onclick="shopCheck('${w.id}')" ${SHOP_RUN[w.id] ? "disabled" : ""}>${SHOP_RUN[w.id] ? "检查中…" : "立即检查"}</button>
+    ${w.diag_at ? `<button class="btn sm" onclick="shopDiag('${w.id}')">查看诊断</button>` : ""}
     <button class="btn sm" onclick='toggleShop(${esc(JSON.stringify(w))})'>${w.enabled ? "暂停" : "启用"}</button>
     <button class="btn sm danger" onclick="delRow('watches','${w.id}',loadWatches)">删除</button></div></div>`;
 }
@@ -116,4 +118,71 @@ async function toggleShop(w) {
 
 async function shopOpenTask(tid) {
   try { const t = await api("GET", `/api/tasks/${tid}`); if (t.thread_id) { go("chat"); openThread(t.thread_id); } } catch (e) { toast(e.message); }
+}
+
+/* v6: 立即检查 runs as a job; the card shows its stage (推送探针 → 连接浏览器 → 打开商品页 → 等待价格渲染 → 读取价格 → 完成) */
+const SHOP_RUN = {};    // watch id -> {job, label, t0}
+const SHOP_LAST = {};   // watch id -> {text, at, ok}
+function shopRunLine(w) {
+  const run = SHOP_RUN[w.id];
+  if (run) return `<div class="small" id="shopRun-${w.id}" style="display:flex;align-items:center;gap:6px"><span class="spin"></span><span>${esc(run.label)} · ${Math.round((Date.now() - run.t0) / 1000)} 秒</span></div>`;
+  const last = SHOP_LAST[w.id];
+  if (last) return `<div class="small" id="shopRun-${w.id}" style="color:${last.ok ? "var(--ok,#2a8a4a)" : "var(--warn,#c87618)"}">立即检查 ${new Date(last.at).toLocaleTimeString()}：${esc(last.text)}</div>`;
+  return `<div class="small" id="shopRun-${w.id}"></div>`;
+}
+function shopPaintRun(id) {
+  const el = $("shopRun-" + id); const w = { id };
+  if (el) el.outerHTML = shopRunLine(w);
+  const b = $("shopBtn-" + id); if (b) { b.disabled = !!SHOP_RUN[id]; b.textContent = SHOP_RUN[id] ? "检查中…" : "立即检查"; }
+}
+async function shopCheck(id) {
+  if (SHOP_RUN[id]) return;
+  SHOP_RUN[id] = { label: "开始检查", t0: Date.now() }; delete SHOP_LAST[id]; shopPaintRun(id);
+  let job;
+  try { job = (await api("POST", `/api/watches/${id}/check?async=1`)).job; }
+  catch (e) { delete SHOP_RUN[id]; SHOP_LAST[id] = { text: "没能开始：" + e.message, at: Date.now(), ok: false }; shopPaintRun(id); return; }
+  const tick = setInterval(() => shopPaintRun(id), 1000);
+  try {
+    for (let i = 0; i < 400 && job && job.state !== "done"; i++) {
+      await new Promise((ok) => setTimeout(ok, 1200));
+      try { job = await api("GET", `/api/watches/${id}/check/${job.id}`); } catch (e) { if (/404/.test(e.message) || /没有这个检查/.test(e.message)) break; continue; }
+      if (SHOP_RUN[id]) SHOP_RUN[id].label = job.label || job.stage || "检查中";
+    }
+  } finally { clearInterval(tick); }
+  const r = (job && job.result) || {};
+  delete SHOP_RUN[id];
+  SHOP_LAST[id] = { text: job && job.state === "done" ? (job.label || "").replace(/^完成：/, "") : "检查没有结束（服务器重启过？）",
+    at: Date.now(), ok: !!r.ok };
+  toast(r.ok ? (r.triggered ? "触发提醒！" : "检查完成") : "失败：" + (r.note || r.error || r.status || "没有结果"));
+  loadWatches();
+}
+checkWatch = async function (id) {   // other watches on the 追踪 page use the same job (stage text in the toast)
+  let job;
+  try { job = (await api("POST", `/api/watches/${id}/check?async=1`)).job; } catch (e) { toast("失败：" + e.message); return; }
+  toast("检查中…");
+  for (let i = 0; i < 300 && job.state !== "done"; i++) {
+    await new Promise((ok) => setTimeout(ok, 1200));
+    try { job = await api("GET", `/api/watches/${id}/check/${job.id}`); } catch (e) { break; }
+  }
+  const r = job.result || {};
+  toast(r.ok ? (r.triggered ? "触发提醒！" : "检查完成，没有新变化") : "失败：" + (r.note || r.error || r.status || "没有结果"));
+  loadWatches();
+};
+async function shopDiag(id) {
+  let d;
+  try { d = await api("GET", `/api/watches/${id}/diag`); } catch (e) { toast(e.message); return; }
+  const row = (k, v) => v == null || v === "" || (Array.isArray(v) && !v.length) ? "" : `<tr><td class="small" style="white-space:nowrap;vertical-align:top;padding-right:8px">${k}</td><td class="small" style="word-break:break-all">${esc(typeof v === "string" ? v : JSON.stringify(v))}</td></tr>`;
+  const stages = (d.probe_stages && d.probe_stages.length ? d.probe_stages : d.stages || []).map((s) => `${s.label} ${s.ms != null ? (s.ms / 1000).toFixed(1) + "s" : ""}`).join(" → ");
+  const shot = d.screenshot ? `<img src="/api/watches/${id}/diag.jpg?token=${encodeURIComponent(TOKEN)}&t=${Date.now()}" style="width:100%;border-radius:8px;border:1px solid var(--line,#ddd);margin:8px 0" />` : '<div class="muted small">这次没有截图（只在读不到价格/风控/要登录时截图）</div>';
+  modal(`<div class="heading">诊断 · ${esc(SHOP_STATUS[d.status] ? SHOP_STATUS[d.status][0] : d.status || "")}</div>
+    <div class="small">${esc(when(d.at))} · 探针 v${esc(d.probe_version || "?")}（服务器带 v${esc(d.server_probe_version || "?")}）· 服务器 ${esc(d.server_version || "")}</div>
+    ${(d.hints || []).length ? `<div class="small" style="color:var(--warn,#c87618);margin-top:6px">${d.hints.map(esc).join("<br>")}</div>` : ""}
+    ${shot}
+    <table style="width:100%;border-collapse:collapse">${row("说明", d.note)}${row("最终网址", d.final_url)}${row("页面标题", d.page_title)}${row("标题来自", d.title_from)}
+    ${row("页面状态", [d.ready, d.visibility, d.fronted ? "已切前台" : ""].filter(Boolean).join(" · "))}${row("元素数", d.n_elems)}
+    ${row("价格元素", (d.price_elements || []).map((x) => x.role + ":" + x.t))}${row("¥ 文字", d.price_texts)}${row("价格附近文字", d.snippets)}
+    ${row("页面价格接口", (d.net || []).map((n) => n.src + (n.status ? " " + n.status : "") + (n.price ? " ✓" : "") + (n.error ? " " + n.error : "")))}
+    ${row("直接调用接口", (d.api || []).map((a) => a.src + " " + (a.status || a.error || "")))}${row("移动版", d.mobile)}
+    ${row("浏览器配置", d.profile)}${row("阶段耗时", stages)}${row("错误", d.error)}</table>
+    <div style="margin-top:10px;text-align:right"><button class="btn sm" onclick="closeOverlays()">关闭</button></div>`);
 }

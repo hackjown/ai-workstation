@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
-from .shop_probe import is_risk_limit, normalize_jd, parse_api_price
+from .shop_probe import PROBE_VERSION, is_risk_limit, normalize_jd, parse_api_price
 
 log = logging.getLogger("aiw.shopwatch")
 
@@ -44,7 +44,7 @@ REMOTE = "$HOME/.config/aiw/shop/probe.py"
 COLUMNS = (("site", "TEXT"), ("quantity", "INTEGER"), ("sku", "TEXT"), ("address_note", "TEXT"),
            ("auto_order", "INTEGER"), ("machine_id", "TEXT"), ("price", "REAL"), ("final_price", "REAL"),
            ("in_stock", "INTEGER"), ("shop_status", "TEXT"), ("status_note", "TEXT"), ("item_title", "TEXT"),
-           ("below", "INTEGER"), ("order_task_id", "TEXT"), ("order_status", "TEXT"))
+           ("below", "INTEGER"), ("order_task_id", "TEXT"), ("order_status", "TEXT"), ("diag_at", "REAL"))
 
 SITE_NAMES = {"jd": "京东", "taobao": "淘宝", "tmall": "天猫"}
 URL_RE = re.compile(r"https?://[^\s，。；;、\"'<>（）()【】\[\]]+")
@@ -183,6 +183,73 @@ def _label_before(ctx: str, t: str) -> str:
     return ctx.split(t, 1)[0][-8:]
 
 
+KW_FINAL = re.compile(r"(到手价?|券后价?|用券后|领券后|预估到手价?)\s*[:：]?\s*[¥￥]\s*" + NUM + r"|[¥￥]\s*" + NUM + r"\s*(?:到手价?|券后价?)")
+KW_MAIN = re.compile(r"(京东价|秒杀价|促销价|售价|价格)\s*[:：]?\s*[¥￥]\s*" + NUM)
+KW_PLUS = re.compile(r"PLUS|plus|会员|Plus")
+KW_PLUS_PRICE = re.compile(r"(?:PLUS|Plus|plus|会员)\s*(?:专享)?价?\s*[:：]?\s*[¥￥]\s*" + NUM)
+LOGIN_PRICE_RE = re.compile(r"登录查看价格|登录后查看|登录后可见|请登录查看|登录看价|价格登录可见")
+
+
+def _f(v) -> Optional[float]:
+    try:
+        x = float(str(v).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return x if 0 < x < 10_000_000 else None
+
+
+def text_prices(kw: list, max_y: int = 1600) -> dict:
+    """v6: labelled prices in the visible text blocks near the top ('到手价 ¥137', '¥137到手', '京东价 ¥187').
+    PLUS / 会员 prices go to plus, never to the price we judge by."""
+    main, finals, plus = None, [], []
+    for b in sorted([k for k in kw or [] if isinstance(k, dict)], key=lambda k: int(k.get("y") or 0)):
+        if int(b.get("y") or 0) > max_y:
+            continue
+        t = str(b.get("t") or "")
+        for m in KW_PLUS_PRICE.finditer(t):
+            v = _f(m.group(1))
+            if v is not None:
+                plus.append(v)
+        for m in KW_FINAL.finditer(t):
+            v = _f(m.group(2) or m.group(3))
+            pre = t[max(0, m.start() - 8):m.start()]
+            if v is None or NOT_PRICE_RE.search(pre):
+                continue
+            (plus if KW_PLUS.search(pre + m.group(0)) else finals).append(v)
+        for m in KW_MAIN.finditer(t):
+            v = _f(m.group(2))
+            pre = t[max(0, m.start() - 8):m.start()]
+            if v is None or NOT_PRICE_RE.search(pre):
+                continue
+            if KW_PLUS.search(pre):
+                plus.append(v)
+            elif main is None:
+                main = v
+    return {"price": main, "final_price": min(finals) if finals else None, "plus_price": min(plus) if plus else None}
+
+
+def embedded_price(items: list) -> Optional[dict]:
+    """v6: JSON the page carries for this sku (pageConfig.product, __INITIAL_STATE__ ... filtered by sku in the page)."""
+    for e in items or []:
+        if not isinstance(e, dict) or not e.get("body"):
+            continue
+        try:
+            d = json.loads(e["body"])
+        except ValueError:
+            continue
+        got = parse_api_price(d)
+        if not got and isinstance(d, dict):
+            for k in ("jdPrice", "salePrice", "currentPrice", "price", "p"):
+                v = d.get(k)
+                v = _f(v.get("price") if isinstance(v, dict) else v)
+                if v:
+                    got = {"price": v, "final_price": None, "plus_price": None, "in_stock": None}
+                    break
+        if got and (got.get("price") or got.get("final_price")):
+            return {**got, "src": e.get("src")}
+    return None
+
+
 def parse_snapshot(snap: dict) -> dict:
     """Raw probe snapshot -> {status, price, final_price, effective, in_stock, title, url, note}.
 
@@ -295,6 +362,36 @@ def parse_snapshot(snap: dict) -> dict:
             plus.append(float(api["plus_price"]))
         res["via"] = "api"
         res["note"] = f"页面没显示价格，价格由京东价格接口读出（{api.get('src') or 'api'}）"
+    if res["price"] is None and res["final_price"] is None:
+        tp = text_prices(snap.get("kw") or [])     # v6: '到手价 ¥137' in the visible text near the top
+        if tp["price"] is not None or tp["final_price"] is not None:
+            res["price"] = tp["price"]
+            f = tp["final_price"]
+            if f is not None and (res["price"] is None or res["price"] * 0.3 <= f <= res["price"] + 1e-9):
+                res["final_price"] = f
+            res["via"], res["note"] = "text", "价格从页面文字里读出（价格元素没匹配上）"
+        if tp["plus_price"]:
+            plus.append(tp["plus_price"])
+    if res["price"] is None and res["final_price"] is None:
+        emb = embedded_price(snap.get("embedded") or [])   # v6: JSON in the page for this sku
+        if emb:
+            res["price"] = emb.get("price")
+            f = emb.get("final_price")
+            if f is not None and (res["price"] is None or res["price"] * 0.3 <= f <= res["price"] + 1e-9):
+                res["final_price"] = f
+            if emb.get("plus_price"):
+                plus.append(float(emb["plus_price"]))
+            res["via"], res["note"] = "embedded", f"价格从页面内嵌数据读出（{emb.get('src')}）"
+    mob = snap.get("mobile") if isinstance(snap.get("mobile"), dict) else None
+    if res["price"] is None and res["final_price"] is None and mob and not mob.get("skipped") and not mob.get("error"):
+        m = parse_snapshot({**mob, "profile": {k: v for k, v in prof.items() if k != "logged_in"}})
+        if m.get("effective") is not None and m.get("status") == "ok":   # v6: item.m.jd.com, same cookies
+            res.update(price=m.get("price"), final_price=m.get("final_price"), via="mobile",
+                       note="电脑版页面没显示价格，价格由移动版商品页读出")
+            if m.get("plus_price"):
+                plus.append(float(m["plus_price"]))
+            if res["in_stock"] is None:
+                res["in_stock"] = m.get("in_stock")
     # compare by the after-coupon price (券后/到手价, never PLUS-only); the list price only when there is none
     res["effective"] = res["final_price"] if res["final_price"] is not None else res["price"]
     if plus:
@@ -314,6 +411,11 @@ def parse_snapshot(snap: dict) -> dict:
     if res["effective"] is None:
         res.update(status="no_price", note="页面上没有读到价格" + (
             "（京东价格接口也没有返回价格）" if snap.get("api") else ""))
+        lp = LOGIN_PRICE_RE.search(" ".join([text[:3000]] + [str(k.get("t") or "") for k in snap.get("kw") or []
+                                                            if isinstance(k, dict)]))
+        if lp:   # v6: the page hides the price until login
+            res.update(status="need_login", note=f"商品页显示「{lp.group(0)}」，读价用的浏览器没有登录京东")
+            return res
     if prof.get("logged_in") is False and (site_of(url) == "jd" or snap.get("jd_sku")):
         # v5: the DevTools cookie store has no pt_key / thor: this Chrome is not the logged-in one (到手价 needs login)
         res.update(status="need_login", note="读价用的浏览器没有登录京东（没有 pt_key / thor 登录 Cookie）"
@@ -521,9 +623,71 @@ def cdp_env(computer, port: Optional[int] = None) -> str:
     return f"VM_AGENT_CDP=http://127.0.0.1:{p} " if p and p != 9222 else ""
 
 
-async def run_probe(computer, sub: str, timeout: float = 60, cdp_port: Optional[int] = None, **kw) -> dict:
-    r = await computer.execute("shell.exec", {"command": cdp_env(computer, cdp_port) + probe_command(sub, **kw),
-                                              "timeout": timeout}, timeout=timeout + 15)
+STAGE_LABELS = {"start": "开始检查", "machine": "确认电脑在线", "push": "推送探针", "ensure": "打开浏览器调试端口",
+                "vision": "视觉模型读截图", "save": "保存结果", "done": "完成"}
+
+
+class Progress:
+    """Stages of one check, timed; each new stage goes to cb (the 立即检查 job the card polls)."""
+
+    def __init__(self, cb: Optional[Callable[[dict], Any]] = None):
+        self.cb, self.t0, self.stages = cb, time.time(), []
+
+    def __call__(self, stage: str, label: Optional[str] = None, **kw) -> None:
+        label = label or STAGE_LABELS.get(stage, stage)
+        if self.stages and self.stages[-1]["stage"] == stage and self.stages[-1]["label"] == label:
+            return
+        now_ms = int((time.time() - self.t0) * 1000)
+        if self.stages and "ms" not in self.stages[-1]:
+            self.stages[-1]["ms"] = max(0, now_ms - self.stages[-1]["at_ms"])
+        self.stages.append({"stage": stage, "label": label, "at_ms": now_ms, **kw})
+        if self.cb:
+            try:
+                self.cb({"stage": stage, "label": label, **kw})
+            except Exception:  # noqa: BLE001
+                pass
+
+    def close(self) -> list:
+        if self.stages and "ms" not in self.stages[-1]:
+            self.stages[-1]["ms"] = max(0, int((time.time() - self.t0) * 1000) - self.stages[-1]["at_ms"])
+        return self.stages
+
+
+PROGRESS_POLL_S = 1.5
+PROGRESS_FIRST_S = 1.0
+
+
+async def _poll_progress(computer, path: str, prog: "Progress") -> None:
+    """While the probe runs, read the stage it writes to path and pass it on (best effort; never fails the check)."""
+    seen = None
+    await asyncio.sleep(PROGRESS_FIRST_S)
+    while True:
+        try:
+            r = await computer.execute("shell.exec", {"command": f"cat {path} 2>/dev/null || true", "timeout": 5}, timeout=8)
+            got = _last_json(r)
+            if got and got.get("stage") and (got.get("stage"), got.get("label")) != seen:
+                seen = (got.get("stage"), got.get("label"))
+                prog(str(got["stage"]), str(got.get("label") or got["stage"]), src="probe")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(PROGRESS_POLL_S)
+
+
+async def run_probe(computer, sub: str, timeout: float = 60, cdp_port: Optional[int] = None,
+                    progress: Optional["Progress"] = None, **kw) -> dict:
+    poller = None
+    if progress is not None and sub == "probe":
+        path = f"/tmp/aiw-shop-run-{os.urandom(4).hex()}.json"
+        kw["progress"] = path
+        poller = asyncio.ensure_future(_poll_progress(computer, path, progress))
+    try:
+        r = await computer.execute("shell.exec", {"command": cdp_env(computer, cdp_port) + probe_command(sub, **kw),
+                                                  "timeout": timeout}, timeout=timeout + 15)
+    finally:
+        if poller is not None:
+            poller.cancel()
     got = _last_json(r)
     if got is not None:
         return got
@@ -637,7 +801,7 @@ async def desktop_read(computer, sessions, w: dict) -> Optional[dict]:
 # ----------------------------------------------------------------------------- the scheduled check
 LIVE_TASK = ("queued", "running", "paused", "takeover", "waiting_confirm", "waiting_input")
 FAIL_STATES = ("error", "no_price", "no_browser")
-PROBE_TIMEOUT = 90          # v5 waits up to ~24 s for the JD price block, then tries 3 price APIs
+PROBE_TIMEOUT = 120         # v6 waits up to ~20 s (front, scroll), reads page/API prices, mobile page, screenshot
 RISK_BACKOFF_MIN = 2 * 3600  # JD's 活动火爆 page: look again much later, more checks only keep it on
 
 
@@ -686,12 +850,114 @@ def risk_text(machine: str, bname: str = "Chrome") -> str:
             "或者等几个小时再试；频繁刷新只会让限制更久。")
 
 
-async def check(sched, w: dict, now: Optional[float] = None, manual: bool = False) -> dict:
+DIAG_STATES = ("no_price", "risk_limit", "need_login", "login", "captcha", "error", "no_browser")
+
+
+def _diag_dir(sessions) -> Path:
+    base = getattr(getattr(sessions, "settings", None), "artifacts_dir", None) or os.environ.get("AIW_ARTIFACTS") \
+        or "workspace/artifacts"
+    return Path(base) / "shop_diag"
+
+
+def diag_shot_path(sessions, wid: str) -> Path:
+    return _diag_dir(sessions) / f"{re.sub(r'[^A-Za-z0-9_-]', '', str(wid))}.jpg"
+
+
+def diag_hints(raw: dict, r: dict) -> list[str]:
+    """Plain reasons (Chinese) read off the probe's diagnosis: what most likely kept the price from being read."""
+    h = []
+    pv = str(raw.get("probe_version") or "")
+    if pv and pv != PROBE_VERSION:
+        h.append(f"电脑上运行的探针是 v{pv}，服务器带的是 v{PROBE_VERSION}（推送没成功？）")
+    if raw.get("risk_limit"):
+        h.append("京东返回了 活动火爆 风控页（limit.html）")
+    if r.get("status") in ("need_login", "login") or (raw.get("profile") or {}).get("logged_in") is False:
+        h.append("读价用的浏览器没有京东登录 Cookie（pt_key / thor）")
+    if r.get("status") == "no_price":
+        if raw.get("title_from") == "document.title" and not raw.get("sel") and not raw.get("cand"):
+            h.append("商品信息区没有渲染出来（标题只来自 document.title，没有任何价格元素）")
+        if raw.get("visibility") and raw.get("visibility") != "visible" and not raw.get("fronted"):
+            h.append(f"商品页标签一直在后台（visibility={raw.get('visibility')}），没能切到前台")
+        if raw.get("n_elems") is not None and int(raw.get("n_elems") or 0) < 300:
+            h.append(f"页面元素很少（{raw.get('n_elems')} 个），像是白屏或没加载完")
+        if raw.get("net_seen") == 0:
+            h.append("页面自己没有请求任何价格接口（价格模块没加载）")
+        elif raw.get("net") and not any(n.get("price") for n in raw.get("net") or []):
+            h.append("页面自己的价格接口有返回，但里面没读出价格")
+        if raw.get("api") and not raw.get("api_price"):
+            h.append("直接调用的京东价格接口都没返回价格（多半已需要 h5st 签名或已停用）")
+        mob = raw.get("mobile") if isinstance(raw.get("mobile"), dict) else {}
+        if mob.get("risk_limit"):
+            h.append("移动版商品页是 活动火爆 风控页，没用它")
+        elif mob and not mob.get("error") and not mob.get("skipped"):
+            h.append("移动版商品页也没读到价格")
+    return h
+
+
+def build_diag(raw: dict, r: dict, prog: Optional[Progress], now: float, shot: bool) -> dict:
+    """What the card's 查看诊断 shows and the check JSON returns: enough to tell why the next failure happened."""
+    raw = raw if isinstance(raw, dict) else {}
+    prof = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
+    mob = raw.get("mobile") if isinstance(raw.get("mobile"), dict) else None
+    d = {"at": now, "status": r.get("status"), "note": r.get("note"), "via": r.get("via"),
+         "probe_version": raw.get("probe_version"), "server_probe_version": PROBE_VERSION,
+         "server_version": os.environ.get("AIW_VERSION", "dev")[:7],
+         "final_url": raw.get("url") or "", "asked_url": raw.get("asked_url") or "", "page_title": raw.get("doc_title") or raw.get("title") or "",
+         "title": raw.get("title") or "", "title_from": raw.get("title_from"), "ready": raw.get("ready"),
+         "visibility": raw.get("visibility"), "focus": raw.get("focus"), "fronted": raw.get("fronted"),
+         "n_elems": raw.get("n_elems"), "shadow_roots": raw.get("shadow_roots"),
+         "price_elements": [{k: x.get(k) for k in ("role", "q", "t")} for x in (raw.get("sel") or [])[:8]],
+         "price_texts": [x.get("t") for x in (raw.get("cand") or [])[:8]],
+         "snippets": (raw.get("snippets") or [])[:10],
+         "api": [{k: a.get(k) for k in ("src", "status", "error", "jsonp") if k in a} for a in raw.get("api") or [] if isinstance(a, dict)],
+         "net_seen": raw.get("net_seen"), "net": (raw.get("net") or [])[:12],
+         "mobile": ({k: mob.get(k) for k in ("asked_url", "url", "title", "risk_limit", "login", "skipped", "error", "ready")}
+                    | {"price_texts": [x.get("t") for x in (mob.get("cand") or [])[:5]]}) if mob else None,
+         "profile": {k: prof.get(k) for k in ("port", "dir", "logged_in", "jd_cookies", "login_cookies", "cookies_total") if k in prof},
+         "cdp": raw.get("cdp"), "error": raw.get("error") or raw.get("shot_error"),
+         "probe_stages": raw.get("stages") or [], "stages": prog.close() if prog else [],
+         "screenshot": bool(shot)}
+    d["hints"] = diag_hints(raw, r)
+    return d
+
+
+def save_diag(store, sessions, wid: str, raw: dict, d: dict) -> None:
+    """Keep the last diagnosis per watch (kv shop_diag:<wid>) and, on a failure, the probe's screenshot."""
+    shot = raw.get("screenshot") if isinstance(raw, dict) else None
+    if shot and d.get("status") in DIAG_STATES:
+        try:
+            pth = diag_shot_path(sessions, wid)
+            pth.parent.mkdir(parents=True, exist_ok=True)
+            pth.write_bytes(base64.b64decode(shot))
+            d["screenshot"] = True
+            d["screenshot_url"] = f"/api/watches/{wid}/diag.jpg"
+        except Exception as e:  # noqa: BLE001
+            d["screenshot"] = False
+            d["screenshot_error"] = str(e)[:120]
+    else:
+        d["screenshot"] = False
+    try:
+        store.kv_set(f"shop_diag:{wid}", d)
+        store.update("watches", wid, diag_at=d.get("at"))
+    except Exception:  # noqa: BLE001
+        log.info("save_diag %s failed", wid, exc_info=True)
+
+
+def get_diag(store, wid: str) -> Optional[dict]:
+    return store.kv_get(f"shop_diag:{wid}", None)
+
+
+async def check(sched, w: dict, now: Optional[float] = None, manual: bool = False,
+                progress: Optional[Callable[[dict], Any]] = None) -> dict:
     store, sessions, notifier = sched.store, sched.sessions, sched.notifier
     ensure_columns(store)
     now = now or time.time()
+    prog = Progress(progress)
     interval = max(MIN_INTERVAL, int(w.get("interval_min") or DEFAULT_INTERVAL)) * 60
     _sync_order_status(store, w)
+    if manual and int(w.get("fail_count") or 0):   # v6: the user asked now: the 失败 N 次 自动退避 starts over
+        store.update("watches", w["id"], fail_count=0, next_check=None)
+        w = {**w, "fail_count": 0}
     mid = w.get("machine_id")
     if not mid:   # an old watch without a computer: pin one for good (it used to follow settings.machines[0])
         mid = default_machine(store) or (sessions.settings.machines[0].id if getattr(sessions.settings, "machines", None)
@@ -702,27 +968,33 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
         r = {"status": "no_machine", "note": f"设定的电脑「{mid}」已经不在了：请在价格监控里换一台电脑",
              "price": None, "final_price": None, "effective": None, "in_stock": None, "title": ""}
         return await apply_result(store, sessions, notifier, w, r, now, interval, mid, manual=manual)
+    prog("machine")
     wait = await _machine_wait(sessions, mid)
     if wait:
-        return await _defer(store, notifier, w, mid, wait, now, manual)
+        res = await _defer(store, notifier, w, mid, wait, now, manual)
+        res["stages"] = prog.close()
+        return res
     url = normalize_url(w.get("url") or "")
     if url and url != w.get("url"):   # an old watch saved with a mobile / share link: probe the desktop item page
         store.update("watches", w["id"], url=url)
         w = {**w, "url": url}
-    ens = None
+    ens, raw = None, {}
     try:
         computer = await _computer(sessions, mid)
-        raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, url=w["url"], sku=w.get("sku") or "")
+        prog("push")
+        raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, progress=prog, url=w["url"], sku=w.get("sku") or "")
         if str(raw.get("error", "")).startswith("NO_CDP"):
             # (1) any other answering endpoint, (2) or the user's own Chrome reopened with the port, login kept
+            prog("ensure")
             ens = await ensure_cdp(computer, mid)
             if not ens.get("ok") and _bname(store, mid) == "BrowserOS":
                 await computer.execute("computer.open_app", {"name": "browseros"}, timeout=30)
                 await asyncio.sleep(6)
                 ens = await ensure_cdp(computer, mid)
             if ens.get("ok"):
-                raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, cdp_port=ens.get("port"), url=w["url"],
-                                     sku=w.get("sku") or "")
+                prog("push")
+                raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, cdp_port=ens.get("port"), progress=prog,
+                                      url=w["url"], sku=w.get("sku") or "")
                 if ens.get("how") in ("relaunched", "launched"):
                     await notifier.notify("watch", f"已重新打开 Chrome（带调试端口）：{w['name']}",
                                           f"「{(store.machine(mid) or {}).get('name') or mid}」上的 Chrome 之前没开调试端口，"
@@ -744,18 +1016,34 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
         elif r["status"] == "no_price":
             vision = sessions._vision_llm() if hasattr(sessions, "_vision_llm") else None
             if vision:
-                raw2 = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT + 10, cdp_port=(ens or {}).get("port"), url=w["url"],
-                                       sku=w.get("sku") or "", shot=True)
-                v = await vision_read(vision, raw2.get("screenshot") or "", w.get("site") or site_of(w["url"]) or "")
+                prog("vision")
+                shot = raw.get("screenshot") or ""
+                if not shot:   # an old probe without the v6 failure screenshot: take one
+                    raw2 = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT + 10, cdp_port=(ens or {}).get("port"),
+                                           url=w["url"], sku=w.get("sku") or "", shot=True)
+                    shot = raw2.get("screenshot") or ""
+                    if shot and not raw.get("screenshot"):
+                        raw["screenshot"] = shot
+                v = await vision_read(vision, shot, w.get("site") or site_of(w["url"]) or "")
                 if v and (v.get("final_price") or v.get("price")):
                     r.update(price=v.get("price"), final_price=v.get("final_price"), status="ok", note="价格由视觉模型读出",
-                             effective=v.get("final_price") or v.get("price"))
+                             effective=v.get("final_price") or v.get("price"), via="vision")
                     if r.get("in_stock") is None:
                         r["in_stock"] = v.get("in_stock")
+            if r["status"] == "no_price":
+                hints = diag_hints(raw, r)
+                if hints:
+                    r["note"] = (r.get("note") or "页面上没有读到价格") + "：" + "；".join(hints[:2])
     except Exception as e:  # noqa: BLE001
         r = {"status": "error", "note": f"{type(e).__name__}: {e}"[:300], "price": None, "final_price": None,
              "effective": None, "in_stock": None, "title": ""}
-    return await apply_result(store, sessions, notifier, w, r, now, interval, mid, manual=manual)
+    prog("save")
+    diag = build_diag(raw, r, prog, now, bool(raw.get("screenshot")) if isinstance(raw, dict) else False)
+    save_diag(store, sessions, w["id"], raw if isinstance(raw, dict) else {}, diag)
+    res = await apply_result(store, sessions, notifier, w, r, now, interval, mid, manual=manual)
+    res["diag"] = diag
+    res["stages"] = diag["stages"]
+    return res
 
 
 BUSY_RECHECK_S = int(os.environ.get("AIW_SHOP_BUSY_RECHECK_S", "300"))

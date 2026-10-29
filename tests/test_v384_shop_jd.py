@@ -201,7 +201,7 @@ def test_profile_dir_from_devtools_active_port(tmp_path):
 
 
 def test_probe_version_is_bumped():
-    assert sp.PROBE_VERSION == "5"
+    assert sp.PROBE_VERSION == "6"   # v6 (2026-10-29): see test_v386_shop_check_progress.py
 
 
 # ----------------------------------------------------------------------------- g. chrome_cdp.py
@@ -315,7 +315,7 @@ def test_probe_waits_then_reads_the_api_and_the_login(monkeypatch):
     dev = FakeDevTools([BANNER], {"getWareBusiness": WARE_BUSINESS}, cookies)
     snap = _run_probe(monkeypatch, dev, SHARE)
     assert dev.navs[-1] == f"https://item.jd.com/{SKU}.html" and snap["asked_url"] == dev.navs[-1]
-    assert "scroll" in dev.calls and snap["jd_sku"] == SKU and snap["probe_version"] == "5"
+    assert ("scroll" in dev.calls or "Page.bringToFront" in dev.calls) and snap["jd_sku"] == SKU and snap["probe_version"] == "6"
     assert snap.get("api_price"), snap.get("api")
     assert snap["api_price"]["src"] == "getWareBusiness" and snap["api_price"]["final_price"] == 137.0
     assert [a["src"] for a in snap["api"]] == ["pc_detailpage_wareBusiness", "getWareBusiness"]   # stops at the first

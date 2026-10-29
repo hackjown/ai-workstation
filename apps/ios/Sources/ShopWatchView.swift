@@ -10,6 +10,9 @@ struct ShopWatchView: View {
     @State private var error = ""
     @State private var busy: String? = nil
     @State private var machines: [JSON] = []   // 3.8.2: each watch says (and can change) which computer it runs on
+    @State private var stage: [String: String] = [:]   // 3.8.6: the running 立即检查 stage per watch
+    @State private var lastRun: [String: String] = [:] // 3.8.6: the result of the last 立即检查, with its time
+    @State private var diag: DiagTarget? = nil
 
     var body: some View {
         List {
@@ -40,6 +43,7 @@ struct ShopWatchView: View {
         .navigationTitle("京东/淘宝价格监控").navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .primaryAction) { Button { showAdd = true } label: { Image(systemName: "plus") } } }
         .sheet(isPresented: $showAdd) { AddShopWatchView { Task { await load() } }.environmentObject(api) }
+        .sheet(item: $diag) { t in ShopDiagView(wid: t.id).environmentObject(api) }
         .refreshable { await load() }
         .task { await load() }
     }
@@ -75,7 +79,22 @@ struct ShopWatchView: View {
             } else if !err.isEmpty {
                 Text(err).font(.caption).foregroundColor(.red).lineLimit(2)
             }
-            if let u = URL(string: w.s("url")) { Link("打开商品", destination: u).font(.caption) }
+            if busy == w.s("id") {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(stage[w.s("id")] ?? "检查中…").font(.caption).foregroundColor(amber)
+                }
+            } else if let l = lastRun[w.s("id")] {
+                Text(l).font(.caption).foregroundColor(.secondary)
+            }
+            HStack(spacing: 14) {
+                Button(busy == w.s("id") ? "检查中…" : "立即检查") { Task { await check(w) } }
+                    .disabled(busy != nil).buttonStyle(.borderless).font(.caption)
+                if w.d("diag_at") > 0 {
+                    Button("查看诊断") { diag = DiagTarget(id: w.s("id")) }.buttonStyle(.borderless).font(.caption)
+                }
+                if let u = URL(string: w.s("url")) { Link("打开商品", destination: u).font(.caption) }
+            }
         }.padding(.vertical, 2)
     }
 
@@ -138,7 +157,8 @@ struct ShopWatchView: View {
 
     let shopStatus: [String: (String, Color)] = ["ok": ("正常", Color.green), "login": ("需要登录", amber), "captcha": ("需要验证", amber),
         "off_shelf": ("已下架", Color.red), "no_price": ("读不到价格", amber), "error": ("出错", Color.red), "no_browser": ("浏览器未就绪", amber),
-        "machine_busy": ("等电脑空闲", amber), "machine_offline": ("等电脑上线", amber), "no_machine": ("电脑不在了", Color.red)]
+        "machine_busy": ("等电脑空闲", amber), "machine_offline": ("等电脑上线", amber), "no_machine": ("电脑不在了", Color.red),
+        "need_login": ("需要登录京东", amber), "risk_limit": ("京东风控限制", amber), "price_pending": ("未开价", amber)]
     let orderStatus: [String: (String, Color)] = ["running": ("下单中", amber), "waiting_confirm": ("等你确认付款", amber),
         "submitted": ("已提交订单", Color.green), "rejected": ("已拒绝", Color.secondary), "timeout": ("超时已取消", Color.secondary),
         "above_target": ("实付超目标", amber), "submit_failed": ("提交失败", Color.red), "failed": ("下单失败", Color.red)]
@@ -149,8 +169,13 @@ struct ShopWatchView: View {
         catch { self.error = error.localizedDescription }
     }
     func check(_ w: JSON) async {
-        busy = w.s("id")
-        do { _ = try await api.obj("POST", "/api/watches/\(w.s("id"))/check") } catch { self.error = error.localizedDescription }
+        let id = w.s("id")
+        if busy != nil { return }
+        busy = id
+        stage[id] = "开始检查"
+        let res = await api.runWatchCheck(id) { s in stage[id] = s }
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+        lastRun[id] = "立即检查 \(f.string(from: Date()))：" + res.s("label")
         busy = nil
         await load()
     }

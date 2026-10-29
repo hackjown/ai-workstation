@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from urllib.parse import quote
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -634,14 +635,19 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         store.delete("watches", wid)
         return {"ok": True}
 
-    @app.post("/api/watches/{wid}/check", dependencies=[Depends(auth)])
-    async def check_watch(wid: str):
-        w = store.get("watches", wid)
-        if not w:
-            raise HTTPException(404)
+    CHECK_JOBS: dict[str, dict] = {}   # v6: 立即检查 jobs (job id -> stage, stages, result), newest 50 kept
+
+    async def _run_check(wid: str, w: dict, job: Optional[dict] = None) -> tuple[dict, int]:
+        def on_stage(ev: dict):
+            if job is not None:
+                job.update(stage=ev.get("stage"), label=ev.get("label"), updated_at=time.time())
+                job["stages"].append({"stage": ev.get("stage"), "label": ev.get("label"),
+                                      "at_ms": int((time.time() - job["started_at"]) * 1000)})
         # always a JSON body (the user saw an empty reply from curl): a crash or a hang becomes {"ok": false, ...}
         try:
-            res = await asyncio.wait_for(scheduler.check_watch(w, manual=True), timeout=CHECK_TIMEOUT_S)
+            coro = scheduler.check_watch(w, manual=True, progress=on_stage) if job is not None else \
+                scheduler.check_watch(w, manual=True)
+            res = await asyncio.wait_for(coro, timeout=CHECK_TIMEOUT_S)
             status = (res.get("result") or {}).get("status") or ("ok" if res.get("ok") else res.get("waiting") or "error")
             body = {**res, "status": status, "note": res.get("note") or (res.get("result") or {}).get("note") or res.get("error") or ""}
             code = 200
@@ -658,7 +664,72 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             body["watch"] = store.get("watches", wid)
         except Exception:  # noqa: BLE001
             body["watch"] = None
-        return JSONResponse(_json_safe(body), status_code=code)
+        body.setdefault("probe_version", (body.get("diag") or {}).get("probe_version"))
+        body["server_version"] = os.environ.get("AIW_VERSION", "dev")[:7]
+        return _json_safe(body), code
+
+    @app.post("/api/watches/{wid}/check", dependencies=[Depends(auth)])
+    async def check_watch(wid: str, request: Request):
+        w = store.get("watches", wid)
+        if not w:
+            raise HTTPException(404)
+        if request.query_params.get("async") in ("1", "true", "yes"):
+            # v6: answer at once with a job id; GET .../check/{job} shows the stage until it is done
+            running = next((j for j in CHECK_JOBS.values() if j["watch_id"] == wid and j["state"] == "running"), None)
+            if running:
+                return JSONResponse(_json_safe({"ok": True, "job": {k: v for k, v in running.items() if not k.startswith("_")}}))
+            jid = uuid.uuid4().hex[:12]
+            job = {"id": jid, "watch_id": wid, "state": "running", "stage": "start", "label": "开始检查",
+                   "stages": [{"stage": "start", "label": "开始检查", "at_ms": 0}], "started_at": time.time(),
+                   "updated_at": time.time(), "result": None}
+            CHECK_JOBS[jid] = job
+            for old in sorted(CHECK_JOBS.values(), key=lambda j: j["started_at"])[:-50]:
+                CHECK_JOBS.pop(old["id"], None)
+
+            async def runner():
+                body, code = await _run_check(wid, w, job)
+                job.update(state="done", result=body, code=code, finished_at=time.time(), stage="done",
+                           label="完成：" + _check_summary(body))
+                job["stages"].append({"stage": "done", "label": job["label"],
+                                      "at_ms": int((job["finished_at"] - job["started_at"]) * 1000)})
+            job["_task"] = asyncio.ensure_future(runner())
+            return {"ok": True, "job": {k: v for k, v in job.items() if not k.startswith("_")}}
+        body, code = await _run_check(wid, w)
+        return JSONResponse(body, status_code=code)
+
+    def _check_summary(body: dict) -> str:
+        r = body.get("result") or {}
+        if r.get("status") == "ok" and r.get("effective") is not None:
+            from . import shopwatch as _sw
+            return _sw.price_line(r) or "正常"
+        if body.get("ok") and not r:
+            return "触发提醒" if body.get("triggered") else "没有新变化"
+        return str(body.get("note") or body.get("status") or "失败")[:120]
+
+    @app.get("/api/watches/{wid}/check/{jid}", dependencies=[Depends(auth)])
+    async def check_job(wid: str, jid: str):
+        job = CHECK_JOBS.get(jid)
+        if not job or job["watch_id"] != wid:
+            raise HTTPException(404, "没有这个检查（服务器重启过？）")
+        return JSONResponse(_json_safe({k: v for k, v in job.items() if not k.startswith("_")}))
+
+    @app.get("/api/watches/{wid}/diag", dependencies=[Depends(auth)])
+    async def watch_diag(wid: str):
+        from . import shopwatch as _sw
+        if not store.get("watches", wid):
+            raise HTTPException(404)
+        d = _sw.get_diag(store, wid)
+        if not d:
+            raise HTTPException(404, "还没有诊断信息：点一次「立即检查」")
+        return JSONResponse(_json_safe(d))
+
+    @app.get("/api/watches/{wid}/diag.jpg", dependencies=[Depends(auth)])
+    async def watch_diag_shot(wid: str):
+        from . import shopwatch as _sw
+        p = _sw.diag_shot_path(sessions, wid)
+        if not store.get("watches", wid) or not p.exists():
+            raise HTTPException(404)
+        return FileResponse(str(p), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     # ------------------------------------------------------------- memory + profile
     # /api/memories* lives in memory.py (kinds, superseded, search); mounted next to the chat above

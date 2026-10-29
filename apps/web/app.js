@@ -624,7 +624,9 @@ function deskTouch() {
   const touch = window.AiwTouch && (matchMedia("(pointer: coarse)").matches || "ontouchstart" in window);
   ["desk", "deskBig"].forEach((id) => {
     const f = $(id), on = !!(touch && S.take && f && f.offsetParent && f.src && f.src !== "about:blank");
-    if (on && !deskTouchCtl[id]) deskTouchCtl[id] = AiwTouch.attach(f.parentElement, f, {});
+    // 3.8.4: mid + token: touches and keys go straight to the VM (/ws/input), not into the viewer page
+    if (on && deskTouchCtl[id] && deskTouchCtl[id].mid !== MID) { deskTouchCtl[id].detach(); delete deskTouchCtl[id]; }
+    if (on && !deskTouchCtl[id]) { deskTouchCtl[id] = AiwTouch.attach(f.parentElement, f, { mid: MID, token: TOKEN }); deskTouchCtl[id].mid = MID; }
     else if (!on && deskTouchCtl[id]) { deskTouchCtl[id].detach(); delete deskTouchCtl[id]; }
   });
 }

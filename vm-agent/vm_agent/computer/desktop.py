@@ -46,6 +46,18 @@ APP_PROCESS = {"chrome": "chrome", "chromium": "chromium", "browser": "chrom", "
                "terminal": "xfce4-terminal", "files": "thunar", "editor": "mousepad"}
 
 
+def _runs(text: str) -> list[tuple[str, bool]]:
+    """Split text into (run, has non-ASCII) pieces, in order."""
+    out: list[tuple[str, bool]] = []
+    for ch in text:
+        wide = ord(ch) > 126
+        if out and out[-1][1] == wide:
+            out[-1] = (out[-1][0] + ch, wide)
+        else:
+            out.append((ch, wide))
+    return out
+
+
 def normalize_key(key: str) -> str:
     parts = [p.strip() for p in key.replace(" ", "").split("+") if p.strip()]
     return "+".join(KEY_ALIASES.get(p.upper(), p) for p in parts)
@@ -72,6 +84,8 @@ class DesktopBackend:
     async def type(self, text: str) -> None: ...
     async def key(self, key: str) -> None: ...
     async def scroll(self, dx: int, dy: int) -> None: ...
+    async def mouse_down(self, x: int, y: int, button: int = 1) -> None: ...
+    async def mouse_up(self, x: int, y: int, button: int = 1) -> None: ...
     async def open_app(self, name: str) -> dict: ...
     async def close_app(self, name: str) -> dict: ...
 
@@ -214,7 +228,17 @@ class X11Backend(DesktopBackend):
         await self._xdo("mouseup 1")
 
     async def type(self, text):
-        await self._xdo(f"type --delay 12 -- {shlex.quote(text)}")
+        # 3.8.4: xdotool types a character that is not on the keyboard map (Chinese, emoji) by remapping a spare
+        # keycode for it; at --delay 12 the app often reads the key after the map moved on and drops it
+        # (丹防援荣图.dxf for 兴丹路消防救援站荣誉室施工图.dxf). Such runs go slower; plain ASCII stays fast.
+        for run, wide in _runs(text):
+            await self._xdo(f"type --delay {70 if wide else 12} -- {shlex.quote(run)}")
+
+    async def mouse_down(self, x, y, button=1):
+        await self._xdo(f"mousemove --sync {int(x)} {int(y)} mousedown {int(button)}")
+
+    async def mouse_up(self, x, y, button=1):
+        await self._xdo(f"mousemove --sync {int(x)} {int(y)} mouseup {int(button)}")
 
     async def key(self, key):
         await self._xdo(f"key -- {shlex.quote(normalize_key(key))}")
@@ -320,6 +344,14 @@ class MockBackend(DesktopBackend):
 
     async def scroll(self, dx, dy):
         self.log.append(("scroll", dx, dy))
+
+    async def mouse_down(self, x, y, button=1):
+        await self.move(x, y)
+        self.log.append(("down", x, y, button))
+
+    async def mouse_up(self, x, y, button=1):
+        await self.move(x, y)
+        self.log.append(("up", x, y, button))
 
     async def open_app(self, name):
         self.open_apps.add(name.lower())

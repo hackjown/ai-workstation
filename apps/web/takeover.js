@@ -1,30 +1,38 @@
-/* Aiw touch takeover (3.7): precise control of the remote desktop (noVNC) from a phone.
+/* Aiw touch takeover (3.8.4): precise control of the remote desktop from a phone, modelled on Microsoft's
+ * "Windows App" (Remote Desktop) for iOS.
  *
- * Used by the web app (app.js: the takeover iframe on a touch screen) and by the iOS app (takeover.html, loaded into
- * the takeover WKWebView with the Aiw server as its origin). Both put the noVNC page (/desktop/<id>/vnc.html, same
- * origin as the Aiw server) in an iframe; this layer covers the iframe and turns touches into mouse / wheel / key
- * events dispatched on noVNC's canvas, which noVNC then sends over its RFB socket like a real mouse:
+ * Used by the web app (app.js: the takeover iframe on a touch screen), by a phone browser (/takeover.html?src=…&mid=…)
+ * and by the iOS app (takeover.html in the takeover WKWebView, the Aiw server as its origin). The viewer (noVNC for
+ * local computers, InstaBox's own page for 云电脑) only shows the desktop; this layer covers it and turns touches
+ * into input that goes STRAIGHT TO THE VM: small ops over /ws/input/<machine> (POST /api/machines/<machine>/input when
+ * a socket cannot be opened), run there with absolute xdotool (services/api/aiw_api/remote_input.py, vm-agent
+ * computer.input). So it works the same in portrait and landscape and for a viewer on another origin, and nothing
+ * inside the viewer ever takes focus away from the keyboard. Without a machine id (an old page) it falls back to
+ * faking mouse / key events on noVNC's canvas, as 3.7 did.
  *
- *   触控板 (trackpad, default on phones): a visible cursor. One finger moves it relatively, with acceleration (slow =
- *     precise, fast = far); tap = left click at the cursor; two-finger tap = right click; long press, or tap then
- *     drag, = drag / select (button held until the finger lifts); two-finger drag = scroll.
- *   直点 (direct): the click lands where you touch. While the finger is down a loupe shows the desktop under it,
- *     magnified, with a crosshair; slide to aim, the click happens on release at that exact point.
- *   Both: pinch to zoom (1x-5x) and pan the desktop (two fingers). The zoom makes the iframe really bigger (its
- *     layout size, not a CSS scale): noVNC (resize=scale) then draws the desktop bigger and maps every CSS pixel to
- *     fewer framebuffer pixels, so zooming in really is more precise (a mouse event's clientX is a whole CSS pixel).
- *   Toolbar: mode switch, keyboard (a hidden input; typed text becomes key presses), Esc, Tab, Ctrl (sticky, applies
- *   to the next key), Enter, arrows, ⌫, zoom reset, 横屏 (landscape full screen) and its exit.
+ *   鼠标指针 (mode "trackpad", the default, the precise one): a visible cursor on the desktop. One finger moves it
+ *     relatively like a trackpad, with acceleration (slow = finer than the finger, fast = far); tap = left click AT THE
+ *     CURSOR (not at the finger); double tap = double click; tap-and-hold (or tap, then touch again and drag) = drag
+ *     (button down / move / up); two-finger tap: right click; two-finger drag = scroll wheel; pinch = zoom the local
+ *     view (1x-5x), the cursor stays visible and the view pans by itself when the cursor nears an edge.
+ *   直接触控 (mode "direct"): tap = left click exactly where the finger is; long press = right click there;
+ *     one-finger drag = mouse drag, with a loupe (magnifier + crosshair) above the finger; two-finger drag = scroll;
+ *     pinch = zoom + pan.
+ *   Toolbar: mode switch (remembered), keyboard, Esc, Tab, Ctrl / Alt / Super (sticky: they apply to the next key),
+ *   ↵ ⌫ arrows, ^C ^V ^A, zoom reset, 横屏 and its exit. In the iOS app the keyboard is native (a hidden text field
+ *   with its own key bar, DesktopView.swift KeyBridge) and reaches this page through `input(op)`.
  *
- * Coordinates: S = point in the stage's padding box (the overlay's own frame; un-rotated when the stage is
- * CSS-rotated for landscape), z / (px, py) = zoom and pan. The iframe sits at the stage origin, z times the stage size,
- * moved by translate(px, py), so the iframe-internal client point is c = S - pan (rounded to a whole pixel, as a real
- * mouse event is). noVNC maps that client point to framebuffer pixels itself (its canvas is inside the iframe), so the
- * zoom, noVNC's own scale-to-fit and the rotation all compose correctly. The cursor is kept as a fraction of the
- * canvas (u, v), so it stays on the same desktop spot when the zoom changes; it is drawn at S = c + pan.
+ * Coordinates: S = point in the stage's padding box (un-rotated when the stage is CSS-rotated for landscape),
+ * z / (px, py) = zoom and pan. The iframe sits at the stage origin, z times the stage size, moved by translate(px, py),
+ * so the iframe-internal client point is c = S - pan. The desktop picture inside it is `view()`: noVNC's canvas rect
+ * when the viewer is same-origin (measured, exact), else the remote screen (its size comes in the socket's hello)
+ * aspect-fit and centred in the iframe, as both viewers draw it (letterboxing). A point maps to the remote pixel
+ * floor((c - view.origin) / view.size * remote size): zoom, pan, letterboxing, rotation and the device scale all
+ * compose, and the cursor is kept as a fraction (u, v) of the desktop, so its precision is the remote pixel, not the
+ * phone's CSS pixel.
  *
- * A viewer on another origin (InstaBox cloud computers) cannot be reached from here: then the layer steps aside
- * (touches go to that viewer as before) and says so; landscape still works.
+ * Mouse moves are coalesced to ~60 a second (MOVE_MS) and the last position is always sent before a click, a button
+ * change or a scroll.
  */
 (function () {
   "use strict";
@@ -60,7 +68,7 @@
     ".aiwt-stage .takebanner{pointer-events:none;background:rgba(20,17,13,.82)!important;color:#f3ede4!important;border:1px solid rgba(240,160,48,.55);z-index:9}" +
     ".aiwt-stage .takebanner button{pointer-events:auto}" +
     ".aiwt-stage .vfchip{display:none}" +
-    ".aiwt-kb{position:absolute;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0;font-size:16px;z-index:0}" +
+    ".aiwt-kb{position:absolute;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0;font-size:16px;z-index:0;caret-color:transparent;color:transparent;background:transparent}" +
     /* landscape: real fullscreen (+ orientation lock) where the browser has it, else this rotated full-screen view */
     ".aiwt-full{position:fixed!important;left:0;top:0;width:100vw!important;height:100vh!important;z-index:2147483000;border-radius:0!important;margin:0!important;aspect-ratio:auto!important}" +
     ".aiwt-rot{position:fixed!important;left:100vw;top:0;width:100vh!important;height:100vw!important;transform:rotate(90deg);transform-origin:0 0;" +
@@ -68,23 +76,31 @@
 
   var CURSOR = '<svg viewBox="0 0 22 22" width="22" height="22"><path d="M2 1.5 L2 17.5 L6.3 13.6 L9.2 20.2 L12 19 L9.2 12.6 L15 12.6 Z" ' +
     'fill="#fff" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/></svg>';
-  var KEYS = {
+  /* xdotool key names -> DOM keys, for the old in-viewer fallback only */
+  var DOMK = {
     Escape: { key: "Escape", code: "Escape", keyCode: 27 }, Tab: { key: "Tab", code: "Tab", keyCode: 9 },
-    Enter: { key: "Enter", code: "Enter", keyCode: 13 }, Backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
-    ArrowLeft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 }, ArrowUp: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
-    ArrowRight: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 }, ArrowDown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
-    Control: { key: "Control", code: "ControlLeft", keyCode: 17 }
+    Return: { key: "Enter", code: "Enter", keyCode: 13 }, BackSpace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+    Left: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 }, Up: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+    Right: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 }, Down: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+    Delete: { key: "Delete", code: "Delete", keyCode: 46 },
+    ctrl: { key: "Control", code: "ControlLeft", keyCode: 17 }, alt: { key: "Alt", code: "AltLeft", keyCode: 18 },
+    super: { key: "Meta", code: "MetaLeft", keyCode: 91 }, shift: { key: "Shift", code: "ShiftLeft", keyCode: 16 }
   };
-  var TAP_MS = 260, TAP_MOVE = 9, HOLD_MS = 450, ZMAX = 5;
+  /* browser key names (a hardware keyboard on the hidden input) -> xdotool */
+  var XK = { Enter: "Return", Backspace: "BackSpace", Tab: "Tab", Escape: "Escape", ArrowLeft: "Left", ArrowRight: "Right",
+    ArrowUp: "Up", ArrowDown: "Down", Delete: "Delete", Home: "Home", End: "End", PageUp: "Prior", PageDown: "Next" };
+  var TAP_MS = 260, TAP_MOVE = 9, HOLD_MS = 450, DTAP_MS = 320, ZMAX = 5, MOVE_MS = 16, SCROLL_PX = 16;
 
   function css(doc) {
     if (doc.getElementById("aiwt-css")) return;
     var s = doc.createElement("style"); s.id = "aiwt-css"; s.textContent = CSS; doc.head.appendChild(s);
   }
   function el(doc, tag, cls, html) { var e = doc.createElement(tag); if (cls) e.className = cls; if (html) e.innerHTML = html; return e; }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
   /** attach(stage, frame, opts) -> controller. stage: the element around the iframe (made position:relative).
-   *  opts: { mode: "trackpad"|"direct", native: bool (iOS: landscape / exit go to the app), onLandscape(on), onExit() } */
+   *  opts: { mode: "trackpad"|"direct", native: bool (iOS: keyboard / landscape go to the app), mid: machine id,
+   *          token: API token, base: server URL (default: the page's), onLandscape(on) } */
   function attach(stage, frame, opts) {
     opts = opts || {};
     var doc = stage.ownerDocument, win = doc.defaultView;
@@ -94,17 +110,83 @@
     var loupe = el(doc, "div", "aiwt-loupe"), lc = el(doc, "canvas"), bar = el(doc, "div", "aiwt-bar"), note = el(doc, "div", "aiwt-note");
     var kb = el(doc, "input", "aiwt-kb");
     kb.setAttribute("autocapitalize", "off"); kb.setAttribute("autocomplete", "off"); kb.setAttribute("autocorrect", "off");
-    kb.setAttribute("spellcheck", "false"); kb.setAttribute("aria-label", "键盘输入");
+    kb.setAttribute("spellcheck", "false"); kb.setAttribute("aria-label", "键盘输入"); kb.setAttribute("enterkeyhint", "enter");
     loupe.appendChild(lc);
     [ov, cur, dot, loupe, bar, note, kb].forEach(function (e) { stage.appendChild(e); });
 
+    var saved = "trackpad";
+    try { saved = localStorage.getItem("aiw_touch_mode") || "trackpad"; } catch (e) { /* private mode */ }
     var st = {
-      mode: opts.mode || (localStorage.getItem("aiw_touch_mode") || "trackpad"),
-      z: 1, px: 0, py: 0, u: -1, v: -1, ctrl: false, dragging: false, landscape: false, rot: false, pass: false, gone: false
+      mode: opts.mode || saved,
+      z: 1, px: 0, py: 0, u: -1, v: -1, mods: {}, dragging: false, landscape: false, rot: false, pass: false, gone: false,
+      kbOn: false
     };
-    var touches = {}, g = null, lastTap = 0, lastTapAt = { x: 0, y: 0 }, holdT = 0, raf = 0, pendMove = false, wheelAcc = 0;
+    var touches = {}, g = null, lastTap = 0, lastTapAt = { x: 0, y: 0 }, holdT = 0, raf = 0, pendMove = false;
 
-    // ---- the noVNC page inside the iframe
+    // ---- the input channel to the VM (3.8.4)
+    var rx = { ws: null, open: false, w: 0, h: 0, tries: 0, pend: [], postT: 0, moveAt: 0, mv: null, mvT: 0, pingT: 0, errAt: 0 };
+    var useRemote = !!opts.mid;
+    function base() {
+      var b = opts.base || doc.baseURI || win.location.href;
+      try { return new URL(".", new URL(b, win.location.href)).href.replace(/[^/]*$/, ""); } catch (e) { return "/"; }
+    }
+    function root() {   // the server root ("https://host/"), whatever page this is
+      try { var u = new URL(base()); return u.origin + "/"; } catch (e) { return "/"; }
+    }
+    function connect() {
+      if (!useRemote || st.gone || typeof win.WebSocket !== "function") return;
+      var u = root().replace(/^http/, "ws") + "ws/input/" + encodeURIComponent(opts.mid) + (opts.token ? "?token=" + encodeURIComponent(opts.token) : "");
+      var ws;
+      try { ws = new win.WebSocket(u); } catch (e) { retry(); return; }
+      rx.ws = ws;
+      ws.onopen = function () { rx.open = true; rx.tries = 0; flushPost(); };
+      ws.onmessage = function (m) {
+        var d; try { d = JSON.parse(m.data); } catch (e) { return; }
+        if (d.op === "hello") { if (d.width) { rx.w = d.width; rx.h = d.height; } paint(); }
+        else if (d.op === "error" && Date.now() - rx.errAt > 4000) { rx.errAt = Date.now(); say("电脑没收到操作：" + String(d.error || "").slice(0, 60)); }
+      };
+      ws.onclose = function () { if (rx.ws === ws) { rx.open = false; rx.ws = null; retry(); } };
+      ws.onerror = function () { /* onclose follows */ };
+    }
+    function retry() {
+      if (st.gone) return;
+      rx.tries++;
+      setTimeout(connect, Math.min(8000, 400 * Math.pow(2, Math.min(5, rx.tries))));
+    }
+    /** one op to the VM: the socket, or a POST batch while it is down */
+    function send(op) {
+      if (rx.open && rx.ws && rx.ws.readyState === 1) { try { rx.ws.send(JSON.stringify(op)); return; } catch (e) { /* below */ } }
+      if (op.t === "move" && rx.pend.length && rx.pend[rx.pend.length - 1].t === "move") rx.pend[rx.pend.length - 1] = op;
+      else rx.pend.push(op);
+      if (!rx.postT) rx.postT = setTimeout(flushPost, 60);
+    }
+    function flushPost() {
+      clearTimeout(rx.postT); rx.postT = 0;
+      if (!rx.pend.length) return;
+      var ops = rx.pend.splice(0, 200);
+      if (rx.open && rx.ws && rx.ws.readyState === 1) { try { rx.ws.send(JSON.stringify({ ops: ops })); return; } catch (e) { /* POST */ } }
+      var h = { "Content-Type": "application/json" };
+      if (opts.token) h.Authorization = "Bearer " + opts.token;
+      win.fetch(root() + "api/machines/" + encodeURIComponent(opts.mid) + "/input", { method: "POST", headers: h, body: JSON.stringify({ ops: ops }) })
+        .then(function (r) { if (r.ok) return r.json(); throw new Error("HTTP " + r.status); })
+        .then(function (j) { if (j && j.width && !rx.w) { rx.w = j.width; rx.h = j.height; paint(); } },
+              function (e) { if (Date.now() - rx.errAt > 4000) { rx.errAt = Date.now(); say("连不上电脑：" + e.message); } });
+    }
+    /** mouse moves: at most one per MOVE_MS (~60 a second); the latest position always wins */
+    function moveTo(p) {
+      if (!rx.mv && rx.lastMv && rx.lastMv.x === p.x && rx.lastMv.y === p.y) return;   // same pixel: nothing to send
+      rx.mv = p;
+      if (rx.mvT) return;
+      var wait = Math.max(0, MOVE_MS - (Date.now() - rx.moveAt));
+      rx.mvT = setTimeout(flushMove, wait);
+    }
+    function flushMove() {
+      clearTimeout(rx.mvT); rx.mvT = 0;
+      if (!rx.mv) return;
+      send({ t: "move", x: rx.mv.x, y: rx.mv.y }); rx.lastMv = rx.mv; rx.mv = null; rx.moveAt = Date.now();
+    }
+
+    // ---- the viewer inside the iframe (only reachable when same-origin)
     function idoc() { try { return frame.contentDocument; } catch (e) { return null; } }
     function canvas() {
       var d = idoc(); if (!d) return null;
@@ -116,14 +198,32 @@
       });
       return best;
     }
-    function crect() {   // the canvas in iframe client coordinates (c space), or the whole iframe until it exists
+    /** the desktop picture in iframe client coordinates (c space) */
+    function view() {
       var c = canvas();
       if (c) { var r = c.getBoundingClientRect(); if (r.width > 4) return { l: r.left, t: r.top, w: r.width, h: r.height }; }
-      return { l: 0, t: 0, w: frame.clientWidth || stage.clientWidth, h: frame.clientHeight || stage.clientHeight };
+      var fw = frame.clientWidth || stage.clientWidth, fh = frame.clientHeight || stage.clientHeight;
+      if (rx.w && rx.h) {   // aspect-fit, centred: the letterbox bars are not desktop
+        var k = Math.min(fw / rx.w, fh / rx.h), w = rx.w * k, h = rx.h * k;
+        return { l: (fw - w) / 2, t: (fh - h) / 2, w: w, h: h };
+      }
+      return { l: 0, t: 0, w: fw, h: fh };
     }
+    function rsize() {
+      if (rx.w) return { w: rx.w, h: rx.h };
+      var c = canvas(); if (c && c.width) return { w: c.width, h: c.height };
+      var r = view(); return { w: Math.round(r.w), h: Math.round(r.h) };
+    }
+    /** c-space point -> remote pixel */
+    function toR(c) {
+      var r = view(), s = rsize();
+      return { x: clamp(Math.floor((c.x - r.l) / Math.max(1, r.w) * s.w), 0, s.w - 1),
+               y: clamp(Math.floor((c.y - r.t) / Math.max(1, r.h) * s.h), 0, s.h - 1) };
+    }
+    function inside(c) { var r = view(); return c.x >= r.l && c.y >= r.t && c.x < r.l + r.w && c.y < r.t + r.h; }
     function checkReach() {
       var d = idoc(), was = st.pass;
-      st.pass = !d;   // another origin: step aside
+      st.pass = !d && !useRemote;   // another origin and no channel to the VM: step aside
       ov.classList.toggle("pass", st.pass);
       if (st.pass && !was) say("这台电脑的桌面不支持精确触控：直接点画面操作");
       paint();
@@ -148,18 +248,22 @@
     function toC(s) { return { x: s.x - st.px, y: s.y - st.py }; }
     function fromC(c) { return { x: c.x + st.px, y: c.y + st.py }; }
     function snap(c) { return { x: Math.round(c.x), y: Math.round(c.y) }; }
-    /** the cursor in c space (from its place on the canvas) */
-    function cur0() { var r = crect(); return snap({ x: r.l + st.u * r.w, y: r.t + st.v * r.h }); }
-    function setCur(c) { var r = crect(); st.u = Math.max(0, Math.min(1, (c.x - r.l) / Math.max(1, r.w))); st.v = Math.max(0, Math.min(1, (c.y - r.t) / Math.max(1, r.h))); }
+    /** the cursor in c space (from its place on the desktop), centred on its remote pixel */
+    function cur0() {
+      var r = view(), s = rsize();
+      var px = Math.min(s.w - 1, Math.floor(st.u * s.w)) + 0.5, py = Math.min(s.h - 1, Math.floor(st.v * s.h)) + 0.5;
+      return { x: r.l + px / s.w * r.w, y: r.t + py / s.h * r.h };
+    }
+    function setCur(c) { var r = view(); st.u = clamp((c.x - r.l) / Math.max(1, r.w), 0, 0.99999); st.v = clamp((c.y - r.t) / Math.max(1, r.h), 0, 0.99999); }
     function clampPan() {
       var w = W(), h = H();
       st.px = Math.min(0, Math.max(w - st.z * w, st.px)); st.py = Math.min(0, Math.max(h - st.z * h, st.py));
     }
     function ensureCursor() { if (st.u < 0) { st.u = 0.5; st.v = 0.5; } }
-    /** zoomed in: keep the cursor on screen by panning (trackpad) */
+    /** zoomed in: keep the cursor on screen by panning (鼠标指针) */
     function follow() {
       if (st.z <= 1.001) return;
-      var s = fromC(cur0()), m = 36, w = W(), h = H();
+      var s = fromC(cur0()), m = 40, w = W(), h = H();
       if (s.x < m) st.px += m - s.x; else if (s.x > w - m) st.px -= s.x - (w - m);
       if (s.y < m) st.py += m - s.y; else if (s.y > h - 70) st.py -= s.y - (h - 70);
       clampPan();
@@ -176,7 +280,7 @@
       zoomBtn.style.display = st.z > 1.001 ? "" : "none";
     }
 
-    // ---- events into noVNC
+    // ---- output: to the VM (remote) or, without a machine id, faked events on noVNC's canvas (old pages)
     function fire(type, c, button, buttons) {
       var cv = canvas(), d = idoc(); if (!cv || !d) return false;
       c = snap(c); st.last = { type: type, x: c.x, y: c.y };
@@ -185,57 +289,75 @@
         screenX: c.x, screenY: c.y, button: button || 0, buttons: buttons == null ? 0 : buttons }));
       return true;
     }
-    function move(c) { return fire("mousemove", c, 0, st.dragging ? 1 : 0); }
-    function click(c, button) {
-      button = button || 0; var mask = button === 2 ? 2 : 1;
-      move(c); fire("mousedown", c, button, mask); fire("mouseup", c, button, 0);
-      if (button === 2) fire("contextmenu", c, 2, 0);
+    var BTN = { left: 0, middle: 1, right: 2 };
+    function outMove(c) {
+      if (useRemote) { moveTo(toR(c)); return; }
+      if (pendMove) return; pendMove = true;
+      raf = win.requestAnimationFrame(function () { pendMove = false; fire("mousemove", c, 0, st.dragging ? 1 : 0); });
     }
-    function wheel(c, dy, dx) {
+    /** a click: the final position goes first, then the click at that same pixel */
+    function outClick(c, button, count) {
+      button = button || "left";
+      if (useRemote) { var p = toR(c); rx.mv = p; flushMove(); send({ t: "click", x: p.x, y: p.y, button: button, count: count === 2 ? 2 : 1 }); st.last = { type: "click", x: p.x, y: p.y, button: button }; return; }
+      var b = BTN[button], mask = b === 2 ? 2 : 1;
+      fire("mousemove", c, 0, 0); fire("mousedown", c, b, mask); fire("mouseup", c, b, 0);
+      if (b === 2) fire("contextmenu", c, 2, 0);
+    }
+    function outButton(kind, c) {   // "down" / "up", left button (drag)
+      if (useRemote) { var p = toR(c); rx.mv = p; flushMove(); send({ t: kind, x: p.x, y: p.y, button: "left" }); st.last = { type: kind, x: p.x, y: p.y }; return; }
+      fire("mousemove", c, 0, kind === "up" ? 1 : 0); fire(kind === "down" ? "mousedown" : "mouseup", c, 0, kind === "down" ? 1 : 0);
+    }
+    function outScroll(c, ny, nx) {   // wheel notches, ny > 0 = down
+      if (useRemote) { var p = toR(c); flushMove(); send({ t: "scroll", x: p.x, y: p.y, dx: nx || 0, dy: ny || 0 }); return; }
       var cv = canvas(), d = idoc(); if (!cv || !d) return;
       var v = d.defaultView;
       cv.dispatchEvent(new v.WheelEvent("wheel", { bubbles: true, cancelable: true, view: v, clientX: c.x, clientY: c.y,
-        deltaX: dx || 0, deltaY: dy, deltaMode: 0 }));
+        deltaX: (nx || 0) * 50, deltaY: (ny || 0) * 50, deltaMode: 0 }));
     }
-    function key(name, down) {
+    function outText(t) {
+      if (!t) return;
+      if (useRemote) { flushMove(); send({ t: "text", text: t }); return; }
+      for (var i = 0; i < t.length; i++) domKey(t[i] === "\n" ? "Return" : t[i]);
+    }
+    /** a key or combo in xdotool names ("Return", "ctrl+c"); the sticky Ctrl / Alt / Super join it and turn off */
+    function outKey(k) {
+      var mods = Object.keys(st.mods).filter(function (m) { return st.mods[m]; });
+      var combo = mods.concat([k]).join("+");
+      clearMods();
+      if (useRemote) { flushMove(); send({ t: "key", key: combo }); return; }
+      domKey(combo);
+    }
+    function domKey(combo) {
       var cv = canvas(), d = idoc(); if (!cv || !d) return;
-      var k = KEYS[name] || { key: name, code: codeOf(name), keyCode: name.length === 1 ? name.toUpperCase().charCodeAt(0) : 0 };
-      var v = d.defaultView;
-      ["keydown", "keyup"].forEach(function (t) {
-        if (down === true && t === "keyup") return; if (down === false && t === "keydown") return;
-        var e = new v.KeyboardEvent(t, { bubbles: true, cancelable: true, key: k.key, code: k.code, ctrlKey: st.ctrl && name !== "Control" });
-        try { Object.defineProperty(e, "keyCode", { get: function () { return k.keyCode; } });
-              Object.defineProperty(e, "which", { get: function () { return k.keyCode; } }); } catch (x) { /* read-only */ }
+      var parts = combo.split("+"), main = parts.pop(), v = d.defaultView;
+      var k = DOMK[main] || { key: main, code: /^[a-z]$/i.test(main) ? "Key" + main.toUpperCase() : /^[0-9]$/.test(main) ? "Digit" + main : main === " " ? "Space" : "",
+                              keyCode: main.length === 1 ? main.toUpperCase().charCodeAt(0) : 0 };
+      function ev(t, kk) {
+        var e = new v.KeyboardEvent(t, { bubbles: true, cancelable: true, key: kk.key, code: kk.code, ctrlKey: parts.indexOf("ctrl") >= 0 });
+        try { Object.defineProperty(e, "keyCode", { get: function () { return kk.keyCode; } });
+              Object.defineProperty(e, "which", { get: function () { return kk.keyCode; } }); } catch (x) { /* read-only */ }
         cv.dispatchEvent(e);
-      });
+      }
+      parts.forEach(function (m) { if (DOMK[m]) ev("keydown", DOMK[m]); });
+      ev("keydown", k); ev("keyup", k);
+      parts.slice().reverse().forEach(function (m) { if (DOMK[m]) ev("keyup", DOMK[m]); });
     }
-    function codeOf(ch) {
-      if (/^[a-z]$/i.test(ch)) return "Key" + ch.toUpperCase();
-      if (/^[0-9]$/.test(ch)) return "Digit" + ch;
-      if (ch === " ") return "Space";
-      return "";
-    }
-    /** one key press; with Ctrl on it is Ctrl+key and Ctrl turns off again */
-    function press(name) {
-      if (st.ctrl && name !== "Control") { key("Control", true); key(name); key("Control", false); setCtrl(false); }
-      else key(name);
-    }
-    function typeText(t) { for (var i = 0; i < t.length; i++) { var ch = t[i]; press(ch === "\n" ? "Enter" : ch); } }
 
-    // ---- loupe (direct mode)
+    // ---- loupe (direct mode, while dragging)
     function showLoupe(s) {
-      var cv = canvas(); if (!cv) { loupe.style.display = "none"; return; }
+      var cv = canvas();
       var w = W(), h = H(), dpr = win.devicePixelRatio || 1;
       var size = Math.round(Math.max(72, Math.min(124, h * 0.42, w * 0.42))), gap = 34;
+      dot.style.display = "block"; dot.style.left = s.x + "px"; dot.style.top = s.y + "px";
+      if (!cv) { loupe.style.display = "none"; return; }   // another origin: its picture cannot be read, the dot shows the spot
       // above the finger, else below, else beside it (left / right), else wherever it fits best in the stage
       var cand = [[s.x - size / 2, s.y - size - gap], [s.x - size / 2, s.y + gap], [s.x - size - gap, s.y - size / 2], [s.x + gap, s.y - size / 2]];
       var fit = cand.filter(function (q) { return q[0] >= 4 && q[1] >= 4 && q[0] + size <= w - 4 && q[1] + size <= h - 4; })[0] || cand[0];
-      var lx = Math.max(4, Math.min(w - size - 4, fit[0])), ly = Math.max(4, Math.min(h - size - 4, fit[1]));
+      var lx = clamp(fit[0], 4, w - size - 4), ly = clamp(fit[1], 4, h - size - 4);
       loupe.style.width = loupe.style.height = size + "px";
       loupe.style.display = "block"; loupe.style.left = lx + "px"; loupe.style.top = ly + "px";
-      dot.style.display = "block"; dot.style.left = s.x + "px"; dot.style.top = s.y + "px";
       if (lc.width !== Math.round(size * dpr)) { lc.width = lc.height = Math.round(size * dpr); }
-      var c = toC(s), r = crect(), k = cv.width / Math.max(1, r.w);
+      var c = toC(s), r = view(), k = cv.width / Math.max(1, r.w);
       var mag = 2.6, areaC = size / mag;                      // the desktop area the loupe shows, in c units
       var sw = areaC * k, sx = (c.x - r.l) * k - sw / 2, sy = (c.y - r.t) * k - sw / 2;
       var x2 = lc.getContext("2d");
@@ -244,6 +366,10 @@
       try { x2.drawImage(cv, sx, sy, sw, sw, 0, 0, lc.width, lc.height); } catch (e) { /* not drawable yet */ }
     }
     function hideLoupe() { loupe.style.display = "none"; dot.style.display = "none"; }
+    function blip(s) {   // where a direct click / right click landed
+      dot.style.display = "block"; dot.style.left = s.x + "px"; dot.style.top = s.y + "px";
+      setTimeout(function () { if (!st.dragging) dot.style.display = "none"; }, 260);
+    }
 
     // ---- gestures
     function pts() { return Object.keys(touches).map(function (k) { return touches[k]; }); }
@@ -251,8 +377,7 @@
     function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
     function onStart(e) {
       if (st.pass) return;
-      e.preventDefault();
-      if (e.target === kb) return;
+      e.preventDefault();   // no click / focus change: the keyboard stays up while you tap the desktop
       var now = Date.now();
       Array.prototype.forEach.call(e.changedTouches, function (t) { var s = toS(t.clientX, t.clientY); touches[t.identifier] = { x: s.x, y: s.y, x0: s.x, y0: s.y, t: now }; });
       var p = pts();
@@ -260,19 +385,27 @@
       if (p.length === 1) {
         var a = p[0];
         g = { kind: "one", t0: now, x0: a.x, y0: a.y, lx: a.x, ly: a.y, lt: now, moved: 0,
-              second: now - lastTap < 300 && Math.hypot(a.x - lastTapAt.x, a.y - lastTapAt.y) < 60 };
+              second: now - lastTap < DTAP_MS && Math.hypot(a.x - lastTapAt.x, a.y - lastTapAt.y) < 60 };
         clearTimeout(holdT);
         if (st.mode === "trackpad") {
-          holdT = setTimeout(function () {   // long press: hold the left button (drag / select)
-            if (g && g.kind === "one" && g.moved < TAP_MOVE && !st.dragging) { startDrag(); g.held = true; }
+          holdT = setTimeout(function () {   // tap-and-hold: hold the left button (drag / select) at the cursor
+            if (g && g.kind === "one" && g.moved < TAP_MOVE && !st.dragging) { startDrag(cur0()); g.held = true; }
           }, HOLD_MS);
-        } else showLoupe(a);
+        } else {
+          holdT = setTimeout(function () {   // direct: long press = right click where the finger is
+            if (g && g.kind === "one" && g.moved < TAP_MOVE && !st.dragging) {
+              var c = toC({ x: g.x0, y: g.y0 });
+              if (inside(c)) { setCur(c); outClick(c, "right"); blip({ x: g.x0, y: g.y0 }); }
+              g.done = true;
+            }
+          }, HOLD_MS + 50);
+        }
       } else if (p.length === 2) {
         clearTimeout(holdT);
-        if (st.dragging && g && g.kind === "one") endDrag();
+        if (st.dragging && g && g.kind === "one") endDrag(st.mode === "trackpad" ? cur0() : toC({ x: g.lx, y: g.ly }));
         hideLoupe();
         var m = mid(p[0], p[1]);
-        g = { kind: "two", t0: now, d0: dist(p[0], p[1]), m0: m, lm: m, z0: st.z, px0: st.px, py0: st.py, pinch: false, moved: 0 };
+        g = { kind: "two", t0: now, d0: dist(p[0], p[1]), m0: m, lm: m, z0: st.z, px0: st.px, py0: st.py, pinch: false, moved: 0, sy: 0, sx: 0 };
       } else if (g) { g.kind = "many"; }
     }
     function onMove(e) {
@@ -284,19 +417,35 @@
       });
       var p = pts(); if (!g) return;
       if (g.kind === "one" && p.length === 1) {
-        var a = p[0], dx = a.x - g.lx, dy = a.y - g.ly, dt = Math.max(1, now - g.lt);
+        var a = p[0], dt = Math.max(1, now - g.lt);
+        var v = Math.hypot(a.x - g.lx, a.y - g.ly) / dt;                    // finger speed, px / ms
         g.moved = Math.max(g.moved, Math.hypot(a.x - g.x0, a.y - g.y0));
         g.lx = a.x; g.ly = a.y; g.lt = now;
         if (st.mode === "trackpad") {
-          if (g.moved < TAP_MOVE && !st.dragging) return;   // still a tap / long press candidate
-          if (g.second && !st.dragging && !g.held) startDrag();   // tap, then drag = drag
-          var v = Math.hypot(dx, dy) / dt;                          // px / ms
-          var gain = 1 + Math.min(2.4, Math.max(0, v - 0.2) * 2.2); // slow 1x (precise) .. fast 3.4x
-          var r = crect();                                          // zoomed in, the canvas is bigger: finer steps
-          st.u = Math.max(0, Math.min(1, st.u + dx * gain / Math.max(1, r.w)));
-          st.v = Math.max(0, Math.min(1, st.v + dy * gain / Math.max(1, r.h)));
-          follow(); queueMove();
-        } else showLoupe(a);
+          if (g.moved < TAP_MOVE && !st.dragging) return;   // still a tap / hold candidate
+          clearTimeout(holdT);
+          if (g.second && !st.dragging && !g.held) startDrag(cur0());   // tap, then touch again and drag = drag
+          // the movement since the last applied point (the first time: since the finger went down, so the tap
+          // threshold is not lost)
+          var ox = g.ox == null ? g.x0 : g.ox, oy = g.oy == null ? g.y0 : g.oy, dx = a.x - ox, dy = a.y - oy;
+          g.ox = a.x; g.oy = a.y;
+          // trackpad acceleration: slow = finer than the finger (0.55x), fast = far (up to ~3.4x)
+          var gain = 0.55 + Math.min(2.85, Math.max(0, v - 0.12) * 2.4);
+          var r = view();                                                   // zoomed in, the desktop is bigger: finer
+          st.u = clamp(st.u + dx * gain / Math.max(1, r.w), 0, 0.99999);
+          st.v = clamp(st.v + dy * gain / Math.max(1, r.h), 0, 0.99999);
+          follow(); paint(); outMove(cur0());
+        } else {
+          if (g.done) return;
+          if (!st.dragging) {
+            if (g.moved < TAP_MOVE) return;
+            clearTimeout(holdT);
+            var c0 = toC({ x: g.x0, y: g.y0 });
+            if (!inside(c0)) { g.done = true; return; }
+            setCur(c0); startDrag(c0);   // one-finger drag in direct mode = mouse drag from where it began
+          }
+          var c = toC(a); setCur(c); outMove(c); showLoupe(a);
+        }
       } else if (g.kind === "two" && p.length === 2) {
         var m = mid(p[0], p[1]), d = dist(p[0], p[1]);
         g.moved = Math.max(g.moved, Math.hypot(m.x - g.m0.x, m.y - g.m0.y), Math.abs(d - g.d0));
@@ -304,15 +453,15 @@
           g.pinch = true; g.d0 = d; g.m0 = m; g.z0 = st.z; g.px0 = st.px; g.py0 = st.py;
         }
         if (g.pinch) {
-          var z = Math.max(1, Math.min(ZMAX, g.z0 * d / g.d0));
+          var z = clamp(g.z0 * d / g.d0, 1, ZMAX);
           var fx = (g.m0.x - g.px0) / (W() * g.z0), fy = (g.m0.y - g.py0) / (H() * g.z0);   // the spot under the fingers
           st.z = z; st.px = m.x - fx * W() * z; st.py = m.y - fy * H() * z; clampPan(); paint();
-        } else if (g.moved > TAP_MOVE) {   // two-finger drag: scroll (natural direction) at the cursor / fingers
-          var sdy = m.y - g.lm.y, sdx = m.x - g.lm.x;
-          wheelAcc += -sdy * 2.2;
-          if (Math.abs(wheelAcc) >= 1) {
-            var at = st.mode === "trackpad" ? cur0() : toC(m);
-            wheel(at, wheelAcc, -sdx * 2.2); wheelAcc = 0;
+        } else if (g.moved > TAP_MOVE) {   // two-finger drag: scroll wheel (natural direction) at the cursor / fingers
+          g.sy += -(m.y - g.lm.y) / SCROLL_PX; g.sx += -(m.x - g.lm.x) / SCROLL_PX;
+          var ny = g.sy > 0 ? Math.floor(g.sy) : Math.ceil(g.sy), nx = g.sx > 0 ? Math.floor(g.sx) : Math.ceil(g.sx);
+          if (ny || nx) {
+            outScroll(st.mode === "trackpad" ? cur0() : toC(m), ny, nx);
+            g.sy -= ny; g.sx -= nx;
           }
         }
         g.lm = m;
@@ -329,12 +478,17 @@
         clearTimeout(holdT);
         var quick = now - g.t0 < TAP_MS + (g.second ? 120 : 0);
         if (st.mode === "trackpad") {
-          if (st.dragging) endDrag();
-          else if (g.moved < TAP_MOVE && quick) { click(cur0(), 0); lastTap = now; lastTapAt = { x: g.x0, y: g.y0 }; }
+          if (st.dragging) endDrag(cur0());
+          else if (g.moved < TAP_MOVE && quick) {   // tap = left click at the cursor; a second tap soon after = double click
+            outClick(cur0(), "left", 1); lastTap = now; lastTapAt = { x: g.x0, y: g.y0 };
+          }
         } else {
-          var c = toC({ x: g.lx, y: g.ly }); hideLoupe();
-          var r = crect();
-          if (c.x >= r.l && c.y >= r.t && c.x < r.l + r.w && c.y < r.t + r.h) { setCur(c); click(c, 0); }
+          hideLoupe();
+          if (st.dragging) endDrag(toC({ x: g.lx, y: g.ly }));
+          else if (!g.done && g.moved < TAP_MOVE) {   // tap = left click exactly under the finger (where it went down)
+            var c = toC({ x: g.x0, y: g.y0 });
+            if (inside(c)) { setCur(c); outClick(c, "left", 1); blip({ x: g.x0, y: g.y0 }); }
+          }
         }
         g = null;
       } else if (g.kind === "two") {
@@ -342,91 +496,125 @@
         // pinch / scroll does nothing
         if (left === 0) {
           if (!g.pinch && g.moved < TAP_MOVE * 1.5 && now - g.t0 < TAP_MS + 120) {   // two-finger tap: right click
-            click(st.mode === "trackpad" ? cur0() : toC(g.m0), 2);
+            outClick(st.mode === "trackpad" ? cur0() : toC(g.m0), "right", 1);
           }
+          if (g.pinch && st.mode === "trackpad") { follow(); paint(); }   // the cursor stays in view after a zoom
           g = null;
         }
       } else if (left === 0) g = null;
     }
-    function startDrag() { st.dragging = true; move(cur0()); fire("mousedown", cur0(), 0, 1); paint(); }
-    function endDrag() { st.dragging = false; fire("mouseup", cur0(), 0, 0); paint(); }
-    function queueMove() {
-      paint();
-      if (pendMove) return; pendMove = true;
-      raf = win.requestAnimationFrame(function () { pendMove = false; move(cur0()); });
-    }
+    function startDrag(c) { st.dragging = true; outButton("down", c); paint(); }
+    function endDrag(c) { st.dragging = false; outButton("up", c); paint(); }
     ov.addEventListener("touchstart", onStart, { passive: false });
     ov.addEventListener("touchmove", onMove, { passive: false });
     ov.addEventListener("touchend", onEnd, { passive: false });
     ov.addEventListener("touchcancel", function (e) {
-      touches = {}; clearTimeout(holdT); hideLoupe(); if (st.dragging) endDrag(); g = null; e.preventDefault();
+      touches = {}; clearTimeout(holdT); hideLoupe();
+      if (st.dragging) endDrag(st.mode === "trackpad" ? cur0() : toC({ x: g ? g.lx : 0, y: g ? g.ly : 0 }));
+      g = null; e.preventDefault();
     }, { passive: false });
-    // a mouse / pen on the overlay (tablet with a pointer, desktop testing): pass straight through at the same point
-    ov.addEventListener("mousedown", function (e) { if (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return; var c = toC(toS(e.clientX, e.clientY)); fire("mousedown", c, e.button, e.buttons); });
-    ov.addEventListener("mousemove", function (e) { if (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return; var c = toC(toS(e.clientX, e.clientY)); fire("mousemove", c, e.button, e.buttons); });
-    ov.addEventListener("mouseup", function (e) { if (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return; var c = toC(toS(e.clientX, e.clientY)); fire("mouseup", c, e.button, e.buttons); });
+    // a mouse / pen on the overlay (tablet with a pointer, desktop testing): straight through at the same point
+    function mouseOk(e) { return !(e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents); }
+    ov.addEventListener("mousedown", function (e) { if (!mouseOk(e)) return; e.preventDefault(); var c = toC(toS(e.clientX, e.clientY)); setCur(c);
+      if (e.button === 2) outClick(c, "right"); else startDrag(c); refocus(); });
+    ov.addEventListener("mousemove", function (e) { if (!mouseOk(e)) return; var c = toC(toS(e.clientX, e.clientY)); setCur(c); outMove(c); paint(); });
+    ov.addEventListener("mouseup", function (e) { if (!mouseOk(e) || e.button === 2) return; if (st.dragging) endDrag(toC(toS(e.clientX, e.clientY))); });
     ov.addEventListener("contextmenu", function (e) { e.preventDefault(); });
-    ov.addEventListener("wheel", function (e) { e.preventDefault(); wheel(toC(toS(e.clientX, e.clientY)), e.deltaY, e.deltaX); }, { passive: false });
+    ov.addEventListener("wheel", function (e) { e.preventDefault(); var n = e.deltaY > 0 ? 1 : e.deltaY < 0 ? -1 : 0, nx = e.deltaX > 0 ? 1 : e.deltaX < 0 ? -1 : 0;
+      if (n || nx) outScroll(toC(toS(e.clientX, e.clientY)), n, nx); }, { passive: false });
 
-    // ---- keyboard: a hidden input; what is typed becomes key presses on the desktop
+    // ---- keyboard (web): a hidden input that keeps the focus; committed text goes to the VM as unicode text
+    // (Chinese IME: only the compositionend string, never the pinyin), special keys as xdotool keys.
     var SENT = "\u200b\u200b";
     kb.value = SENT;
     var composing = false;
     kb.addEventListener("compositionstart", function () { composing = true; });
-    kb.addEventListener("compositionend", function (e) { composing = false; if (e.data) typeText(e.data); kb.value = SENT; });
+    kb.addEventListener("compositionend", function (e) { composing = false; if (e.data) typed(e.data); kb.value = SENT; });
     kb.addEventListener("keydown", function (e) {
-      if (composing) return;
-      var special = { Enter: 1, Backspace: 1, Tab: 1, Escape: 1, ArrowLeft: 1, ArrowRight: 1, ArrowUp: 1, ArrowDown: 1 };
-      if (special[e.key]) { e.preventDefault(); press(e.key); kb.value = SENT; }
+      if (composing || e.isComposing || e.keyCode === 229) return;
+      var x = XK[e.key];
+      if (x) { e.preventDefault(); outKey(x); kb.value = SENT; return; }
+      if ((e.ctrlKey || e.metaKey || e.altKey) && e.key && e.key.length === 1) {   // hardware keyboard shortcut
+        e.preventDefault();
+        if (e.ctrlKey) st.mods.ctrl = true; if (e.altKey) st.mods.alt = true; if (e.metaKey) st.mods.super = true;
+        outKey(e.key.toLowerCase()); kb.value = SENT;
+      }
     });
     kb.addEventListener("input", function (e) {
-      if (composing) return;
+      if (composing || e.isComposing) return;
       var v = kb.value;
-      if (e.inputType === "deleteContentBackward" || v.length < SENT.length) press("Backspace");
-      else { var t = v.replace(/\u200b/g, ""); if (t) typeText(t); }
+      if (e.inputType === "deleteContentBackward" || v.length < SENT.length) outKey("BackSpace");
+      else if (e.inputType === "insertLineBreak") outKey("Return");
+      else { var t = v.replace(/\u200b/g, ""); if (t) typed(t); }
       kb.value = SENT;
     });
+    kb.addEventListener("blur", function () {   // something took the focus while the keyboard is wanted: take it back
+      if (st.kbOn && !st.gone) setTimeout(function () { if (st.kbOn && doc.activeElement !== kb) kb.focus({ preventScroll: true }); }, 0);
+    });
+    /** typed text; with Ctrl / Alt / Super on, one character becomes that shortcut */
+    function typed(t) {
+      var on = Object.keys(st.mods).some(function (m) { return st.mods[m]; });
+      if (on && t.length === 1) { outKey(t === " " ? "space" : t.toLowerCase()); return; }
+      clearMods(); outText(t);
+    }
+    function refocus() { if (st.kbOn && !opts.native && doc.activeElement !== kb) kb.focus({ preventScroll: true }); }
+    function setKb(on) {
+      st.kbOn = on; kbBtn.classList.toggle("on", on);
+      if (opts.native) {   // iOS: the app's own keyboard (KeyBridge) and key bar
+        try { win.webkit.messageHandlers.aiwTakeover.postMessage({ op: on ? "keyboard" : "keyboard-off" }); } catch (e) { /* not in the app */ }
+        return;
+      }
+      if (on) { kb.value = SENT; kb.focus({ preventScroll: true }); } else kb.blur();
+    }
 
     // ---- toolbar
     function btn(label, title, fn, keep) {
       var b = el(doc, "button"); b.type = "button"; b.textContent = label; b.title = title; b.setAttribute("aria-label", title);
+      b.tabIndex = -1;
       if (keep) b.classList.add("keep");
       b.addEventListener("touchstart", function (e) { e.stopPropagation(); }, { passive: true });
-      b.addEventListener("click", function (e) { e.preventDefault(); e.stopPropagation(); fn(b); });
+      b.addEventListener("mousedown", function (e) { e.preventDefault(); });   // a button never takes the focus from the keyboard
+      b.addEventListener("click", function (e) { e.preventDefault(); e.stopPropagation(); fn(b); refocus(); });
       bar.appendChild(b); return b;
     }
     function sep() { bar.appendChild(el(doc, "span", "sep")); }
     var modeBtn = btn("", "切换触控方式", function () { setMode(st.mode === "trackpad" ? "direct" : "trackpad"); }, true);
-    btn("⌨", "键盘", function () {
-      if (doc.activeElement === kb) { kb.blur(); return; }
-      kb.value = SENT; kb.focus({ preventScroll: true });
-    });
+    var kbBtn = btn("⌨", "键盘", function () { setKb(!st.kbOn); }, true);
     sep();
-    btn("Esc", "Esc", function () { press("Escape"); });
-    btn("Tab", "Tab", function () { press("Tab"); });
-    var ctrlBtn = btn("Ctrl", "Ctrl（按一下作用于下一个键）", function () { setCtrl(!st.ctrl); });
-    btn("↵", "回车", function () { press("Enter"); });
-    btn("⌫", "退格", function () { press("Backspace"); });
-    btn("←", "左", function () { press("ArrowLeft"); });
-    btn("↑", "上", function () { press("ArrowUp"); });
-    btn("↓", "下", function () { press("ArrowDown"); });
-    btn("→", "右", function () { press("ArrowRight"); });
+    btn("Esc", "Esc", function () { outKey("Escape"); });
+    btn("Tab", "Tab", function () { outKey("Tab"); });
+    var modBtn = {};
+    [["ctrl", "Ctrl"], ["alt", "Alt"], ["super", "Super"]].forEach(function (m) {
+      modBtn[m[0]] = btn(m[0] === "super" ? "⌘" : m[1], m[1] + "（按一下作用于下一个键）", function () { setMod(m[0], !st.mods[m[0]]); });
+    });
+    btn("↵", "回车", function () { outKey("Return"); });
+    btn("⌫", "退格", function () { outKey("BackSpace"); });
+    btn("←", "左", function () { outKey("Left"); });
+    btn("↑", "上", function () { outKey("Up"); });
+    btn("↓", "下", function () { outKey("Down"); });
+    btn("→", "右", function () { outKey("Right"); });
+    btn("^C", "复制 Ctrl+C", function () { clearMods(); outKey("ctrl+c"); });
+    btn("^V", "粘贴 Ctrl+V", function () { clearMods(); outKey("ctrl+v"); });
+    btn("^A", "全选 Ctrl+A", function () { clearMods(); outKey("ctrl+a"); });
     sep();
     var zoomBtn = btn("1:1", "缩放复位", function () { st.z = 1; st.px = 0; st.py = 0; paint(); }, true);
     var landBtn = btn("横屏", "横屏全屏", function () { setLandscape(!st.landscape); }, true);
-    var foldBtn = btn("▾", "收起工具条", function () {   // folded: just the mode, 横屏 and this, so the desktop shows
+    var foldBtn = btn("▾", "收起工具条", function () {   // folded: just the mode, keyboard, 横屏 and this, so the desktop shows
       var min = !bar.classList.contains("min"); bar.classList.toggle("min", min);
       foldBtn.textContent = min ? "▸" : "▾"; foldBtn.title = min ? "展开工具条" : "收起工具条"; paint();
       try { localStorage.setItem("aiw_touch_bar", min ? "min" : ""); } catch (e) { /* private mode */ }
     }, true);
-    if (localStorage.getItem("aiw_touch_bar") === "min") { bar.classList.add("min"); foldBtn.textContent = "▸"; }
-    function setCtrl(on) { st.ctrl = on; ctrlBtn.classList.toggle("on", on); }
+    try { if (localStorage.getItem("aiw_touch_bar") === "min") { bar.classList.add("min"); foldBtn.textContent = "▸"; } } catch (e) { /* ok */ }
+    function setMod(m, on) { st.mods[m] = on; modBtn[m].classList.toggle("on", on); }
+    function clearMods() { Object.keys(modBtn).forEach(function (m) { setMod(m, false); }); }
     function setMode(m) {
-      st.mode = m; localStorage.setItem("aiw_touch_mode", m);
-      modeBtn.textContent = m === "trackpad" ? "触控板" : "直点"; modeBtn.classList.add("on");
-      if (st.dragging) endDrag();
+      if (m !== "direct") m = "trackpad";
+      st.mode = m; try { localStorage.setItem("aiw_touch_mode", m); } catch (e) { /* private mode */ }
+      modeBtn.textContent = m === "trackpad" ? "鼠标指针" : "直接触控"; modeBtn.classList.add("on");
+      if (st.dragging) endDrag(cur0());
       hideLoupe(); ensureCursor(); paint();
-      say(m === "trackpad" ? "触控板：单指移动光标，轻点=左键，双指轻点=右键，长按拖动=选择，双指拖=滚动" : "直点：按住看放大镜对准，松手就点在那里；双指拖=滚动，捏合=缩放");
+      say(m === "trackpad" ? "鼠标指针：单指移动光标，轻点=左键，双击=双击，按住再拖=拖动，双指轻点=右键，双指拖=滚动，捏合=缩放"
+                           : "直接触控：轻点=点在手指处，长按=右键，单指拖=拖动（放大镜），双指拖=滚动，捏合=缩放");
     }
     var noteT = 0;
     function say(t) { note.textContent = t; note.classList.add("on"); clearTimeout(noteT); noteT = setTimeout(function () { note.classList.remove("on"); }, 3200); }
@@ -477,25 +665,43 @@
       stage.classList.toggle("aiwt-rot", st.rot);
       relayout();
     }
-    function relayout() {
+    function relayout() {   // orientation changed: back to the whole desktop, cursor where it was on it
       setTimeout(function () { st.z = 1; st.px = 0; st.py = 0; ensureCursor(); paint(); }, 350);
     }
     function onFs() { if (!fsEl() && st.landscape && !opts.native && !st.rot && !wantRot) { st.landscape = false; stage.classList.remove("aiwt-full"); landBtn.textContent = "横屏"; landBtn.classList.remove("on"); if (opts.onLandscape) opts.onLandscape(false); relayout(); } }
     doc.addEventListener("fullscreenchange", onFs); doc.addEventListener("webkitfullscreenchange", onFs);
-    function onResize() { if (st.landscape && !opts.native && stage.classList.contains("aiwt-full")) setRot(wantRot && win.innerHeight > win.innerWidth); else relayout(); }
+    var lastWide = win.innerWidth > win.innerHeight;
+    function onResize() {
+      if (st.landscape && !opts.native && stage.classList.contains("aiwt-full")) { setRot(wantRot && win.innerHeight > win.innerWidth); return; }
+      var wide = win.innerWidth > win.innerHeight;
+      if (wide !== lastWide) { lastWide = wide; relayout(); return; }
+      clampPan(); paint();   // the keyboard came up / went away: keep the zoom
+    }
     win.addEventListener("resize", onResize);
 
     setMode(st.mode);
-    checkReach(); tidy();
+    checkReach(); tidy(); connect();
     var poll = setInterval(function () { if (st.gone) return; checkReach(); tidy(); paint(); }, 1500);
+    rx.pingT = setInterval(function () { if (rx.open && rx.ws) { try { rx.ws.send(JSON.stringify({ op: "ping", t: Date.now() })); } catch (e) { /* closes */ } } }, 20000);
 
     return {
       setMode: setMode, setLandscape: setLandscape,
-      state: function () { var c = cur0(); return { mode: st.mode, z: st.z, px: st.px, py: st.py, cx: c.x, cy: c.y, u: st.u, v: st.v, pass: st.pass, landscape: st.landscape, rot: st.rot, last: st.last }; },
-      /** for tests / the screenshots: map a stage point to the iframe client point */
+      /** the iOS keyboard: {t: "text", text} committed text, {t: "key", key: "Return" | "ctrl+c" …} */
+      input: function (op) {
+        if (!op) return;
+        if (op.t === "text") outText(String(op.text || ""));
+        else if (op.t === "key" && op.key) { clearMods(); outKey(String(op.key)); }
+      },
+      kb: function (on) { st.kbOn = !!on; kbBtn.classList.toggle("on", !!on); },
+      state: function () { var c = cur0(); return { mode: st.mode, z: st.z, px: st.px, py: st.py, cx: c.x, cy: c.y, u: st.u, v: st.v, pass: st.pass, landscape: st.landscape, rot: st.rot, last: st.last, remote: useRemote, open: rx.open, rw: rx.w, rh: rx.h }; },
+      /** for tests: a stage point -> the iframe client point, and -> the remote pixel */
       map: function (x, y) { return toC({ x: x, y: y }); },
+      remote: function (x, y) { return toR(toC({ x: x, y: y })); },
       detach: function () {
-        st.gone = true; clearInterval(poll); win.cancelAnimationFrame(raf); if (st.dragging) endDrag();
+        st.gone = true; clearInterval(poll); clearInterval(rx.pingT); win.cancelAnimationFrame(raf);
+        if (st.dragging) endDrag(cur0());
+        flushMove(); flushPost();
+        if (rx.ws) { var w = rx.ws; rx.ws = null; setTimeout(function () { try { w.close(); } catch (e) { /* gone */ } }, 300); }
         if (st.landscape) setLandscape(false);
         win.removeEventListener("resize", onResize);
         doc.removeEventListener("fullscreenchange", onFs); doc.removeEventListener("webkitfullscreenchange", onFs);

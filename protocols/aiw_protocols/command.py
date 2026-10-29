@@ -28,6 +28,9 @@ class ActionType(str, Enum):
     CLOSE_APP = "computer.close_app"
     CURSOR = "computer.cursor_position"
     SCREEN_SIZE = "computer.screen_size"
+    # 3.8.4: the user's own takeover input (touch layer / native keyboard), a batch of absolute xdotool ops run in order
+    # under the input lock: move / click / down / up / scroll / text (unicode) / key (vm_agent.computer.remote_input)
+    INPUT = "computer.input"
     # shell.*
     SHELL_EXEC = "shell.exec"
     SHELL_KILL = "shell.kill"
@@ -64,6 +67,7 @@ PAYLOAD_SCHEMA: dict[str, list[str]] = {
     ActionType.KEYPRESS.value: ["key"],
     ActionType.HOTKEY.value: ["keys"],
     ActionType.SCROLL.value: ["dx", "dy"],
+    ActionType.INPUT.value: ["ops"],
     ActionType.OPEN_APP.value: ["name"],
     ActionType.CLOSE_APP.value: ["name"],
     ActionType.SHELL_EXEC.value: ["command"],

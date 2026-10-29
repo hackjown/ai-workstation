@@ -228,6 +228,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     from . import xhs   # 小红书运营: settings, approval queue, pause (/api/xhs/*)
     xhs.mount(app, store, sessions, notifier, auth)
+    from . import remote_input   # 3.8.4: takeover input straight to the VM (/ws/input/{mid}, /api/machines/{mid}/input)
+    remote_input.mount(app, store, sessions, auth, lambda ws: _ok(ws_token(ws)))
     from . import browseros   # BrowserOS neo per computer (/api/browseros*)
     browseros.mount(app, store, sessions, auth)
     from . import chat as _chat   # the persistent 小秘 chat (/api/chat*): routing, task cards, escalations in the chat

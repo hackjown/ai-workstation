@@ -9,8 +9,8 @@
   <key>CFBundleName</key><string>AiwShare</string>
   <key>CFBundlePackageType</key><string>XPC!</string>
   <!-- build-ipa.sh copies the app's version and build number in here -->
-  <key>CFBundleShortVersionString</key><string>3.8.3</string>
-  <key>CFBundleVersion</key><string>24</string>
+  <key>CFBundleShortVersionString</key><string>3.8.4</string>
+  <key>CFBundleVersion</key><string>25</string>
   <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
   <key>MinimumOSVersion</key><string>16.0</string>
   <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>

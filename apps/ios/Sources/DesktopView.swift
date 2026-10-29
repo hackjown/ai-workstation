@@ -117,6 +117,9 @@ struct DesktopPane: View {
 }
 
 /// Full screen desktop you can drive (noVNC from the Aiw server), with a bar to hand control back.
+/// 3.8.4: touches and keys no longer go into the viewer page: takeover.js sends them to the VM over /ws/input/<mid>
+/// (absolute xdotool through the vm-agent), so 云电脑 (InstaBox viewer, another origin) and portrait work too, and the
+/// keyboard is native (TakeoverHost / KeyField: a hidden first-responder field and a key bar).
 /// 3.7: the desktop is the takeover page (apps/web/takeover.html + takeover.js, bundled, loaded with the Aiw server as
 /// its origin so the noVNC iframe inside is same-origin) and touches go through its touch layer: 触控板 mode (default:
 /// a cursor moved relatively with acceleration, tap = click, two-finger tap = right click, long press / tap-then-drag =
@@ -130,6 +133,7 @@ struct TakeoverView: View {
     @State private var url: URL?
     @State private var err = ""
     @State private var landscape = false
+    @State private var mid = ""
     @ObservedObject private var bus = TakeoverBus.shared
     var asked: JSON? { (bus.pending?.s("session_id") ?? "") == (liveSession ?? "-") ? bus.pending : nil }
     var body: some View {
@@ -149,11 +153,13 @@ struct TakeoverView: View {
             }
             ZStack {
                 Color.black
-                if let u = url { TakeoverWeb(url: u, server: api.server) { op in setLandscape(op == "landscape") } }
+                if let u = url {
+                    TakeoverWeb(url: u, server: api.server, mid: mid, token: api.token) { op in setLandscape(op == "landscape") }
+                }
                 else if !err.isEmpty { Text(err).foregroundColor(.white).padding() }
                 else { ProgressView().tint(.white) }
             }
-            .ignoresSafeArea(edges: landscape ? .all : [])
+            .ignoresSafeArea(.container, edges: landscape ? .all : [])   // the keyboard still shrinks it (you see what you type)
         }
         .statusBarHidden(landscape)
         .persistentSystemOverlays(landscape ? .hidden : .automatic)
@@ -170,7 +176,8 @@ struct TakeoverView: View {
     }
     func load() async {
         do {
-            let d = try await api.obj("GET", "/api/machines/\(api.machine)/desktop?view_only=false")
+            mid = api.machine
+            let d = try await api.obj("GET", "/api/machines/\(mid)/desktop?view_only=false")
             let raw = d.s("novnc_url")
             if raw.isEmpty { err = d.b("paused") ? "云电脑暂停中，发个任务会自动唤醒" : "这台电脑没有桌面"; return }
             let full = d.b("external") ? raw : api.server + raw + "&token=" + (api.token.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")
@@ -210,18 +217,28 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 }
 
 /// The takeover page in a WKWebView: the bundled takeover.html with takeover.js inlined, loaded with the Aiw server as
-/// its base URL (so the noVNC iframe is same-origin and the touch layer can reach its canvas). A server copy
-/// (/takeover.html) is the fallback when the bundle has none. `op` gets the page's 横屏 / 退出横屏.
+/// its base URL. A server copy (/takeover.html) is the fallback when the bundle has none. `op` gets the page's 横屏 /
+/// 退出横屏. 3.8.4: the page sends every touch straight to the VM over /ws/input/<mid> (so it gets the machine id and
+/// the token), and its ⌨ button opens the native keyboard below (KeyField) instead of a hidden web input.
 struct TakeoverWeb: UIViewRepresentable {
     let url: URL
     let server: String
+    var mid: String = ""
+    var token: String = ""
     let op: (String) -> Void
 
     final class Coord: NSObject, WKScriptMessageHandler {
         var op: (String) -> Void = { _ in }
+        weak var host: TakeoverHost?
         func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
             guard let b = m.body as? [String: Any], let o = b["op"] as? String else { return }
-            DispatchQueue.main.async { self.op(o) }
+            DispatchQueue.main.async {
+                switch o {
+                case "keyboard": self.host?.keyboard(true)
+                case "keyboard-off": self.host?.keyboard(false)
+                default: self.op(o)
+                }
+            }
         }
     }
     /// WKUserContentController keeps its handlers strongly: this breaks the cycle
@@ -232,7 +249,7 @@ struct TakeoverWeb: UIViewRepresentable {
     }
     func makeCoordinator() -> Coord { Coord() }
 
-    func makeUIView(context: Context) -> WKWebView {
+    func makeUIView(context: Context) -> TakeoverHost {
         let c = WKWebViewConfiguration()
         c.allowsInlineMediaPlayback = true
         c.userContentController.add(Weak(context.coordinator), name: "aiwTakeover")
@@ -242,28 +259,224 @@ struct TakeoverWeb: UIViewRepresentable {
         w.scrollView.bounces = false
         w.scrollView.contentInsetAdjustmentBehavior = .never
         context.coordinator.op = op
-        if let html = TakeoverWeb.page(src: url.absoluteString), let base = URL(string: server.hasSuffix("/") ? server : server + "/") {
+        if let html = TakeoverWeb.page(src: url.absoluteString, mid: mid, token: token),
+           let base = URL(string: server.hasSuffix("/") ? server : server + "/") {
             w.loadHTMLString(html, baseURL: base)
         } else if var u = URLComponents(string: server + "/takeover.html") {
-            u.queryItems = [URLQueryItem(name: "src", value: url.absoluteString), URLQueryItem(name: "native", value: "1")]
+            u.queryItems = [URLQueryItem(name: "src", value: url.absoluteString), URLQueryItem(name: "native", value: "1"),
+                            URLQueryItem(name: "mid", value: mid), URLQueryItem(name: "token", value: token)]
             if let full = u.url { w.load(URLRequest(url: full)) } else { w.load(URLRequest(url: url)) }
         } else { w.load(URLRequest(url: url)) }
-        return w
+        let host = TakeoverHost(web: w)
+        context.coordinator.host = host
+        return host
     }
-    func updateUIView(_ w: WKWebView, context: Context) { context.coordinator.op = op }
-    static func dismantleUIView(_ w: WKWebView, coordinator: Coord) {
-        w.configuration.userContentController.removeScriptMessageHandler(forName: "aiwTakeover")
+    func updateUIView(_ h: TakeoverHost, context: Context) { context.coordinator.op = op }
+    static func dismantleUIView(_ h: TakeoverHost, coordinator: Coord) {
+        h.keys.show(false)
+        h.web.configuration.userContentController.removeScriptMessageHandler(forName: "aiwTakeover")
     }
-    /// takeover.html from the bundle with takeover.js inlined and the desktop address set
-    static func page(src: String) -> String? {
+    /// a JS string literal
+    static func lit(_ s: String) -> String? {
+        guard let d = try? JSONSerialization.data(withJSONObject: [s]), let a = String(data: d, encoding: .utf8) else { return nil }
+        return String(a.dropFirst().dropLast())
+    }
+    /// takeover.html from the bundle with takeover.js inlined and the desktop address, machine and token set
+    static func page(src: String, mid: String, token: String) -> String? {
         guard let h = Bundle.main.url(forResource: "takeover", withExtension: "html", subdirectory: "takeover"),
               let j = Bundle.main.url(forResource: "takeover", withExtension: "js", subdirectory: "takeover"),
               var html = try? String(contentsOf: h, encoding: .utf8), let js = try? String(contentsOf: j, encoding: .utf8),
-              let data = try? JSONSerialization.data(withJSONObject: [src]), let arr = String(data: data, encoding: .utf8) else { return nil }
-        let lit = String(arr.dropFirst().dropLast())   // the JSON string literal of src
+              let s1 = lit(src), let s2 = lit(mid), let s3 = lit(token) else { return nil }
         let tag = "<script src=\"takeover.js\"></script>"
         guard html.contains(tag) else { return nil }
-        html = html.replacingOccurrences(of: tag, with: "<script>window.AIW_TAKEOVER_SRC=\(lit);window.AIW_TAKEOVER_NATIVE=true;</script>\n<script>\(js)</script>")
+        let vars = "window.AIW_TAKEOVER_SRC=\(s1);window.AIW_TAKEOVER_NATIVE=true;window.AIW_TAKEOVER_MID=\(s2);window.AIW_TAKEOVER_TOKEN=\(s3);"
+        html = html.replacingOccurrences(of: tag, with: "<script>\(vars)</script>\n<script>\(js)</script>")
         return html
+    }
+}
+
+/// The web view plus the hidden keyboard field. Keys go into the page (`aiwTouch.input`), which sends them to the VM
+/// on the same socket as the touches, so they stay in order with the clicks.
+final class TakeoverHost: UIView {
+    let web: WKWebView
+    let keys = KeyField(frame: CGRect(x: 0, y: 0, width: 2, height: 2))
+
+    init(web: WKWebView) {
+        self.web = web
+        super.init(frame: .zero)
+        backgroundColor = .black
+        addSubview(web)
+        addSubview(keys)
+        keys.send = { [weak self] op in self?.forward(op) }
+        keys.closed = { [weak self] in self?.js("window.aiwTouch&&aiwTouch.kb(false)") }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        web.frame = bounds
+        keys.frame = CGRect(x: 0, y: max(0, bounds.height - 2), width: 2, height: 2)
+    }
+    func keyboard(_ on: Bool) {
+        keys.show(on)
+        js("window.aiwTouch&&aiwTouch.kb(\(on ? "true" : "false"))")
+    }
+    func forward(_ op: [String: Any]) {
+        guard let d = try? JSONSerialization.data(withJSONObject: op), let s = String(data: d, encoding: .utf8) else { return }
+        js("window.aiwTouch&&aiwTouch.input(\(s))")
+    }
+    func js(_ s: String) { web.evaluateJavaScript(s, completionHandler: nil) }
+}
+
+/// 3.8.4 takeover keyboard: a hidden text field that stays first responder while the keyboard is on (taps on the
+/// desktop can't take it away: canResignFirstResponder is false until 收起), with a key bar above the keyboard.
+/// Committed text only (a Chinese IME's marked pinyin is left alone until it commits) goes out as unicode text;
+/// ⌫ on the empty field, return, the bar's keys and a hardware keyboard's arrows / Esc / Tab go out as key names.
+final class KeyField: UITextField, UITextFieldDelegate {
+    var send: (([String: Any]) -> Void)?
+    var closed: (() -> Void)?
+    private var keepUp = false
+    private var mods: [String] = []            // sticky Ctrl / Alt / Super for the next key
+    private var modButtons: [String: UIButton] = [:]
+    private static let hw: [String: String] = [
+        UIKeyCommand.inputUpArrow: "Up", UIKeyCommand.inputDownArrow: "Down", UIKeyCommand.inputLeftArrow: "Left",
+        UIKeyCommand.inputRightArrow: "Right", UIKeyCommand.inputEscape: "Escape", "\t": "Tab",
+    ]
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        delegate = self
+        autocorrectionType = .no
+        autocapitalizationType = .none
+        spellCheckingType = .no
+        smartQuotesType = .no
+        smartDashesType = .no
+        smartInsertDeleteType = .no
+        keyboardAppearance = .dark
+        textColor = .clear
+        tintColor = .clear
+        backgroundColor = .clear
+        alpha = 0.02
+        addTarget(self, action: #selector(changed), for: .editingChanged)
+        inputAccessoryView = makeBar()
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override var canResignFirstResponder: Bool { !keepUp }
+
+    func show(_ on: Bool) {
+        if on {
+            keepUp = true
+            text = ""
+            _ = becomeFirstResponder()
+        } else {
+            keepUp = false
+            _ = resignFirstResponder()
+        }
+    }
+
+    @objc private func changed() {
+        guard markedTextRange == nil, let t = text, !t.isEmpty else { return }   // IME: wait for the committed string
+        text = ""
+        if !mods.isEmpty && t.count == 1 { key(t == " " ? "space" : t.lowercased()); return }
+        send?(["t": "text", "text": t])
+    }
+    func key(_ k: String) {
+        let combo = (["ctrl", "alt", "super"].filter { mods.contains($0) } + [k]).joined(separator: "+")
+        clearMods()
+        send?(["t": "key", "key": combo])
+    }
+    override func deleteBackward() {
+        if markedTextRange == nil && (text ?? "").isEmpty { key("BackSpace") } else { super.deleteBackward() }
+    }
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        key("Return")
+        return false
+    }
+    override var keyCommands: [UIKeyCommand]? {
+        KeyField.hw.keys.map { input in
+            let c = UIKeyCommand(input: input, modifierFlags: [], action: #selector(hardware(_:)))
+            if #available(iOS 15.0, *) { c.wantsPriorityOverSystemBehavior = true }
+            return c
+        }
+    }
+    @objc private func hardware(_ c: UIKeyCommand) {
+        if let i = c.input, let k = KeyField.hw[i] { key(k) }
+    }
+
+    // ---- the key bar
+    private func clearMods() {
+        mods = []
+        paintMods()
+    }
+    private func paintMods() {
+        for (m, b) in modButtons {
+            let on = mods.contains(m)
+            b.backgroundColor = on ? UIColor(red: 0.94, green: 0.63, blue: 0.19, alpha: 1) : UIColor.white.withAlphaComponent(0.14)
+            b.setTitleColor(on ? UIColor(red: 0.16, green: 0.10, blue: 0.02, alpha: 1) : .white, for: .normal)
+        }
+    }
+    private func makeBar() -> UIView {
+        let bar = UIInputView(frame: CGRect(x: 0, y: 0, width: 320, height: 46), inputViewStyle: .keyboard)
+        bar.autoresizingMask = [.flexibleWidth]
+        let scroll = UIScrollView()
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 6
+        stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(scroll)
+        scroll.addSubview(stack)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: bar.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -8),
+            stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            stack.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
+        ])
+        let items: [(String, String)] = [
+            ("收起", "hide"), ("Esc", "Escape"), ("Tab", "Tab"), ("Ctrl", "mod:ctrl"), ("Alt", "mod:alt"), ("⌘", "mod:super"),
+            ("←", "Left"), ("↑", "Up"), ("↓", "Down"), ("→", "Right"), ("^C", "ctrl+c"), ("^V", "ctrl+v"), ("^A", "ctrl+a"),
+            ("⌫", "BackSpace"), ("↵", "Return"),
+        ]
+        for (title, action) in items {
+            let b = UIButton(type: .system)
+            b.setTitle(title, for: .normal)
+            b.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+            b.setTitleColor(.white, for: .normal)
+            b.backgroundColor = UIColor.white.withAlphaComponent(0.14)
+            b.layer.cornerRadius = 8
+            b.accessibilityIdentifier = action
+            b.accessibilityLabel = title == "⌘" ? "Super" : title
+            b.translatesAutoresizingMaskIntoConstraints = false
+            b.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            b.widthAnchor.constraint(greaterThanOrEqualToConstant: title.count > 2 ? 48 : 40).isActive = true
+            b.addTarget(self, action: #selector(tapBar(_:)), for: .touchUpInside)
+            if action.hasPrefix("mod:") { modButtons[String(action.dropFirst(4))] = b }
+            stack.addArrangedSubview(b)
+        }
+        return bar
+    }
+    @objc private func tapBar(_ b: UIButton) {
+        guard let a = b.accessibilityIdentifier else { return }
+        if a == "hide" {
+            show(false)
+            closed?()
+        } else if a.hasPrefix("mod:") {
+            let m = String(a.dropFirst(4))
+            if let i = mods.firstIndex(of: m) { mods.remove(at: i) } else { mods.append(m) }
+            paintMods()
+        } else if a.contains("+") {
+            clearMods()
+            send?(["t": "key", "key": a])
+        } else {
+            key(a)
+        }
     }
 }

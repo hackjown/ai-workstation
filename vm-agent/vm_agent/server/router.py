@@ -9,7 +9,7 @@ from aiw_protocols import ActionType as A, Command, CommandResult, Observation
 
 from ..browser.browseros import BrowserOS, status as bos_status
 from ..browser.playwright import Browser
-from ..computer import keyboard, mouse
+from ..computer import keyboard, mouse, remote_input
 from ..computer.desktop import DesktopBackend
 from ..computer.screenshot import screenshot
 from ..files import read as fread, transfer, write as fwrite
@@ -39,6 +39,7 @@ class Router:
             A.TYPE: lambda p: keyboard.type_text(b, p["text"]),
             A.KEYPRESS: lambda p: keyboard.keypress(b, p["key"]),
             A.HOTKEY: lambda p: keyboard.hotkey(b, p["keys"]),
+            A.INPUT: lambda p: remote_input.run(b, p["ops"]),
             A.OPEN_APP: lambda p: b.open_app(p["name"]),
             A.CLOSE_APP: lambda p: b.close_app(p["name"]),
             A.CURSOR: self._cursor,

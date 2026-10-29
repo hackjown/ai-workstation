@@ -138,7 +138,12 @@ async def test_retry_and_recover_interrupted(stack):
     client, backend, scripts, app, providers, _ = stack
     scripts.append([("fail", {"reason": "no"})])
     r = (await client.post("/api/tasks", json={"prompt": "试一下"})).json()
-    assert (await wait_task(client, r["task"]["id"]))["status"] == "failed"
+    for _ in range(100):   # 3.8.2: giving up pauses the task until the user answers; 停止 ends it
+        if (await client.get(f"/api/sessions/{r['session_id']}")).json().get("pending_question"):
+            break
+        await asyncio.sleep(0.1)
+    await client.post("/api/agent/answer", json={"session_id": r["session_id"], "text": "停止任务"})
+    assert (await wait_task(client, r["task"]["id"]))["status"] == "stopped"
     scripts.append([("done", {"summary": "ok"})])
     rr = (await client.post(f"/api/tasks/{r['task']['id']}/retry")).json()
     assert (await wait_task(client, rr["task"]["id"]))["status"] == "succeeded"

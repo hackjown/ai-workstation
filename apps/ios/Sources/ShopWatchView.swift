@@ -9,6 +9,7 @@ struct ShopWatchView: View {
     @State private var showAdd = false
     @State private var error = ""
     @State private var busy: String? = nil
+    @State private var machines: [JSON] = []   // 3.8.2: each watch says (and can change) which computer it runs on
 
     var body: some View {
         List {
@@ -21,6 +22,13 @@ struct ShopWatchView: View {
                             Button { Task { await toggle(items[i]) } } label: {
                                 Label(items[i].b("enabled") ? "暂停" : "启用", systemImage: items[i].b("enabled") ? "pause" : "play")
                             }.tint(.gray)
+                        }
+                        .contextMenu {
+                            Menu("换一台电脑检查") {
+                                ForEach(machines.indices, id: \.self) { j in
+                                    Button(machineName(machines[j].s("id"))) { Task { await setMachine(items[i], machines[j].s("id")) } }
+                                }
+                            }
                         }
                         .swipeActions(edge: .leading) {
                             Button { Task { await check(items[i]) } } label: { Label("立即检查", systemImage: "arrow.clockwise") }.tint(amber)
@@ -56,10 +64,14 @@ struct ShopWatchView: View {
             }
             Text(priceLine(w)).font(.footnote)
             Text(checkLine).font(.caption).foregroundColor(.secondary)
+            Label("在「\(machineName(w.s("machine_id")))」上检查（只用这台，不借别的电脑）", systemImage: "desktopcomputer")
+                .font(.caption).foregroundColor(.secondary)
             if w.s("shop_status") == "login" {
                 Text("这台电脑的 Chrome 还没登录\(site)：在桌面里点接管，登录一次（扫码即可）。").font(.caption).foregroundColor(amber)
             } else if w.s("shop_status") == "captcha" {
-                Text("遇到滑块验证：在桌面里点接管，完成一次验证。").font(.caption).foregroundColor(amber)
+                Text("「\(machineName(w.s("machine_id")))」上遇到滑块验证：打开这台电脑的桌面点接管，完成一次验证。").font(.caption).foregroundColor(amber)
+            } else if ["machine_busy", "machine_offline"].contains(w.s("shop_status")) {
+                Text(str(w, "status_note")).font(.caption).foregroundColor(amber)
             } else if !err.isEmpty {
                 Text(err).font(.caption).foregroundColor(.red).lineLimit(2)
             }
@@ -67,6 +79,20 @@ struct ShopWatchView: View {
         }.padding(.vertical, 2)
     }
 
+    func machineName(_ id: String) -> String {
+        if id.isEmpty { return "未指定" }
+        let m = machines.first { $0.s("id") == id }
+        return (m?.s("name").isEmpty ?? true) ? id : m!.s("name")
+    }
+    func setMachine(_ w: JSON, _ mid: String) async {
+        var body: JSON = [:]
+        for k in ["name", "url", "mode", "value", "sku", "address_note"] { if let v = w[k] as? String { body[k] = v } }
+        body["value"] = str(w, "value")
+        body["interval_min"] = Int(w.d("interval_min")); body["quantity"] = max(1, Int(w.d("quantity")))
+        body["auto_order"] = w.b("auto_order"); body["enabled"] = w.b("enabled"); body["machine_id"] = mid
+        do { _ = try await api.obj("PUT", "/api/watches/\(w.s("id"))", body) } catch { self.error = error.localizedDescription }
+        await load()
+    }
     func str(_ w: JSON, _ k: String) -> String {
         if let v = w[k] as? String { return v }
         if let v = w[k] as? NSNumber { return v.stringValue }
@@ -111,12 +137,14 @@ struct ShopWatchView: View {
     }
 
     let shopStatus: [String: (String, Color)] = ["ok": ("正常", Color.green), "login": ("需要登录", amber), "captcha": ("需要验证", amber),
-        "off_shelf": ("已下架", Color.red), "no_price": ("读不到价格", amber), "error": ("出错", Color.red), "no_browser": ("浏览器未就绪", amber)]
+        "off_shelf": ("已下架", Color.red), "no_price": ("读不到价格", amber), "error": ("出错", Color.red), "no_browser": ("浏览器未就绪", amber),
+        "machine_busy": ("等电脑空闲", amber), "machine_offline": ("等电脑上线", amber), "no_machine": ("电脑不在了", Color.red)]
     let orderStatus: [String: (String, Color)] = ["running": ("下单中", amber), "waiting_confirm": ("等你确认付款", amber),
         "submitted": ("已提交订单", Color.green), "rejected": ("已拒绝", Color.secondary), "timeout": ("超时已取消", Color.secondary),
         "above_target": ("实付超目标", amber), "submit_failed": ("提交失败", Color.red), "failed": ("下单失败", Color.red)]
 
     func load() async {
+        if machines.isEmpty { machines = (try? await api.list("/api/machines")) ?? [] }
         do { items = try await api.list("/api/watches").filter { $0.s("mode") == "shop" }; error = "" }
         catch { self.error = error.localizedDescription }
     }
@@ -129,6 +157,7 @@ struct ShopWatchView: View {
     func toggle(_ w: JSON) async {
         var body: JSON = [:]
         for k in ["name", "url", "mode", "value", "sku", "address_note", "machine_id"] { if let v = w[k] as? String { body[k] = v } }
+        body["value"] = str(w, "value")   // a number in the row would otherwise be dropped
         body["interval_min"] = Int(w.d("interval_min")); body["quantity"] = max(1, Int(w.d("quantity")))
         body["auto_order"] = w.b("auto_order"); body["enabled"] = !w.b("enabled")
         do { _ = try await api.obj("PUT", "/api/watches/\(w.s("id"))", body) } catch { self.error = error.localizedDescription }
@@ -196,7 +225,10 @@ struct AddShopWatchView: View {
             }
             .task {
                 machines = (try? await api.list("/api/machines")) ?? []
-                if machine.isEmpty { machine = api.machine }
+                // 3.8.2: default to a local computer (home IP, logged-in Chrome), not whichever one is selected now
+                if machine.isEmpty {
+                    machine = machines.first { $0.s("provider") != "instabox" && !$0.s("id").hasPrefix("cloud-") }?.s("id") ?? api.machine
+                }
             }
         }
     }

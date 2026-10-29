@@ -94,7 +94,7 @@ def test_381_ring_is_the_thick_pre_38_disc():
     assert "viewBox" in (WEB / "vendor" / "emotionball" / "ball.js").read_text(encoding="utf-8") and "[228.54,114.27]" in rings
 
 
-def test_381_ios_version():
+def test_ios_version_at_least_381():   # 3.8.2 / 23 now (same check, later builds pass too)
     for p in ("Info.plist", "Share/Info.plist"):
         pl = (ROOT / "apps" / "ios" / p).read_text(encoding="utf-8")
-        assert "<string>3.8.1</string>" in pl and "<key>CFBundleVersion</key><string>22</string>" in pl
+        assert "<string>3.8.2</string>" in pl and "<key>CFBundleVersion</key><string>23</string>" in pl

@@ -27,8 +27,8 @@ class Task(BaseModel):
     prompt: str
     machine_id: str = "ai-linux-001"
     status: TaskStatus = TaskStatus.PENDING
-    max_steps: int = 40
-    timeout_s: float = 600.0
+    max_steps: int = 0        # 0 = no step budget (3.8.2: a task never ends itself)
+    timeout_s: float = 0.0    # 0 = no time budget
     created_at: float = Field(default_factory=time.time)
     result: Optional[str] = None
     thread_id: Optional[str] = None

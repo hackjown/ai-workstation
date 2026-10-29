@@ -233,6 +233,24 @@ class Chat:
             self._push("update", m)
         return m
 
+    def delete_message(self, mid: str) -> dict:
+        """3.8.2: delete one message of the chat. A task card of a queued task also takes the task out of the queue;
+        a card whose task is still running is refused (stop the task first) so nothing keeps running unseen."""
+        m = self.get(mid)
+        if not m:
+            raise KeyError(mid)
+        cancelled = False
+        if m["kind"] == "task" and m.get("task_id"):
+            t = self.store.task(m["task_id"]) or {}
+            st = t.get("status")
+            if st == "queued":
+                cancelled = bool(self.sessions and self.sessions.cancel_queued(t["id"]))
+            elif st in ("pending", "running", "paused", "takeover", "waiting_confirm", "waiting_input"):
+                raise ValueError("这个任务还在进行：先停止它，再删除这条")
+        self.store._x("DELETE FROM chat_messages WHERE id=?", (mid,))
+        self._push("delete", {"id": mid, "deleted": True, "task_id": m.get("task_id")})
+        return {"deleted": True, "id": mid, "cancelled_task": cancelled}
+
     def _push(self, op: str, m: Optional[dict]):
         if not (self.notifier and m):
             return
@@ -778,6 +796,10 @@ class Chat:
         cd = card["data"]
         base = {"task_id": task.id, "thread_id": cd.get("thread_id") or task.thread_id, "session_id": sid,
                 "title": cd.get("title") or card.get("text")}
+        if typ == "task.cancelled":   # 3.8.2: taken out of the queue (删除): the card says so instead of 排队中 forever
+            self.update(card["id"], data={**base, "status": "cancelled", "status_line": "已从排队中删除",
+                                          "queue": None}, task_id=task.id)
+            return
         if typ == "task.started":
             self.update(card["id"], data={**base, "status": "running", "status_line": "进行中", "step": 0,
                                           "max_steps": task.max_steps}, task_id=task.id)
@@ -807,7 +829,8 @@ class Chat:
                         answer_text(ans, m["data"].get("fields"), bool(d.get("cancelled")))
                     self.update(m["id"], data={"resolved": {"answer": ans if not isinstance(ans, str) else ans[:200],
                                                             "text": txt, "by": d.get("by"), "at": time.time()}})
-            self.update(card["id"], data={**base, "status": "running", "status_line": self._line(cd, "running")})
+            self.update(card["id"], data={**base, "status": "running", "status_line": self._line(cd, "running"),
+                                          "stuck": None})
         elif typ == "agent.confirm_required":
             s = d.get("summary") or {}
             self.add("assistant", "confirm", s.get("title") or d.get("reason") or "需要你确认", {
@@ -855,9 +878,12 @@ class Chat:
             # labels only (the answer card shows 标签：值); which fields are secret, never their values
             data["fields"] = [{"key": f.get("key"), "label": f.get("label"), "secret": bool(f.get("secret"))}
                               for f in form.get("fields") or [] if isinstance(f, dict)][:20]
+        stuck = d.get("stuck") if isinstance(d.get("stuck"), dict) else None
+        if stuck:   # 3.8.2: a stuck task is paused, not ended; the card says why and what the user can do
+            data["stuck"] = stuck
         self.add("assistant", "ask", text, data, task_id=task.id)
-        self.update(card["id"], data={"status": "waiting_input",
-                                      "status_line": "需要你接管" if kind == "takeover" else "等你回答"})
+        line = "需要你接管" if kind == "takeover" else (stuck or {}).get("line") or "等你回答"
+        self.update(card["id"], data={"status": "waiting_input", "status_line": line, "stuck": stuck})
 
     async def answer(self, mid: str, choice: Optional[str] = None, approve: Optional[bool] = None,
                      text: Optional[str] = None) -> dict:
@@ -989,6 +1015,15 @@ def mount(app, chat: Chat, auth) -> None:
     async def chat_answer(mid: str, body: AnswerIn):
         try:
             return await chat.answer(mid, body.choice, body.approve, body.text)
+        except KeyError:
+            raise HTTPException(404)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+
+    @app.delete("/api/chat/messages/{mid}", dependencies=dep)
+    async def chat_delete(mid: str):
+        try:
+            return chat.delete_message(mid)
         except KeyError:
             raise HTTPException(404)
         except ValueError as e:

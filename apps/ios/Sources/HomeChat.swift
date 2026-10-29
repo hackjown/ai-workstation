@@ -86,7 +86,9 @@ final class HomeChat: ObservableObject {
         }
         greetAt = Date()
     }
-    @MainActor func leaveStage() { stageOff = true; if staged { staged = false; bottomTick += 1 } }
+    /// 3.8.2: set when "↑ 聊天记录" (or anything) leaves the stage, so the chat opens at the newest message
+    var openAtEnd = false
+    @MainActor func leaveStage() { stageOff = true; if staged { openAtEnd = true; staged = false; bottomTick += 1 } }
     /// 停止 while 球球 is answering (POST /api/chat/cancel keeps what streamed so far).
     @MainActor func cancel() async {
         do {
@@ -108,7 +110,16 @@ final class HomeChat: ObservableObject {
         markRead()
     }
     @MainActor func onEvent(_ e: JSON) {
+        if e.s("kind") == "chat" && e.s("op") == "delete" { remove(e.o("message").s("id")); return }
         if e.s("kind") == "chat" { upsert(e.o("message")) }
+    }
+    @MainActor func remove(_ id: String) { if !id.isEmpty { msgs.removeAll { $0.s("id") == id } } }
+    /// 3.8.2: delete one message (DELETE /api/chat/messages/{id}); a queued task's card also leaves the queue.
+    @MainActor func deleteMessage(_ id: String) async {
+        do {
+            _ = try await API.shared.call("DELETE", "/api/chat/messages/\(id)")
+            remove(id)
+        } catch { err = "没能删除：\(error.localizedDescription)" }
     }
     @MainActor func markRead() {
         guard let last = msgs.last(where: { $0.d("seq") > 0 }) else { return }
@@ -249,6 +260,10 @@ struct HomeChatView: View {
     @AppStorage("hdraft") private var draft = ""
     @StateObject private var voice = SpeechInput()
     @State private var queuedPick: JSON? = nil
+    @State private var deletePick: JSON? = nil
+    /// 3.8.2: older pages load only after the opening jump to the newest message (the "加载更早的消息" row is on screen
+    /// while the list still sits at the top, and its onAppear used to load a page and pin the view to it)
+    @State private var olderOK = false
 
     var liveStatus: String {
         m.msgs.last(where: { $0.s("kind") == "task" && isLive($0.o("data").s("status")) })?.o("data").s("status") ?? ""
@@ -266,17 +281,24 @@ struct HomeChatView: View {
                         HStack { Spacer(); if m.loadingOlder { ProgressView() } else { Text("加载更早的消息").font(.caption).foregroundColor(.secondary) }; Spacer() }
                             .padding(.vertical, 6).id("older")
                             .onAppear { Task {
+                                guard olderOK else { return }
                                 if let keep = await m.older() { proxy.scrollTo(keep, anchor: .top) }
                             } }
                     } else if !m.msgs.isEmpty {
                         Text("· 聊天从这里开始 ·").font(.caption2).foregroundColor(.secondary).frame(maxWidth: .infinity)
                     }
                     if m.loaded && m.msgs.isEmpty { HomeChatEmpty(agent: m.agent) { text = $0; focused = true } }
-                    ForEach(m.msgs.indices, id: \.self) { i in
-                        row(m.msgs[i]).id(m.msgs[i].s("id"))
+                    // 3.8.2: rows keyed by message id (index keys mixed rows up after a delete)
+                    ForEach(m.msgs.indices.map { HRowKey(i: $0, id: m.msgs[$0].s("id")) }, id: \.id) { k in
+                        let msg = m.msgs[k.i]
+                        row(msg).id(k.id)
+                            .environment(\.aiwDeleteMessage, delAction(msg))
                     }
                     if let s = m.stream { streamRow(s) }
-                    ForEach(m.outbox.indices, id: \.self) { i in queuedRow(m.outbox[i]).id(m.outbox[i].s("id")) }
+                    ForEach(m.outbox.indices.map { HRowKey(i: $0, id: m.outbox[$0].s("id")) }, id: \.id) { k in
+                        queuedRow(m.outbox[k.i]).id(k.id)
+                            .environment(\.aiwDeleteMessage, { let id = k.id; Task { @MainActor in m.dropQueued(id) } })
+                    }
                     if !m.err.isEmpty { Text(m.err).font(.footnote).foregroundColor(.red) }
                     if !voice.error.isEmpty { Text(voice.error).font(.footnote).foregroundColor(.orange) }
                     Color.clear.frame(height: 1).id("end")
@@ -295,7 +317,13 @@ struct HomeChatView: View {
                 }
                 // opening the chat (or leaving 球球's stage) starts at the newest message; back from a task keeps
                 // the place you were reading unless you were at the end
-                if !pin.opened || pin.pinned { pin.toEnd(follow: 2.5) }
+                // 3.8.2: "↑ 聊天记录" always lands on the newest message
+                if !pin.opened || pin.pinned || m.openAtEnd {
+                    m.openAtEnd = false
+                    olderOK = false
+                    pin.toEnd(follow: 2.5)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { olderOK = true }
+                } else { olderOK = true }
             }
             }
           }
@@ -338,6 +366,21 @@ struct HomeChatView: View {
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .refreshable { await m.load() }
         .onReceive(hub.events) { e in m.onEvent(e) }
+        // 3.8.2: one dialog for the queued message you tapped (a dialog per row inside the lazy list did not always
+        // run its 删除), and one for deleting a chat message
+        .confirmationDialog("这条还在排队", isPresented: Binding(get: { queuedPick != nil }, set: { if !$0 { queuedPick = nil } }),
+                            titleVisibility: .visible, presenting: queuedPick) { q in
+            Button(m.sending ? "立即发送（停止当前回复）" : "立即发送") { let id = q.s("id"); queuedPick = nil; Task { await m.sendQueuedNow(id) } }
+            Button("删除", role: .destructive) { let id = q.s("id"); queuedPick = nil; m.dropQueued(id) }
+            Button("取消", role: .cancel) { queuedPick = nil }
+        } message: { _ in Text(m.sending ? "球球还在回复上一条，回复完会自动发出。" : "马上就发。") }
+        .confirmationDialog("删除这条消息？", isPresented: Binding(get: { deletePick != nil }, set: { if !$0 { deletePick = nil } }),
+                            titleVisibility: .visible, presenting: deletePick) { d in
+            Button(d.s("kind") == "task" && d.o("data").s("status") == "queued" ? "删除（这个排队的任务不再执行）" : "删除",
+                   role: .destructive) { let id = d.s("id"); deletePick = nil; Task { await m.deleteMessage(id) } }
+            Button("取消", role: .cancel) { deletePick = nil }
+        } message: { d in Text(isLive(d.o("data").s("status")) && d.s("kind") == "task" && d.o("data").s("status") != "queued"
+                               ? "这个任务还在进行，要先进去停止它才能删除。" : "只删除这一条，其他聊天记录不受影响。") }
         // 3.8 aiw://chat (a push): the chat itself, at the newest message
         .onReceive(NotificationCenter.default.publisher(for: .aiwShowChat)) { _ in
             Task { await m.sync(); m.leaveStage(); pin.toEnd(follow: 2) }
@@ -388,12 +431,23 @@ struct HomeChatView: View {
         } else {
             switch msg.s("kind") {
             case "task": withAvatar(meta: false) { TaskCardRow(msg: msg, open: { open(msg, takeover: false) }, retry: { Task { await m.retry(d.s("task_id")) } }) }
+                .contextMenu { deleteItem(msg) }
             case "ask": withAvatar(meta: false) { AskRow(msg: msg, model: m, open: { take in open(msg, takeover: take) }) }
+                .contextMenu { deleteItem(msg) }
             case "confirm": withAvatar(meta: false) { ConfirmRow(msg: msg, model: m, open: { open(msg, takeover: false) }) }
+                .contextMenu { deleteItem(msg) }
             case "task_result": resultRow(msg)
             default: textRow(msg)
             }
         }
+    }
+    func delAction(_ msg: JSON) -> (() -> Void)? {
+        if msg.b("tmp") { return nil }   // still sending: nothing on the server to delete yet
+        return { deletePick = msg }
+    }
+    /// 3.8.2: 删除 in a card's long-press menu
+    @ViewBuilder func deleteItem(_ msg: JSON) -> some View {
+        Button(role: .destructive) { deletePick = msg } label: { Label("删除", systemImage: "trash") }
     }
     /// 球球's messages, task cards and questions carry the small 球球 head on the left (a still frame, see MateAvatar)
     @ViewBuilder func withAvatar<C: View>(meta: Bool, @ViewBuilder _ c: () -> C) -> some View {
@@ -442,12 +496,6 @@ struct HomeChatView: View {
                 }.buttonStyle(.plain).foregroundColor(hAmber)
             }
         }
-        .confirmationDialog("这条还在排队", isPresented: Binding(get: { queuedPick?.s("id") == q.s("id") }, set: { if !$0 { queuedPick = nil } }),
-                            titleVisibility: .visible) {
-            Button(m.sending ? "立即发送（停止当前回复）" : "立即发送") { let id = q.s("id"); queuedPick = nil; Task { await m.sendQueuedNow(id) } }
-            Button("删除", role: .destructive) { m.dropQueued(q.s("id")); queuedPick = nil }
-            Button("取消", role: .cancel) { queuedPick = nil }
-        } message: { Text(m.sending ? "球球还在回复上一条，回复完会自动发出。" : "马上就发。") }
     }
     @ViewBuilder func resultRow(_ msg: JSON) -> some View {
         let d = msg.o("data")
@@ -888,3 +936,6 @@ struct ConfirmRow: View {
     }
     func go(_ ok: Bool) { busy = true; Task { _ = await model.answer(msg.s("id"), ["approve": ok]); busy = false } }
 }
+
+/// 3.8.2: a row of the home chat keyed by its message id, with its index into the current array.
+struct HRowKey: Hashable { let i: Int; let id: String }

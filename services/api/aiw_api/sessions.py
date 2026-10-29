@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from agent_runtime import AgentControl, AgentLoop, LoopConfig
+from agent_runtime import escalate as _es
 from aiw_protocols import AgentEvent, EventType, Task, TaskStatus
 from computer_runtime import Computer, LinuxComputerProvider
 from llm_router import LLMRouter
@@ -215,7 +216,7 @@ class SessionManager:
         return None
 
     async def submit(self, prompt: str, machine_id: Optional[str] = None, thread_id: Optional[str] = None,
-                     source: str = "chat", max_steps: int = 40, timeout_s: float = float(os.environ.get("AIW_TASK_TIMEOUT", "900")), title: Optional[str] = None,
+                     source: str = "chat", max_steps: Optional[int] = None, timeout_s: Optional[float] = None, title: Optional[str] = None,
                      isolated: bool = False, context_extra: Optional[str] = None) -> dict:
         """context_extra: background the task gets on top of its thread and memory (the chat turns before a task
         the persistent chat started); kept in kv so a queued task still has it when it starts."""
@@ -224,6 +225,8 @@ class SessionManager:
             raise KeyError(machine_id)
         if not thread_id or not self.store.thread(thread_id):
             thread_id = self.store.create_thread(title or _title(prompt))["id"]
+        max_steps = _es.step_cap() if max_steps is None else max_steps
+        timeout_s = _es.time_cap() if timeout_s is None else timeout_s
         max_steps, timeout_s = _budget(prompt, max_steps, timeout_s)
         task = Task(prompt=prompt, machine_id=machine_id, max_steps=max_steps, timeout_s=timeout_s,
                     thread_id=thread_id, source=source)
@@ -264,8 +267,11 @@ class SessionManager:
             ctx = (ctx + "\n\n" if ctx else "") + extra_ctx
         if row.get("parent_id"):
             ctx = _child_note(self.store.task(row["parent_id"]) or {}) + ("\n\n" + ctx if ctx else "")
-        steps, secs = _budget(row["prompt"], row.get("max_steps") or 40,
-                              row.get("timeout_s") or float(os.environ.get("AIW_TASK_TIMEOUT", "900")), ctx)
+        steps, secs = row.get("max_steps"), row.get("timeout_s")
+        if row.get("source") not in ("xhs", "watch_order"):
+            # 3.8.2: tasks have no step / time budget (rows saved before carry the old 40 steps / 900 s)
+            steps, secs = _es.step_cap(), _es.time_cap()
+        steps, secs = _budget(row["prompt"], int(steps or 0), float(secs or 0), ctx)
         task = Task(id=row["id"], prompt=row["prompt"], machine_id=row["machine_id"], thread_id=row.get("thread_id"),
                     source=row.get("source") or "chat", max_steps=steps, timeout_s=secs)
         task.context = ctx
@@ -304,6 +310,14 @@ class SessionManager:
         self.store.update_task(task_id, "cancelled", "removed from queue")
         if task_id in self.queue_front:
             self.queue_front.remove(task_id)
+        # 3.8.2: tell the chat card and every open client (before, nothing was told: the home card kept saying
+        # 排队中 and the iOS task view kept the message, so 删除 looked like it did nothing)
+        with contextlib.suppress(RuntimeError):
+            loop = asyncio.get_running_loop()
+            tk = Task(id=t["id"], prompt=t.get("prompt") or "", machine_id=t.get("machine_id") or "ai-linux-001",
+                      thread_id=t.get("thread_id"))
+            loop.create_task(self._tell(tk, t.get("session_id") or "", {"type": "task.cancelled", "status": "cancelled"}))
+            loop.create_task(self._event_all({"kind": "task", "task": self.store.task(task_id)}))
         return True
 
     def queue_info(self, row: dict) -> dict:
@@ -470,12 +484,20 @@ class SessionManager:
                         extra["machine"] = m.get("name") or task.machine_id
                     extra["machine_id"] = task.machine_id
             self.store.update_task(task.id, TaskStatus.WAITING_INPUT.value)
-            await self._notify("input", "需要你填写资料" if kind == "form" else
+            lp = getattr(live, "loop", None)
+            forever = bool(getattr(lp, "_ask_forever", False))   # a stuck task: paused until the user decides
+            stuck = getattr(lp, "_stuck", None) if forever else None
+            if stuck and kind != "takeover":
+                await self._notify("input", "任务卡住了，等你处理", f"{stuck.get('reason')}。可以：继续 / 接管 / 停止", task)
+            else:
+                await self._notify("input", "需要你填写资料" if kind == "form" else
                                (extra.get("title") or "需要你接管桌面") if kind == "takeover" else "Agent 在问你",
                                ((extra.get("steps") or question) + (f"（{extra['machine']}）" if extra.get("machine") else ""))
                                if kind == "takeover" else question, task,
-                               deep=f"takeover/{task.machine_id}?task={task.id}" if kind == "takeover" else None)
+                                   deep=f"takeover/{task.machine_id}?task={task.id}" if kind == "takeover" else None)
             try:
+                if forever:   # never times out: only an answer or 停止 (which cancels the loop) ends this wait
+                    return await live.question
                 # filling a form or passing a captcha takes longer than answering a question
                 wait = float(self.settings.ask_timeout_s) * (3 if extra else 1)
                 return await asyncio.wait_for(live.question, wait)
@@ -794,7 +816,7 @@ class SessionManager:
         kids: list[dict] = []
         for it, mid, queued in plan:
             th = self.store.create_thread("↳ " + _title(it["goal"]), parent_task_id=ptask.id, parent_thread_id=ptask.thread_id)
-            steps, secs = _budget(it["goal"], 40, max(float(os.environ.get("AIW_TASK_TIMEOUT", "900")), timeout_s))
+            steps, secs = _budget(it["goal"], _es.step_cap(), _es.time_cap())
             t = Task(prompt=it["goal"], machine_id=mid, thread_id=th["id"], source="dispatch", max_steps=steps, timeout_s=secs)
             row = t.model_dump()
             row.update(status="queued", parent_id=ptask.id)
@@ -839,7 +861,10 @@ class SessionManager:
 
         own_job = asyncio.ensure_future(run_own())
         poll = float(os.environ.get("AIW_DISPATCH_POLL", "1.0"))
-        deadline = time.monotonic() + timeout_s
+        # 3.8.2: children are never stopped by a clock (a stuck child pauses and asks the user itself);
+        # AIW_DISPATCH_STOP_ON_TIMEOUT=1 brings the old overall limit back
+        deadline = (time.monotonic() + timeout_s if os.environ.get("AIW_DISPATCH_STOP_ON_TIMEOUT", "0") == "1"
+                    else float("inf"))
         timed_out = False
         last = None
         try:
@@ -1056,6 +1081,13 @@ _OFFICE_TASK = re.compile(r"officecli|\.?docx|\.?xlsx|\.?pptx|word|excel|空白�
 
 
 def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str] = None) -> tuple[int, float]:
+    """0 means no budget (the 3.8.2 default) and stays 0: the per-skill bumps below only raise a budget that is set.
+    """
+    st, secs = _budget_raw(prompt, max_steps, timeout_s, context)
+    return (st if max_steps and max_steps > 0 else 0), (secs if timeout_s and timeout_s > 0 else 0.0)
+
+
+def _budget_raw(prompt: str, max_steps: int, timeout_s: float, context: Optional[str] = None) -> tuple[int, float]:
     """Drawing a construction set in the CAD GUI takes hundreds of steps and hours, not 40 steps / 15 min.
     A revision in a drawing thread gets the same budget (it saves, exports and sends the whole set again)."""
     from agent_runtime.cad import cad_mode

@@ -252,6 +252,24 @@ enum StageLayout {
         return (dx * dx + dy * dy).squareRoot()
     }
     /// The tail: two dots between the bubble edge facing 球球 and the circle.
+    /// 3.8.2: 球球 + its briefing bubble as ONE group, centred vertically in the stage (the space between the 聊天记录
+    /// button and the input bar; the keyboard shrinks the stage). The bubble sits under 球球, never over it: before,
+    /// 球球 was centred alone at 52 % and the bubble placed around it, so on a phone the pair sat low and a long bubble
+    /// could cover the orb (IMG_2936). Returns 球球's centre and the bubble (cut to the lines that fit).
+    static func group(bubble b: CGSize, d: CGFloat, area: CGRect) -> (CGPoint, StagePlacement) {
+        let minY = area.minY + edge, maxY = area.maxY - edge
+        let room = max(0, (maxY - minY) - d - gap)              // height left for the bubble under 球球
+        var h = b.height, lines: Int? = nil
+        if h > room {
+            let n = max(1, Int(((room - padV) / lineH).rounded(.down)))
+            lines = n; h = min(h, padV + CGFloat(n) * lineH)
+        }
+        let groupH = d + gap + h
+        let top = max(minY, area.minY + (area.height - groupH) / 2)
+        let c = CGPoint(x: area.midX, y: top + d / 2)
+        let x = max(area.minX + edge, min(area.midX - b.width / 2, area.maxX - edge - b.width))
+        return (c, StagePlacement(rect: CGRect(x: x, y: top + d + gap, width: b.width, height: h), side: .below, lines: lines))
+    }
     static func tail(_ p: StagePlacement, _ c: CGPoint, _ r: CGFloat) -> (CGPoint, CGPoint) {
         let f = p.rect
         let start: CGPoint
@@ -300,10 +318,13 @@ struct HomeStage: View {
             let top: CGFloat = m.msgs.isEmpty ? 4 : 46               // below the 聊天记录 button
             let area = CGRect(x: 0, y: top, width: geo.size.width, height: max(120, geo.size.height - top - 4))
             let orb: CGFloat = max(72, min(150, geo.size.width * 0.36, area.height * 0.3))
-            let c = CGPoint(x: area.midX, y: area.minY + area.height * 0.52)
             let maxW = min(270, area.width - 2 * StageLayout.edge)
             let text = plain(item?.s("text") ?? "")
             let w = max(60, min(maxW, ceil(lineW) + 28 + 1))
+            // 3.8.2: 球球 and its bubble are centred together; with no bubble yet, 球球 alone sits in the middle
+            let speaking = item != nil && natural != .zero
+            let g = StageLayout.group(bubble: CGSize(width: w, height: speaking ? natural.height : 0), d: orb, area: area)
+            let c = speaking ? g.0 : CGPoint(x: area.midX, y: area.midY)
             ZStack(alignment: .topLeading) {
                 // measuring copies (never shown): the one-line width, then the height at the chosen width
                 Text(text).font(.system(size: 15)).fixedSize()
@@ -316,17 +337,19 @@ struct HomeStage: View {
                 MateView(status: "", threadId: nil, bus: false, emotion: "02", animate: true, mood: item?.s("mood") ?? "02")
                     .frame(width: orb, height: orb)
                     .position(c)
-                if let it = item, natural != .zero {
-                    let p = StageLayout.place(slot: idx, bubble: CGSize(width: w, height: natural.height), orb: c, r: orb / 2, area: area)
+                if let it = item, speaking {
+                    let p = g.1
                     let dots = StageLayout.tail(p, c, orb / 2)
                     ZStack(alignment: .topLeading) {
                         Circle().fill(hAmber).frame(width: 11, height: 11).position(dots.0)
                         Circle().fill(hAmber).frame(width: 6, height: 6).position(dots.1)
+                        // anchored by its top-left corner (a height measured a bit short grows downwards, away from 球球,
+                        // instead of spilling over it as a centred .position did)
                         Button { act(it.o("action")) } label: { label(text, width: p.rect.width, lines: p.lines) }
                             .buttonStyle(.plain)
                             .copyMenu(text)   // 3.8: tap runs it, long-press copies it (a tap target can't also select)
-                            .frame(width: p.rect.width, height: p.rect.height)
-                            .position(x: p.rect.midX, y: p.rect.midY)
+                            .frame(width: p.rect.width, alignment: .topLeading)
+                            .offset(x: p.rect.minX, y: p.rect.minY)
                             .accessibilityHint("点一下就去做")
                     }
                     .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)

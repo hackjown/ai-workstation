@@ -23,6 +23,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import logging
 import re
 import time
@@ -161,13 +162,20 @@ def parse_snapshot(snap: dict) -> dict:
     title = (snap.get("title") or snap.get("doc_title") or "").strip()
     res = {"status": "ok", "price": None, "final_price": None, "effective": None, "in_stock": None,
            "title": title[:120], "url": url, "note": "", "range": False}
+    if snap.get("cdp"):
+        res["cdp"] = str(snap["cdp"])[:60]
+    prof = snap.get("profile") if isinstance(snap.get("profile"), dict) else {}
+    if prof.get("dir"):
+        res["profile"] = str(prof["dir"])[:120]
+    fresh = prof.get("cookies") == 0
     frames = " ".join(snap.get("frames") or [])
     if any(h in host for h in LOGIN_HOSTS) or (snap.get("password_input") and re.search(r"登录|login", text[:800] + title, re.I)) \
             or any(h in frames for h in ("login.taobao.com", "passport.jd.com", "havanalogin")):
-        res.update(status="login", note="需要登录")
+        res.update(status="login", note="需要登录" + (f"（读价用的浏览器配置 {prof['dir']} 里没有登录信息）" if fresh else ""))
         return res
     if any(h in url for h in CAPTCHA_HOSTS) or (CAPTCHA_RE.search(text[:1500]) and len(text) < 2500):
-        res.update(status="captcha", note="出现了滑块/安全验证")
+        res.update(status="captcha", note="出现了滑块/安全验证" + (
+            f"（读价用的浏览器配置 {prof['dir']} 里没有登录信息，像是新开的配置）" if fresh else ""))
         return res
     if OFF_SHELF.search(text[:3000]):
         res.update(status="off_shelf", in_stock=False, note="商品已下架")
@@ -307,6 +315,44 @@ def watch_fields(d: dict, default_machine: Optional[str] = None) -> dict:
             "auto_order": 1 if d.get("auto_order") else 0,
             "machine_id": str(d.get("machine_id") or d.get("machine") or default_machine or "").strip() or None,
             "enabled": 0 if d.get("enabled") is False else 1}
+
+
+def _is_cloud(m: dict) -> bool:
+    return (m.get("provider") or "") == "instabox" or str(m.get("id") or "").startswith("cloud-")
+
+
+def default_machine(store) -> Optional[str]:
+    """Where a watch runs when nobody chose: the first local computer (home IP, the user's logged-in Chrome), never
+    whichever computer happens to be busy or selected right now."""
+    ms = store.machines() if store else []
+    local = [m for m in ms if not _is_cloud(m)]
+    return (local or ms or [{}])[0].get("id")
+
+
+def resolve_machine(store, value) -> Optional[str]:
+    """A computer the user named: its id, or its name ('本地vm', '云电脑 2'), or 本地/local for the only local one.
+    None when nothing matches (the caller says so; it never swaps in another computer)."""
+    v = str(value or "").strip()
+    if not v or not store:
+        return None
+    ms = store.machines()
+    for m in ms:
+        if m["id"] == v:
+            return v
+    key = re.sub(r"\s+", "", v).lower()
+    for m in ms:
+        for n in (m.get("name"), m.get("custom_name"), m.get("default_name"), m.get("raw_name")):
+            if n and re.sub(r"\s+", "", str(n)).lower() == key:
+                return m["id"]
+    if re.fullmatch(r"(本地|本机|家里|local)(的)?(vm|虚拟机|电脑|机器|computer)?", key):
+        local = [m for m in ms if not _is_cloud(m)]
+        if len(local) == 1:
+            return local[0]["id"]
+    return None
+
+
+def machine_label(store, mid: Optional[str]) -> str:
+    return ((store.machine(mid) or {}).get("name") if (store and mid) else None) or (mid or "未指定的电脑")
 
 
 # ----------------------------------------------------------------------------- running the probe on the computer
@@ -547,8 +593,20 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
     ensure_columns(store)
     now = now or time.time()
     interval = max(MIN_INTERVAL, int(w.get("interval_min") or DEFAULT_INTERVAL)) * 60
-    mid = w.get("machine_id") or (sessions.settings.machines[0].id if getattr(sessions.settings, "machines", None) else "ai-linux-001")
     _sync_order_status(store, w)
+    mid = w.get("machine_id")
+    if not mid:   # an old watch without a computer: pin one for good (it used to follow settings.machines[0])
+        mid = default_machine(store) or (sessions.settings.machines[0].id if getattr(sessions.settings, "machines", None)
+                                         else "ai-linux-001")
+        store.update("watches", w["id"], machine_id=mid)
+        w = {**w, "machine_id": mid}
+    if not store.machine(mid):   # 3.8.2: never borrow another computer
+        r = {"status": "no_machine", "note": f"设定的电脑「{mid}」已经不在了：请在价格监控里换一台电脑",
+             "price": None, "final_price": None, "effective": None, "in_stock": None, "title": ""}
+        return await apply_result(store, sessions, notifier, w, r, now, interval, mid, manual=manual)
+    wait = await _machine_wait(sessions, mid)
+    if wait:
+        return await _defer(store, notifier, w, mid, wait, now, manual)
     ens = None
     try:
         computer = await _computer(sessions, mid)
@@ -590,6 +648,43 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
         r = {"status": "error", "note": f"{type(e).__name__}: {e}"[:300], "price": None, "final_price": None,
              "effective": None, "in_stock": None, "title": ""}
     return await apply_result(store, sessions, notifier, w, r, now, interval, mid, manual=manual)
+
+
+BUSY_RECHECK_S = int(os.environ.get("AIW_SHOP_BUSY_RECHECK_S", "300"))
+
+
+async def _machine_wait(sessions, mid: str) -> Optional[str]:
+    """'' when the watch's own computer can be used now, else why it has to wait: 'busy' (a task runs there; the
+    check would share its browser) or 'offline'. A paused cloud computer is woken by the check, so it is not offline."""
+    if os.environ.get("AIW_SHOP_WAIT_BUSY", "1") != "0" and getattr(sessions, "busy_session", None) and sessions.busy_session(mid):
+        return "busy"
+    cloud = getattr(sessions, "cloud", None)
+    if cloud and cloud.is_cloud(mid):
+        return ""
+    probe = getattr(sessions, "_probe", None)
+    if probe is not None:
+        try:
+            if not await probe(mid, 6.0):
+                return "offline"
+        except Exception:  # noqa: BLE001
+            return "offline"
+    return ""
+
+
+async def _defer(store, notifier, w: dict, mid: str, why: str, now: float, manual: bool) -> dict:
+    """Wait for the watch's own computer (never another one) and say so once per stretch of waiting."""
+    machine = machine_label(store, mid)
+    status = "machine_busy" if why == "busy" else "machine_offline"
+    note = (f"「{machine}」正在做别的任务，价格检查等它做完再做（不会换到别的电脑）" if why == "busy" else
+            f"「{machine}」现在连不上（关机或 vm-agent 没在运行），等它上线再检查（不会换到别的电脑）")
+    store.update("watches", w["id"], shop_status=status, status_note=note, last_error=note[:300],
+                 next_check=now + (BUSY_RECHECK_S if why == "busy" else max(BUSY_RECHECK_S, 600)))
+    if manual or w.get("shop_status") != status:
+        say_chat(f"价格监控「{w['name']}」：{note}。")
+        if why == "offline":
+            await notifier.notify("watch_error", f"价格监控在等电脑上线（{machine}）：{w['name']}", note, link=w.get("url"),
+                                  push=manual is False)
+    return {"ok": False, "waiting": why, "machine": mid, "machine_name": machine, "error": note}
 
 
 async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, interval: int, mid: str,
@@ -644,9 +739,12 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
                                   f"「{machine}」上的 {bname} 还没登录{site_name}。请在 AIW 里打开这台电脑的接管桌面，"
                                   f"在 {bname} 里登录一次（扫码即可），之后价格会自动读取。\n{w['url']}", link=w["url"])
         elif r["status"] == "captcha":
-            await notifier.notify("watch_error", f"{site_name}要求验证：{w['name']}",
-                                  f"读取价格时遇到滑块/安全验证。请在「{machine}」的接管桌面里完成一次验证；"
-                                  f"检查频率已自动放慢。\n{w['url']}", link=w["url"])
+            via = f"（读的是 {r.get('cdp') or bname} 上的浏览器）" if r.get("cdp") else ""
+            await notifier.notify("watch_error", f"{site_name}要求验证（{machine}）：{w['name']}",
+                                  f"在「{machine}」上读取价格时遇到滑块/安全验证{via}。请在「{machine}」的接管桌面里完成一次验证；"
+                                  f"检查频率已自动放慢。\n{w['url']}", link=w["url"], deep=f"takeover/{mid}")
+        elif r["status"] == "no_machine":
+            await notifier.notify("watch_error", f"价格监控的电脑不在了：{w['name']}", r.get("note") or "", link=w["url"])
         elif r["status"] == "off_shelf":
             await notifier.notify("watch_error", f"商品已下架：{w['name']}", w["url"], link=w["url"])
         elif r["status"] == "price_pending":
@@ -655,13 +753,13 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
         elif r["status"] == "no_browser":
             await notifier.notify("watch_error", f"价格监控打不开浏览器：{w['name']}", f"{r.get('note')}\n{w['url']}", link=w["url"])
     # no silent failure (escalate.py): anything the user must fix becomes a chat question with one-tap 立即重试
-    if r["status"] in FAIL_STATES + ("login", "captcha") and (changed or manual or fails == 3):
+    if r["status"] in FAIL_STATES + ("login", "captcha", "no_machine") and (changed or manual or fails == 3):
         what = {"login": f"「{machine}」上的 {bname} 还没登录{site_name}：请在接管桌面里登录一次（扫码即可），再点「{OPT_RETRY}」。",
                 "captcha": f"{site_name}弹出了滑块/安全验证：请在「{machine}」的接管桌面里完成一次，再点「{OPT_RETRY}」。"
                 }.get(r["status"]) or str(r.get("note") or r["status"])
         if r["status"] in ("error", "no_price"):
             what = f"价格监控「{w['name']}」这次没读到价格：{what}" + ("（已连续 3 次）" if fails >= 3 else "")
-        post_ask(w, what)
+        post_ask(w, what, mid=mid, machine=machine)
     if r["status"] in FAIL_STATES and fails == 3:
         await notifier.notify("watch_error", f"价格监控失败：{w['name']}", f"连续 3 次读取失败：{r.get('note')}", link=w["url"])
     return {"ok": False, "error": r.get("note") or r["status"], "result": r}
@@ -702,14 +800,18 @@ def say_chat(text: str) -> None:
             log.warning("shopwatch chat: %s", e)
 
 
-def post_ask(w: dict, text: str) -> Optional[dict]:
-    """One open question per watch: the older one is closed when a newer one is posted."""
+def post_ask(w: dict, text: str, mid: Optional[str] = None, machine: Optional[str] = None) -> Optional[dict]:
+    """One open question per watch: the older one is closed when a newer one is posted. 3.8.2: the card names the
+    computer it came from (the user saw captcha cards and no captcha on the computer they had chosen)."""
     if not CHAT:
         return None
     try:
+        mid = mid or w.get("machine_id")
+        machine = machine or machine_label(getattr(CHAT, "store", None), mid)
         resolve_asks(w["id"], "有了新的情况，见下一条")
         return CHAT.add("assistant", "ask", text, {"watch_id": w["id"], "ask_kind": "question",
-                                                   "title": f"价格监控 · {w['name']}", "question": text,
+                                                   "title": f"价格监控 · {w['name']} · {machine}", "question": text,
+                                                   "machine_id": mid, "machine": machine,
                                                    "options": [OPT_RETRY, OPT_PAUSE]})
     except Exception as e:  # noqa: BLE001
         log.warning("shopwatch ask: %s", e)
@@ -914,17 +1016,27 @@ def create_tool(store, task):
             "address_note": {"type": "string", "description": "收货地址说明，空=默认地址"},
             "interval_min": {"type": "integer", "description": "检查间隔分钟，最少 10，默认 30"},
             "auto_order": {"type": "boolean", "description": "触发后自动下单到付款前"},
+            "machine": {"type": "string", "description": "在哪台电脑上检查：电脑的名字或 id（如 '本地vm'）。用户说了就必须填；"
+                                                          "不填 = 第一台本地电脑（不是当前这台）"},
             "name": {"type": "string"}},
             "required": ["url", "target_price"]}}
 
     async def call(a: dict) -> dict:
         ensure_columns(store)
-        f = watch_fields(a, default_machine=task.machine_id)
-        if f.get("machine_id") and not store.machine(f["machine_id"]):
-            f["machine_id"] = task.machine_id
+        want = a.get("machine_id") or a.get("machine")
+        f = watch_fields({k: v for k, v in a.items() if k not in ("machine", "machine_id")}, default_machine=None)
+        if want:   # 3.8.2: the computer the user named, by id or name; never silently the one this task runs on
+            mid = resolve_machine(store, want)
+            if not mid:
+                names = "、".join(f"{m.get('name') or m['id']}（{m['id']}）" for m in store.machines())
+                return {"error": f"没有叫「{want}」的电脑。可选：{names}。请问用户要用哪一台，再调用一次。"}
+            f["machine_id"] = mid
+        else:
+            f["machine_id"] = default_machine(store)
         w = store.insert("watches", f)
         return {"created": w["id"], "name": w["name"], "url": w["url"], "target": w["value"], "auto_order": bool(w["auto_order"]),
                 "interval_min": w["interval_min"], "machine": w["machine_id"],
+                "machine_name": machine_label(store, w["machine_id"]),
                 "note": "已创建，首次检查会在 1 分钟内开始；在「追踪」页可以查看和修改。"}
 
     call.needs_confirm = lambda a: False

@@ -322,3 +322,12 @@ html[data-theme=light] .hhist { background:#fff; color:#b8680c; border-color:rgb
 #hmsgs .hq-meta { color:var(--h-amber); font-size:12px; text-align:right; white-space:nowrap; align-self:flex-end; }
 #hmsgs .hq-meta .link { color:inherit; text-decoration:underline; font-size:12px; padding:0; display:inline; width:auto; height:auto; min-height:0; }
 #hmsgs .hq-meta { display:block; }
+
+/* 3.8.2 delete one message: hover (desktop) or long-press (touch) shows 删除 */
+.hrow { position:relative; }
+.hrow > .hdel { display:none; position:absolute; top:2px; font-size:12px; padding:2px 8px; border-radius:10px; border:1px solid var(--line, #e5ded3);
+  background:var(--card, #fff); color:#c0392b; cursor:pointer; z-index:2; }
+.hrow.u > .hdel { left:0; }
+.hrow:not(.u) > .hdel { right:0; }
+@media (hover:hover) { .hrow:hover > .hdel { display:block; } }
+.hrow.hdel-on > .hdel { display:block; }

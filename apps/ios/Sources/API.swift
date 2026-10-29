@@ -171,5 +171,5 @@ func when(_ ts: Double) -> String {
 
 let statusText: [String: String] = [
     "pending": "准备中", "running": "进行中", "paused": "已暂停", "takeover": "你在接管", "waiting_confirm": "等你确认",
-    "waiting_input": "等你回答", "queued": "排队中", "interrupted": "已中断", "succeeded": "完成", "failed": "失败", "stopped": "已停止"]
+    "waiting_input": "等你回答", "queued": "排队中", "interrupted": "已中断", "succeeded": "完成", "failed": "失败", "stopped": "已停止", "cancelled": "已删除"]
 func isLive(_ s: String) -> Bool { ["pending", "running", "paused", "takeover", "waiting_confirm", "waiting_input", "queued"].contains(s) }

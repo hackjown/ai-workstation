@@ -61,8 +61,8 @@ class TaskIn(BaseModel):
     prompt: str
     machine_id: str = "ai-linux-001"
     thread_id: Optional[str] = None
-    max_steps: int = 40
-    timeout_s: float = float(os.environ.get("AIW_TASK_TIMEOUT", "900"))
+    max_steps: Optional[int] = None   # None = AIW_TASK_MAX_STEPS (default 0: no step budget)
+    timeout_s: Optional[float] = None  # None = AIW_TASK_TIMEOUT (default 0: no time budget)
     isolated: bool = False
 
 class Answer(BaseModel):
@@ -501,11 +501,15 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if body.mode == shopwatch.MODE or (body.mode == "price_below" and shopwatch.is_shop_url(body.url)):
             shopwatch.ensure_columns(store)
             try:
-                f = shopwatch.watch_fields(body.model_dump(), default_machine=settings.machines[0].id if settings.machines else None)
+                f = shopwatch.watch_fields(body.model_dump(), default_machine=shopwatch.default_machine(store) or
+                                           (settings.machines[0].id if settings.machines else None))
             except ValueError as e:
                 raise HTTPException(400, str(e))
             if f.get("machine_id") and not store.machine(f["machine_id"]):
-                raise HTTPException(400, f"unknown machine {f['machine_id']}")
+                mid = shopwatch.resolve_machine(store, f["machine_id"])   # 3.8.2: a name ('本地vm') works too
+                if not mid:
+                    raise HTTPException(400, f"没有这台电脑：{f['machine_id']}")
+                f["machine_id"] = mid
             return f
         if not body.name:
             raise HTTPException(400, "name is required")

@@ -50,8 +50,8 @@ ExtTool = tuple[dict, Callable[[dict], Awaitable[dict]]]  # (schema, call)
 
 @dataclass
 class LoopConfig:
-    max_steps: int = 40
-    timeout_s: float = 600.0
+    max_steps: int = 0      # 0 = no step budget (3.8.2); >0 pauses and asks when reached, never ends the task
+    timeout_s: float = 0.0  # 0 = no time budget; >0 pauses and asks when it runs low
     action_retries: int = 1
     llm_image_width: int = 1280  # downscale screenshots sent to the LLM
     skip_unchanged_screens: bool = True  # don't resend an identical screenshot (terminal/file work)
@@ -77,15 +77,22 @@ class AgentLoop:
         self._cad_task = self._cad_mode is not None
         self._cad_file: Optional[str] = None  # the DXF this task saves to (a revision edits it in place)
         if self._cad_task and config is None:  # drawing a set in the GUI takes hundreds of steps
-            self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400")))
-            self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800")))
+            if self.cfg.max_steps > 0:
+                self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400")))
+            if self.cfg.timeout_s > 0:
+                self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800")))
         self._image_task = bool(_IMAGE_TASK.search(task.prompt or "")) and not self._cad_task
-        if self._image_task and config is None:  # each AI edit takes ~70 s and a check ~30 s (task-4e2 ran out at 900 s)
+        if self._image_task and config is None and self.cfg.timeout_s > 0:  # task-4e2 ran out at 900 s
             self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_IMAGE_TIMEOUT", "2400")))
         self._video_task = bool(_VIDEO_TASK.search(task.prompt or "")) and not self._cad_task
         if self._video_task and config is None:  # task-247: reading a 16-page deck alone took 15 min
-            self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_VIDEO_MAX_STEPS", "200")))
-            self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_VIDEO_TIMEOUT", "3600")))
+            if self.cfg.max_steps > 0:
+                self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_VIDEO_MAX_STEPS", "200")))
+            if self.cfg.timeout_s > 0:
+                self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_VIDEO_TIMEOUT", "3600")))
+        self._checkin = _es.checkin_steps()   # soft valve: pause and ask after this many steps without progress
+        self._progress_at = 0                 # the step of the last visible progress
+        self._pages_seen: set = set()
         self._waited = 0.0  # seconds spent waiting on the user (ask_user, confirmations): not counted toward timeout
         self._last_image: Optional[str] = None  # newest image_edit output, delivered if the task runs out of time
         self.validator = Validator()
@@ -294,12 +301,17 @@ class AgentLoop:
         try:
             while True:
                 asking = getattr(self, "_asking_since", None)   # a question open right now does not use up the budget
-                left = (self.cfg.timeout_s + self._waited + (time.monotonic() - asking if asking else 0)
-                        - (time.monotonic() - start))
-                if asking and left <= 0:
-                    left = 30
-                if left <= 0:
-                    raise asyncio.TimeoutError
+                if self.cfg.timeout_s <= 0:
+                    left = 3600.0          # no time budget: only the user's stop ends the task
+                else:
+                    left = (self.cfg.timeout_s + self._waited + (time.monotonic() - asking if asking else 0)
+                            - (time.monotonic() - start))
+                    if (asking or getattr(self, "ask", None)) and left <= 0:
+                        # with someone to ask the time budget only pauses the task (the loop asks at the next step)
+                        self._time_up = True
+                        left = 30
+                    if left <= 0:
+                        raise asyncio.TimeoutError
                 done, _ = await asyncio.wait({job, stop_w} - {None}, timeout=left, return_when=asyncio.FIRST_COMPLETED)
                 if job in done:
                     return job.result()
@@ -481,20 +493,26 @@ class AgentLoop:
         self._stall = _es.Stall()
         self._time_asked = False
         while True:
-            if self.step >= self.cfg.max_steps:
+            if self.cfg.max_steps > 0 and self.step >= self.cfg.max_steps:
                 n = await self._escalate("max_steps", f"已经执行了 {self.step} 步")
                 if n is None:
                     return
                 note, failures, shots = n, 0, 0
+            if self._checkin and self.step - self._progress_at >= self._checkin:
+                n = await self._escalate("checkin", f"已经执行了 {self.step} 步，最近 {self.step - self._progress_at} 步"
+                                                    "没有勾掉计划、发出文件或打开新页面")
+                if n is None:
+                    return
+                note, failures, shots = n, 0, 0
             t0 = getattr(self, "_t0", None)
-            if t0 and not self._time_asked and self.ask and (
-                    self.cfg.timeout_s + self._waited - (time.monotonic() - t0)) < min(90.0, 0.15 * self.cfg.timeout_s):
+            if t0 and self.cfg.timeout_s > 0 and not self._time_asked and self.ask and (getattr(self, "_time_up", False) or (
+                    self.cfg.timeout_s + self._waited - (time.monotonic() - t0)) < min(90.0, 0.15 * self.cfg.timeout_s)):
                 self._time_asked = True
                 n = await self._escalate("time", f"任务时间预算 {self.cfg.timeout_s:.0f} 秒快用完了")
                 if n is None:
                     return
                 note, failures, shots = n, 0, 0
-            if self.step == self.cfg.max_steps - 3:
+            if self.cfg.max_steps > 3 and self.step == self.cfg.max_steps - 3:
                 note = ((note + "\n") if note else "") + (
                     "Only 3 steps are left in this task's budget. If you can finish, finish (send what you have, then done). "
                     "If something blocks you, call request_takeover or ask_user NOW and explain the problem to the user.")
@@ -619,7 +637,7 @@ class AgentLoop:
                 note, failures, shots = n, 0, 0
                 continue
             if (decision.tool == "done" and self._cad_task and not self._sent_file and self._done_rejects < 6
-                    and self.step < self.cfg.max_steps - 3):
+                    and self.step < self._cap() - 3):
                 self._done_rejects += 1
                 await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
                 await self.emit(EventType.VALIDATION, success=False, change=0.0,
@@ -630,7 +648,7 @@ class AgentLoop:
                         "unfinished sheet in cad/plan.md now (cad_command). If you have no plan yet, write it first.")
                 continue
             if (decision.tool == "done" and self._cad_task and self._sent_file and self._done_rejects < 6
-                    and self.step < self.cfg.max_steps - 3 and (not self._cad_pdf_ok or self._sheet_audit.get("thin"))):
+                    and self.step < self._cap() - 3 and (not self._cad_pdf_ok or self._sheet_audit.get("thin"))):
                 self._done_rejects += 1
                 thin = self._sheet_audit.get("thin")
                 await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
@@ -747,6 +765,10 @@ class AgentLoop:
                     self._last_page = {"url": str(decision.args["url"]), "title": ""}
                 if outcome.success and isinstance(outcome.result, dict) and outcome.result.get("url"):
                     self._last_page = {"url": str(outcome.result["url"]), "title": str(outcome.result.get("title") or "")}
+                u = str((getattr(self, "_last_page", None) or {}).get("url") or "").split("#", 1)[0]
+                if outcome.success and u and u not in self._pages_seen:
+                    self._pages_seen.add(u)
+                    self._mark_progress()
             except Exception:  # noqa: BLE001
                 pass
             if outcome.action == "browseros.call" and self._secrets and isinstance(outcome.result, dict):
@@ -760,6 +782,7 @@ class AgentLoop:
                 outcome.result = {k: v for k, v in outcome.result.items() if k != "content_b64"}
                 outcome.result["sent_to_user"] = True
                 self._sent_file = Path(outcome.result.get("path") or "file").name
+                self._mark_progress()
                 note = ("The file was delivered to the user's chat. If nothing else was asked, call done NOW "
                         "with a short Chinese summary.")
             if outcome.success and decision.tool not in ("screenshot", "done", "fail"):
@@ -897,6 +920,8 @@ class AgentLoop:
         if t == "update_plan":
             for i in a.get("done") or []:
                 if isinstance(i, int) and 0 <= i < len(self.plan_steps):
+                    if i not in self.plan_done:
+                        self._mark_progress()
                     self.plan_done.add(i)
             await self.emit(EventType.PLAN_UPDATE, done=sorted(self.plan_done), note=a.get("note"))
             await self.emit(EventType.ACTION_RESULT, tool=t, success=True, error=None, result={})
@@ -979,10 +1004,17 @@ class AgentLoop:
         return None
 
     # ------------------------------------------------- forms the user fills (sign-ups, profiles)
+    def _cap(self) -> int:
+        return self.cfg.max_steps if self.cfg.max_steps > 0 else 10 ** 9
+
+    def _mark_progress(self) -> None:
+        self._progress_at = self.step
+
     async def _ask(self, q: str, opts: list, extra: Optional[dict] = None):
         if not self.ask:
             return None
         self._asking_since = time.monotonic()
+        self._mark_progress()          # the user was in the loop: the no-progress count starts again
         try:
             if getattr(self, "_stall", None) is not None:
                 self._stall.reset()
@@ -1114,6 +1146,13 @@ class AgentLoop:
         if not self.ask:
             self._finish(TaskStatus.FAILED, _es.report(kind, detail, self.history, page, blocked))
             return None
+        self._ask_forever = True   # the session's ask() waits without a deadline: the task pauses, never ends itself
+        try:
+            return await self._escalate_ask(kind, detail, page, stall, blocked)
+        finally:
+            self._ask_forever = False
+
+    async def _escalate_ask(self, kind: str, detail: str, page: dict, stall, blocked: str) -> Optional[str]:
         if blocked:
             act = "slider" if re.search(r"滑块|拖动|slide", blocked, re.I) else "captcha"
             r = await self._request_takeover({"action": act, "url": page.get("url") or "",
@@ -1126,26 +1165,41 @@ class AgentLoop:
                 return ("The user completed the verification on the desktop. Re-read the page now (bos_snapshot of the page "
                         "you were on) and continue the task from there.")
         q = _es.question(kind, detail, page, blocked)
-        await self.emit(EventType.INPUT_REQUIRED, question=q, options=list(_es.OPTIONS))
-        t0 = time.monotonic()
-        reply = await self._ask(q, list(_es.OPTIONS))
-        self.add_wait(time.monotonic() - t0)
-        await self.emit(EventType.INPUT_ANSWERED, answer=reply)
-        c = _es.choice(reply)
-        if c == "takeover":
-            r = await self._request_takeover({"action": "other", "url": page.get("url") or "",
-                                              "what_to_do": "在桌面上把卡住的这一步处理掉，完成后点「完成，交还给 Aiw」",
-                                              "reason": _es.KIND_TEXT.get(kind, "卡住了")}, detail or "")
-            self.history.append(f"{self.step}. request_takeover(user chose to take over) -> {r}")
-            if r.startswith("the user handled it"):
-                c, reply = "retry", "我已经在桌面上处理好了，接着做"
-            else:
-                c = "none" if "did not take over" in r else "stop"
+        stuck = _es.stuck_card(kind, detail, blocked)
+        while True:
+            self._stuck = stuck
+            await self.emit(EventType.INPUT_REQUIRED, question=q, options=list(_es.OPTIONS), stuck=stuck)
+            t0 = time.monotonic()
+            reply = await self._ask(q, list(_es.OPTIONS))
+            tries = 0
+            while reply is None and tries < int(os.environ.get("AIW_STUCK_REASK", "1000000")):
+                # an ask channel without "wait forever" timed out: keep the task paused and ask again
+                tries += 1
+                await asyncio.sleep(min(60.0, 2.0 * tries))
+                reply = await self._ask(q, list(_es.OPTIONS))
+            self.add_wait(time.monotonic() - t0)
+            self._stuck = None
+            await self.emit(EventType.INPUT_ANSWERED, answer=reply)
+            c = _es.choice(reply)
+            if c == "takeover":
+                r = await self._request_takeover({"action": "other", "url": page.get("url") or "",
+                                                  "what_to_do": "在桌面上把卡住的这一步处理掉，完成后点「完成，交还给 Aiw」",
+                                                  "reason": _es.KIND_TEXT.get(kind, "卡住了")}, detail or "")
+                self.history.append(f"{self.step}. request_takeover(user chose to take over) -> {r}")
+                if r.startswith("the user handled it"):
+                    c, reply = "retry", "我已经在桌面上处理好了，接着做"
+                else:   # the takeover was cancelled or not done: still paused, ask again (only 停止 ends the task)
+                    q = "接管没有完成，任务还停在这里。\n" + _es.question(kind, detail, page, blocked)
+                    continue
+            break
         if c == "retry":
-            self.cfg.max_steps = max(self.cfg.max_steps, self.step + 25)
+            if self.cfg.max_steps > 0:
+                self.cfg.max_steps = max(self.cfg.max_steps, self.step + max(25, _es.step_cap()))
             if kind == "time":
-                self.cfg.timeout_s += 900
+                self.cfg.timeout_s += max(900.0, _es.time_cap())
                 self._time_asked = False
+                self._time_up = False
+            self._mark_progress()
             self._rep, self._prev_sig = 0, None
             stall.reset()
             hint = "" if reply in (_es.OPT_RETRY, None) else f" The user said: {reply!r}. Follow it."

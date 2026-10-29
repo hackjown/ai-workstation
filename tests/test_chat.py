@@ -329,6 +329,10 @@ async def test_takeover_choice_posts_a_takeover_message(stack):
     tk = await wait_for(await ask_of("takeover"), 10)
     assert tk["data"]["session_id"] and tk["text"].startswith("需要你接管")
     await client.post(f"/api/chat/messages/{tk['id']}/answer", json={"choice": "__cancel__"})
+    # 3.8.2: a cancelled takeover leaves the task paused and asks again; only 停止 ends it
+    again = await wait_for(await ask_of("escalate"), 10)
+    assert again["id"] != esc["id"] and "接管没有完成" in again["text"] and again["data"].get("stuck")
+    await client.post(f"/api/chat/messages/{again['id']}/answer", json={"choice": "停止任务"})
 
     async def ended():
         h = (await client.get("/api/chat")).json()["messages"]

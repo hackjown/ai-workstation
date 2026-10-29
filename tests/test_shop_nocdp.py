@@ -24,6 +24,7 @@ def store(tmp_path, monkeypatch):
     sw.ensure_columns(s)
     chat_mod.ensure_tables(s)
     monkeypatch.setattr(browseros, "_STORE", s)     # BrowserOS off, no remembered port: a clean computer
+    s.upsert_machine({"id": "m-nocdp", "name": "本地vm", "provider": "proxmox", "provider_vm_id": "104", "agent_endpoint": "ws://127.0.0.1:1", "desktop_endpoint": ""})
     return s
 
 

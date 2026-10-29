@@ -172,7 +172,8 @@ final class ChatModel: ObservableObject {
             let pt = th.s("parent_thread_id")
             parentThread = pt.isEmpty || pt == "<null>" ? nil : pt
             parentTitle = th.s("parent_title")
-            let ts = th.a("tasks")
+            // 3.8.2: a message taken out of the queue (删除) is gone, like on the web (it stayed as "cancelled" before)
+            let ts = th.a("tasks").filter { $0.s("status") != "cancelled" }
             for t in ts { sync(t) }
             tasks = ts
             err = ""

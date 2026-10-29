@@ -51,6 +51,7 @@ func selectableSize(_ s: NSAttributedString, width: CGFloat) -> CGSize {
 
 final class AiwTextView: UITextView, UITextViewDelegate {
     var whole: String = ""
+    var onDelete: (() -> Void)? = nil   // 3.8.2: 删除 this chat message (set from the environment)
     private var storage: NSTextStorage?
     /// An explicit TextKit 1 stack: the same layout boundingRect measures (iOS 16 would pick TextKit 2 by default).
     convenience init() {
@@ -84,7 +85,11 @@ final class AiwTextView: UITextView, UITextViewDelegate {
     func textView(_ textView: UITextView, editMenuForTextIn range: NSRange, suggestedActions: [UIMenuElement]) -> UIMenu? {
         let all = whole.isEmpty ? (textView.text ?? "") : whole
         let copyAll = UIAction(title: "复制全文", image: UIImage(systemName: "doc.on.doc")) { _ in UIPasteboard.general.string = all }
-        return UIMenu(children: suggestedActions + [copyAll])
+        var extra: [UIMenuElement] = [copyAll]
+        if let del = onDelete {
+            extra.append(UIAction(title: "删除", image: UIImage(systemName: "trash"), attributes: .destructive) { _ in del() })
+        }
+        return UIMenu(children: suggestedActions + extra)
     }
 }
 
@@ -98,12 +103,14 @@ struct SelectableText: UIViewRepresentable {
         let v = AiwTextView()
         v.attributedText = text
         v.whole = whole
+        v.onDelete = context.environment.aiwDeleteMessage
         if let l = link { v.linkTextAttributes = [.foregroundColor: l, .underlineStyle: NSUnderlineStyle.single.rawValue] }
         return v
     }
     func updateUIView(_ v: AiwTextView, context: Context) {
         if !(v.attributedText?.isEqual(to: text) ?? false) { v.attributedText = text }
         v.whole = whole
+        v.onDelete = context.environment.aiwDeleteMessage
         if let l = link { v.linkTextAttributes = [.foregroundColor: l, .underlineStyle: NSUnderlineStyle.single.rawValue] }
     }
     @available(iOS 16.0, *)
@@ -118,10 +125,24 @@ struct SelectableText: UIViewRepresentable {
 /// text view's long-press (word selection + edit menu with 复制全文), so the two never fight over one touch.
 struct CopyMenu: ViewModifier {
     let text: String
+    @Environment(\.aiwDeleteMessage) private var onDelete
     func body(content: Content) -> some View {
         content.contextMenu {
             Button { UIPasteboard.general.string = text } label: { Label("复制", systemImage: "doc.on.doc") }
+            if let del = onDelete {   // 3.8.2: delete this one message (home chat)
+                Button(role: .destructive) { del() } label: { Label("删除", systemImage: "trash") }
+            }
         }
+    }
+}
+
+/// 3.8.2: the home chat sets this on each message row; the long-press menus (bubble background and the text's edit
+/// menu) then offer 删除 for that message.
+private struct AiwDeleteMessageKey: EnvironmentKey { static let defaultValue: (() -> Void)? = nil }
+extension EnvironmentValues {
+    var aiwDeleteMessage: (() -> Void)? {
+        get { self[AiwDeleteMessageKey.self] }
+        set { self[AiwDeleteMessageKey.self] = newValue }
     }
 }
 extension View {

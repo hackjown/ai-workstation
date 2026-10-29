@@ -172,6 +172,7 @@ function hRender(keep) {
   const top = HS.hasMore ? `<div class="hmore">${HS.loading ? "加载中…" : "上滑加载更早的消息"}</div>` : (list.length ? `<div class="hmore end">· 聊天从这里开始 ·</div>` : "");
   box.innerHTML = (list.length ? top + list.map(hMsg).join("") : hEmpty()) + (HS.outbox || []).map(hQueued).join("");
   paintIcons(box);
+  hDelBtns(box);
   hThinkLive();
   if (keep === "bottom") hScrollLatest();
 }
@@ -188,11 +189,38 @@ function hPatch(m) {   // one message changed: swap its node in place (no scroll
   const box = hBox(); if (!box) return;
   const el = box.querySelector(`[data-id="${CSS.escape(m.id)}"]`);
   if (!el) return false;
-  const tpl = document.createElement("div"); tpl.innerHTML = hMsg(m); paintIcons(tpl);
+  const tpl = document.createElement("div"); tpl.innerHTML = hMsg(m); paintIcons(tpl); hDelBtns(tpl);
   el.replaceWith(tpl.firstElementChild);
   hThinkLive();
   return true;
 }
+/* 3.8.2: delete one message (hover 删除, right-click or long-press on touch). A queued task's card also takes the
+   task out of the queue; a running task's card is refused by the server (stop it first). */
+function hDelBtns(root) {
+  root.querySelectorAll(".hrow[data-id]").forEach((row) => {
+    const id = row.dataset.id;
+    if (!id || id === "stream" || row.classList.contains("hqueued") || row.querySelector(":scope > .hdel")) return;
+    const m = HS.msgs.find((x) => x.id === id); if (!m || m.tmp) return;
+    const b = document.createElement("button");
+    b.className = "hdel"; b.type = "button"; b.title = "删除这条消息"; b.textContent = "删除";
+    b.onclick = (e) => { e.stopPropagation(); hDelete(id); };
+    row.appendChild(b);
+    row.oncontextmenu = (e) => { if (window.getSelection && String(window.getSelection())) return; e.preventDefault(); hDelete(id); };
+    let t = null;
+    row.addEventListener("touchstart", () => { t = setTimeout(() => { t = null; row.classList.add("hdel-on"); }, 550); }, { passive: true });
+    ["touchend", "touchmove", "touchcancel"].forEach((ev) => row.addEventListener(ev, () => { if (t) { clearTimeout(t); t = null; } }, { passive: true }));
+  });
+}
+async function hDelete(id) {
+  const m = HS.msgs.find((x) => x.id === id); if (!m) return;
+  const q = m.kind === "task" && (m.data || {}).status === "queued" ? "删除这条排队的任务？（它不会再执行）" : "删除这条消息？";
+  if (!confirm(q)) { hBox().querySelectorAll(".hdel-on").forEach((r) => r.classList.remove("hdel-on")); return; }
+  try {
+    await api("DELETE", `/api/chat/messages/${encodeURIComponent(id)}`);
+    hRemove(id);
+  } catch (e) { toast("没能删除：" + e.message); }
+}
+function hRemove(id) { const n = HS.msgs.length; HS.msgs = HS.msgs.filter((x) => x.id !== id); if (HS.msgs.length !== n) hRender(); }
 function hNear() { const b = hBox(); return b.scrollHeight - b.scrollTop - b.clientHeight < 160; }
 function hScrollLatest(smooth) { const b = hBox(); if (b) b.scrollTo({ top: b.scrollHeight, behavior: smooth ? "smooth" : "auto" }); }
 
@@ -227,6 +255,7 @@ async function hLoad() {
 }
 async function hOlder() {
   if (HS.loading || !HS.hasMore || !HS.msgs.length) return;
+  if (HS.pinUntil && Date.now() < HS.pinUntil) return;   // opening at the newest message: no older page yet
   HS.loading = true;
   const box = hBox(), h0 = box.scrollHeight, t0 = box.scrollTop;
   try {
@@ -266,6 +295,7 @@ function hUnread(on) {
 function hTitle() { if (S.view === "home") { $("viewTitle").textContent = HS.agent || (S.profile || {}).agent_name || "小秘"; $("viewSub").textContent = ""; } }
 
 window.onAiwEvent = (e) => {
+  if (e.kind === "chat" && e.message && e.op === "delete") { hRemove(e.message.id); return; }
   if (e.kind === "chat" && e.message) {
     hUpsert(e.message);
     if (S.view !== "home" && e.op === "new" && e.message.role !== "user") hUnread(true);
@@ -557,7 +587,14 @@ function hStage(on) {
   $("hHistBtn").hidden = !HS.msgs.length;
   if (on) { hStageStart(); const w = document.querySelector("#hbbs .hbw:not(.out)"); if (w) requestAnimationFrame(() => hLayoutBubble(w)); } else hStageStop();
 }
-function hShowChat() { HS.stageOff = true; hStage(false); hRender("bottom"); setTimeout(hScrollLatest, 60); }
+/* 3.8.2 "↑ 聊天记录" opens the chat at the newest message. Before, the list came back from display:none at scrollTop 0,
+   that first scroll event loaded an older page (hOlder) and kept the view at the top of it: the user landed on old
+   messages. Now older pages wait until the jump is done, and the jump repeats while late content (pictures) lays out. */
+function hShowChat() {
+  HS.stageOff = true; HS.pinUntil = Date.now() + 1500;
+  hStage(false); hRender("bottom");
+  [0, 60, 250, 600, 1200].forEach((t) => setTimeout(() => { if (Date.now() < HS.pinUntil + 50) hScrollLatest(); }, t));
+}
 async function hStageStart() {
   if (!HB.mate && window.AiwMate && AiwMate.create) { HB.mate = AiwMate.create($("hstOrb"), { eyeScale: 1.7 }); HB.mate.set("02"); }
   if (!HB.items.length || Date.now() - HB.at > 60000) {
@@ -817,6 +854,7 @@ backToChat = function () { go(HS.fromHome === false ? "tasks" : "home"); };
 newThread = function () { S.threadId = null; S.thread = null; localStorage.removeItem("aiw_thread"); backToChat(); };
 hBox().addEventListener("scroll", () => {
   const b = hBox();
+  if (HS.pinUntil && Date.now() < HS.pinUntil && !hNear()) return;   // the jump to the newest message is under way
   if (b.scrollTop < 80) hOlder();
   $("hToLatest").classList.toggle("on", b.scrollHeight - b.scrollTop - b.clientHeight > 300);
   if (hNear()) hMarkRead();

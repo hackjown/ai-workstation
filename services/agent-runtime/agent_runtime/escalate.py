@@ -14,8 +14,36 @@ Pure helpers here (tested in tests/test_escalate.py); the loop wiring is in loop
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import Optional
+
+
+def step_cap() -> int:
+    """Hard step budget for a task. 0 (the default since 3.8.2) = none: a task runs until it is done or the user
+    presses stop (task-c5a94187a0 ended at 40 steps half way through a Fliggy comparison). AIW_TASK_MAX_STEPS=N
+    brings a budget back; reaching it still only pauses and asks, it never ends the task."""
+    try:
+        return max(0, int(os.environ.get("AIW_TASK_MAX_STEPS", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def time_cap() -> float:
+    """Time budget in seconds, 0 (default) = none. AIW_TASK_TIMEOUT=N brings one back (pauses and asks)."""
+    try:
+        return max(0.0, float(os.environ.get("AIW_TASK_TIMEOUT", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
+def checkin_steps() -> int:
+    """The soft safety valve: after this many steps with no visible progress (no plan item ticked, no file sent,
+    no new page, no answer from the user) the task pauses and asks. AIW_TASK_CHECKIN_STEPS, default 150, 0 = off."""
+    try:
+        return max(0, int(os.environ.get("AIW_TASK_CHECKIN_STEPS", "150") or 0))
+    except ValueError:
+        return 150
 
 # captcha / risk-control / login walls a model cannot pass (same wording family as apps/web/mate-map.js BLOCKED)
 BLOCKED = re.compile(
@@ -34,6 +62,7 @@ BLOCKED_LOOKS = 2     # look-only steps after a captcha/login wall showed up bef
 KIND_TEXT = {
     "fail": "模型判断这一步做不下去",
     "max_steps": "步数用完了，任务还没做完",
+    "checkin": "已经做了很多步，最近一直没有明显进展",
     "time": "时间快用完了，任务还没做完",
     "errors": "连续几步都出错",
     "repeat": "模型在重复同一个操作",
@@ -133,8 +162,17 @@ def question(kind: str, detail: str, page: Optional[dict] = None, blocked: str =
     d = (detail or "").strip()
     if d:
         lines.append(f"具体情况：{d[:300]}")
-    lines.append("你想怎么处理？")
+    lines.append("任务已暂停，不会自己结束。你可以：继续（换个方法再试）/ 接管桌面自己处理 / 停止任务。")
     return "\n".join(lines)
+
+
+def stuck_card(kind: str, detail: str = "", blocked: str = "") -> dict:
+    """What the task card shows while the task waits: what blocked it and what the user can do."""
+    why = KIND_TEXT.get(kind, KIND_TEXT["error"])
+    if blocked:
+        why = f"页面出现「{blocked}」，需要真人验证"
+    return {"kind": kind, "reason": why, "detail": str(detail or "").strip()[:200],
+            "actions": ["继续", "接管", "停止"], "line": f"卡住了：{why} · 等你选 继续 / 接管 / 停止"}
 
 
 def report(kind: str, detail: str, history: list[str], page: Optional[dict] = None, blocked: str = "",

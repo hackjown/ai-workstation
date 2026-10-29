@@ -27,7 +27,7 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "3"
+PROBE_VERSION = "4"
 CDP = os.environ.get("VM_AGENT_CDP", "http://127.0.0.1:9222")
 # DevTools is on 127.0.0.1: never through an http_proxy the desktop user may have set (it answers 404 / refuses)
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -165,6 +165,34 @@ def cdp_candidates(proc_root: str = "/proc") -> list[str]:
             seen.add(u)
             uniq.append(u)
     return uniq
+
+
+def profile_of(base: str, proc_root: str = "/proc") -> dict:
+    """Which browser profile answers on this DevTools endpoint (3.8.2: the card says where the price was read, and a
+    profile without cookies explains a login / captcha page)."""
+    port = (urlparse(base).port or 0) if base else 0
+    out = {"port": port, "dir": "", "cookies": None}
+    try:
+        pids = [x for x in os.listdir(proc_root) if x.isdigit()]
+    except OSError:
+        pids = []
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as f:
+                argv = [x.decode(errors="replace") for x in f.read().split(b"\0") if x]
+        except OSError:
+            continue
+        if not argv or any(x.startswith("--type=") for x in argv):
+            continue
+        if f"--remote-debugging-port={port}" in argv:
+            d = next((x.split("=", 1)[1] for x in argv if x.startswith("--user-data-dir=")), "")
+            out["dir"] = d or "(default)"
+            break
+    if out["dir"] and out["dir"] != "(default)":
+        ck = [os.path.join(os.path.expanduser(out["dir"]), "Default", n) for n in ("Cookies", os.path.join("Network", "Cookies"))]
+        sizes = [os.path.getsize(c) for c in ck if os.path.exists(c)]
+        out["cookies"] = max(sizes) if sizes else 0
+    return out
 
 
 def find_cdp() -> str:
@@ -447,6 +475,10 @@ def cmd_probe(a):
         bws.close()
     snap["probe_version"] = PROBE_VERSION
     snap["cdp"] = CDP
+    try:
+        snap["profile"] = profile_of(CDP)
+    except Exception:  # noqa: BLE001
+        pass
     out(snap)
 
 

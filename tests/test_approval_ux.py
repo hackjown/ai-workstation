@@ -247,6 +247,11 @@ async def test_takeover_request_card_and_cancel(stack):
     assert f["kind"] == "takeover" and f["title"] == "需要你接管：在京东登录页输入短信验证码"
     assert f["machine"] and f["machine_id"] and f["site"] == "京东"
     await client.post("/api/agent/answer", json={"session_id": sid, "text": "__cancel__"})
-    await wait_task(client, r["task"]["id"])
+    # 3.8.2: the scripted model then gives up; that pauses the task (it never ends itself) until the user says 停止
+    s = await _wait(client, sid, "pending_question")
+    assert "任务已暂停" in s["pending_question"]["question"]
+    await client.post("/api/agent/answer", json={"session_id": sid, "text": "停止任务"})
+    t = await wait_task(client, r["task"]["id"])
+    assert t["status"] == "stopped"
     hist = "\n".join(providers[0].requests[-1].history)
     assert "cancelled the takeover" in hist

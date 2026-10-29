@@ -9,7 +9,7 @@ SRC = IOS / "Sources"
 
 def test_version_and_camera_permissions():
     p = plistlib.loads((IOS / "Info.plist").read_bytes())
-    assert p["CFBundleShortVersionString"] == "3.8.1" and p["CFBundleVersion"] == "22"
+    assert p["CFBundleShortVersionString"] == "3.8.2" and p["CFBundleVersion"] == "23"
     for k in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription", "NSPhotoLibraryUsageDescription"):
         assert p.get(k), k
 
@@ -57,7 +57,7 @@ def test_36_fixes_are_wired():
     chat = (SRC / "ChatView.swift").read_text(encoding="utf-8")
     mate = (SRC / "MateView.swift").read_text(encoding="utf-8")
     # 1. bubbles placed from the orb circle, not hung on it with alignment guides
-    assert "StageLayout.place(" in v2 and "StageLayout.tail(" in v2 and "alignmentGuide(below" not in v2
+    assert "StageLayout.group(" in v2 and "StageLayout.tail(" in v2 and "alignmentGuide(below" not in v2
     # 2. no quick chips above the input
     assert "m.chips.indices" not in home
     # 3. light-mode 球球 bubbles

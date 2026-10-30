@@ -201,7 +201,7 @@ def test_profile_dir_from_devtools_active_port(tmp_path):
 
 
 def test_probe_version_is_bumped():
-    assert sp.PROBE_VERSION == "7"   # v7 (2026-10-29): see test_v388_jd_risk_limit.py
+    assert sp.PROBE_VERSION == "8"   # v8 (2026-10-30), v7 (2026-10-29): see test_v388_jd_risk_limit.py
 
 
 # ----------------------------------------------------------------------------- g. chrome_cdp.py
@@ -313,9 +313,9 @@ def test_probe_waits_then_reads_the_api_and_the_login(monkeypatch):
     cookies = [{"name": "pt_key", "value": "SECRETVAL", "domain": ".jd.com", "expires": -1},
                {"name": "pt_pin", "value": "u", "domain": ".jd.com", "expires": -1}]
     dev = FakeDevTools([BANNER], {"getWareBusiness": WARE_BUSINESS}, cookies)
-    snap = _run_probe(monkeypatch, dev, SHARE)
+    snap = _run_probe(monkeypatch, dev, SHARE, wait="8")   # v8: the budget's clock reads cost fake time too
     assert dev.navs[-1] == f"https://item.jd.com/{SKU}.html" and snap["asked_url"] == dev.navs[-1]
-    assert ("scroll" in dev.calls or "Page.bringToFront" in dev.calls) and snap["jd_sku"] == SKU and snap["probe_version"] == "7"
+    assert ("scroll" in dev.calls or "Page.bringToFront" in dev.calls) and snap["jd_sku"] == SKU and snap["probe_version"] == sp.PROBE_VERSION
     assert snap.get("api_price"), snap.get("api")
     assert snap["api_price"]["src"] == "getWareBusiness" and snap["api_price"]["final_price"] == 137.0
     assert [a["src"] for a in snap["api"]] == ["pc_detailpage_wareBusiness", "getWareBusiness"]   # stops at the first

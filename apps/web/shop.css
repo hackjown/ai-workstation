@@ -1,0 +1,40 @@
+/* 3.8.9: price-watch cards on the 追踪 page (shop.js shopRow). One full-width column: title, chips, price, meta,
+   notes / error, the latest 立即检查 line, then the computer + actions in a row that wraps. */
+.item.shopw { display:block; padding:14px 16px; }
+.shopw .sw-head { display:flex; gap:10px; align-items:flex-start; }
+.shopw .sw-head .iconbox { flex:none; }
+.shopw .sw-title { flex:1; min-width:0; font-weight:600; font-size:15px; line-height:21px; color:var(--text);
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; word-break:break-word; }
+.shopw .sw-chips { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 8px; }
+.shopw .sw-chips .chip { white-space:nowrap; }
+.shopw .sw-price { font-size:13.5px; line-height:20px; color:var(--text); }
+.shopw .sw-meta { font-size:12.5px; line-height:19px; color:var(--mute); margin-top:2px; }
+.shopw .sw-meta a { color:inherit; text-decoration:underline; text-underline-offset:2px; }
+.shopw .sw-bad { color:var(--bad); }
+.shopw .sw-note { margin-top:8px; font-size:12.5px; line-height:19px; color:var(--text);
+  background:var(--panel2); border:1px solid var(--line2); border-radius:var(--r-sm,10px); padding:7px 10px; }
+.shopw .sw-err { margin-top:8px; font-size:12.5px; line-height:19px; color:var(--bad);
+  background:var(--badBg); border:1px solid var(--badLine); border-radius:var(--r-sm,10px); padding:7px 10px; word-break:break-word; }
+.shopw .sw-errn { opacity:.8; }
+.shopw .sw-run { margin-top:8px; font-size:12.5px; line-height:19px; color:var(--mute); display:flex; gap:6px; align-items:flex-start; word-break:break-word; }
+.shopw .sw-run.empty { display:none; }
+.shopw .sw-run.ok { color:var(--ok); } .shopw .sw-run.bad { color:var(--bad); }
+.shopw .sw-run .spin { flex:none; margin-top:3px; }
+.shopw .sw-foot { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:center; justify-content:space-between;
+  margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.shopw .sw-machine { display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--mute); min-width:0; flex:1 1 auto; max-width:100%; }
+.shopw .sw-machine span { white-space:nowrap; }
+.shopw .sw-machine select { min-width:0; max-width:100%; flex:0 1 auto; width:auto; }
+.shopw .sw-acts { display:flex; flex-wrap:wrap; gap:6px; justify-content:flex-end; flex:none; margin-left:auto; }
+.shopw .sw-acts .btn { white-space:nowrap; }
+@media (max-width:480px) {
+  .item.shopw { padding:12px; }
+  .shopw .sw-title { font-size:15px; }
+  .shopw .sw-foot { flex-direction:column; align-items:stretch; }
+  .shopw .sw-machine { flex-direction:column; align-items:stretch; gap:4px; flex:none; }
+  .shopw .sw-machine select { width:100%; }
+  .shopw .sw-acts { display:grid; grid-template-columns:1fr 1fr; justify-content:stretch; }
+  .shopw .sw-acts .btn { width:100%; justify-content:center; }
+  #shopForm { grid-template-columns:1fr; }
+  #shopForm > * { grid-column:auto !important; min-width:0; }
+}

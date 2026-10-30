@@ -159,7 +159,7 @@ def test_hidden_tab_is_brought_forward_and_the_pages_own_price_api_is_read(monke
     assert "Network.enable" in dev.calls
     assert snap["api_price"]["src"] == "page:pc_detailpage_wareBusiness" and snap["api_price"]["final_price"] == 137.0
     assert "api" not in snap                                        # the unsigned API calls were not needed
-    assert snap["probe_version"] == "7" and not prog.exists()
+    assert snap["probe_version"] == sp.PROBE_VERSION and not prog.exists()
     stages = [s["stage"] for s in snap["stages"]]
     assert stages[:4] == ["connect", "open", "wait", "front"] and "net" in stages and stages[-1] == "done"
     r = sw.parse_snapshot(snap)

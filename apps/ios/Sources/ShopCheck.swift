@@ -51,7 +51,7 @@ struct ShopDiagView: View {
                         line("状态", d.s("status"))
                         line("说明", d.s("note"))
                         ForEach(strings("hints"), id: \.self) { Text($0).font(.footnote).foregroundColor(amber) }
-                        line("探针", "v\(d.s("probe_version"))（服务器带 v\(d.s("server_probe_version"))）· 服务器 \(d.s("server_version"))")
+                        line("探针", "v\(d.s("probe_version").isEmpty ? d.s("server_probe_version") : d.s("probe_version"))\(d["probe_answered"] as? Bool == false ? "（已推送，探针没回话）" : "")（服务器带 v\(d.s("server_probe_version"))）· 服务器 \(d.s("server_version"))")
                     }
                     if d.b("screenshot"), let u = api.url("/api/watches/\(wid)/diag.jpg",
                                                           query: [URLQueryItem(name: "token", value: api.token),

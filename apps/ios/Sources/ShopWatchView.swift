@@ -13,12 +13,14 @@ struct ShopWatchView: View {
     @State private var stage: [String: String] = [:]   // 3.8.6: the running 立即检查 stage per watch
     @State private var lastRun: [String: String] = [:] // 3.8.6: the result of the last 立即检查, with its time
     @State private var diag: DiagTarget? = nil
+    @State private var confirmDelete: DiagTarget? = nil   // 3.8.9: 删除 is a button on the card, asked once
 
     var body: some View {
         List {
-            Section(footer: Text("在 AIW 电脑上已登录的 Chrome 里读价格（含到手价/券后价）和库存。开了“自动下单”会停在付款前，推送给你确认，你允许后才提交；支付密码由你在接管桌面里输入。也可以在对话里说：帮我盯着这个链接，低于 199 就下单。")) {
-                if items.isEmpty { Text("还没有价格监控").foregroundColor(.secondary) }
-                ForEach(items.indices, id: \.self) { i in
+            // 3.8.9: each watch is its own inset card (full width on the phone), the explanation below them
+            if items.isEmpty { Section { Text("还没有价格监控").foregroundColor(.secondary) } }
+            ForEach(items.indices, id: \.self) { i in
+                Section {
                     row(items[i])
                         .swipeActions(edge: .trailing) {
                             Button(role: .destructive) { Task { await delete(items[i]) } } label: { Label("删除", systemImage: "trash") }
@@ -26,76 +28,118 @@ struct ShopWatchView: View {
                                 Label(items[i].b("enabled") ? "暂停" : "启用", systemImage: items[i].b("enabled") ? "pause" : "play")
                             }.tint(.gray)
                         }
-                        .contextMenu {
-                            Menu("换一台电脑检查") {
-                                ForEach(machines.indices, id: \.self) { j in
-                                    Button(machineName(machines[j].s("id"))) { Task { await setMachine(items[i], machines[j].s("id")) } }
-                                }
-                            }
-                        }
                         .swipeActions(edge: .leading) {
                             Button { Task { await check(items[i]) } } label: { Label("立即检查", systemImage: "arrow.clockwise") }.tint(amber)
                         }
                 }
             }
+            Section(footer: Text("在 AIW 电脑上已登录的 Chrome 里读价格（含到手价/券后价）和库存。开了“自动下单”会停在付款前，推送给你确认，你允许后才提交；支付密码由你在接管桌面里输入。也可以在对话里说：帮我盯着这个链接，低于 199 就下单。")) { EmptyView() }
             if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
         }
+        .listStyle(.insetGrouped)
         .navigationTitle("京东/淘宝价格监控").navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .primaryAction) { Button { showAdd = true } label: { Image(systemName: "plus") } } }
         .sheet(isPresented: $showAdd) { AddShopWatchView { Task { await load() } }.environmentObject(api) }
         .sheet(item: $diag) { t in ShopDiagView(wid: t.id).environmentObject(api) }
+        .confirmationDialog("删除这个价格监控？", isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
+                            titleVisibility: .visible) {
+            Button("删除", role: .destructive) {
+                if let t = confirmDelete, let w = items.first(where: { $0.s("id") == t.id }) { Task { await delete(w) } }
+                confirmDelete = nil
+            }
+            Button("取消", role: .cancel) { confirmDelete = nil }
+        }
         .refreshable { await load() }
         .task { await load() }
     }
 
+    /// 3.8.9: one full-width card per watch: title (2 lines), chips that wrap, price, meta, note / error box, the
+    /// latest 立即检查 line, the computer (full name, a menu) and the actions in a row that wraps.
     @ViewBuilder func row(_ w: JSON) -> some View {
         let site = siteName(w)
-        let title = str(w, "item_title").isEmpty ? str(w, "name") : str(w, "item_title")
-        let checkLine = timeLine(w)
-        let err = str(w, "last_error")
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Text(title).font(.subheadline.weight(.semibold)).lineLimit(2)
-                Spacer(minLength: 4)
-                if busy == w.s("id") { ProgressView().scaleEffect(0.7) }
-            }
-            HStack(spacing: 6) {
+        let id = w.s("id")
+        let err = shopCN(str(w, "last_error"))
+        let st = w.s("shop_status")
+        VStack(alignment: .leading, spacing: 8) {
+            Text(watchTitle(w)).font(.subheadline.weight(.semibold)).lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true).frame(maxWidth: .infinity, alignment: .leading)
+            WrapLayout(spacing: 6) {
                 chip(site + " ≤ ¥" + str(w, "value"), .secondary)
                 if w.b("auto_order") { chip("自动下单", amber) }
-                if let st = shopStatus[w.s("shop_status")] { chip(st.0, st.1) }
+                if let ss = shopStatus[st] { chip(ss.0, ss.1) }
                 if let os = orderStatus[w.s("order_status")] { chip(os.0, os.1) }
                 if !w.b("enabled") { chip("已暂停", Color.secondary) }
             }
-            Text(priceLine(w)).font(.footnote)
-            Text(checkLine).font(.caption).foregroundColor(.secondary)
-            Label("在「\(machineName(w.s("machine_id")))」上检查（只用这台，不借别的电脑）", systemImage: "desktopcomputer")
-                .font(.caption).foregroundColor(.secondary)
-            if w.s("shop_status") == "login" {
-                Text("这台电脑的 Chrome 还没登录\(site)：在桌面里点接管，登录一次（扫码即可）。").font(.caption).foregroundColor(amber)
-            } else if w.s("shop_status") == "captcha" {
-                Text("「\(machineName(w.s("machine_id")))」上遇到滑块验证：打开这台电脑的桌面点接管，完成一次验证。").font(.caption).foregroundColor(amber)
-            } else if ["machine_busy", "machine_offline"].contains(w.s("shop_status")) {
-                Text(str(w, "status_note")).font(.caption).foregroundColor(amber)
-            } else if !err.isEmpty {
-                Text(err).font(.caption).foregroundColor(.red).lineLimit(2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(priceLine(w)).font(.footnote).fixedSize(horizontal: false, vertical: true)
+                Text(timeLine(w)).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            if busy == w.s("id") {
+            if let note = statusNote(w, site) {
+                box(note, amber)
+            } else if !err.isEmpty {
+                box(err + "（已失败 \(Int(w.d("fail_count"))) 次）", .red)
+            }
+            if busy == id {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.mini)
-                    Text(stage[w.s("id")] ?? "检查中…").font(.caption).foregroundColor(amber)
+                    Text("正在检查：" + (stage[id] ?? "开始检查")).font(.caption).foregroundColor(amber)
                 }
-            } else if let l = lastRun[w.s("id")] {
-                Text(l).font(.caption).foregroundColor(.secondary)
+            } else if let l = lastRun[id] {
+                Text(shopCN(l)).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 14) {
-                Button(busy == w.s("id") ? "检查中…" : "立即检查") { Task { await check(w) } }
-                    .disabled(busy != nil).buttonStyle(.borderless).font(.caption)
-                if w.d("diag_at") > 0 {
-                    Button("查看诊断") { diag = DiagTarget(id: w.s("id")) }.buttonStyle(.borderless).font(.caption)
+            Divider()
+            Menu {
+                ForEach(machines.indices, id: \.self) { j in
+                    Button { Task { await setMachine(w, machines[j].s("id")) } } label: {
+                        if machines[j].s("id") == w.s("machine_id") { Label(machineName(machines[j].s("id")), systemImage: "checkmark") }
+                        else { Text(machineName(machines[j].s("id"))) }
+                    }
                 }
-                if let u = URL(string: w.s("url")) { Link("打开商品", destination: u).font(.caption) }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "desktopcomputer")
+                    Text("检查电脑：").foregroundColor(.secondary)
+                    Text(machineName(w.s("machine_id"))).foregroundColor(.primary).lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true).multilineTextAlignment(.leading)
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundColor(.secondary)
+                }.font(.caption)
+            }.buttonStyle(.borderless)
+            WrapLayout(spacing: 8) {
+                Button(busy == id ? "检查中…" : "立即检查") { Task { await check(w) } }.disabled(busy != nil)
+                if w.d("diag_at") > 0 { Button("查看诊断") { diag = DiagTarget(id: id) } }
+                Button(w.b("enabled") ? "暂停" : "启用") { Task { await toggle(w) } }
+                if let u = URL(string: w.s("url")) { Link("打开商品", destination: u) }
+                Button("删除", role: .destructive) { confirmDelete = DiagTarget(id: id) }
             }
-        }.padding(.vertical, 2)
+            .buttonStyle(.bordered).controlSize(.small).font(.caption)
+        }.padding(.vertical, 6)
+    }
+
+    func box(_ text: String, _ c: Color) -> some View {
+        Text(text).font(.caption).foregroundColor(c == amber ? .primary : c).fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(c.opacity(0.10)).overlay(RoundedRectangle(cornerRadius: 8).stroke(c.opacity(0.35)))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    func statusNote(_ w: JSON, _ site: String) -> String? {
+        let m = machineName(w.s("machine_id"))
+        switch w.s("shop_status") {
+        case "login": return "这台电脑的 Chrome 还没登录\(site)：在桌面里点接管，登录一次（扫码即可）。"
+        case "captcha": return "「\(m)」上遇到滑块验证：打开这台电脑的桌面点接管，完成一次验证。"
+        case "need_login": return shopCN(str(w, "status_note")) + "：在「\(m)」的桌面里接管，登录京东一次（扫码即可）。"
+        case "risk_limit": return shopCN(str(w, "status_note")) + "。这不是验证码，检查已自动放慢。"
+        case "machine_busy", "machine_offline", "no_machine": return shopCN(str(w, "status_note"))
+        default: return nil
+        }
+    }
+
+    /// Never JD's site-wide title (a product page that did not render): the user's own name instead.
+    func watchTitle(_ w: JSON) -> String {
+        let t = str(w, "item_title").trimmingCharacters(in: .whitespaces)
+        return t.isEmpty || isGenericJDTitle(t) ? str(w, "name") : t
     }
 
     func machineName(_ id: String) -> String {
@@ -175,7 +219,7 @@ struct ShopWatchView: View {
         stage[id] = "开始检查"
         let res = await api.runWatchCheck(id) { s in stage[id] = s }
         let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
-        lastRun[id] = "立即检查 \(f.string(from: Date()))：" + res.s("label")
+        lastRun[id] = "刚才 \(f.string(from: Date())) 立即检查：" + shopCN(res.s("label").replacingOccurrences(of: "完成：", with: ""))
         busy = nil
         await load()
     }
@@ -267,4 +311,27 @@ struct AddShopWatchView: View {
         do { _ = try await api.obj("POST", "/api/watches", body); done(); dismiss() }
         catch { self.error = error.localizedDescription }
     }
+}
+
+/// 3.8.9: JD's site-wide title ('京东(JD.COM)-正品低价、品质保障、配送及时、轻松购物!') is never a product name.
+func isGenericJDTitle(_ t: String) -> Bool {
+    let s = t.trimmingCharacters(in: .whitespaces)
+    if s.isEmpty { return true }
+    if s.contains("正品低价、品质保障、配送及时、轻松购物") || s.contains("多快好省") { return true }
+    return ["京东", "京东(JD.COM)", "京东（JD.COM）", "JD.COM", "京东商城"].contains(s)
+}
+
+/// 3.8.9: errors stored by older servers in English, in plain Chinese (new servers translate them already).
+func shopCN(_ t: String) -> String {
+    var s = t
+    let rules: [(String, String)] = [
+        ("probe failed: timeout after (\\d+)s?", "检查超时（$1 秒没有结束）"),
+        ("timeout after (\\d+(?:\\.\\d+)?)s?", "超时（$1 秒）"),
+        ("^probe failed:\\s*", "检查失败："),
+        ("NO_CDP:?\\s*", "连不上浏览器调试端口："),
+        ("Failed to fetch", "请求被浏览器拦下")]
+    for (p, r) in rules {
+        s = s.replacingOccurrences(of: p, with: r, options: [.regularExpression, .caseInsensitive])
+    }
+    return s
 }

@@ -294,8 +294,103 @@ class Chat:
             rows = self.store._x("SELECT * FROM chat_messages WHERE conv=? ORDER BY seq DESC LIMIT ?", (CONV, limit + 1))
         more = len(rows) > limit
         msgs = [self.fresh(_row(r)) for r in reversed(rows[:limit])]
+        msgs = self.fold_old(msgs)
         return {"messages": msgs, "has_more": more, "read": self.store.kv_get("chat_read", {}) or {},
                 "agent_name": self.agent_name()}
+
+    # ------------------------------------------------------------------ 3.8.9: old task messages, folded when shown
+    OLD_TASK_KINDS = ("task", "ask", "confirm", "task_result")
+
+    def fold_old(self, msgs: list[dict]) -> list[dict]:
+        """Chat written before the 3.8.8 task card (ccd7a59) has one bubble per task event: the v1 task card, then
+        需要你接管 / 任务卡住了 questions, confirmations and the 任务已停止 / result message, all with a task_id. Shown
+        now, each task's old messages become ONE v2 task card built from the task record, at the place of its first
+        message. Render-time only: nothing in the database is rewritten, and a group that still waits for an answer
+        (a live question) is left as it is so it can be answered."""
+        from . import continuation as _cont
+        groups: dict[str, list[int]] = {}
+        for i, m in enumerate(msgs):
+            d = m.get("data") or {}
+            if m.get("role") != "assistant" or m.get("kind") not in self.OLD_TASK_KINDS or d.get("card") == CARD_V:
+                continue
+            tid = m.get("task_id") or d.get("task_id")
+            if not tid:
+                continue
+            try:
+                root = d.get("root_id") or _cont.root_id(self.store, tid)
+            except Exception:  # noqa: BLE001
+                root = tid
+            groups.setdefault(root, []).append(i)
+        if not groups:
+            return msgs
+        drop, put = set(), {}
+        for root, idx in groups.items():
+            ms = [msgs[i] for i in idx]
+            if len(ms) < 2 and ms[0]["kind"] == "task":
+                continue          # a lone old card is already one card
+            if any(m["kind"] in ("ask", "confirm") and not (m.get("data") or {}).get("resolved")
+                   and not (m.get("data") or {}).get("stale") for m in ms):
+                continue          # still waiting for the user: keep the answerable bubbles
+            put[idx[0]] = self._folded_card(root, ms)
+            drop.update(idx[1:])
+        return [put.get(i, m) for i, m in enumerate(msgs) if i not in drop]
+
+    def _folded_card(self, root: str, ms: list[dict]) -> dict:
+        first = ms[0]
+        card = next((m for m in ms if m["kind"] == "task"), None)
+        cd = (card or {}).get("data") or {}
+        runs = []
+        try:
+            runs = self.store.continuations(root) or []
+        except Exception:  # noqa: BLE001
+            runs = []
+        tids = [m.get("task_id") for m in ms if m.get("task_id")]
+        last_tid = tids[-1] if tids else root
+        t = self.store.task(last_tid) or self.store.task(root) or {}
+        st = t.get("status") or cd.get("status") or "interrupted"
+        if st in ("running", "paused", "takeover") + WAITING and not (self.sessions and self.sessions.live_for_task(t.get("id") or "")):
+            st = "interrupted"
+        title = cd.get("title") or (card or {}).get("text") or t.get("title") or one_line(t.get("prompt") or "", 30) or "任务"
+        actions = []
+        for m in ms:
+            if m["kind"] not in ("ask", "confirm"):
+                continue
+            d = m.get("data") or {}
+            a = {"id": "old-" + m["id"], "kind": m["kind"], "ask_kind": d.get("ask_kind") or m["kind"],
+                 "question": d.get("question") or m.get("text") or "", "options": d.get("options") or [],
+                 "at": m.get("created_at"), "task_id": m.get("task_id"), "folded_from": m["id"]}
+            for k in ("summary", "takeover", "fields", "form_title", "stuck"):
+                if d.get(k):
+                    a[k] = d[k]
+            if d.get("resolved"):
+                a["resolved"] = d["resolved"]
+            else:
+                a["stale"] = True
+            actions.append(a)
+        res_msg = next((m for m in reversed(ms) if m["kind"] == "task_result"), None)
+        result = None
+        if res_msg:
+            rd = res_msg.get("data") or {}
+            files = rd.get("files") or []
+            result = {"text": res_msg.get("text") or "", "status": rd.get("status") or st, "files": files,
+                      "thumb": next((f.get("path") for f in files if isinstance(f, dict) and f.get("kind") == "image"), None),
+                      "has_more": bool(rd.get("has_more")), "at": res_msg.get("created_at")}
+        elif st in FINAL:
+            line = one_line(t.get("result") or "")
+            result = {"text": line or STATUS_CN.get(st, st), "status": st, "files": [], "thumb": None,
+                      "has_more": len((t.get("result") or "").strip()) > len(line) + 2, "at": t.get("updated_at")}
+        data = {"card": CARD_V, "folded": True, "folded_ids": [m["id"] for m in ms], "root_id": root,
+                "task_id": t.get("id") or last_tid, "thread_id": cd.get("thread_id") or t.get("thread_id"),
+                "machine_id": cd.get("machine_id") or t.get("machine_id"), "title": title,
+                "prompt": cd.get("prompt") or one_line(SKILL_RE.sub("", t.get("prompt") or ""), 120),
+                "status": st, "status_line": STATUS_CN.get(st, st), "step": cd.get("step") or t.get("steps") or 0,
+                "max_steps": cd.get("max_steps") or t.get("max_steps"), "started_at": cd.get("started_at") or t.get("created_at")
+                or first.get("created_at"), "ended_at": cd.get("ended_at") or (res_msg or {}).get("created_at")
+                or (t.get("updated_at") if st in FINAL else None),
+                "runs": max(1, len(runs)), "actions": actions[-MAX_ACTIONS:], "result": result}
+        return {**first, "id": card["id"] if card else "fold-" + root, "kind": "task", "text": title,
+                "task_id": t.get("id") or last_tid, "data": data,
+                "updated_at": max((m.get("updated_at") or 0) for m in ms)}
 
     def fresh(self, m: dict) -> dict:
         """A card or a question re-checked against the task as it is now (an API restart ends every live task)."""

@@ -180,7 +180,7 @@ def test_redirect_to_the_mobile_page_is_refused_and_the_signed_api_reads_the_pri
     assert snap["mobile_blocked"] == M_URL and snap["nav_chain"][-1] == {"url": M_URL, "from_status": 302}
     assert not any("item.m.jd.com" in u for u in dev.navs)
     assert [a["route"] for a in snap["alt"]] == ["cart"] and snap["alt_price"]["src"] == "cart"   # priced: no more JD calls
-    assert snap["probe_version"] == "7"
+    assert snap["probe_version"] == sp.PROBE_VERSION
     r = sw.parse_snapshot(snap)
     assert r["status"] == "ok" and r["via"] == "alt" and r["risk"] is True and r["effective"] == 187.0
     assert r["note"].startswith("京东风控限流，已自动换方式读价") and "购物车" in r["note"]

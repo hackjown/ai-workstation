@@ -585,7 +585,15 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     # ------------------------------------------------------------- watches (page tracking)
     @app.get("/api/watches", dependencies=[Depends(auth)])
     async def watches():
-        return store.all("watches", order="created_at ASC")
+        rows = store.all("watches", order="created_at ASC")
+        from . import shopwatch
+        if any(w.get("mode") == shopwatch.MODE for w in rows):
+            rows = shopwatch.repair_titles(store, rows)   # v8: never show JD's generic site title as the name
+            # v8: errors stored by earlier versions in English ('probe failed: timeout after 160s') read in Chinese
+            rows = [{**w, "last_error": shopwatch.cn_error(w.get("last_error")) if w.get("last_error") else w.get("last_error"),
+                     "status_note": shopwatch.cn_error(w.get("status_note")) if w.get("status_note") else w.get("status_note")}
+                    if w.get("mode") == shopwatch.MODE else w for w in rows]
+        return rows
 
     def _watch_fields(body: WatchIn) -> dict:
         from . import shopwatch
@@ -757,6 +765,23 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         m = {k: (str(body.get(k) or "").strip() or None)
              for k in ("model", "vision_model", "vision_fallback", "fallback", "subagent_model", "image_model", "video_model", "base_url", "thinking",
                        "chat_model", "small_model", "embed_model")}
+        store.kv_set("models", m)
+        return m
+
+    MODEL_KEYS = ("model", "vision_model", "vision_fallback", "fallback", "subagent_model", "image_model", "video_model",
+                  "base_url", "thinking", "chat_model", "small_model", "embed_model")
+
+    @app.patch("/api/settings/models", dependencies=[Depends(auth)])
+    async def patch_models(body: dict):
+        """3.8.9: change only the keys given (the iOS 主模型思考 switch sends {"thinking": "on"|"off"}); the same kv
+        'models' the web form saves with PUT, so the other settings stay as they are."""
+        m = dict(store.kv_get("models", {}) or {})
+        for k in MODEL_KEYS:
+            if k in body:
+                v = str(body.get(k) or "").strip() or None
+                if k == "thinking" and v not in (None, "on", "off"):
+                    raise HTTPException(400, "thinking must be on or off")
+                m[k] = v
         store.kv_set("models", m)
         return m
 

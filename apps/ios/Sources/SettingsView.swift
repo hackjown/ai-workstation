@@ -6,6 +6,11 @@ struct SettingsView: View {
     @State private var machines: [JSON] = []
     @AppStorage("appearance") private var appearance = "system"
     @AppStorage("mate") private var mate = true
+    // 3.8.9: 主模型思考 = the server's models.thinking ("on" | "off"), the same setting as the web 深度思考 select
+    @State private var thinking = false
+    @State private var thinkingLoaded = false
+    @State private var thinkingSaving = false
+    @State private var thinkingError = ""
     var body: some View {
         NavigationStack {
             Form {
@@ -26,6 +31,17 @@ struct SettingsView: View {
                             }
                         }
                     }
+                }
+                Section(header: Text("模型"), footer: Text(thinkingError.isEmpty
+                        ? "打开后主模型每一步先深度思考再操作，更稳但慢很多；关闭更快（推荐）。和网页设置里的「深度思考」是同一个开关，下一个任务开始生效。"
+                        : thinkingError).foregroundColor(thinkingError.isEmpty ? .secondary : .red)) {
+                    Toggle(isOn: Binding(get: { thinking }, set: { v in Task { await setThinking(v) } })) {
+                        HStack(spacing: 6) {
+                            Text("主模型思考")
+                            if thinkingSaving || !thinkingLoaded { ProgressView().controlSize(.mini) }
+                        }
+                    }
+                    .tint(amber).disabled(!thinkingLoaded || thinkingSaving)
                 }
                 Section(footer: Text("球球记得的你：画像、事实和决定，聊天和每个任务都会参考；可以查看、修改、删除")) {
                     NavigationLink { MemoryView() } label: { Label("记忆", systemImage: "brain.head.profile") }
@@ -54,7 +70,35 @@ struct SettingsView: View {
             }
             .navigationTitle("设置").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
-            .task { machines = (try? await api.list("/api/machines")) ?? [] }
+            .task {
+                machines = (try? await api.list("/api/machines")) ?? []
+                await loadThinking()
+            }
+        }
+    }
+
+    func loadThinking() async {
+        do {
+            let m = try await api.obj("GET", "/api/settings/models")
+            thinking = m.s("thinking") == "on"
+            thinkingLoaded = true
+            thinkingError = ""
+        } catch { thinkingError = "读不到模型设置：" + error.localizedDescription }
+    }
+
+    func setThinking(_ on: Bool) async {
+        let before = thinking
+        thinking = on
+        thinkingSaving = true
+        defer { thinkingSaving = false }
+        do {
+            // PATCH changes only this key of the server's models settings (PUT would replace them all)
+            let m = try await api.obj("PATCH", "/api/settings/models", ["thinking": on ? "on" : "off"])
+            thinking = m.s("thinking") == "on"
+            thinkingError = ""
+        } catch {
+            thinking = before
+            thinkingError = "没能保存：" + error.localizedDescription
         }
     }
 }

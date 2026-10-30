@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
-from .shop_probe import PROBE_VERSION, is_risk_limit, normalize_jd, parse_api_price
+from .shop_probe import PROBE_VERSION, clean_name, is_generic_title, is_risk_limit, normalize_jd, parse_api_price
 
 log = logging.getLogger("aiw.shopwatch")
 
@@ -267,6 +267,17 @@ def _alt_result(alt: dict) -> dict:
 
 
 def parse_snapshot(snap: dict) -> dict:
+    """_parse_snapshot, plus v8's partial runs: a probe that ran out of time still gives what it read, and the note
+    says which stage it stopped in."""
+    res = _parse_snapshot(snap)
+    if isinstance(snap, dict) and not snap.get("error") and snap.get("stage_error"):
+        res["timed_out"] = True
+        if res["status"] != "ok":
+            res["note"] = ((res.get("note") or "") + "；这次检查" + snap["stage_error"]).lstrip("；")
+    return res
+
+
+def _parse_snapshot(snap: dict) -> dict:
     """Raw probe snapshot -> {status, price, final_price, effective, in_stock, title, url, note}.
 
     status: ok | login | need_login | captcha | risk_limit | off_shelf | price_pending | no_price | error
@@ -274,12 +285,16 @@ def parse_snapshot(snap: dict) -> dict:
     effective = final_price or price (what the order would cost per item before shipping)."""
     if not isinstance(snap, dict) or snap.get("error"):
         err = (snap or {}).get("error") if isinstance(snap, dict) else "bad probe output"
-        return {"status": "no_browser" if str(err).startswith("NO_CDP") else "error", "note": str(err)[:300],
+        note = cn_error(str(err))
+        if isinstance(snap, dict) and snap.get("stage_error"):
+            note += "，" + snap["stage_error"]
+        return {"status": "no_browser" if str(err).startswith("NO_CDP") else "error", "note": note[:300],
                 "price": None, "final_price": None, "effective": None, "in_stock": None, "title": "", "url": ""}
     url = snap.get("url") or ""
     host = (urlparse(url).hostname or "").lower()
     text = snap.get("text") or ""
-    title = (snap.get("title") or snap.get("doc_title") or "").strip()
+    # v8: the product name from JD's own data first; the site-wide '京东(JD.COM)-正品低价…' title is never a name
+    title = clean_name(snap.get("item_name") or "") or clean_name(snap.get("title") or "") or clean_name(snap.get("doc_title") or "")
     res = {"status": "ok", "price": None, "final_price": None, "effective": None, "in_stock": None,
            "title": title[:120], "url": url, "note": "", "range": False}
     if snap.get("cdp"):
@@ -713,21 +728,68 @@ async def _poll_progress(computer, path: str, prog: "Progress") -> None:
 
 async def run_probe(computer, sub: str, timeout: float = 60, cdp_port: Optional[int] = None,
                     progress: Optional["Progress"] = None, **kw) -> dict:
-    poller = None
-    if progress is not None and sub == "probe":
+    poller, path = None, ""
+    if sub == "probe":
+        kw.setdefault("budget", str(int(min(PROBE_BUDGET, max(20, timeout - 40)))))
         path = f"/tmp/aiw-shop-run-{os.urandom(4).hex()}.json"
         kw["progress"] = path
-        poller = asyncio.ensure_future(_poll_progress(computer, path, progress))
+        if progress is not None:
+            poller = asyncio.ensure_future(_poll_progress(computer, path, progress))
+    r = None
     try:
         r = await computer.execute("shell.exec", {"command": cdp_env(computer, cdp_port) + probe_command(sub, **kw),
                                                   "timeout": timeout}, timeout=timeout + 15)
+    except Exception as e:  # noqa: BLE001  (the agent's own timeout / a dropped connection): keep what the probe wrote
+        r = type("R", (), {"result": {"stderr": f"{type(e).__name__}: {e}"}, "error": str(e)})()
     finally:
         if poller is not None:
             poller.cancel()
     got = _last_json(r)
     if got is not None:
+        if sub == "probe":
+            got.setdefault("pushed_version", PROBE_VERSION)
         return got
-    return {"error": f"probe failed: {_err_of(r)}"}
+    out = {"error": f"probe failed: {_err_of(r)}"}
+    if sub == "probe":
+        # v8: the probe was pushed in this very command, so its version is known; the stages it got through are in
+        # its progress file (it is killed before it can print): the card says WHERE it stopped, not just "timeout"
+        out["pushed_version"] = PROBE_VERSION
+        part = await _read_partial(computer, path)
+        if part:
+            out["stages"] = part.get("stages") or []
+            out["probe_version"] = str(part.get("probe_version") or "") or None
+            cur = (out["stages"][-1] if out["stages"] else {}) or {}
+            if cur:
+                out["stage_error"] = f"卡在「{cur.get('label') or cur.get('stage')}」"
+    return out
+
+
+async def _read_partial(computer, path: str) -> Optional[dict]:
+    if not path:
+        return None
+    try:
+        r = await computer.execute("shell.exec", {"command": f"cat {path} 2>/dev/null; rm -f {path} {path}.tmp", "timeout": 5},
+                                   timeout=8)
+        return _last_json(r)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+ERR_CN = ((re.compile(r"probe failed: timeout after (\d+)s?", re.I), lambda m: f"检查超时（{m.group(1)} 秒没有结束）"),
+          (re.compile(r"timeout after (\d+(?:\.\d+)?)s?", re.I), lambda m: f"超时（{m.group(1)} 秒）"),
+          (re.compile(r"^probe failed: no output$", re.I), lambda m: "探针没有输出（电脑上的 python3 没运行起来？）"),
+          (re.compile(r"^probe failed:\s*", re.I), lambda m: "检查失败："),
+          (re.compile(r"NO_CDP:?\s*", re.I), lambda m: "连不上浏览器调试端口："),
+          (re.compile(r"Failed to fetch", re.I), lambda m: "请求被浏览器拦下"),
+          (re.compile(r"ConnectionError|ConnectionResetError|websocket closed", re.I), lambda m: "连接断开"))
+
+
+def cn_error(text: str) -> str:
+    """v8: the status / error line in plain Chinese ('probe failed: timeout after 160s' -> '检查超时（160 秒没有结束）')."""
+    t = str(text or "")
+    for rx, f in ERR_CN:
+        t = rx.sub(f, t)
+    return t
 
 
 async def run_cdp_tool(computer, sub: str, timeout: float = 150, **kw) -> dict:
@@ -837,7 +899,8 @@ async def desktop_read(computer, sessions, w: dict) -> Optional[dict]:
 # ----------------------------------------------------------------------------- the scheduled check
 LIVE_TASK = ("queued", "running", "paused", "takeover", "waiting_confirm", "waiting_input")
 FAIL_STATES = ("error", "no_price", "no_browser")
-PROBE_TIMEOUT = 160         # v7 adds signed API / cart / 我的关注 routes; v6 waits up to ~20 s (front, scroll), reads page/API prices, mobile page, screenshot
+PROBE_TIMEOUT = 160         # hard cap for one probe run (the shell command is killed after this)
+PROBE_BUDGET = 115          # v8: the probe's own budget; it stops each stage in time and answers well before the cap
 RISK_BACKOFF_MIN = 2 * 3600  # JD's 活动火爆 page: look again much later, more checks only keep it on
 
 
@@ -960,6 +1023,10 @@ def diag_hints(raw: dict, r: dict) -> list[str]:
     pv = str(raw.get("probe_version") or "")
     if pv and pv != PROBE_VERSION:
         h.append(f"电脑上运行的探针是 v{pv}，服务器带的是 v{PROBE_VERSION}（推送没成功？）")
+    if raw.get("stage_error"):
+        h.append("这次检查" + str(raw["stage_error"]) + "，已返回到这一步为止读到的内容")
+    if raw.get("skeleton"):
+        h.append("商品页只有京东通用标题、没有商品模块（骨架页/软拦截），已直接改用签名接口")
     if raw.get("risk_limit"):
         h.append("京东返回了 活动火爆 风控页（limit.html）")
     env = raw.get("env") if isinstance(raw.get("env"), dict) else {}
@@ -1009,7 +1076,10 @@ def build_diag(raw: dict, r: dict, prog: Optional[Progress], now: float, shot: b
     prof = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
     mob = raw.get("mobile") if isinstance(raw.get("mobile"), dict) else None
     d = {"at": now, "status": r.get("status"), "note": r.get("note"), "via": r.get("via"),
-         "probe_version": raw.get("probe_version"), "server_probe_version": PROBE_VERSION,
+         "probe_version": raw.get("probe_version") or raw.get("pushed_version") or PROBE_VERSION,
+         "probe_answered": bool(raw.get("probe_version")), "server_probe_version": PROBE_VERSION,
+         "stage_error": raw.get("stage_error"), "timed_out": bool(raw.get("timed_out") or raw.get("stage_error")),
+         "budget_s": raw.get("budget_s"), "item_name": raw.get("item_name"),
          "server_version": os.environ.get("AIW_VERSION", "dev")[:7],
          "final_url": raw.get("url") or "", "asked_url": raw.get("asked_url") or "", "page_title": raw.get("doc_title") or raw.get("title") or "",
          "title": raw.get("title") or "", "title_from": raw.get("title_from"), "ready": raw.get("ready"),
@@ -1023,7 +1093,7 @@ def build_diag(raw: dict, r: dict, prog: Optional[Progress], now: float, shot: b
          "mobile": ({k: mob.get(k) for k in ("asked_url", "url", "title", "risk_limit", "login", "skipped", "error", "ready")}
                     | {"price_texts": [x.get("t") for x in (mob.get("cand") or [])[:5]]}) if mob else None,
          "profile": {k: prof.get(k) for k in ("port", "dir", "logged_in", "jd_cookies", "login_cookies", "cookies_total") if k in prof},
-         "cdp": raw.get("cdp"), "error": raw.get("error") or raw.get("shot_error"),
+         "cdp": raw.get("cdp"), "error": cn_error(raw.get("error") or raw.get("shot_error") or "") or None,
          "route": raw.get("route"), "env": raw.get("env"), "nav_chain": (raw.get("nav_chain") or [])[:12],
          "mobile_blocked": raw.get("mobile_blocked"), "resolved": raw.get("resolved"),
          "alt": [{k: a.get(k) for k in ("route", "price", "status", "error", "refused", "login", "missing", "rows", "url",
@@ -1056,6 +1126,30 @@ def save_diag(store, sessions, wid: str, raw: dict, d: dict) -> None:
         store.update("watches", wid, diag_at=d.get("at"))
     except Exception:  # noqa: BLE001
         log.info("save_diag %s failed", wid, exc_info=True)
+
+
+def repair_titles(store, rows: Optional[list] = None) -> list:
+    """v8: watches whose shown name became JD's site-wide title ('京东(JD.COM)-正品低价…', from a page that never
+    rendered): the stored item_title is cleared (the user's own name shows again) and a generic name falls back to
+    '京东商品 <sku>'. Returns the rows as they are now. Idempotent; touches only those rows."""
+    rows = list(rows if rows is not None else store.all("watches", order="created_at ASC"))
+    out = []
+    for w in rows:
+        fix = {}
+        if w.get("mode") == MODE and w.get("item_title") and is_generic_title(w["item_title"]):
+            fix["item_title"] = None
+        if w.get("mode") == MODE and is_generic_title(w.get("name") or ""):
+            sku = re.search(r"/(\d{5,})\.html", w.get("url") or "")
+            fix["name"] = f"{SITE_NAMES.get(w.get('site') or 'jd', '京东')}商品 {sku.group(1)}" if sku else \
+                f"{SITE_NAMES.get(w.get('site') or 'jd', '京东')} ≤ ¥{w.get('value')}"
+        if fix:
+            try:
+                store.update("watches", w["id"], **fix)
+            except Exception:  # noqa: BLE001
+                log.info("repair_titles %s failed", w.get("id"), exc_info=True)
+            w = {**w, **fix}
+        out.append(w)
+    return out
 
 
 def get_diag(store, wid: str) -> Optional[dict]:
@@ -1147,7 +1241,8 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
             if vision:
                 prog("vision")
                 shot = raw.get("screenshot") or ""
-                if not shot:   # an old probe without the v6 failure screenshot: take one
+                old = str(raw.get("probe_version") or "0")
+                if not shot and old.isdigit() and int(old) < 6:   # an old probe without the v6 failure screenshot
                     raw2 = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT + 10, cdp_port=(ens or {}).get("port"),
                                            url=w["url"], sku=w.get("sku") or "", shot=True)
                     shot = raw2.get("screenshot") or ""
@@ -1259,8 +1354,10 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
     site_name = SITE_NAMES.get(w.get("site") or site_of(w["url"]) or "", "电商")
     machine = (store.machine(mid) or {}).get("name") or mid
     fields: dict[str, Any] = {"last_checked": now, "shop_status": r["status"], "status_note": r.get("note") or None}
-    if r.get("title"):
+    if r.get("title") and not is_generic_title(r["title"]):
         fields["item_title"] = r["title"]
+    elif is_generic_title(w.get("item_title") or "x") and w.get("item_title"):
+        fields["item_title"] = None    # v8: a generic JD title stored by an earlier version
     if r["status"] == "ok":
         fields.update(price=r.get("price"), final_price=r.get("final_price"),
                       in_stock=None if r.get("in_stock") is None else int(bool(r["in_stock"])),

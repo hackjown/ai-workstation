@@ -12,6 +12,14 @@ The API ships this file to ~/.config/aiw/shop/probe.py and runs one command per 
   probe.py url                                      the visible tab's URL
   probe.py profile                                  which Chrome profile answers and whether it is logged in to JD
 
+v8 (2026-10-30): one time budget per run (--budget, default 115 s; the server's hard cap is 160 s) with short
+per-stage timeouts (no socket read blocks past its call's timeout) and a SIGALRM watchdog that stops the running stage
+and still prints the partial snapshot with stage_error. The render wait is at most 15 s and stops after ~6 s on a
+skeleton (only JD's site-wide title, few elements, no price module); the signed API then runs first, the page's own
+answers next (bodies read at Network.loadingFinished, a dropped body is 'gone', not an error), the unsigned APIs only
+with time left. The screenshot takes ≤5 s and is skipped / dropped when a price was found; cart and 我的关注 run only
+while time remains. The product name comes from JD's data (wname/skuName, cart / 关注 rows), never the generic title.
+
 v7 (2026-10-29): on ai-linux-001 v6 ended on trade.m.jd.com/common/limit.html?module=detail_m1 (the MOBILE item page's
 limiter) with a logged-in desktop profile (thor). v7 never loads the mobile item page: short links (3.cn, u.jd.com,
 union-click) are resolved to the sku over plain HTTP first (stopping before item.m.jd.com), the tab gets a desktop
@@ -53,7 +61,26 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "7"
+PROBE_VERSION = "8"
+
+# v8: one time budget for the whole probe run (the server's hard cap is 160 s; the probe aims to answer by ~120 s).
+# Each stage takes what it needs out of what is left; the cart / 我的关注 routes run only while time remains, and a
+# watchdog (SIGALRM at budget + 12 s) stops whatever is running so the partial result is still printed.
+DEFAULT_BUDGET = 115.0
+BUDGET = {"end": 0.0, "total": 0.0}
+
+
+class OutOfTime(BaseException):
+    """Raised by the watchdog (a BaseException so no `except Exception` on the way swallows it)."""
+
+
+def budget_left() -> float:
+    return max(0.0, BUDGET["end"] - time.time()) if BUDGET.get("end") else 1e9
+
+
+def cap(seconds: float, reserve: float = 0.0) -> float:
+    """seconds, but never more than what is left of the budget (minus reserve)."""
+    return max(0.2, min(float(seconds), budget_left() - reserve))
 CDP = os.environ.get("VM_AGENT_CDP", "http://127.0.0.1:9222")
 # DevTools is on 127.0.0.1: never through an http_proxy the desktop user may have set (it answers 404 / refuses)
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -205,6 +232,51 @@ def parse_api_price(body) -> dict | None:
         return None
     return {"price": price, "final_price": final,
             "plus_price": min(plus) if plus else None, "in_stock": stock}
+
+
+# v8: JD's site-wide title. A product page that never rendered (a skeleton / soft block) only has this as its
+# document.title; it must never become a watch's product name.
+GENERIC_TITLE = re.compile(r"^\s*(京东\s*[(（]?\s*JD\.COM\s*[)）]?|JD\.COM|京东|京东商城|京东全球购|京东超市)\s*"
+                           r"([-–—_|·]\s*(正品低价|多快好省|品质保障|配送及时|轻松购物|专业综合网上购物商城).*)?\s*[!！]?\s*$|"
+                           r"正品低价、品质保障、配送及时、轻松购物|多快好省，购物上京东", re.I)
+_NAME_KEYS = ("skuName", "wname", "wareName", "skuTitle", "goodsName", "itemName", "productName", "name", "title")
+_NAME_SKIP = re.compile(r"^(满\s*\d|领券|优惠|券|PLUS|plus|京东价|到手价|券后|有货|无货|自营|官方|店铺|促销|赠品)|^[\d\s.¥￥,]+$")
+
+
+def is_generic_title(t: str) -> bool:
+    t = (t or "").strip()
+    return not t or bool(GENERIC_TITLE.search(t))
+
+
+def clean_name(t: str) -> str:
+    """A product name as shown on a card: the page-title suffix (【行情 报价 价格 评测】-京东) cut off."""
+    t = re.sub(r"\s+", " ", str(t or "")).strip()
+    t = re.sub(r"\s*【[^】]*(行情|报价|价格|评测)[^】]*】.*$", "", t)
+    t = re.sub(r"\s*[-–—_|]\s*(京东|JD\.COM|京东商城)\s*$", "", t, flags=re.I).strip()
+    return "" if is_generic_title(t) else t[:120]
+
+
+def name_of(body, sku: str = "") -> str:
+    """v8: the product name in a JD API answer (wareBusiness / cart / follow JSON): skuName, wname, wareName ...
+    Prefers a dict that also names this sku."""
+    data = _jsonp(body) if isinstance(body, str) else body
+    if data is None:
+        return ""
+    best = ""
+    for d in _walk(data):
+        mine = bool(sku) and any(str(d.get(k) or "") == str(sku) for k in ("skuId", "skuid", "id", "sku", "wareId"))
+        for k in _NAME_KEYS:
+            v = d.get(k)
+            if not isinstance(v, str) or not (6 <= len(v.strip()) <= 200) or _NAME_SKIP.search(v.strip()):
+                continue
+            if k in ("name", "title") and not mine:
+                continue      # 'name' is everywhere (coupons, shops): only next to this sku
+            v = clean_name(v)
+            if v:
+                if mine:
+                    return v
+                best = best or v
+    return best
 
 
 def api_urls(sku: str) -> list[tuple[str, str]]:
@@ -370,6 +442,7 @@ class WS:
     def __init__(self, url: str, timeout: float = 15):
         u = urlparse(url)
         self.sock = socket.create_connection((u.hostname, u.port or 80), timeout=timeout)
+        self.base_timeout = timeout
         key = base64.b64encode(os.urandom(16)).decode()
         path = u.path + (("?" + u.query) if u.query else "")
         # no Origin header: Chrome 111+ only checks --remote-allow-origins when one is sent
@@ -387,15 +460,43 @@ class WS:
         self.buf = head.split(b"\r\n\r\n", 1)[1]
         self.ids = 0
         self.on_event = None      # v6: DevTools events (Network.responseReceived) seen while waiting for answers
+        self.pending = {}         # v8: id -> callback for request() (response bodies read at loadingFinished)
+        self.bodies = {}          # v8: requestId -> response body text, read the moment loading finished
 
-    def _read(self, n: int) -> bytes:
-        while len(self.buf) < n:
-            chunk = self.sock.recv(65536)
-            if not chunk:
-                raise ConnectionError("websocket closed")
-            self.buf += chunk
-        out, self.buf = self.buf[:n], self.buf[n:]
-        return out
+    def _frame(self):
+        """v8: one whole frame from the buffer, or None (nothing is consumed until the frame is complete, so a socket
+        timeout in the middle of a frame never corrupts the stream)."""
+        b = self.buf
+        if len(b) < 2:
+            return None
+        b1, b2 = b[0], b[1]
+        n, at = b2 & 0x7F, 2
+        if n == 126:
+            if len(b) < 4:
+                return None
+            n, at = struct.unpack(">H", b[2:4])[0], 4
+        elif n == 127:
+            if len(b) < 10:
+                return None
+            n, at = struct.unpack(">Q", b[2:10])[0], 10
+        mask = None
+        if b2 & 0x80:
+            if len(b) < at + 4:
+                return None
+            mask, at = b[at:at + 4], at + 4
+        if len(b) < at + n:
+            return None
+        data, self.buf = b[at:at + n], b[at + n:]
+        if mask:
+            data = bytes(x ^ mask[i % 4] for i, x in enumerate(data))
+        return b1, data
+
+    def _more(self, wait: float | None = None):
+        self.sock.settimeout(self.base_timeout if wait is None else max(0.05, wait))
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("websocket closed")
+        self.buf += chunk
 
     def send(self, text: str, op: int = 1):
         data = text.encode() if isinstance(text, str) else text
@@ -410,19 +511,17 @@ class WS:
         mask = os.urandom(4)
         self.sock.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
 
-    def recv(self) -> str:
+    def recv(self, wait: float | None = None) -> str:
+        """One message. wait: seconds before socket.timeout (None = the socket's own timeout)."""
+        end = None if wait is None else time.time() + wait
         parts = b""
         while True:
-            b1, b2 = self._read(2)
-            op, n = b1 & 0x0F, b2 & 0x7F
-            if n == 126:
-                n = struct.unpack(">H", self._read(2))[0]
-            elif n == 127:
-                n = struct.unpack(">Q", self._read(8))[0]
-            mask = self._read(4) if b2 & 0x80 else None
-            data = self._read(n)
-            if mask:
-                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            fr = self._frame()
+            if fr is None:
+                self._more(None if end is None else end - time.time())
+                continue
+            b1, data = fr
+            op = b1 & 0x0F
             if op == 9:          # ping
                 self.send(data, op=10)
                 continue
@@ -432,25 +531,56 @@ class WS:
             if b1 & 0x80:
                 return parts.decode(errors="replace")
 
+    def _dispatch(self, msg: dict, mid: int | None = None) -> bool:
+        """True when msg answers mid. Events go to on_event, answers to fire-and-forget requests to their callback."""
+        if "method" in msg and "id" not in msg:
+            if self.on_event:
+                try:
+                    self.on_event(msg)
+                except Exception:  # noqa: BLE001
+                    pass
+            return False
+        if mid is not None and msg.get("id") == mid:
+            return True
+        cb = self.pending.pop(msg.get("id"), None)
+        if cb:
+            try:
+                cb(msg)
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
     def call(self, method: str, params: dict | None = None, timeout: float = 20):
         self.ids += 1
         mid = self.ids
         self.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+        timeout = max(0.2, min(timeout, budget_left() + 2)) if BUDGET.get("end") else timeout
         end = time.time() + timeout
         while time.time() < end:
-            msg = json.loads(self.recv())
-            if "method" in msg and "id" not in msg:
-                if self.on_event:
-                    try:
-                        self.on_event(msg)
-                    except Exception:  # noqa: BLE001
-                        pass
-                continue
-            if msg.get("id") == mid:
+            try:   # v8: never block past the call's own timeout (a slow page used to hold the socket 15 s per read)
+                msg = json.loads(self.recv(end - time.time()))
+            except socket.timeout:
+                break
+            if self._dispatch(msg, mid):
                 if "error" in msg:
                     raise RuntimeError(f"{method}: {msg['error'].get('message')}")
                 return msg.get("result", {})
         raise TimeoutError(method)
+
+    def request(self, method: str, params: dict | None, cb) -> None:
+        """v8: send now, answer to cb whenever it arrives (inside a later call()/pump())."""
+        self.ids += 1
+        self.pending[self.ids] = cb
+        self.send(json.dumps({"id": self.ids, "method": method, "params": params or {}}))
+
+    def pump(self, seconds: float = 0.3) -> None:
+        """Read whatever arrives for a moment (events, answers to request())."""
+        end = time.time() + max(0.0, seconds)
+        while time.time() < end:
+            try:
+                self._dispatch(json.loads(self.recv(end - time.time())))
+            except (socket.timeout, ValueError):
+                break
 
     def notify(self, method: str, params: dict | None = None):
         """v7: a command whose answer we do not wait for (Fetch.failRequest from inside an event handler: a nested
@@ -827,7 +957,10 @@ ROW_JS = r"""
       if (!t || t.length > 40 || !/[¥￥]\s*\d/.test(t)) continue; const st = getComputedStyle(el);
       prices.push({t, strike: /line-through/.test(st.textDecorationLine || '') || /^(DEL|S)$/.test(el.tagName), fs: parseFloat(st.fontSize) || 0,
                    cls: ((typeof el.className === 'string' ? el.className : '') + ' ' + (el.parentElement && typeof el.parentElement.className === 'string' ? el.parentElement.className : '')).slice(0, 120)}); if (prices.length > 12) break; }
-    return {text: T(r).slice(0, 400), prices}; });
+    let name = '';   // v8: the product name: the longest link text / title pointing at this sku inside the row
+    for (const a of r.querySelectorAll('a[href*="' + sku + '"], [title]')) { const t = ((a.getAttribute('title') || '') || T(a)).trim();
+      if (t.length > name.length && t.length < 200 && !/[¥￥]\s*\d/.test(t)) name = t; }
+    return {text: T(r).slice(0, 400), prices, name}; });
   return JSON.stringify({url: location.href, title: document.title, rows: out, n_links: links.length,
                          login: /passport\.jd\.com|plogin|login\.aspx/.test(location.href), n_elems: document.getElementsByTagName('*').length,
                          text: (document.body ? document.body.innerText : '').slice(0, 600)});
@@ -982,7 +1115,8 @@ class Stages:
             cur = self.list[-1] if self.list else {}
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
-                f.write(json.dumps({"stage": cur.get("stage"), "label": cur.get("label"), "stages": self.list}, ensure_ascii=False))
+                f.write(json.dumps({"stage": cur.get("stage"), "label": cur.get("label"), "stages": self.list,
+                                    "probe_version": PROBE_VERSION, "budget_s": BUDGET.get("total")}, ensure_ascii=False))
             os.replace(tmp, self.path)
         except OSError:
             pass
@@ -1021,10 +1155,38 @@ def net_name(u: str) -> str:
     return ((p.hostname or "") + p.path)[:80]
 
 
+def body_of(ws, rid: str, timeout: float = 3) -> tuple[str, str]:
+    """v8: a response body -> (text, why_missing). The body read at loadingFinished (ws.bodies) comes first; asking
+    later often answers 'No resource with given identifier found' (Chrome dropped it), which is reported as 'gone',
+    never as an error that hides the rest."""
+    bodies = getattr(ws, "bodies", None) or {}
+    if rid in bodies:
+        return bodies[rid], ""
+    try:
+        b = ws.call("Network.getResponseBody", {"requestId": rid}, cap(timeout))
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        return "", "gone" if "No resource" in msg or "No data found" in msg else f"{type(e).__name__}: {msg}"[:120]
+    text = b.get("body") or ""
+    if b.get("base64Encoded"):
+        text = base64.b64decode(text).decode("utf-8", "replace")
+    return text, ""
+
+
+NET_TOTAL_S = 5.0
+
+
 def net_prices(ws, captured: dict, sku: str) -> tuple[list, dict | None]:
-    """The page's OWN price API responses (seen on the Network domain while it loaded; the page signed them itself)."""
+    """The page's OWN price API responses (seen on the Network domain while it loaded; the page signed them itself).
+    v8: at most ~5 s in all, bodies taken from what was read at loadingFinished."""
     tries, items = [], list(captured.items())
     items.sort(key=lambda kv: 0 if NET_PRIO.search(net_name(kv[1].get("url", ""))) else 1)
+    try:
+        if hasattr(ws, "pump"):
+            ws.pump(0.3)   # answers to the body requests sent at loadingFinished
+    except Exception:  # noqa: BLE001
+        pass
+    end = time.time() + cap(NET_TOTAL_S, 2)
     for rid, info in items[:12]:
         name = net_name(info.get("url", ""))
         ent = {"src": "page:" + name, "status": info.get("status")}
@@ -1032,19 +1194,19 @@ def net_prices(ws, captured: dict, sku: str) -> tuple[list, dict | None]:
         if NET_SKIP.search(name):
             ent["skipped"] = True
             continue
-        try:
-            b = ws.call("Network.getResponseBody", {"requestId": rid}, 6)
-            text = b.get("body") or ""
-            if b.get("base64Encoded"):
-                text = base64.b64decode(text).decode("utf-8", "replace")
-        except Exception as e:  # noqa: BLE001
-            ent["error"] = f"{type(e).__name__}: {e}"[:120]
+        if time.time() > end:
+            ent["skipped"] = "no_time"
+            continue
+        text, why = body_of(ws, rid, 3)
+        if why:
+            ent["gone" if why == "gone" else "error"] = True if why == "gone" else why
             continue
         ent["size"] = len(text)
         got = parse_api_price(text) if text else None
         ent["price"] = bool(got)
         if got and (got.get("price") or got.get("final_price")) and (sku in text or NET_PRIO.search(name)):
-            return tries, {**got, "src": ent["src"]}
+            nm = name_of(text, sku)
+            return tries, {**got, "src": ent["src"], **({"name": nm} if nm else {})}
         if not got:
             ent["head"] = re.sub(r"\s+", " ", text[:160])
     return tries, None
@@ -1096,15 +1258,19 @@ def jd_api_price(ws, sku: str) -> dict:
     """JD's own price APIs, tried in order from inside the item page; the first that yields a price wins."""
     tries = []
     for src, url in api_urls(sku):
+        if budget_left() < 12:   # v8: the unsigned APIs are long shots; never at the cost of the routes after them
+            tries.append({"src": src, "skipped": "no_time"})
+            continue
         try:
-            one = json.loads(ws.eval(f"({API_JS})({json.dumps(src)}, {json.dumps(url)})", 12) or "{}")
+            one = json.loads(ws.eval(f"({API_JS})({json.dumps(src)}, {json.dumps(url)})", cap(8, 4)) or "{}")
         except Exception as e:  # noqa: BLE001
             one = {"src": src, "error": f"{type(e).__name__}: {e}"[:160]}
         got = parse_api_price(one.get("body") or "") if one.get("body") else None
         tries.append({k: (v[:300] if k == "body" and isinstance(v, str) else v) for k, v in one.items()})
         if got and (got.get("price") or got.get("final_price")):
             tries[-1]["body"] = (one.get("body") or "")[:20000]
-            return {"api": tries, "api_price": {**got, "src": src}}
+            nm = name_of(one.get("body") or "", sku)
+            return {"api": tries, "api_price": {**got, "src": src, **({"name": nm} if nm else {})}}
     return {"api": tries}
 
 
@@ -1141,7 +1307,11 @@ def row_price(rows: list) -> dict | None:
         if fin is not None and price is not None and not (price * 0.3 <= fin <= price + 1e-9):
             fin = None
         if price is not None or fin is not None:
-            return {"price": price, "final_price": fin, "plus_price": None, "in_stock": None}
+            out = {"price": price, "final_price": fin, "plus_price": None, "in_stock": None}
+            nm = clean_name(r.get("name") or "")
+            if nm:
+                out["name"] = nm
+            return out
     return None
 
 
@@ -1155,11 +1325,14 @@ def _cookie_value(cookies, name: str) -> str:
 def signed_price(ws, sku: str, area: str) -> dict:
     """JD's signed pc_detailpage_wareBusiness from the current desktop jd.com page (see SIGNED_JS)."""
     try:
-        one = json.loads(ws.eval(f"({SIGNED_JS})({json.dumps(sku)}, {json.dumps(area)})", 25) or "{}")
+        one = json.loads(ws.eval(f"({SIGNED_JS})({json.dumps(sku)}, {json.dumps(area)})", cap(20, 2)) or "{}")
     except Exception as e:  # noqa: BLE001
         one = {"src": "signed:pc_detailpage_wareBusiness", "error": f"{type(e).__name__}: {e}"[:160]}
     body = one.pop("body", "") or ""
     got = parse_api_price(body) if body else None
+    nm = name_of(body, sku) if body else ""
+    if got and nm:
+        got = {**got, "name": nm}
     one["route"] = "signed"
     one["price"] = bool(got and (got.get("price") or got.get("final_price")))
     if not one["price"]:
@@ -1168,21 +1341,21 @@ def signed_price(ws, sku: str, area: str) -> dict:
     return {"try": one, "price": {**got, "src": "signed"} if one["price"] else None}
 
 
-def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 12) -> dict:
+def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 10) -> dict:
     """Open the cart / 我的关注 page in the probe tab (a link from www.jd.com), read this sku's row and the page's
     own API answers that carry it. Read only: nothing is clicked there."""
     one = {"route": name, "asked_url": url}
     captured.clear()
     try:
-        ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, 30)
+        ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, cap(15, 3))
     except Exception as e:  # noqa: BLE001
         one["error"] = f"{type(e).__name__}: {e}"[:160]
         return {"try": one, "price": None}
-    end, snap = time.time() + wait, {}
+    end, snap = time.time() + cap(wait, 6), {}
     while time.time() < end:
         time.sleep(1.2)
         try:
-            snap = json.loads(ws.eval(f"({ROW_JS})({json.dumps(sku)})", 8) or "{}")
+            snap = json.loads(ws.eval(f"({ROW_JS})({json.dumps(sku)})", cap(6, 1)) or "{}")
         except Exception:  # noqa: BLE001
             continue
         if snap.get("login") or snap.get("rows") or is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
@@ -1197,18 +1370,18 @@ def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 
         one["price"] = True
         one["from"] = "row"
         return {"try": one, "price": {**got, "src": name}}
+    end = time.time() + cap(NET_TOTAL_S, 2)
     for rid, info in list(captured.items())[:20]:     # the page's own answers (cart / follow APIs) naming this sku
-        try:
-            b = ws.call("Network.getResponseBody", {"requestId": rid}, 6)
-            text = b.get("body") or ""
-            if b.get("base64Encoded"):
-                text = base64.b64decode(text).decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001
-            continue
-        if sku not in text:
+        if time.time() > end:
+            break
+        text, why = body_of(ws, rid, 3)
+        if why or sku not in text:
             continue
         got = price_of_items(text, sku)
         if got:
+            nm = name_of(text, sku)
+            if nm:
+                got = {**got, "name": nm}
             one.update(price=True, src_api=net_name(info.get("url", "")))
             one["from"] = "net"
             return {"try": one, "price": {**got, "src": name}}
@@ -1217,16 +1390,23 @@ def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 
     return {"try": one, "price": None}
 
 
-def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool) -> dict:
-    """v7: the price without the item page, each route once, in order: signed API, cart, 我的关注."""
+ROUTE_MIN_S = {"cart": 20.0, "follow": 14.0}   # v8: a page route starts only with this much of the budget left
+
+
+def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool, signed_done: bool = False) -> dict:
+    """v7: the price without the item page, each route once, in order: signed API, cart, 我的关注.
+    v8: the signed API is skipped when it already ran on the item page; cart / 我的关注 only while time remains."""
     tries = []
-    if on_jd_page:
+    if on_jd_page and not signed_done:
         st("signed")
         r = signed_price(ws, sku, area)
         tries.append(r["try"])
         if r["price"]:
             return {"alt": tries, "alt_price": r["price"]}
     for name, url in (("cart", CART_URL), ("follow", FOLLOW_URL)):
+        if budget_left() < ROUTE_MIN_S[name]:
+            tries.append({"route": name, "skipped": "no_time", "price": False})
+            continue
         st(name)
         r = page_route(ws, name, url, sku, captured)
         tries.append(r["try"])
@@ -1234,7 +1414,7 @@ def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool) ->
             return {"alt": tries, "alt_price": r["price"]}
         if r["try"].get("risk_limit"):
             break
-        if name == "cart" and not on_jd_page and not r["try"].get("login"):
+        if name == "cart" and not on_jd_page and not signed_done and not r["try"].get("login"):
             st("signed")   # the cart page carries JD's signing SDK: the signed API from there
             r2 = signed_price(ws, sku, area)
             tries.append(r2["try"])
@@ -1243,8 +1423,41 @@ def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool) ->
     return {"alt": tries}
 
 
+SKELETON_AFTER_S = 6.0      # v8: a generic-title page with no product module this long is not going to render
+SKELETON_MAX_ELEMS = 600
+WAIT_MAX_S = 15.0           # v8: the render wait never takes more than this (v7: up to ~36 s with slow evals)
+SHOT_MAX_S = 5.0
+
+
+def is_skeleton(snap: dict) -> bool:
+    """v8: JD answered the item URL with a page that is not a product page: only the site-wide title (no product
+    title element), few elements, no price element or price text. Seen on 102 (295 elements, 2026-10-30)."""
+    return (is_generic_title(snap.get("doc_title") or snap.get("title") or "") and snap.get("title_from") != "element"
+            and int(snap.get("n_elems") or 0) < SKELETON_MAX_ELEMS and not snap.get("sel") and not snap.get("cand"))
+
+
+def _watchdog(total: float):
+    """SIGALRM at budget + 12 s: raise OutOfTime in whatever is running, so cmd_probe still prints what it has."""
+    try:
+        import signal
+
+        def fire(_sig, _frm):
+            raise OutOfTime()
+        signal.signal(signal.SIGALRM, fire)
+        signal.setitimer(signal.ITIMER_REAL, total + 12)
+        return lambda: signal.setitimer(signal.ITIMER_REAL, 0)
+    except (ImportError, ValueError, AttributeError, OSError):   # not the main thread / no signals: soft budget only
+        return lambda: None
+
+
 def cmd_probe(a):
     st = Stages(getattr(a, "progress", "") or "")
+    try:
+        total = float(getattr(a, "budget", "") or DEFAULT_BUDGET)
+    except (TypeError, ValueError):
+        total = DEFAULT_BUDGET
+    BUDGET.update(end=time.time() + total, total=total)
+    stop_dog = _watchdog(total) if getattr(a, "progress", "") or getattr(a, "budget", "") else (lambda: None)
     st("connect")
     route = (getattr(a, "route", "") or "auto").lower()
     url = normalize_jd(a.url)
@@ -1266,6 +1479,7 @@ def cmd_probe(a):
     front_mode = os.environ.get("AIW_SHOP_FRONT", "1") != "0"
     fronted, snap, captured, prev = None, {}, {}, ""
     blocked, chain, env = [], [], {}
+    stage_error, signed_done = "", False
     bws = browser_ws()
     tid = bws.call("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
     try:
@@ -1286,6 +1500,18 @@ def cmd_probe(a):
                 u = resp.get("url") or ""
                 if PRICE_NET_RE.search(u) or "cart" in u.lower() or "follow" in u.lower():
                     captured[prm.get("requestId")] = {"url": u, "status": resp.get("status")}
+            elif meth == "Network.loadingFinished" and prm.get("requestId") in captured and hasattr(ws, "request"):
+                # v8: read the body NOW; asked for later Chrome may have dropped it ('No resource with given identifier')
+                rid = prm.get("requestId")
+                if not NET_SKIP.search(net_name(captured[rid].get("url", ""))) and len(ws.bodies) < 30:
+                    def keep(msg, _rid=rid):
+                        res = msg.get("result") or {}
+                        text = res.get("body") or ""
+                        if res.get("base64Encoded"):
+                            text = base64.b64decode(text).decode("utf-8", "replace")
+                        if text:
+                            ws.bodies[_rid] = text[:200000]
+                    ws.request("Network.getResponseBody", {"requestId": rid}, keep)
             elif meth == "Network.requestWillBeSent" and prm.get("type") == "Document" and len(chain) < 12:
                 rr = prm.get("redirectResponse") or {}
                 chain.append({"url": str((prm.get("request") or {}).get("url") or "")[:200],
@@ -1337,22 +1563,22 @@ def cmd_probe(a):
         picked = None
         if route != "alt":
             st("open")
-            ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, 30)
+            ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, cap(20, 30))
             st("wait")
             t_wait = time.time()
-            end = t_wait + float(a.wait)
+            end = t_wait + min(float(a.wait), WAIT_MAX_S, max(1.0, budget_left() - 60))
             last_sig, i = None, 0
             while time.time() < end:
                 if blocked:
                     break
                 try:   # v6: returns as soon as a price element appears (MutationObserver), else after 1.5 s
-                    ws.eval(f"({WAIT_JS})(1500)", 5)
+                    ws.eval(f"({WAIT_JS})(1500)", cap(4))
                 except Exception:  # noqa: BLE001
                     pass
                 time.sleep(0.3)
                 i += 1
                 try:
-                    snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
+                    snap = json.loads(ws.eval(EXTRACT_JS, cap(6)) or "{}")
                 except Exception:  # noqa: BLE001 - navigating; retry
                     time.sleep(0.9)
                     continue
@@ -1360,6 +1586,9 @@ def cmd_probe(a):
                     break
                 if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
                     snap["risk_limit"] = True     # 活动火爆: nothing renders later, stop here
+                    break
+                if jd and snap.get("ready") == "complete" and time.time() - t_wait >= SKELETON_AFTER_S and is_skeleton(snap):
+                    snap["skeleton"] = True       # v8: a generic-title shell: go straight to the signed API
                     break
                 host = urlparse(snap.get("url") or "").hostname or ""
                 if any(k in host for k in LOGIN_HOST_KEYS):
@@ -1419,34 +1648,58 @@ def cmd_probe(a):
         login_page = any(k in host for k in LOGIN_HOST_KEYS)
         on_item = route != "alt" and not blocked and not snap.get("risk_limit") and not login_page
         page_ok = on_item
+        cookies = None
         if jd:
             snap["jd_sku"] = snap.get("jd_sku") or sku
             if page_ok and not has_jd_price(snap) and not kw_price(snap):
-                st("net")
-                snap["net"], got = net_prices(ws, captured, snap["jd_sku"])
-                if got:
-                    snap["api_price"] = got
-                elif "jd.com" in (snap.get("url") or url):
-                    st("api")
-                    snap.update(jd_api_price(ws, snap["jd_sku"]))
+                # v8: the signed API first (proven on 102: it priced the item when the page showed nothing), then the
+                # page's own answers (bodies read at loadingFinished), then the unsigned APIs if time is left
+                if "jd.com" in (snap.get("url") or url):
+                    cookies = read_cookies(bws, ws)
+                    area = jd_area("ipLoc-djd=" + _cookie_value(cookies, "ipLoc-djd")) if cookies else "1_72_2799_0"
+                    st("signed")
+                    r = signed_price(ws, snap["jd_sku"], area)
+                    signed_done = True
+                    snap.setdefault("alt", []).append(r["try"])
+                    if r["price"]:
+                        snap["api_price"] = r["price"]
+                if not snap.get("api_price"):
+                    st("net")
+                    snap["net"], got = net_prices(ws, captured, snap["jd_sku"])
+                    if got:
+                        snap["api_price"] = got
+                    elif "jd.com" in (snap.get("url") or url) and budget_left() > 30:
+                        st("api")
+                        snap.update(jd_api_price(ws, snap["jd_sku"]))
         priced = (has_jd_price(snap) or kw_price(snap) or bool(snap.get("api_price"))) if jd else \
             bool(snap.get("sel") or len(snap.get("cand") or []) >= 1)
         need_diag = not page_ok or not priced
-        if (a.shot or need_diag) and route != "alt":
+        if (a.shot or need_diag) and route != "alt" and (a.shot or budget_left() > 25):
+            # v8: at most ~5 s, never when the price is already known (v7: 27 s on 102)
             st("shot")
+            t_shot = time.time()
             try:   # a background tab produces no frames: bring it forward for the picture
                 if not fronted:
-                    prev = prev or prev_visible(tid)
-                    bws.call("Target.activateTarget", {"targetId": tid}, 5)
-                time.sleep(0.8)
-                snap["screenshot"] = ws.call("Page.captureScreenshot", {"format": "jpeg", "quality": 60}, 20).get("data")
+                    bws.call("Target.activateTarget", {"targetId": tid}, 1.5)
+                time.sleep(0.3)
+                left = SHOT_MAX_S - (time.time() - t_shot)
+                if left > 0.5:
+                    snap["screenshot"] = ws.call("Page.captureScreenshot", {"format": "jpeg", "quality": 50,
+                                                                            "optimizeForSpeed": True}, left).get("data")
+                else:
+                    snap["shot_error"] = "skipped: no time"
             except Exception as e:  # noqa: BLE001
                 snap["shot_error"] = str(e)[:160]
-        cookies = read_cookies(bws, ws)
+        if cookies is None:
+            cookies = read_cookies(bws, ws)
         if jd and not login_page and (route == "alt" or not page_ok or not priced):
             # v7: limited, redirected to the mobile page, or no price: another route, once each
             area = jd_area("ipLoc-djd=" + _cookie_value(cookies, "ipLoc-djd")) if cookies else "1_72_2799_0"
-            snap.update(alt_routes(ws, sku, area, captured, st, on_jd_page=on_item))
+            got_alt = alt_routes(ws, sku, area, captured, st, on_jd_page=on_item, signed_done=signed_done)
+            got_alt["alt"] = (snap.get("alt") or []) + got_alt.get("alt", [])
+            snap.update(got_alt)
+            if snap.get("alt_price") and not a.shot:
+                snap.pop("screenshot", None)   # v8: priced after all: no picture to keep
         if cookies is not None:
             stl = jd_login_state(cookies)
             prof.update(logged_in=stl["logged_in"] if (jd or stl["jd_cookies"]) else None, jd_cookies=stl["jd_cookies"],
@@ -1456,7 +1709,12 @@ def cmd_probe(a):
         snap["snippets"] = snippets(snap)
         snap["net_seen"] = len(captured)
         ws.close()
+    except OutOfTime:
+        # v8: the budget ran out in the middle of a stage: say which, keep everything read so far
+        cur = st.list[-1] if st.list else {}
+        stage_error = f"「{cur.get('label') or cur.get('stage') or '?'}」超时（总预算 {int(BUDGET['total'])} 秒用完）"
     finally:
+        stop_dog()
         try:
             bws.call("Target.closeTarget", {"targetId": tid})
         except Exception:  # noqa: BLE001
@@ -1471,6 +1729,14 @@ def cmd_probe(a):
         st.finish()
     snap["stages"] = st.list
     snap["probe_version"] = PROBE_VERSION
+    snap["budget_s"] = BUDGET["total"]
+    if stage_error:
+        snap["stage_error"] = stage_error
+        snap["timed_out"] = True
+    nm = next((clean_name(x.get("name") or "") for x in (snap.get("api_price"), snap.get("alt_price"))
+               if isinstance(x, dict) and x.get("name")), "")
+    if nm:
+        snap["item_name"] = nm      # v8: the product name from JD's own data (the page may show only the generic title)
     snap["cdp"] = CDP
     snap["asked_url"] = url
     snap["profile"] = prof
@@ -1580,6 +1846,7 @@ def main():
     p.add_argument("--wait", default="20")
     p.add_argument("--progress", default="")
     p.add_argument("--route", default="auto", choices=("auto", "alt"))
+    p.add_argument("--budget", default="")   # v8: seconds for the whole run (the server passes its own)
     sub.add_parser("order")
     sub.add_parser("submit")
     sub.add_parser("close-order")

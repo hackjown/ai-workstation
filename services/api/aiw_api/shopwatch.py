@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import logging
+import random
 import re
 import time
 from pathlib import Path
@@ -250,6 +251,21 @@ def embedded_price(items: list) -> Optional[dict]:
     return None
 
 
+RISK_ALT_NOTE = "京东风控限流，已自动换方式读价"
+ROUTE_CN = {"signed": "京东签名价格接口", "cart": "购物车", "follow": "我的关注"}
+
+
+def _alt_result(alt: dict) -> dict:
+    price, fin = alt.get("price"), alt.get("final_price")
+    if fin is not None and price is not None and not (price * 0.3 <= fin <= price + 1e-9):
+        fin = None
+    out = {"status": "ok", "price": price, "final_price": fin, "effective": fin if fin is not None else price,
+           "in_stock": alt.get("in_stock"), "via": "alt", "alt_src": alt.get("src")}
+    if alt.get("plus_price"):
+        out["plus_price"] = alt["plus_price"]
+    return out
+
+
 def parse_snapshot(snap: dict) -> dict:
     """Raw probe snapshot -> {status, price, final_price, effective, in_stock, title, url, note}.
 
@@ -275,10 +291,26 @@ def parse_snapshot(snap: dict) -> dict:
     if "logged_in" in prof:
         res["logged_in"] = prof.get("logged_in")
     frames = " ".join(snap.get("frames") or [])
-    if snap.get("risk_limit") or is_risk_limit(url, text):
+    risk = bool(snap.get("risk_limit") or is_risk_limit(url, text) or snap.get("mobile_blocked"))
+    alt = snap.get("alt_price") if isinstance(snap.get("alt_price"), dict) else None
+    if (risk or snap.get("route") == "alt") and alt and (alt.get("price") or alt.get("final_price")):
+        # v7: the item page was limited / sent to the mobile page (or skipped during the cool-down): another route
+        res.update(_alt_result(alt), risk=risk or bool(snap.get("cooling")), route=snap.get("route") or "auto")
+        res["title"] = res["title"] if res["title"] and not is_risk_limit(url, res["title"]) and "多快好省" not in res["title"] else ""
+        res["note"] = (RISK_ALT_NOTE if res["risk"] else "") + f"（{ROUTE_CN.get(alt.get('src'), alt.get('src') or '')}）"
+        return res
+    if risk or snap.get("route") == "alt":
         # 活动火爆 请选购其他商品 (trade.m.jd.com/common/limit.html): JD refuses this computer for now; not a captcha
-        res.update(status="risk_limit", note="京东风控限制了这台电脑的访问（活动火爆页）。这不是验证码，没有可以完成的验证"
-                   + ("；读价用的浏览器也没有登录京东" if prof.get("logged_in") is False else ""))
+        res["risk"] = True
+        if snap.get("mobile_blocked") and not snap.get("risk_limit"):
+            note = ("京东把商品页跳到了移动版商品页（item.m.jd.com，被限流的就是它），已拦截没有打开；"
+                    "换方式（签名接口/购物车/我的关注）也没读到价格")
+        elif snap.get("route") == "alt" and not risk:
+            note = "京东风控限流冷却中，只用了其他方式（签名接口/购物车/我的关注），没读到价格"
+        else:
+            note = "京东风控限制了这台电脑的访问（活动火爆页）。这不是验证码，没有可以完成的验证" + (
+                "；已自动换方式（签名接口/购物车/我的关注）也没读到价格" if snap.get("alt") else "")
+        res.update(status="risk_limit", note=note + ("；读价用的浏览器也没有登录京东" if prof.get("logged_in") is False else ""))
         return res
     if any(h in host for h in LOGIN_HOSTS) or (snap.get("password_input") and re.search(r"登录|login", text[:800] + title, re.I)) \
             or any(h in frames for h in ("login.taobao.com", "passport.jd.com", "havanalogin")):
@@ -346,6 +378,9 @@ def parse_snapshot(snap: dict) -> dict:
         if res["price"] is None or (res["price"] * 0.3 <= f <= res["price"]):
             res["final_price"] = f
     api = snap.get("api_price") if isinstance(snap.get("api_price"), dict) else None
+    alt_used = False
+    if api is None and alt and (alt.get("price") or alt.get("final_price")):
+        api, alt_used = alt, True     # v7: no price on the item page: signed API / cart / 我的关注
     if api is None:
         for att in snap.get("api") or []:
             got = parse_api_price(att.get("body") or "") if isinstance(att, dict) and att.get("body") else None
@@ -360,8 +395,9 @@ def parse_snapshot(snap: dict) -> dict:
             res["final_price"] = f
         if api.get("plus_price"):
             plus.append(float(api["plus_price"]))
-        res["via"] = "api"
-        res["note"] = f"页面没显示价格，价格由京东价格接口读出（{api.get('src') or 'api'}）"
+        res["via"] = "alt" if alt_used else "api"
+        res["note"] = (f"页面没显示价格，价格由{ROUTE_CN.get(api.get('src'), '')}读出" if alt_used else
+                       f"页面没显示价格，价格由京东价格接口读出（{api.get('src') or 'api'}）")
     if res["price"] is None and res["final_price"] is None:
         tp = text_prices(snap.get("kw") or [])     # v6: '到手价 ¥137' in the visible text near the top
         if tp["price"] is not None or tp["final_price"] is not None:
@@ -801,8 +837,61 @@ async def desktop_read(computer, sessions, w: dict) -> Optional[dict]:
 # ----------------------------------------------------------------------------- the scheduled check
 LIVE_TASK = ("queued", "running", "paused", "takeover", "waiting_confirm", "waiting_input")
 FAIL_STATES = ("error", "no_price", "no_browser")
-PROBE_TIMEOUT = 120         # v6 waits up to ~20 s (front, scroll), reads page/API prices, mobile page, screenshot
+PROBE_TIMEOUT = 160         # v7 adds signed API / cart / 我的关注 routes; v6 waits up to ~20 s (front, scroll), reads page/API prices, mobile page, screenshot
 RISK_BACKOFF_MIN = 2 * 3600  # JD's 活动火爆 page: look again much later, more checks only keep it on
+
+
+# v7: JD's limiter is per computer (its IP / browser), so the cool-down is too: every watch on that computer waits.
+RISK_COOL_BASE = int(os.environ.get("AIW_SHOP_RISK_COOL_MIN", "45")) * 60    # 45 min, then 90, 180 ... (max 12 h)
+RISK_COOL_MAX = 12 * 3600
+
+
+def jitter(seconds: float, frac: float = 0.15, rnd: Optional[Callable[[], float]] = None) -> float:
+    """seconds +-frac (so checks never line up on a fixed beat JD can see)."""
+    r = (rnd or random.random)()
+    return round(max(60.0, seconds * (1 - frac + 2 * frac * r)), 3)
+
+
+def risk_cooldown(level: int, rnd: Optional[Callable[[], float]] = None) -> float:
+    return jitter(min(RISK_COOL_BASE * (2 ** max(0, level - 1)), RISK_COOL_MAX), 0.2, rnd)
+
+
+def risk_state(store, mid: str) -> dict:
+    try:
+        return store.kv_get(f"shop_risk:{mid}", None) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def risk_cooling(store, mid: str, now: float) -> Optional[dict]:
+    st = risk_state(store, mid)
+    return st if float(st.get("until") or 0) > now else None
+
+
+def risk_hit(store, mid: str, now: float, alt_ok: bool, url: str = "") -> dict:
+    """One more limit page (or redirect to the mobile page) on this computer: the cool-down doubles."""
+    st = risk_state(store, mid)
+    # a limit page long after the last cool-down ended starts over at level 1
+    level = 1 if now - float(st.get("until") or 0) > 24 * 3600 else int(st.get("level") or 0) + 1
+    st = {"level": level, "at": now, "until": now + risk_cooldown(level), "alt_ok": bool(alt_ok), "url": (url or "")[:200]}
+    store.kv_set(f"shop_risk:{mid}", st)
+    return st
+
+
+def risk_alt(store, mid: str, alt_ok: bool) -> None:
+    st = risk_state(store, mid)
+    if st:
+        st["alt_ok"] = bool(alt_ok)
+        store.kv_set(f"shop_risk:{mid}", st)
+
+
+def risk_clear(store, mid: str) -> None:
+    if risk_state(store, mid):
+        store.kv_set(f"shop_risk:{mid}", {})
+
+
+def mins_left(until: float, now: float) -> int:
+    return max(1, int(round((until - now) / 60)))
 
 
 def risk_backoff(interval_s: int, fails: int) -> int:
@@ -844,10 +933,12 @@ def no_browser_text(machine: str, bname: str, ens: Optional[dict], raw_note: str
 USER_STATES = ("login", "need_login", "captcha", "risk_limit")   # the user (or time) has to clear these
 
 
-def risk_text(machine: str, bname: str = "Chrome") -> str:
-    return (f"京东风控限制了「{machine}」的访问（活动火爆页：“活动火爆 请选购其他商品”）。这不是验证码，没有要完成的验证。"
-            f"检查已自动放慢（至少 2 小时一次）。可以在「{machine}」的接管桌面里用 {bname} 手动打开一次这个商品看看，"
-            "或者等几个小时再试；频繁刷新只会让限制更久。")
+def risk_text(machine: str, bname: str = "Chrome", minutes: Optional[int] = None) -> str:
+    wait = f"约 {minutes} 分钟后再试，之后每次被限流冷却时间翻倍" if minutes else "冷却 30–60 分钟后再试，之后每次被限流冷却时间翻倍"
+    return (f"京东风控限流：「{machine}」被京东限制访问（活动火爆页：“活动火爆 请选购其他商品”）。这不是验证码，没有要完成的验证。"
+            f"已自动换方式（京东签名接口 / 购物车 / 我的关注）读价，读不到就稍后重试：{wait}，冷却期间不打开商品页。"
+            f"可以在「{machine}」的接管桌面里用 {bname} 手动打开一次这个商品看看；频繁刷新只会让限制更久。"
+            "把商品加入购物车或关注它，换方式读价会更稳。")
 
 
 DIAG_STATES = ("no_price", "risk_limit", "need_login", "login", "captcha", "error", "no_browser")
@@ -871,6 +962,24 @@ def diag_hints(raw: dict, r: dict) -> list[str]:
         h.append(f"电脑上运行的探针是 v{pv}，服务器带的是 v{PROBE_VERSION}（推送没成功？）")
     if raw.get("risk_limit"):
         h.append("京东返回了 活动火爆 风控页（limit.html）")
+    env = raw.get("env") if isinstance(raw.get("env"), dict) else {}
+    if raw.get("mobile_blocked"):
+        h.append("京东把商品页跳到了移动版商品页（item.m.jd.com，限流的就是它），探针已拦截没有打开")
+    if env.get("ua_override"):
+        h.append("浏览器的 User-Agent 像手机（京东会把手机 UA 跳到移动版），这次已改成电脑版 UA")
+    if env.get("webdriver"):
+        h.append("浏览器报告 navigator.webdriver=true（像是带自动化参数启动），已在页面里改成 false")
+    res = raw.get("resolved") if isinstance(raw.get("resolved"), dict) else None
+    if res and not res.get("sku"):
+        h.append("短链接没能解析出商品编号（" + str(res.get("error") or "") + "）")
+    for a in raw.get("alt") or []:
+        if not isinstance(a, dict) or a.get("price"):
+            continue
+        name = {"signed": "京东签名接口", "cart": "购物车", "follow": "我的关注"}.get(a.get("route"), a.get("route"))
+        why = ("没登录" if a.get("login") else "风控页" if a.get("risk_limit") else
+               "列表里没有这个商品" if a.get("missing") == "not_listed" else
+               (a.get("refused") or a.get("error") or (f"HTTP {a.get('status')}" if a.get("status") else "没读到")))
+        h.append(f"{name}：{str(why)[:60]}")
     if r.get("status") in ("need_login", "login") or (raw.get("profile") or {}).get("logged_in") is False:
         h.append("读价用的浏览器没有京东登录 Cookie（pt_key / thor）")
     if r.get("status") == "no_price":
@@ -915,6 +1024,12 @@ def build_diag(raw: dict, r: dict, prog: Optional[Progress], now: float, shot: b
                     | {"price_texts": [x.get("t") for x in (mob.get("cand") or [])[:5]]}) if mob else None,
          "profile": {k: prof.get(k) for k in ("port", "dir", "logged_in", "jd_cookies", "login_cookies", "cookies_total") if k in prof},
          "cdp": raw.get("cdp"), "error": raw.get("error") or raw.get("shot_error"),
+         "route": raw.get("route"), "env": raw.get("env"), "nav_chain": (raw.get("nav_chain") or [])[:12],
+         "mobile_blocked": raw.get("mobile_blocked"), "resolved": raw.get("resolved"),
+         "alt": [{k: a.get(k) for k in ("route", "price", "status", "error", "refused", "login", "missing", "rows", "url",
+                                        "signed", "risk_limit", "from") if k in a}
+                 for a in raw.get("alt") or [] if isinstance(a, dict)],
+         "cooldown": r.get("cooldown"),
          "probe_stages": raw.get("stages") or [], "stages": prog.close() if prog else [],
          "screenshot": bool(shot)}
     d["hints"] = diag_hints(raw, r)
@@ -978,11 +1093,23 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
     if url and url != w.get("url"):   # an old watch saved with a mobile / share link: probe the desktop item page
         store.update("watches", w["id"], url=url)
         w = {**w, "url": url}
+    is_jd = (w.get("site") or site_of(w["url"])) == "jd"
+    route = ""
+    cool = risk_cooling(store, mid, now) if is_jd else None
+    if cool:
+        # v7: JD limited this computer a moment ago. Scheduled checks touch JD again only by the other route and only
+        # while that route works; the item page waits for the cool-down to end. 立即检查 tries the other route once.
+        if not manual and not cool.get("alt_ok"):
+            res = await _risk_wait(store, w, mid, cool, now)
+            res["stages"] = prog.close()
+            return res
+        route = "alt"
     ens, raw = None, {}
     try:
         computer = await _computer(sessions, mid)
         prog("push")
-        raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, progress=prog, url=w["url"], sku=w.get("sku") or "")
+        raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, progress=prog, url=w["url"], sku=w.get("sku") or "",
+                              route=route)
         if str(raw.get("error", "")).startswith("NO_CDP"):
             # (1) any other answering endpoint, (2) or the user's own Chrome reopened with the port, login kept
             prog("ensure")
@@ -994,7 +1121,7 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
             if ens.get("ok"):
                 prog("push")
                 raw = await run_probe(computer, "probe", timeout=PROBE_TIMEOUT, cdp_port=ens.get("port"), progress=prog,
-                                      url=w["url"], sku=w.get("sku") or "")
+                                      url=w["url"], sku=w.get("sku") or "", route=route)
                 if ens.get("how") in ("relaunched", "launched"):
                     await notifier.notify("watch", f"已重新打开 Chrome（带调试端口）：{w['name']}",
                                           f"「{(store.machine(mid) or {}).get('name') or mid}」上的 Chrome 之前没开调试端口，"
@@ -1002,6 +1129,8 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
                                           link=w["url"], push=False)
         r = parse_snapshot(raw)
         mname = (store.machine(mid) or {}).get("name") or mid
+        if is_jd and isinstance(raw, dict) and not raw.get("error"):
+            r = _risk_update(store, w, mid, raw, r, route, now)
         if r["status"] == "need_login":
             r["note"] = f"「{mname}」上的 {_bname(store, mid)} " + r["note"].replace("读价用的浏览器", "")
         elif r["status"] == "risk_limit":
@@ -1044,6 +1173,47 @@ async def check(sched, w: dict, now: Optional[float] = None, manual: bool = Fals
     res["diag"] = diag
     res["stages"] = diag["stages"]
     return res
+
+
+def _risk_update(store, w: dict, mid: str, raw: dict, r: dict, route: str, now: float) -> dict:
+    """v7: keep the computer's cool-down in step with what this run met, and say it on the card."""
+    sku = str(raw.get("jd_sku") or (raw.get("resolved") or {}).get("sku") or "")
+    if sku.isdigit() and not normalize_jd(w.get("url") or "").startswith("https://item.jd.com/"):
+        store.update("watches", w["id"], url=f"https://item.jd.com/{sku}.html")   # a short link, resolved for good
+    if route == "alt":
+        st = risk_state(store, mid)
+        risk_alt(store, mid, r.get("status") == "ok")
+        until = float(st.get("until") or now)
+        if r.get("status") == "ok":
+            r["note"] = (RISK_ALT_NOTE + r["note"][len(RISK_ALT_NOTE):] if r.get("note", "").startswith(RISK_ALT_NOTE)
+                         else RISK_ALT_NOTE + (r.get("note") or "")) + f"；商品页冷却中，约 {mins_left(until, now)} 分钟后再打开"
+            r["risk"] = True
+        else:
+            r["retry_at"] = until
+            r["note"] = "京东风控限流冷却中，换方式也没读到价格，约 " + f"{mins_left(until, now)} 分钟后再试（冷却期间不再打开商品页）"
+        return r
+    if r.get("risk"):
+        st = risk_hit(store, mid, now, r.get("status") == "ok", raw.get("url") or "")
+        if r.get("status") == "ok":
+            r["note"] = (r.get("note") or RISK_ALT_NOTE) + f"；商品页冷却约 {mins_left(st['until'], now)} 分钟"
+        else:
+            r["retry_at"] = st["until"]
+            r["note"] = (r.get("note") or "京东风控限流") + f"。已自动换方式/稍后重试：约 {mins_left(st['until'], now)} 分钟后再试"
+        r["cooldown"] = {"level": st["level"], "until": st["until"]}
+    elif r.get("status") == "ok":
+        risk_clear(store, mid)
+    return r
+
+
+async def _risk_wait(store, w: dict, mid: str, cool: dict, now: float) -> dict:
+    """No JD request at all while the computer cools down and the other route did not work either."""
+    left = mins_left(float(cool["until"]), now)
+    note = f"京东风控限流冷却中（{machine_label(store, mid)}），约 {left} 分钟后再试；冷却期间不访问京东"
+    store.update("watches", w["id"], shop_status="risk_limit", status_note=note, last_error=note[:300],
+                 next_check=float(cool["until"]) + jitter(180, 0.5))
+    return {"ok": False, "waiting": "risk_cooldown", "machine": mid, "until": cool["until"], "error": note,
+            "result": {"status": "risk_limit", "note": note, "price": None, "final_price": None, "effective": None,
+                       "in_stock": None, "title": ""}}
 
 
 BUSY_RECHECK_S = int(os.environ.get("AIW_SHOP_BUSY_RECHECK_S", "300"))
@@ -1094,7 +1264,7 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
     if r["status"] == "ok":
         fields.update(price=r.get("price"), final_price=r.get("final_price"),
                       in_stock=None if r.get("in_stock") is None else int(bool(r["in_stock"])),
-                      fail_count=0, last_error=None, next_check=now + interval,
+                      fail_count=0, last_error=None, next_check=now + jitter(interval),
                       last_value=f"{r['effective']:g}")
         hit, below, msg = evaluate(w, r)
         fields["below"] = int(below)
@@ -1106,7 +1276,8 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
         if manual or (prev_status in FAIL_STATES + USER_STATES):
             say_chat(f"价格监控「{w['name']}」恢复了：{price_line(r, w.get('value') or 0)}。"
                      + ("（页面没显示价格，这次是从京东价格接口读的）" if r.get("via") == "api" else "")
-                     + ("（这次是从屏幕截图读的）" if r.get("via") == "screen" else ""))
+                     + ("（这次是从屏幕截图读的）" if r.get("via") == "screen" else "")
+                     + (f"（{r.get('note')}）" if r.get("via") == "alt" and r.get("note") else ""))
         if hit:
             w2 = store.get("watches", w["id"])
             title = w2.get("item_title") or w2["name"]
@@ -1125,16 +1296,18 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
     elif r["status"] == "price_pending":     # not a failure: keep looking at the normal pace until it is priced
         fields.update(below=0, fail_count=0, next_check=now + interval, last_error=None)
     elif r["status"] == "risk_limit":       # JD's 活动火爆 page: back off for hours, more checks only keep it on
-        fields.update(fail_count=fails, next_check=now + risk_backoff(interval, fails), last_error=(r.get("note") or "")[:300])
+        fields.update(fail_count=fails, next_check=r.get("retry_at") or now + jitter(risk_backoff(interval, fails)),
+                      last_error=(r.get("note") or "")[:300])
     else:
-        fields.update(fail_count=fails, next_check=now + _backoff(interval, fails), last_error=(r.get("note") or r["status"])[:300])
+        fields.update(fail_count=fails, next_check=now + jitter(_backoff(interval, fails)), last_error=(r.get("note") or r["status"])[:300])
     store.update("watches", w["id"], **fields)
     bname = _bname(store, mid)
     changed = r["status"] != prev_status
     if changed:
         if r["status"] == "risk_limit":
-            await notifier.notify("watch_error", f"京东风控限制了访问（{machine}）：{w['name']}",
-                                  risk_text(machine, bname) + f"\n{w['url']}", link=w["url"], deep=f"takeover/{mid}")
+            mins = mins_left(r["retry_at"], now) if r.get("retry_at") else None
+            await notifier.notify("watch_error", f"京东风控限流，已自动换方式/稍后重试（{machine}）：{w['name']}",
+                                  risk_text(machine, bname, mins) + f"\n{w['url']}", link=w["url"], deep=f"takeover/{mid}")
         elif r["status"] == "need_login":
             await notifier.notify("watch_error", f"需要登录{site_name}（{machine}）：{w['name']}",
                                   f"{r.get('note')}。请在 AIW 里打开「{machine}」的接管桌面，在 {bname} 里登录京东一次（扫码即可），"
@@ -1161,7 +1334,7 @@ async def apply_result(store, sessions, notifier, w: dict, r: dict, now: float, 
     if r["status"] in FAIL_STATES + USER_STATES + ("no_machine",) and (changed or manual or fails == 3):
         what = {"login": f"「{machine}」上的 {bname} 还没登录{site_name}：请在接管桌面里登录一次（扫码即可），再点「{OPT_RETRY}」。",
                 "need_login": f"{r.get('note')}：请在「{machine}」的接管桌面里登录京东一次（扫码即可），再点「{OPT_RETRY}」。",
-                "risk_limit": risk_text(machine, bname),
+                "risk_limit": risk_text(machine, bname, mins_left(r["retry_at"], now) if r.get("retry_at") else None),
                 "captcha": f"{site_name}弹出了滑块/安全验证：请在「{machine}」的接管桌面里完成一次，再点「{OPT_RETRY}」。"
                 }.get(r["status"]) or str(r.get("note") or r["status"])
         if r["status"] in ("error", "no_price"):

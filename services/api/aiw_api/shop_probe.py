@@ -12,6 +12,17 @@ The API ships this file to ~/.config/aiw/shop/probe.py and runs one command per 
   probe.py url                                      the visible tab's URL
   probe.py profile                                  which Chrome profile answers and whether it is logged in to JD
 
+v7 (2026-10-29): on ai-linux-001 v6 ended on trade.m.jd.com/common/limit.html?module=detail_m1 (the MOBILE item page's
+limiter) with a logged-in desktop profile (thor). v7 never loads the mobile item page: short links (3.cn, u.jd.com,
+union-click) are resolved to the sku over plain HTTP first (stopping before item.m.jd.com), the tab gets a desktop
+user agent when the browser's looks mobile (item.jd.com 302s mobile UAs to item.m.jd.com), navigator.webdriver is
+patched before any page script, the item page is opened as a link from www.jd.com (referrer), and every Document
+request to item.m.jd.com or limit.html is refused (Fetch domain) and recorded with the redirect chain. When the item
+page is limited, redirected or shows no price, the price is read once by another route, in order: JD's own signed
+pc_detailpage_wareBusiness (PSign / h5st made by JD's SDK in the page), the cart page (cart.jd.com/cart_index) and
+the 我的关注 list (t.jd.com/follow/product), both read-only. --route alt skips the item page (the server's cool-down
+after a limit page). The v6 item.m.jd.com fallback is gone: it was the page being limited.
+
 v6 (2026-10-29): the item tab is brought to the front when it stays hidden without a price (a background tab never
 runs requestAnimationFrame / IntersectionObserver, so JD's client-rendered price module may never appear), waits with a
 MutationObserver (up to ~20 s, scrolling), reads open shadow roots and same-origin iframes, the price-keyword text
@@ -42,7 +53,7 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "6"
+PROBE_VERSION = "7"
 CDP = os.environ.get("VM_AGENT_CDP", "http://127.0.0.1:9222")
 # DevTools is on 127.0.0.1: never through an http_proxy the desktop user may have set (it answers 404 / refuses)
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -51,7 +62,8 @@ ORDER_HOSTS = ("trade.jd.com", "buy.taobao.com", "buy.tmall.com", "h5.m.taobao.c
 # ----------------------------------------------------------------------------- pure helpers (unit-tested)
 _JD_SKU = (r"item\.jd\.com/(\d+)\.html", r"item\.m\.jd\.com/product/(\d+)\.html", r"item\.m\.jd\.com/(\d+)\.html",
            r"(?:^|\.)m\.jd\.com/product/(\d+)\.html", r"jd\.com/product/(\d+)\.html",
-           r"item\.m\.jd\.com/ware/view\.action\?(?:.*&)?wareId=(\d+)", r"jd\.(?:com|hk)/.*?[?&](?:sku|skuId|wareId)=(\d+)")
+           r"item\.m\.jd\.com/ware/view\.action\?(?:.*&)?wareId=(\d+)", r"jd\.(?:com|hk)/.*?[?&](?:sku|skuId|wareId)=(\d+)",
+           r"(?:wqitem|wq)\.jd\.com/item/view\?(?:.*&)?sku=(\d+)")
 RISK_TEXT = ("活动火爆", "请选购其他商品")
 JD_LOGIN_COOKIES = ("pt_key", "thor")          # pt_pin alone (the account name) stays after a logout: not a session
 JD_ID_COOKIES = ("pt_key", "pt_pin", "thor")
@@ -204,6 +216,155 @@ def api_urls(sku: str) -> list[tuple[str, str]]:
             ("p.3.cn", f"https://p.3.cn/prices/mgets?skuIds=J_{sku}")]
 
 
+# ----------------------------------------------------------------------------- v7: links, user agent, routes
+JD_SHORT_HOSTS = ("3.cn", "u.jd.com", "union-click.jd.com", "jd.cn", "m.jd.com", "jingfen.jd.com", "prodev.m.jd.com")
+# the mobile item page and its limiter: never loaded by the probe (module=detail_m1 is what JD rate-limits)
+MOBILE_DOC_PATTERNS = ("*://item.m.jd.com/*", "*://trade.m.jd.com/common/limit.html*", "*://wqitem.jd.com/*",
+                       "*://wq.jd.com/item/*")
+_MOBILE_UA = re.compile(r"iphone|ipad|ipod|android|mobile|\bios\b|windows phone|harmonyos", re.I)
+JD_HOME = "https://www.jd.com/"
+CART_URL = "https://cart.jd.com/cart_index"
+FOLLOW_URL = "https://t.jd.com/follow/product"
+
+
+def is_jd_link(url: str) -> bool:
+    host = (urlparse((url or "").strip()).hostname or "").lower()
+    return host in JD_SHORT_HOSTS or host == "jd.com" or host.endswith((".jd.com", ".3.cn"))
+
+
+def is_mobile_item_url(url: str) -> bool:
+    """item.m.jd.com / wqitem / the limit page: the mobile item flow JD limits (module=detail_m1)."""
+    u = (url or "").lower()
+    host = urlparse(u).hostname or ""
+    return host in ("item.m.jd.com", "wqitem.jd.com") or "/common/limit.html" in u or (host == "wq.jd.com" and "/item/" in u)
+
+
+def mobile_ua(ua: str) -> bool:
+    return bool(_MOBILE_UA.search(ua or ""))
+
+
+def desktop_ua(ua: str) -> str:
+    """A desktop Chrome UA with the same Chrome version (item.jd.com 302s any mobile UA to item.m.jd.com)."""
+    m = re.search(r"(?:Chrome|CriOS)/(\d+)", ua or "")
+    major = m.group(1) if m else "130"
+    return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+
+
+_HOP_RE = (re.compile(r"""\bhrl\s*=\s*['"]([^'"]+)['"]"""), re.compile(r"""location(?:\.href)?\s*=\s*['"](https?:[^'"]+)['"]"""),
+           re.compile(r"""location\.replace\(\s*['"](https?:[^'"]+)['"]"""),
+           re.compile(r"""<meta[^>]+http-equiv=["']?refresh[^>]+url=([^"'>\s]+)""", re.I))
+
+
+def next_hop(base: str, body: str) -> str:
+    """The URL a JD jump page (u.jd.com / union-click: var hrl='...'; a meta refresh) sends the browser to."""
+    from urllib.parse import urljoin
+    for rx in _HOP_RE:
+        m = rx.search(body or "")
+        if m:
+            return urljoin(base, m.group(1).replace("&amp;", "&"))
+    m = re.search(r"item\.jd\.com/(\d+)\.html|item\.m\.jd\.com/product/(\d+)\.html", body or "")
+    if m:
+        return f"https://item.jd.com/{m.group(1) or m.group(2)}.html"
+    return ""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):   # noqa: D401 - we follow by hand (and stop before item.m.jd.com)
+        return None
+
+
+def _http_hop(url: str, timeout: float = 8) -> tuple[int, str, str]:
+    """One GET without following redirects: (status, Location, body head). Desktop UA, no cookies."""
+    op = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers={"User-Agent": desktop_ua(""), "Accept-Language": "zh-CN,zh;q=0.9"})
+    try:
+        with op.open(req, timeout=timeout) as r:   # noqa: S310 - JD short links only
+            return r.status, r.headers.get("Location") or "", r.read(60000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location") or "", ""
+
+
+def resolve_jd_link(url: str, hop=None, hops: int = 6) -> dict:
+    """3.cn / u.jd.com / union-click / other JD links without a sku -> the sku, over plain HTTP (no browser, no
+    cookies). Stops at the first URL that names the sku, so item.m.jd.com itself is never fetched."""
+    from urllib.parse import urljoin
+    hop = hop or _http_hop
+    chain, cur = [], (url or "").strip()
+    for _ in range(hops):
+        sku = jd_sku_of(cur)
+        if sku:
+            return {"sku": sku, "url": f"https://item.jd.com/{sku}.html", "chain": chain}
+        if not cur.startswith("http"):
+            break
+        try:
+            status, loc, body = hop(cur)
+        except Exception as e:  # noqa: BLE001
+            chain.append({"url": cur[:200], "error": f"{type(e).__name__}: {e}"[:120]})
+            return {"sku": "", "url": url, "chain": chain, "error": chain[-1]["error"]}
+        chain.append({"url": cur[:200], "status": status})
+        nxt = urljoin(cur, loc) if loc else next_hop(cur, body)
+        if not nxt or nxt == cur:
+            break
+        cur = nxt
+    sku = jd_sku_of(cur)
+    if sku:
+        return {"sku": sku, "url": f"https://item.jd.com/{sku}.html", "chain": chain}
+    return {"sku": "", "url": url, "chain": chain, "error": "no sku in the link"}
+
+
+def jd_area(cookie_str: str) -> str:
+    """ipLoc-djd=1-72-2799-0 (the user's delivery area) -> 1_72_2799_0; Beijing when absent."""
+    m = re.search(r"(?:^|;\s*)ipLoc-djd=([\d\-_.]+)", cookie_str or "")
+    if not m:
+        return "1_72_2799_0"
+    parts = re.split(r"[-_.]", m.group(1))[:4]
+    return "_".join(parts + ["0"] * (4 - len(parts)))
+
+
+RISK_CODES = re.compile(r'"code"\s*:\s*"?(601|605|403|-1|1)"?|"echo"\s*:|risk|verify|h5st', re.I)
+
+
+def api_risk(body: str) -> str:
+    """Why a JD API answer carries no data: a risk / signature refusal ('' when it looks like data)."""
+    b = (body or "")[:600]
+    if not b or parse_api_price(body):
+        return ""
+    m = re.search(r'"(?:echo|message|msg)"\s*:\s*"([^"]{1,80})"', b)
+    if RISK_CODES.search(b):
+        return (m.group(1) if m else b[:80]).strip()
+    return ""
+
+
+def items_for_sku(body, sku: str) -> list:
+    """Objects in a cart / follow-list API answer that are this sku (skuId / id / wareId), at most 5."""
+    data = _jsonp(body) if isinstance(body, str) else body
+    out = []
+    for d in _walk(data):
+        ids = {str(d.get(k)) for k in ("skuId", "skuid", "sku", "id", "wareId", "itemId", "productId") if d.get(k) is not None}
+        if sku in ids and any(re.search(r"price|Price", k) for k in d):
+            out.append(d)
+            if len(out) >= 5:
+                break
+    return out
+
+
+def price_of_items(body, sku: str) -> dict | None:
+    """The price of this sku inside a cart / follow-list API answer (other items in the list are ignored)."""
+    for d in items_for_sku(body, sku):
+        got = parse_api_price(d)
+        p = _num(d.get("price")) or _num(d.get("jdPrice")) or _num(d.get("salePrice"))
+        if not got:
+            got = {"price": p, "final_price": None, "plus_price": None, "in_stock": None} if p else None
+        elif got.get("price") is None and p:
+            # a cart row: {"skuId", "price": "187.00", "finalPrice": {...到手价}} -> the row's own price is the price
+            got = dict(got, price=p)
+            if got.get("final_price") and not (p * 0.3 <= got["final_price"] <= p + 1e-9):
+                got["final_price"] = None
+        if got and (got.get("price") or got.get("final_price")):
+            return got
+    return None
+
+
 # ----------------------------------------------------------------------------- tiny websocket client (RFC 6455)
 class WS:
     def __init__(self, url: str, timeout: float = 15):
@@ -290,6 +451,12 @@ class WS:
                     raise RuntimeError(f"{method}: {msg['error'].get('message')}")
                 return msg.get("result", {})
         raise TimeoutError(method)
+
+    def notify(self, method: str, params: dict | None = None):
+        """v7: a command whose answer we do not wait for (Fetch.failRequest from inside an event handler: a nested
+        call() would swallow the answer the outer call is waiting for)."""
+        self.ids += 1
+        self.send(json.dumps({"id": self.ids, "method": method, "params": params or {}}))
 
     def eval(self, expr: str, timeout: float = 20):
         r = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True, "awaitPromise": True}, timeout)
@@ -604,6 +771,69 @@ API_JS = r"""
 })
 """
 
+# v7: before any page script runs: a browser started for automation reports navigator.webdriver = true
+STEALTH_JS = r"""
+try { if (navigator.webdriver) Object.defineProperty(Navigator.prototype, 'webdriver', {get: () => false, configurable: true}); } catch (e) {}
+"""
+
+ENV_JS = "JSON.stringify({ua: navigator.userAgent, webdriver: navigator.webdriver === true, platform: navigator.platform || ''})"
+
+# v7: JD's own signed price API, from any desktop jd.com page (item page, cart): JD's SDK (ParamsSign -> h5st,
+# SHA256, getJsToken) is the one the item page uses (appId fb5df, pc-item-soa / pc_detailpage_wareBusiness); it is
+# loaded from JD's CDN when the page has not got it. The logged-in cookies apply (credentials: include).
+SIGNED_JS = r"""
+(async (sku, area) => {
+  const one = {src: 'signed:pc_detailpage_wareBusiness', origin: location.origin};
+  const load = src => new Promise(ok => { const s = document.createElement('script'); s.src = src; s.onload = () => ok(true);
+    s.onerror = () => ok(false); (document.head || document.documentElement).appendChild(s); setTimeout(() => ok(false), 8000); });
+  try {
+    if (!window.ParamsSign && !window.PSign) one.sdk_loaded = await load('https://storage.360buyimg.com/webcontainer/js_security_v3_0.1.8.js');
+    if (!window.SHA256) await load('https://storage.360buyimg.com/retail-mall/lib/sha256-new.js');
+    if (!window.getJsToken) await load('https://gias.jd.com/js/pc-tk.js');
+    const signer = window.PSign || (window.ParamsSign ? new window.ParamsSign({appId: 'fb5df', preRequest: false, debug: false,
+      onSign() {}, onRequestTokenRemotely() {}, onRequestToken() {}}) : null);
+    if (!signer || !window.SHA256) { one.error = 'no JD signing SDK on ' + location.host; return JSON.stringify(one); }
+    const body = {skuId: Number(sku) || sku, area, num: 1, bbTraffic: '', giftServiceIsSelected: '', customInfoId: ''};
+    const t = Date.now(); const bs = JSON.stringify(body);
+    const sig = await signer.sign({appid: 'pc-item-soa', functionId: 'pc_detailpage_wareBusiness', client: 'pc',
+                                   clientVersion: '1.0.0', t, body: window.SHA256(bs)});
+    const tok = await new Promise(ok => { try { window.getJsToken(r => ok((r && r.jsToken) || ''), 200); } catch (e) { ok(''); }
+                                          setTimeout(() => ok(''), 3000); });
+    const ck = (document.cookie.match(/(?:^|;\s*)__jda=([^;]+)/) || [])[1] || '';
+    const q = new URLSearchParams({appid: 'pc-item-soa', functionId: 'pc_detailpage_wareBusiness', client: 'pc',
+      clientVersion: '1.0.0', t: String(t), body: bs, h5st: (sig && sig.h5st) || '', 'x-api-eid-token': tok,
+      loginType: '3', uuid: ck.split('.')[1] || '', scval: String(sku)});
+    one.signed = !!(sig && sig.h5st);
+    const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 8000);
+    const r = await fetch('https://api.m.jd.com/?' + q.toString(), {credentials: 'include', signal: ctl.signal}); clearTimeout(tm);
+    one.status = r.status; one.body = (await r.text()).slice(0, 60000);
+  } catch (e) { one.error = String(e).slice(0, 160); }
+  return JSON.stringify(one);
+})
+"""
+
+# v7: this sku's row on the cart / 我的关注 page (read only: nothing is clicked or changed there)
+ROW_JS = r"""
+(sku => {
+  const T = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  const links = [...document.querySelectorAll('a[href*="' + sku + '"], [data-sku="' + sku + '"], [data-skuid="' + sku + '"], [skuid="' + sku + '"], [data-id="' + sku + '"]')];
+  const rows = [];
+  for (const a of links) { let e = a, best = null;
+    for (let i = 0; i < 9 && e && e !== document.body; i++, e = e.parentElement) { const t = T(e);
+      if (/[¥￥]\s*\d/.test(t) && t.length < 700) { best = e; break; } }
+    if (best && !rows.includes(best)) rows.push(best); if (rows.length >= 3) break; }
+  const out = rows.map(r => { const prices = [];
+    for (const el of r.querySelectorAll('span,em,strong,b,i,div,p,del,s,label')) { if (el.children.length > 4) continue; const t = T(el);
+      if (!t || t.length > 40 || !/[¥￥]\s*\d/.test(t)) continue; const st = getComputedStyle(el);
+      prices.push({t, strike: /line-through/.test(st.textDecorationLine || '') || /^(DEL|S)$/.test(el.tagName), fs: parseFloat(st.fontSize) || 0,
+                   cls: ((typeof el.className === 'string' ? el.className : '') + ' ' + (el.parentElement && typeof el.parentElement.className === 'string' ? el.parentElement.className : '')).slice(0, 120)}); if (prices.length > 12) break; }
+    return {text: T(r).slice(0, 400), prices}; });
+  return JSON.stringify({url: location.href, title: document.title, rows: out, n_links: links.length,
+                         login: /passport\.jd\.com|plogin|login\.aspx/.test(location.href), n_elems: document.getElementsByTagName('*').length,
+                         text: (document.body ? document.body.innerText : '').slice(0, 600)});
+})
+"""
+
 PICK_SKU_JS = r"""
 (tokens => {
   const vis = el => { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2 && getComputedStyle(el).visibility !== 'hidden'; };
@@ -725,6 +955,7 @@ def kw_price(snap: dict) -> bool:
 
 STAGE_CN = {"connect": "连接浏览器", "open": "打开商品页", "wait": "等待价格渲染", "front": "切到前台渲染", "read": "读取价格",
             "net": "读取页面自己的价格接口", "api": "调用价格接口", "shot": "保存诊断截图", "mobile": "试移动版商品页",
+            "resolve": "解析短链接", "signed": "用京东签名接口读价", "cart": "从购物车读价", "follow": "从我的关注读价",
             "done": "完成"}
 
 
@@ -781,9 +1012,6 @@ WAIT_JS = r"""
 PRICE_NET_RE = re.compile(r"api\.m\.jd\.com|item-soa\.jd\.com|p\.3\.cn|pe\.3\.cn|cd\.jd\.com|[/?&]price", re.I)
 NET_SKIP = re.compile(r"recommend|similar|guess|hotsale|comment|shopInfo|pc_shop|getLegoWareDetail|club", re.I)
 NET_PRIO = re.compile(r"warebusiness|price|getWareBusiness|pc_item", re.I)
-IPHONE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
-             "Version/17.5 Mobile/15E148 Safari/604.1")
-
 
 def net_name(u: str) -> str:
     m = re.search(r"functionId=([\w.\-]+)", u or "")
@@ -852,49 +1080,6 @@ def bring_front(ws, bws, tid: str) -> dict:
     return out
 
 
-def mobile_read(ws, sku: str, wait: float = 12) -> dict:
-    """item.m.jd.com/product/<sku>.html in the same tab (same cookies, iPhone UA). Its limit.html is not used."""
-    url = f"https://item.m.jd.com/product/{sku}.html"
-    res = {"asked_url": url}
-    try:
-        try:
-            ws.call("Emulation.setUserAgentOverride", {"userAgent": IPHONE_UA}, 5)
-            ws.call("Emulation.setDeviceMetricsOverride", {"width": 390, "height": 844, "deviceScaleFactor": 2, "mobile": True}, 5)
-        except Exception:  # noqa: BLE001
-            pass
-        ws.call("Page.navigate", {"url": url}, 20)
-        end, snap = time.time() + wait, {}
-        while time.time() < end:
-            time.sleep(1.0)
-            try:
-                snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
-            except Exception:  # noqa: BLE001
-                continue
-            if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
-                return {**res, "url": snap.get("url"), "risk_limit": True, "skipped": "limit.html"}
-            if any(k in (urlparse(snap.get("url") or "").hostname or "") for k in LOGIN_HOST_KEYS):
-                return {**res, "url": snap.get("url"), "login": True, "skipped": "login page"}
-            if snap.get("ready") == "complete" and (has_jd_price(snap) or kw_price(snap) or len(snap.get("cand") or []) >= 1):
-                time.sleep(1.0)
-                try:
-                    snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
-                except Exception:  # noqa: BLE001
-                    pass
-                break
-        keep = {k: snap.get(k) for k in ("url", "title", "doc_title", "sel", "cand", "btn", "kw", "embedded", "ready",
-                                         "visibility", "jd_sku", "frames", "password_input")}
-        keep["text"] = (snap.get("text") or "")[:3000]
-        return {**res, **keep}
-    except Exception as e:  # noqa: BLE001
-        return {**res, "error": f"{type(e).__name__}: {e}"[:160]}
-    finally:
-        for m, p in (("Emulation.setUserAgentOverride", {"userAgent": ""}), ("Emulation.clearDeviceMetricsOverride", {})):
-            try:
-                ws.call(m, p, 5)
-            except Exception:  # noqa: BLE001
-                pass
-
-
 def snippets(snap: dict) -> list[str]:
     """Short visible-text snippets around price keywords (for the diagnosis)."""
     out = [str(k.get("t"))[:120] + f" @y{k.get('y')}" for k in (snap.get("kw") or [])[:10]]
@@ -934,12 +1119,145 @@ def profile_dir_from_version_page(ws) -> str:
         return ""
 
 
+_FINAL_ROW = re.compile(r"到手|券后|用券|优惠后|预估|折后")
+
+
+def row_price(rows: list) -> dict | None:
+    """Prices read off this sku's row on the cart / 我的关注 page -> {price, final_price}; struck-through and PLUS
+    prices are skipped, a 到手/券后/优惠后 price is the final one."""
+    for r in rows or []:
+        mains, finals = [], []
+        for x in r.get("prices") or []:
+            t = str(x.get("t") or "")
+            m = re.search(r"[¥￥]\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", t)
+            if not m or x.get("strike") or _PLUS_WORD.search(t + " " + str(x.get("cls") or "")):
+                continue
+            v = _num(m.group(1))
+            if not v:
+                continue
+            (finals if _FINAL_ROW.search(t + " " + str(x.get("cls") or "")) else mains).append(v)
+        price = mains[0] if mains else None
+        fin = min(finals) if finals else None
+        if fin is not None and price is not None and not (price * 0.3 <= fin <= price + 1e-9):
+            fin = None
+        if price is not None or fin is not None:
+            return {"price": price, "final_price": fin, "plus_price": None, "in_stock": None}
+    return None
+
+
+def _cookie_value(cookies, name: str) -> str:
+    for c in cookies or []:
+        if isinstance(c, dict) and c.get("name") == name and str(c.get("domain") or "").lstrip(".").endswith("jd.com"):
+            return str(c.get("value") or "")
+    return ""
+
+
+def signed_price(ws, sku: str, area: str) -> dict:
+    """JD's signed pc_detailpage_wareBusiness from the current desktop jd.com page (see SIGNED_JS)."""
+    try:
+        one = json.loads(ws.eval(f"({SIGNED_JS})({json.dumps(sku)}, {json.dumps(area)})", 25) or "{}")
+    except Exception as e:  # noqa: BLE001
+        one = {"src": "signed:pc_detailpage_wareBusiness", "error": f"{type(e).__name__}: {e}"[:160]}
+    body = one.pop("body", "") or ""
+    got = parse_api_price(body) if body else None
+    one["route"] = "signed"
+    one["price"] = bool(got and (got.get("price") or got.get("final_price")))
+    if not one["price"]:
+        one["refused"] = api_risk(body) or None
+        one["head"] = re.sub(r"\s+", " ", body[:160]) if body else None
+    return {"try": one, "price": {**got, "src": "signed"} if one["price"] else None}
+
+
+def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 12) -> dict:
+    """Open the cart / 我的关注 page in the probe tab (a link from www.jd.com), read this sku's row and the page's
+    own API answers that carry it. Read only: nothing is clicked there."""
+    one = {"route": name, "asked_url": url}
+    captured.clear()
+    try:
+        ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, 30)
+    except Exception as e:  # noqa: BLE001
+        one["error"] = f"{type(e).__name__}: {e}"[:160]
+        return {"try": one, "price": None}
+    end, snap = time.time() + wait, {}
+    while time.time() < end:
+        time.sleep(1.2)
+        try:
+            snap = json.loads(ws.eval(f"({ROW_JS})({json.dumps(sku)})", 8) or "{}")
+        except Exception:  # noqa: BLE001
+            continue
+        if snap.get("login") or snap.get("rows") or is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
+            break
+    one.update(url=(snap.get("url") or "")[:200], login=bool(snap.get("login")), rows=len(snap.get("rows") or []),
+               n_links=snap.get("n_links"), n_elems=snap.get("n_elems"))
+    if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
+        one["risk_limit"] = True
+        return {"try": one, "price": None}
+    got = row_price(snap.get("rows") or [])
+    if got:
+        one["price"] = True
+        one["from"] = "row"
+        return {"try": one, "price": {**got, "src": name}}
+    for rid, info in list(captured.items())[:20]:     # the page's own answers (cart / follow APIs) naming this sku
+        try:
+            b = ws.call("Network.getResponseBody", {"requestId": rid}, 6)
+            text = b.get("body") or ""
+            if b.get("base64Encoded"):
+                text = base64.b64decode(text).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            continue
+        if sku not in text:
+            continue
+        got = price_of_items(text, sku)
+        if got:
+            one.update(price=True, src_api=net_name(info.get("url", "")))
+            one["from"] = "net"
+            return {"try": one, "price": {**got, "src": name}}
+    one["price"] = False
+    one["missing"] = "not_listed" if not one.get("login") else "login"
+    return {"try": one, "price": None}
+
+
+def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool) -> dict:
+    """v7: the price without the item page, each route once, in order: signed API, cart, 我的关注."""
+    tries = []
+    if on_jd_page:
+        st("signed")
+        r = signed_price(ws, sku, area)
+        tries.append(r["try"])
+        if r["price"]:
+            return {"alt": tries, "alt_price": r["price"]}
+    for name, url in (("cart", CART_URL), ("follow", FOLLOW_URL)):
+        st(name)
+        r = page_route(ws, name, url, sku, captured)
+        tries.append(r["try"])
+        if r["price"]:
+            return {"alt": tries, "alt_price": r["price"]}
+        if r["try"].get("risk_limit"):
+            break
+        if name == "cart" and not on_jd_page and not r["try"].get("login"):
+            st("signed")   # the cart page carries JD's signing SDK: the signed API from there
+            r2 = signed_price(ws, sku, area)
+            tries.append(r2["try"])
+            if r2["price"]:
+                return {"alt": tries, "alt_price": r2["price"]}
+    return {"alt": tries}
+
+
 def cmd_probe(a):
     st = Stages(getattr(a, "progress", "") or "")
     st("connect")
+    route = (getattr(a, "route", "") or "auto").lower()
     url = normalize_jd(a.url)
     sku = jd_sku_of(url)
+    resolved = None
+    if not sku and is_jd_link(url):
+        # v7: a 3.cn / u.jd.com share link opened in the browser lands on item.m.jd.com (the limited page)
+        st("resolve")
+        resolved = resolve_jd_link(url)
+        if resolved.get("sku"):
+            url, sku = resolved["url"], resolved["sku"]
     jd = bool(sku)
+    jd_link = jd or is_jd_link(url)
     prof = {}
     try:
         prof = profile_of(CDP)
@@ -947,6 +1265,7 @@ def cmd_probe(a):
         prof = {"port": urlparse(CDP).port or 0, "dir": "", "cookies": None}
     front_mode = os.environ.get("AIW_SHOP_FRONT", "1") != "0"
     fronted, snap, captured, prev = None, {}, {}, ""
+    blocked, chain, env = [], [], {}
     bws = browser_ws()
     tid = bws.call("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
     try:
@@ -961,11 +1280,23 @@ def cmd_probe(a):
             raise RuntimeError("background tab did not appear")
 
         def on_event(m):
-            if m.get("method") == "Network.responseReceived" and len(captured) < 40:
-                resp = (m.get("params") or {}).get("response") or {}
+            meth, prm = m.get("method"), m.get("params") or {}
+            if meth == "Network.responseReceived" and len(captured) < 40:
+                resp = prm.get("response") or {}
                 u = resp.get("url") or ""
-                if PRICE_NET_RE.search(u):
-                    captured[m["params"].get("requestId")] = {"url": u, "status": resp.get("status")}
+                if PRICE_NET_RE.search(u) or "cart" in u.lower() or "follow" in u.lower():
+                    captured[prm.get("requestId")] = {"url": u, "status": resp.get("status")}
+            elif meth == "Network.requestWillBeSent" and prm.get("type") == "Document" and len(chain) < 12:
+                rr = prm.get("redirectResponse") or {}
+                chain.append({"url": str((prm.get("request") or {}).get("url") or "")[:200],
+                              **({"from_status": rr.get("status")} if rr else {})})
+            elif meth == "Fetch.requestPaused":
+                u = str((prm.get("request") or {}).get("url") or "")
+                if is_mobile_item_url(u):   # v7: the mobile item page / its limiter: never loaded
+                    blocked.append(u[:240])
+                    ws.notify("Fetch.failRequest", {"requestId": prm.get("requestId"), "errorReason": "BlockedByClient"})
+                else:
+                    ws.notify("Fetch.continueRequest", {"requestId": prm.get("requestId")})
         ws.on_event = on_event
         ws.call("Page.enable")
         try:   # v6: the page's own (signed) price API answers, read back if nothing renders
@@ -976,78 +1307,118 @@ def cmd_probe(a):
             ws.call("Emulation.setFocusEmulationEnabled", {"enabled": True}, 5)
         except Exception:  # noqa: BLE001
             pass
+        try:   # v7: what JD sees: the user agent (a mobile one is 302'd to item.m.jd.com) and navigator.webdriver
+            env = json.loads(ws.eval(ENV_JS, 5) or "{}")
+        except Exception:  # noqa: BLE001
+            env = {}
+        if jd_link and mobile_ua(env.get("ua") or ""):
+            try:
+                ws.call("Emulation.setUserAgentOverride", {"userAgent": desktop_ua(env.get("ua") or ""),
+                                                           "acceptLanguage": "zh-CN,zh", "platform": "Linux x86_64"}, 5)
+                env["ua_override"] = desktop_ua(env.get("ua") or "")
+            except Exception as e:  # noqa: BLE001
+                env["ua_override_error"] = str(e)[:100]
+        try:
+            ws.call("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS}, 5)
+            env["webdriver_patch"] = True
+        except Exception:  # noqa: BLE001
+            env["webdriver_patch"] = False
+        if jd_link:
+            try:
+                ws.call("Fetch.enable", {"patterns": [{"urlPattern": p, "resourceType": "Document", "requestStage": "Request"}
+                                                      for p in MOBILE_DOC_PATTERNS]}, 5)
+                env["mobile_guard"] = True
+            except Exception:  # noqa: BLE001
+                env["mobile_guard"] = False
         if not prof.get("dir"):
             prof["dir"] = profile_dir_from_version_page(ws)
             if prof["dir"]:
                 prof["dir_from"] = "chrome://version"
-        st("open")
-        ws.call("Page.navigate", {"url": url}, 30)
-        st("wait")
-        t_wait = time.time()
-        end = t_wait + float(a.wait)
-        picked, last_sig, i = None, None, 0
-        while time.time() < end:
-            try:   # v6: returns as soon as a price element appears (MutationObserver), else after 1.5 s
-                ws.eval(f"({WAIT_JS})(1500)", 5)
-            except Exception:  # noqa: BLE001
-                pass
-            time.sleep(0.3)
-            i += 1
-            try:
-                snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
-            except Exception:  # noqa: BLE001 - navigating; retry
-                time.sleep(0.9)
-                continue
-            if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
-                snap["risk_limit"] = True     # 活动火爆: nothing renders later, stop here
-                break
-            host = urlparse(snap.get("url") or "").hostname or ""
-            if any(k in host for k in LOGIN_HOST_KEYS):
-                break
-            priced = has_jd_price(snap) or kw_price(snap)
-            if jd and not priced and front_mode and fronted is None and time.time() - t_wait > 5 \
-                    and snap.get("visibility") != "visible":
-                # v6: a hidden background tab runs no requestAnimationFrame / IntersectionObserver: JD's
-                # client-rendered price module may never appear there
-                st("front")
-                fronted = bring_front(ws, bws, tid)
-                prev = fronted.get("prev") or ""
-                st("wait")
-                continue
-            if jd and not priced and i % 3 == 0:
-                try:   # JD renders the price module lazily: nudge it with a scroll, then back to the top
-                    ws.eval("window.scrollBy(0, 600); setTimeout(() => window.scrollTo(0, 0), 600); 1", 5)
+        picked = None
+        if route != "alt":
+            st("open")
+            ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, 30)
+            st("wait")
+            t_wait = time.time()
+            end = t_wait + float(a.wait)
+            last_sig, i = None, 0
+            while time.time() < end:
+                if blocked:
+                    break
+                try:   # v6: returns as soon as a price element appears (MutationObserver), else after 1.5 s
+                    ws.eval(f"({WAIT_JS})(1500)", 5)
                 except Exception:  # noqa: BLE001
                     pass
-            # prices render late (and timers run slow in a background tab): act only once two reads agree
-            sig = json.dumps([x.get("t") for x in (snap.get("sel") or []) + (snap.get("cand") or [])], ensure_ascii=False)
-            stable, last_sig = sig == last_sig, sig
-            if not stable and time.time() < end - 3:
-                continue
-            complete = snap.get("ready") == "complete"
-            if jd:   # a JD item page is done only when its own price is there
-                found = complete and priced
-            else:
-                found = complete and (snap.get("sel") or len(snap.get("cand") or []) >= 2)
-            if found and picked is None and a.sku:
-                st("read")
-                toks = [t for t in a.sku.replace("，", " ").replace(",", " ").replace("/", " ").split() if t]
+                time.sleep(0.3)
+                i += 1
                 try:
-                    picked = json.loads(ws.eval(f"({PICK_SKU_JS})({json.dumps(toks, ensure_ascii=False)})") or "[]")
-                except Exception as e:  # noqa: BLE001
-                    picked = [{"error": str(e)[:120]}]
-                time.sleep(2.5)
-                snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
-                break
-            if found and not a.sku:
-                st("read")
-                time.sleep(1.5)   # coupons / 到手价 load after the main price
-                snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
-                break
+                    snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
+                except Exception:  # noqa: BLE001 - navigating; retry
+                    time.sleep(0.9)
+                    continue
+                if blocked:
+                    break
+                if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
+                    snap["risk_limit"] = True     # 活动火爆: nothing renders later, stop here
+                    break
+                host = urlparse(snap.get("url") or "").hostname or ""
+                if any(k in host for k in LOGIN_HOST_KEYS):
+                    break
+                priced = has_jd_price(snap) or kw_price(snap)
+                if jd and not priced and front_mode and fronted is None and time.time() - t_wait > 5 \
+                        and snap.get("visibility") != "visible":
+                    # v6: a hidden background tab runs no requestAnimationFrame / IntersectionObserver: JD's
+                    # client-rendered price module may never appear there
+                    st("front")
+                    fronted = bring_front(ws, bws, tid)
+                    prev = fronted.get("prev") or ""
+                    st("wait")
+                    continue
+                if jd and not priced and i % 3 == 0:
+                    try:   # JD renders the price module lazily: nudge it with a scroll, then back to the top
+                        ws.eval("window.scrollBy(0, 600); setTimeout(() => window.scrollTo(0, 0), 600); 1", 5)
+                    except Exception:  # noqa: BLE001
+                        pass
+                # prices render late (and timers run slow in a background tab): act only once two reads agree
+                sig = json.dumps([x.get("t") for x in (snap.get("sel") or []) + (snap.get("cand") or [])], ensure_ascii=False)
+                stable, last_sig = sig == last_sig, sig
+                if not stable and time.time() < end - 3:
+                    continue
+                complete = snap.get("ready") == "complete"
+                if jd:   # a JD item page is done only when its own price is there
+                    found = complete and priced
+                else:
+                    found = complete and (snap.get("sel") or len(snap.get("cand") or []) >= 2)
+                if found and picked is None and a.sku:
+                    st("read")
+                    toks = [t for t in a.sku.replace("，", " ").replace(",", " ").replace("/", " ").split() if t]
+                    try:
+                        picked = json.loads(ws.eval(f"({PICK_SKU_JS})({json.dumps(toks, ensure_ascii=False)})") or "[]")
+                    except Exception as e:  # noqa: BLE001
+                        picked = [{"error": str(e)[:120]}]
+                    time.sleep(2.5)
+                    snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
+                    break
+                if found and not a.sku:
+                    st("read")
+                    time.sleep(1.5)   # coupons / 到手价 load after the main price
+                    snap = json.loads(ws.eval(EXTRACT_JS) or "{}")
+                    break
+        if blocked:
+            # v7: JD sent the desktop item page (or a short link) to the mobile item page: refused, not loaded
+            snap = {**{k: snap.get(k) for k in ("title", "doc_title", "title_from") if snap.get(k)},
+                    "url": blocked[0], "mobile_blocked": blocked[0], "text": "", "sel": [], "cand": [], "btn": []}
+            if not sku and jd_sku_of(blocked[0]):
+                sku = jd_sku_of(blocked[0])
+                jd = True
+                snap["resolved_from_redirect"] = True
         snap["sku_picked"] = picked
         snap["fronted"] = fronted
+        snap["route"] = route
         host = urlparse(snap.get("url") or "").hostname or ""
-        page_ok = not snap.get("risk_limit") and not any(k in host for k in LOGIN_HOST_KEYS)
+        login_page = any(k in host for k in LOGIN_HOST_KEYS)
+        on_item = route != "alt" and not blocked and not snap.get("risk_limit") and not login_page
+        page_ok = on_item
         if jd:
             snap["jd_sku"] = snap.get("jd_sku") or sku
             if page_ok and not has_jd_price(snap) and not kw_price(snap):
@@ -1058,10 +1429,10 @@ def cmd_probe(a):
                 elif "jd.com" in (snap.get("url") or url):
                     st("api")
                     snap.update(jd_api_price(ws, snap["jd_sku"]))
-        priced = has_jd_price(snap) or kw_price(snap) or bool(snap.get("api_price")) if jd else \
+        priced = (has_jd_price(snap) or kw_price(snap) or bool(snap.get("api_price"))) if jd else \
             bool(snap.get("sel") or len(snap.get("cand") or []) >= 1)
         need_diag = not page_ok or not priced
-        if a.shot or need_diag:
+        if (a.shot or need_diag) and route != "alt":
             st("shot")
             try:   # a background tab produces no frames: bring it forward for the picture
                 if not fronted:
@@ -1071,10 +1442,11 @@ def cmd_probe(a):
                 snap["screenshot"] = ws.call("Page.captureScreenshot", {"format": "jpeg", "quality": 60}, 20).get("data")
             except Exception as e:  # noqa: BLE001
                 snap["shot_error"] = str(e)[:160]
-        if jd and page_ok and not priced:
-            st("mobile")
-            snap["mobile"] = mobile_read(ws, snap["jd_sku"])
         cookies = read_cookies(bws, ws)
+        if jd and not login_page and (route == "alt" or not page_ok or not priced):
+            # v7: limited, redirected to the mobile page, or no price: another route, once each
+            area = jd_area("ipLoc-djd=" + _cookie_value(cookies, "ipLoc-djd")) if cookies else "1_72_2799_0"
+            snap.update(alt_routes(ws, sku, area, captured, st, on_jd_page=on_item))
         if cookies is not None:
             stl = jd_login_state(cookies)
             prof.update(logged_in=stl["logged_in"] if (jd or stl["jd_cookies"]) else None, jd_cookies=stl["jd_cookies"],
@@ -1102,6 +1474,12 @@ def cmd_probe(a):
     snap["cdp"] = CDP
     snap["asked_url"] = url
     snap["profile"] = prof
+    snap["env"] = env
+    snap["nav_chain"] = chain
+    if resolved is not None:
+        snap["resolved"] = resolved
+    if blocked:
+        snap["blocked"] = blocked[:5]
     out(snap)
 
 
@@ -1201,6 +1579,7 @@ def main():
     p.add_argument("--shot", action="store_true")
     p.add_argument("--wait", default="20")
     p.add_argument("--progress", default="")
+    p.add_argument("--route", default="auto", choices=("auto", "alt"))
     sub.add_parser("order")
     sub.add_parser("submit")
     sub.add_parser("close-order")

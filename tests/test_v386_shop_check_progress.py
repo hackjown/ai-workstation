@@ -159,7 +159,7 @@ def test_hidden_tab_is_brought_forward_and_the_pages_own_price_api_is_read(monke
     assert "Network.enable" in dev.calls
     assert snap["api_price"]["src"] == "page:pc_detailpage_wareBusiness" and snap["api_price"]["final_price"] == 137.0
     assert "api" not in snap                                        # the unsigned API calls were not needed
-    assert snap["probe_version"] == "6" and not prog.exists()
+    assert snap["probe_version"] == "7" and not prog.exists()
     stages = [s["stage"] for s in snap["stages"]]
     assert stages[:4] == ["connect", "open", "wait", "front"] and "net" in stages and stages[-1] == "done"
     r = sw.parse_snapshot(snap)
@@ -167,13 +167,14 @@ def test_hidden_tab_is_brought_forward_and_the_pages_own_price_api_is_read(monke
     assert "mobile" not in snap and "screenshot" not in snap         # read fine: no diagnosis picture
 
 
-def test_nothing_anywhere_gives_screenshot_and_skips_a_mobile_limit_page(monkeypatch):
+def test_nothing_anywhere_gives_screenshot_and_never_opens_the_mobile_page(monkeypatch):
+    # v7: the v6 item.m.jd.com fallback is gone (that page is the one JD limits); the other routes run instead
     dev = Dev([HIDDEN], net=False, mobile={**LIMIT})
     snap = _probe(monkeypatch, dev, f"https://item.jd.com/{SKU}.html", wait="8")
     assert [a["src"] for a in snap["api"]] == ["pc_detailpage_wareBusiness", "getWareBusiness", "p.3.cn"]
-    assert snap["screenshot"] == "QUJD" and snap["mobile"]["skipped"] == "limit.html"
-    assert dev.navs[-1] == f"https://item.m.jd.com/product/{SKU}.html"
-    assert "Emulation.clearDeviceMetricsOverride" in dev.calls        # the tab's mobile emulation is undone
+    assert snap["screenshot"] == "QUJD" and "mobile" not in snap
+    assert not any("item.m.jd.com" in u for u in dev.navs)
+    assert [a["route"] for a in snap["alt"]][:1] == ["signed"] and sp.CART_URL in dev.navs
     r = sw.parse_snapshot(snap)
     assert r["status"] == "no_price"
     hints = sw.diag_hints(snap, r)

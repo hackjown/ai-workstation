@@ -81,7 +81,7 @@ async def test_risk_limit_backs_off_for_hours_and_says_no_captcha(store, chat): 
     res = await sw.check(sch, w, now=1000.0)
     w2 = store.get("watches", w["id"])
     assert res["result"]["status"] == "risk_limit" and w2["shop_status"] == "risk_limit"
-    assert w2["next_check"] - 1000.0 >= 2 * 3600
+    assert w2["next_check"] - 1000.0 >= 30 * 60     # v7: a per-computer cool-down from ~45 min, doubling
     assert "本地vm" in w2["status_note"]
     kinds = [(t, b) for _k, t, b in sch.notifier.sent]
     assert kinds and all("滑块" not in b for _t, b in kinds) and any("不是验证码" in b for _t, b in kinds)
@@ -201,7 +201,7 @@ def test_profile_dir_from_devtools_active_port(tmp_path):
 
 
 def test_probe_version_is_bumped():
-    assert sp.PROBE_VERSION == "6"   # v6 (2026-10-29): see test_v386_shop_check_progress.py
+    assert sp.PROBE_VERSION == "7"   # v7 (2026-10-29): see test_v388_jd_risk_limit.py
 
 
 # ----------------------------------------------------------------------------- g. chrome_cdp.py
@@ -315,7 +315,7 @@ def test_probe_waits_then_reads_the_api_and_the_login(monkeypatch):
     dev = FakeDevTools([BANNER], {"getWareBusiness": WARE_BUSINESS}, cookies)
     snap = _run_probe(monkeypatch, dev, SHARE)
     assert dev.navs[-1] == f"https://item.jd.com/{SKU}.html" and snap["asked_url"] == dev.navs[-1]
-    assert ("scroll" in dev.calls or "Page.bringToFront" in dev.calls) and snap["jd_sku"] == SKU and snap["probe_version"] == "6"
+    assert ("scroll" in dev.calls or "Page.bringToFront" in dev.calls) and snap["jd_sku"] == SKU and snap["probe_version"] == "7"
     assert snap.get("api_price"), snap.get("api")
     assert snap["api_price"]["src"] == "getWareBusiness" and snap["api_price"]["final_price"] == 137.0
     assert [a["src"] for a in snap["api"]] == ["pc_detailpage_wareBusiness", "getWareBusiness"]   # stops at the first

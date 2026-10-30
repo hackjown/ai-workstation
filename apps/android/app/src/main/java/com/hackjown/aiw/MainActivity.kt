@@ -180,7 +180,7 @@ class MainActivity : AppCompatActivity() {
         s.userAgentString = s.userAgentString + " AiwAndroid/" + BuildConfig.VERSION_NAME
         // dark mode: the page's own prefers-color-scheme styles win; pages without them are darkened by WebView
         if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
-            WebSettingsCompat.setAlgorithmicDarkening(s, true)
+            WebSettingsCompat.setAlgorithmicDarkeningAllowed(s, true)
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)

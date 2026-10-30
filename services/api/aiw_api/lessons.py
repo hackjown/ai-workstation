@@ -84,6 +84,13 @@ SEED = [
      "看 drawing_build 的 report.json（errors 必须为空）和 overlay.png 叠图，再用 read_image 针对性问一次；最多 3 轮，之后报告不确定项"),
 ]
 
+# 3.8.8: task-e63 - the vision model answered HTTP 500 on every call and the agent re-encoded the image for 25+ steps
+SEED_MARK_V2 = "lessons_seeded_v2"
+SEED_V2 = [
+    ("tool", "read_image", "读图报 5xx（HTTP 500/502/503 @ 网关）或超时，换格式/缩小图片也一样",
+     "读图报 5xx = 服务故障，不要转换图片；告诉用户检查服务（设置 › 模型 › 视觉模型，或 /api/vision/test）"),
+]
+
 SECRET_VALUE_RE = re.compile(
     r"((密码|口令|passw(or)?d|pwd|验证码|校验码|动态码|token|api[ _-]?key|secret|私钥|cvv|cvc|支付密码)\s*(是|为|[:：=])\s*\S{3,}|"
     r"sk-[A-Za-z0-9]{8,}|ghp_[A-Za-z0-9]{10,}|xox[abp]-|AKIA[0-9A-Z]{12,}|-----BEGIN|"
@@ -153,17 +160,20 @@ class Lessons:
             log.warning("seeding lessons failed: %s", e)
 
     def seed(self) -> int:
-        """Built-in lessons, written once (kv lessons_seeded_v1), so the user may delete them for good."""
-        try:
-            if self.store.kv_get(SEED_MARK):
-                return 0
-        except Exception:  # noqa: BLE001
-            return 0
+        """Built-in lessons, each set written once (kv lessons_seeded_v1, _v2), so the user may delete them for good."""
         n = 0
-        for scope, key, problem, fix in SEED:
-            if self.add(scope, key, problem, fix, "auto"):
-                n += 1
-        self.store.kv_set(SEED_MARK, {"at": time.time(), "n": n})
+        for mark, rows in ((SEED_MARK, SEED), (SEED_MARK_V2, SEED_V2)):
+            try:
+                if self.store.kv_get(mark):
+                    continue
+            except Exception:  # noqa: BLE001
+                return n
+            k = 0
+            for scope, key, problem, fix in rows:
+                if self.add(scope, key, problem, fix, "auto"):
+                    k += 1
+            self.store.kv_set(mark, {"at": time.time(), "n": k})
+            n += k
         return n
 
     # ------------------------------------------------------------------ rows

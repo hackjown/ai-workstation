@@ -70,10 +70,16 @@ KIND_TEXT = {
     "stall": "模型连续好几步只在看页面、没有往前推进",
     "blocked": "页面出现了需要真人处理的验证",
     "error": "运行中出现了错误",
+    "vision_down": "读图服务（视觉模型）不可用",
 }
 
 OPT_RETRY, OPT_TAKEOVER, OPT_STOP = "继续，换个方法再试", "我来接管桌面", "停止任务"
 OPTIONS = [OPT_RETRY, OPT_TAKEOVER, OPT_STOP]
+OPT_FIXED = "修好后继续"   # 3.8.8 vision_down: the user fixed the vision service; resets the breaker
+
+
+def options(kind: str) -> list:
+    return [OPT_FIXED, OPT_TAKEOVER, OPT_STOP] if kind == "vision_down" else list(OPTIONS)
 
 
 def is_look(tool: str, args: Optional[dict] = None) -> bool:
@@ -162,7 +168,10 @@ def question(kind: str, detail: str, page: Optional[dict] = None, blocked: str =
     d = (detail or "").strip()
     if d:
         lines.append(f"具体情况：{d[:300]}")
-    lines.append("任务已暂停，不会自己结束。你可以：继续（换个方法再试）/ 接管桌面自己处理 / 停止任务。")
+    if kind == "vision_down":
+        lines.append("这是服务故障，不是图片问题。任务已暂停：检查/修好视觉模型服务后点「修好后继续」/ 接管桌面 / 停止任务。")
+    else:
+        lines.append("任务已暂停，不会自己结束。你可以：继续（换个方法再试）/ 接管桌面自己处理 / 停止任务。")
     return "\n".join(lines)
 
 
@@ -171,6 +180,10 @@ def stuck_card(kind: str, detail: str = "", blocked: str = "") -> dict:
     why = KIND_TEXT.get(kind, KIND_TEXT["error"])
     if blocked:
         why = f"页面出现「{blocked}」，需要真人验证"
+    if kind == "vision_down":   # name the service: the notification and the card say what to fix
+        why = str(detail or why).strip().split("。")[0][:120] or why
+        return {"kind": kind, "reason": why, "detail": str(detail or "").strip()[:200],
+                "actions": [OPT_FIXED, "接管", "停止"], "line": f"卡住了：{why} · 等你选 修好后继续 / 接管 / 停止"}
     return {"kind": kind, "reason": why, "detail": str(detail or "").strip()[:200],
             "actions": ["继续", "接管", "停止"], "line": f"卡住了：{why} · 等你选 继续 / 接管 / 停止"}
 

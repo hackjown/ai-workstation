@@ -921,6 +921,7 @@ async function editMem(m) { const v = prompt("编辑记忆", m.text); if (v === 
 const MODEL_ROLES = [
   { key: "model", label: "主模型", hint: "决定操作，需能调用工具", need: "tools" },
   { key: "vision_model", label: "视觉模型", hint: "可选，主模型不会看图时设置", need: "vision" },
+  { key: "vision_fallback", label: "备用视觉模型", hint: "视觉模型报错（如 HTTP 500）时改用它读图", need: "vision" },
   { key: "fallback", label: "备用模型", hint: "主模型出错时用", need: "tools" },
   { key: "subagent_model", label: "子 Agent 模型", hint: "纯文本命令行任务", need: "tools" },
   { key: "video_model", label: "视频模型", hint: "可选，制作/修改视频的任务用它（如 claude-opus），失败回到主模型", need: "tools" },
@@ -936,7 +937,7 @@ async function fetchModels(manual) {
     const cur = sel.value || sel.dataset.cur || "";
     const ids = [...new Set([...(cur ? [cur] : []), ...S.modelIds])];
     const role = MODEL_ROLES.find((x) => x.key === sel.name);
-    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" ? "不用" : role.key === "image_model" ? "不用（不能 AI 改图）" : "同主模型"}</option>`
+    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" || role.key === "vision_fallback" ? "不用" : role.key === "image_model" ? "不用（不能 AI 改图）" : "同主模型"}</option>`
       + ids.map((m) => `<option value="${esc(m)}" ${m === cur ? "selected" : ""}>${esc(m)}${probeTag(m)}</option>`).join("")
       + `<option value="__custom">手动输入…</option>`;
     paintProbe(sel);
@@ -979,7 +980,7 @@ async function saveModels(e) {
   e.preventDefault(); const f = e.target;
   if (f.key.value) await api("PUT", "/api/secrets/openai_api_key", { value: f.key.value });
   const v = (n) => (f[n].value === "__custom" ? "" : f[n].value);
-  await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value });
+  await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), vision_fallback: v("vision_fallback"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value });
   toast("已保存，下个任务生效"); loadSettings();
 }
 async function saveVmNet(e) {

@@ -214,10 +214,10 @@ class OpenAIProvider(LLMProvider):
                "tool_calls": [calls[i] for i in sorted(calls)] or None}
         return {"choices": [{"message": msg, "finish_reason": finish}], "usage": usage}
 
-    async def _post(self, c: httpx.AsyncClient, body: dict) -> dict:
+    async def _post(self, c: httpx.AsyncClient, body: dict, tries: int | None = None) -> dict:
         """POST with retries on network hiccups and 429/5xx (a gateway blip used to fail the whole task)."""
         import asyncio
-        tries = int(os.environ.get("AIW_LLM_RETRIES", "3"))
+        tries = tries or int(os.environ.get("AIW_LLM_RETRIES", "3"))
         for i in range(tries):
             try:
                 r = await c.post(self.url, json={**body, **self._extras()}, headers={"Authorization": f"Bearer {self.key}"})
@@ -240,8 +240,10 @@ class OpenAIProvider(LLMProvider):
             {"role": "system", "content": system},
             {"role": "user", "content": [{"type": "text", "text": user},
                                          {"type": "image_url", "image_url": {"url": f"data:{_mime(image_b64)};base64,{image_b64}"}}]}]}
+        # 3.8.8: at most 2 HTTP attempts for a picture (task-e63: 3 here x2 in the loop = ~24 s per failed read)
+        from ..vision import attempts
         async with httpx.AsyncClient(timeout=120) as c:
-            return strip_think((await self._post(c, body))["choices"][0]["message"].get("content") or "")
+            return strip_think((await self._post(c, body, attempts()))["choices"][0]["message"].get("content") or "")
 
     async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
         body = {"model": self.model, "max_tokens": max_tokens,

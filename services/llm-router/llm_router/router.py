@@ -164,7 +164,7 @@ class LLMRouter:
                 return await p.describe(system, user, image_b64, max_tokens)
             except Exception as e:  # noqa: BLE001
                 last = e
-        raise RuntimeError(f"no provider could describe the image: {last}")
+        raise RuntimeError(f"no provider could describe the image: {last}") from last
 
     async def chat(self, messages: list[dict], tools: Optional[list[dict]] = None, max_tokens: int = 1500,
                    on_delta: Optional[Callable[[str], Awaitable[None]]] = None) -> dict:

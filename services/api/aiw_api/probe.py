@@ -38,6 +38,28 @@ async def _post(c: httpx.AsyncClient, url: str, key: str, body: dict) -> dict:
     return r.json()
 
 
+async def probe_vision(c: httpx.AsyncClient, url: str, key: str, model: str) -> dict:
+    """The red-47 image check alone: {"model", "vision", "ms", "note", "error"?}. Also /api/vision/test (3.8.8)."""
+    t0 = time.time()
+    res: dict = {"model": model, "vision": False, "note": ""}
+    try:
+        data = await _post(c, url, key, {
+            "model": model, "max_tokens": 60, "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "What number is written in the image, and what is the background color? "
+                                         "Answer like: 12, blue"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _probe_image()}}]}]})
+        ans = (data["choices"][0]["message"].get("content") or "").lower()
+        res["vision"] = "47" in ans and ("red" in ans or "红" in ans)
+        res["answer"] = ans[:80]
+        if not res["vision"]:
+            res["note"] = f"看图回答：{ans[:80]}"
+    except Exception as e:  # noqa: BLE001
+        res["note"] = f"看图：{e}"[:200]
+        res["error"] = f"{type(e).__name__}: {e}"[:200]
+    res["ms"] = int((time.time() - t0) * 1000)
+    return res
+
+
 async def probe(base: str, key: str, model: str) -> dict:
     url = base.rstrip("/") + "/chat/completions"
     out: dict = {"model": model, "tools": False, "tool_choice": None, "vision": False, "ts": time.time()}
@@ -67,20 +89,10 @@ async def probe(base: str, key: str, model: str) -> dict:
             notes.append(f"tool_choice={choice}: " + ("没有工具调用" if not calls else
                                                       f"参数{'为空' if not cmd else '不完整'}（{str(raw)[:80]}）"))
         out["tools_ms"] = int((time.time() - t0) * 1000)
-        t0 = time.time()
-        try:
-            data = await _post(c, url, key, {
-                "model": model, "max_tokens": 60, "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "What number is written in the image, and what is the background color? "
-                                             "Answer like: 12, blue"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _probe_image()}}]}]})
-            ans = (data["choices"][0]["message"].get("content") or "").lower()
-            out["vision"] = "47" in ans and ("red" in ans or "红" in ans)
-            if not out["vision"]:
-                notes.append(f"看图回答：{ans[:80]}")
-        except Exception as e:  # noqa: BLE001
-            notes.append(f"看图：{e}"[:200])
-        out["vision_ms"] = int((time.time() - t0) * 1000)
+        v = await probe_vision(c, url, key, model)
+        out["vision"], out["vision_ms"] = v["vision"], v["ms"]
+        if v.get("note"):
+            notes.append(v["note"])
         # speed: plain text generation of a known length -> tokens/s, time to answer, hidden reasoning
         t0 = time.time()
         try:

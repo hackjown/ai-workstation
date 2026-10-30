@@ -29,6 +29,8 @@ from . import image_edit as _ie
 from . import image_brief as _ib
 from . import photopea as _pp
 from . import escalate as _es
+from . import vision_guard as _vg
+from llm_router import vision as _vis
 
 # Only an explicit "go on with the earlier drawing" resumes. The bare words matched far too much: run 3ac's prompt said
 # "把那张补画完整" (redraw that thin sheet) and was taken for a resume, so the previous run's DXF stayed in cad/, LibreCAD
@@ -803,6 +805,12 @@ class AgentLoop:
             self._page_click(decision)
             self._last_tool = decision.tool
             await self.emit(EventType.ACTION, tool=decision.tool, args=decision.args)
+            if decision.tool in _vg.TOOLS and _vg.is_open(self):   # 3.8.8: vision service down, don't call it
+                n = await _vg.gate(self, decision)
+                if n is None:
+                    return
+                note = n
+                continue
             handled = await self._loop_tool(decision)
             if handled is not None:
                 self.history.append(f"{self.step}. {decision.tool}({_args_short(decision.args)}) -> {handled}")
@@ -950,16 +958,17 @@ class AgentLoop:
                   "2. the visible text that matters for the task, quoted exactly;\n"
                   "3. every button, link, field or menu the agent may need next, each as: name -> (x, y) center pixel.\n"
                   "Be factual and concise (max ~250 words). Do not suggest actions.")
+        if _vg.is_open(self):   # 3.8.8: the vision service is down; the screenshot goes to the main model as is
+            return None
         try:
             await self.emit(EventType.THINKING, phase="vision")
-            desc = (await asyncio.wait_for(
-                self.vision_llm.describe("You are the eyes of a computer-use agent.", prompt, shot),
-                self.cfg.vision_timeout_s)).strip()
-        except asyncio.TimeoutError:
-            await self.emit(EventType.ERROR, error=f"视觉模型超过 {self.cfg.vision_timeout_s:.0f} 秒没回应，本步跳过（建议换更快的视觉模型）")
-            return None
-        except Exception as e:  # noqa: BLE001
-            await self.emit(EventType.ERROR, error=f"视觉模型失败，改为直接发截图：{e}"[:300])
+            desc = (await _vg.read(self, self.vision_llm, "You are the eyes of a computer-use agent.", prompt, shot, 900,
+                                   self.cfg.vision_timeout_s, count_timeout=False)).strip()
+        except _vis.VisionFailed as e:
+            if e.err.status is None and e.err.detail.startswith("timeout"):
+                await self.emit(EventType.ERROR, error=f"视觉模型超过 {self.cfg.vision_timeout_s:.0f} 秒没回应，本步跳过（建议换更快的视觉模型）")
+            else:
+                await self.emit(EventType.ERROR, error=f"视觉模型失败（{e.err.where()}），改为直接发截图"[:300])
             return None
         if not desc:
             return None
@@ -1265,15 +1274,15 @@ class AgentLoop:
         stuck = _es.stuck_card(kind, detail, blocked)
         while True:
             self._stuck = stuck
-            await self.emit(EventType.INPUT_REQUIRED, question=q, options=list(_es.OPTIONS), stuck=stuck)
+            await self.emit(EventType.INPUT_REQUIRED, question=q, options=_es.options(kind), stuck=stuck)
             t0 = time.monotonic()
-            reply = await self._ask(q, list(_es.OPTIONS))
+            reply = await self._ask(q, _es.options(kind))
             tries = 0
             while reply is None and tries < int(os.environ.get("AIW_STUCK_REASK", "1000000")):
                 # an ask channel without "wait forever" timed out: keep the task paused and ask again
                 tries += 1
                 await asyncio.sleep(min(60.0, 2.0 * tries))
-                reply = await self._ask(q, list(_es.OPTIONS))
+                reply = await self._ask(q, _es.options(kind))
             self.add_wait(time.monotonic() - t0)
             self._stuck = None
             await self.emit(EventType.INPUT_ANSWERED, answer=reply)
@@ -1299,7 +1308,7 @@ class AgentLoop:
             self._mark_progress()
             self._rep, self._prev_sig = 0, None
             stall.reset()
-            hint = "" if reply in (_es.OPT_RETRY, None) else f" The user said: {reply!r}. Follow it."
+            hint = "" if reply in (_es.OPT_RETRY, _es.OPT_FIXED, None) else f" The user said: {reply!r}. Follow it."
             self.history.append(f"{self.step}. (asked the user: {_es.KIND_TEXT.get(kind, kind)}; they chose to go on)")
             return (f"You were stuck ({kind}: {str(detail)[:200]}). The user wants you to continue.{hint} Do NOT repeat what "
                     "already failed: try a different approach. If a person is needed (captcha, login, SMS code), call "
@@ -2001,11 +2010,10 @@ class AgentLoop:
              + "请逐张对比回答，并明确指出它们之间的差别（没有差别就直接说没有差别）：" + (question or "两张图有什么不同？"))
         eyes = self.vision_llm or self.llm
         try:
-            text = await _retry_once(lambda: asyncio.wait_for(eyes.describe(_cad.READ_IMAGE_PROMPT, q, b64, 1800),
-                                                              self.cfg.vision_timeout_s * 3))
+            text = await _vg.read(self, eyes, _cad.READ_IMAGE_PROMPT, q, b64, 1800, self.cfg.vision_timeout_s * 3)
         except Exception as e:  # noqa: BLE001
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=str(e)[:200], result={})
-            return f"FAILED: the vision model could not read the images ({type(e).__name__})"
+            return _vg.failed_text(e, "images")
         self._acted = True
         await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
                         result={"compare": [p for p, _ in imgs], "chars": len(text or "")})
@@ -2055,11 +2063,11 @@ class AgentLoop:
         if a.get("grid"):
             q = ("图上画了红色像素网格线，线旁的数字是原图像素坐标（x 向右、y 向下）。回答位置时请用这些像素坐标。" + q)
         try:
-            text = await _retry_once(lambda: asyncio.wait_for(
-                eyes.describe(_cad.READ_IMAGE_PROMPT, q or "请按结构描述这张图。", b64, 1800), self.cfg.vision_timeout_s * 3))
+            text = await _vg.read(self, eyes, _cad.READ_IMAGE_PROMPT, q or "请按结构描述这张图。", b64, 1800,
+                                  self.cfg.vision_timeout_s * 3)
         except Exception as e:  # noqa: BLE001
             await self.emit(EventType.ACTION_RESULT, tool="read_image", success=False, error=str(e)[:200], result={})
-            return f"FAILED: the vision model could not read the image ({type(e).__name__})"
+            return _vg.failed_text(e, "image")
         self._acted = True
         await self.emit(EventType.ACTION_RESULT, tool="read_image", success=True, error=None,
                         result={"path": path, "chars": len(text or "")})
@@ -2077,6 +2085,13 @@ class AgentLoop:
             return None, f"{path} is not an image ({e})"
 
     async def _drawing_read(self, a: dict) -> str:
+        try:
+            return await self._drawing_read_body(a)
+        except _vis.VisionFailed as e:   # 3.8.8: service/config trouble is not a misread: say so, never "CONFLICT"
+            await self.emit(EventType.ACTION_RESULT, tool="drawing_read", success=False, error=str(e)[:200], result={})
+            return _vg.failed_text(e)
+
+    async def _drawing_read_body(self, a: dict) -> str:
         """Zoom one region of the source (a dimension chain, a room, a label) and read it with the vision model TWICE,
         asked two different ways; a third, larger read only when they disagree. Never a guess: a disagreement comes
         back as a conflict to re-read. In task-a12 whole-photo questions gave 9300 one time and 9500 the next."""
@@ -2102,8 +2117,11 @@ class AgentLoop:
 
         async def ask(q, im):
             try:
-                return await _retry_once(lambda: asyncio.wait_for(eyes.describe(sysmsg, q + extra, _draw.jpeg_b64(im), 600),
-                                                                  self.cfg.vision_timeout_s * 2))
+                return await _vg.read(self, eyes, sysmsg, q + extra, _draw.jpeg_b64(im), 600, self.cfg.vision_timeout_s * 2)
+            except _vis.VisionFailed as e:
+                if e.err.kind in ("service", "auth", "none"):
+                    raise
+                return f"(read failed: {e.err.where()})"
             except Exception as e:  # noqa: BLE001
                 return f"(read failed: {type(e).__name__})"
         if kind == "chain":

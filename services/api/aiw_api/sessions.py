@@ -145,16 +145,36 @@ class SessionManager:
         probes = self.store.kv_get("model_probes", {}) or {}
         return {k: v.get("tool_choice") for k, v in probes.items() if v.get("tool_choice")}
 
+    def vision_chain(self) -> list[str]:
+        """3.8.8: vision_model -> vision_fallback -> geometry_model -> models probed vision-capable (max 3, none
+        probed text-only). See llm_router/vision.py."""
+        from llm_router.vision import vision_chain
+        return vision_chain(self.model_settings(), self.store.kv_get("model_probes", {}) or {})
+
+    def vision_missing(self) -> Optional[str]:
+        """A clear sentence when nothing configured can read images (else None)."""
+        if self._custom_llm:
+            return None
+        from llm_router.vision import no_vision_text
+        return no_vision_text(self.model_settings(), self.store.kv_get("model_probes", {}) or {})
+
     def _vision_llm(self) -> Optional[LLMRouter]:
         if self._custom_llm:
             return None
         m = self.model_settings()
-        if not m.get("vision_model") or m.get("vision_model") == m.get("model"):
+        chain = self.vision_chain()
+        if not chain:
             return None
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        # the eyes describe pictures; thinking there only adds latency (AIW_VISION_THINKING=on to restore)
-        return LLMRouter.from_settings(m["vision_model"], None, key, m.get("base_url") or None, None,
-                                       os.environ.get("AIW_VISION_THINKING", "off"))
+        if not (key or os.environ.get("OPENAI_API_KEY")):
+            return None
+        # the eyes describe pictures; thinking there only adds latency (AIW_VISION_THINKING=on to restore).
+        # The router tries the chain in order: a 500 from the first vision model falls through to the next.
+        from llm_router.providers.openai import OpenAIProvider
+        key = key or os.environ.get("OPENAI_API_KEY")
+        th = os.environ.get("AIW_VISION_THINKING", "off")
+        return LLMRouter([OpenAIProvider(model=n, api_key=key, base_url=m.get("base_url") or None, thinking=th)
+                          for n in chain])
 
     def _geometry_llm(self) -> Optional[LLMRouter]:
         """Model that boxes things for exact image moves (AIW_GEOMETRY_MODEL / 设置 geometry_model), else the eyes."""
@@ -549,6 +569,9 @@ class SessionManager:
                 self.store.set_task_plan(task.id, plan_state)
             if ev.type == EventType.MEMORY and ev.data.get("text"):
                 pass  # saved by remember()
+            if ev.type == EventType.ERROR and ev.data.get("vision_down"):   # 3.8.8: once per task, names the service
+                with contextlib.suppress(Exception):
+                    await self._notify("input", "读图服务不可用", str(ev.data.get("error") or "")[:300], task)
             msg = {"kind": "event", "task_id": task.id, "thread_id": task.thread_id, **d}
             await self._broadcast(live, msg)
             if ev.type in CHAT_EVENTS:
@@ -748,6 +771,7 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    loop.vision_missing = self.vision_missing()
                     loop.home = home
                     seed = self.store.kv_get(f"task_seed_plan:{task.id}")
                     if seed and seed.get("steps"):   # a continuation keeps the plan and its ticks

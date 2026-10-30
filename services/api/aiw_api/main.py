@@ -755,7 +755,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.put("/api/settings/models", dependencies=[Depends(auth)])
     async def put_models(body: dict):
         m = {k: (str(body.get(k) or "").strip() or None)
-             for k in ("model", "vision_model", "fallback", "subagent_model", "image_model", "video_model", "base_url", "thinking",
+             for k in ("model", "vision_model", "vision_fallback", "fallback", "subagent_model", "image_model", "video_model", "base_url", "thinking",
                        "chat_model", "small_model", "embed_model")}
         store.kv_set("models", m)
         return m
@@ -777,6 +777,38 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         probes[model] = res
         store.kv_set("model_probes", probes)
         return res
+
+    @app.post("/api/vision/test", dependencies=[Depends(auth)])
+    @app.get("/api/vision/test", dependencies=[Depends(auth)])
+    async def vision_test():
+        """3.8.8 health check: the probe's red-47 image read against each model of the current vision chain."""
+        import httpx
+        from llm_router.vision import classify, no_vision_text, vision_chain
+        from .probe import probe_vision
+        m = store.kv_get("models", {}) or {}
+        probes = store.kv_get("model_probes", {}) or {}
+        chain = vision_chain(m, probes)
+        main = m.get("model") or os.environ.get("OPENAI_MODEL") or ""
+        names = chain or ([main] if main else [])
+        base = (m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+        key = secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        out = {"chain": chain, "main_looks": not chain, "missing": no_vision_text(m, probes), "results": []}
+        if not key:
+            return {**out, "ok": False, "error": "no API key"}
+        if not names:
+            return {**out, "ok": False, "error": out["missing"] or "没有配置视觉模型"}
+        async with httpx.AsyncClient(timeout=60) as c:
+            for n in names:
+                r = await probe_vision(c, base + "/chat/completions", key, n)
+                if r.get("error"):
+                    e = classify(RuntimeError(r["error"] + " " + base), n)
+                    r.update(kind=e.kind, status=e.status, host=e.host, message=e.tool_text())
+                elif not r["vision"]:
+                    r.update(kind="model", message=f"{n} 回答了但没认出图（{r.get('answer', '')}）：可能不是视觉模型")
+                out["results"].append(r)
+        out["ok"] = any(r["vision"] for r in out["results"])
+        out["working"] = next((r["model"] for r in out["results"] if r["vision"]), None)
+        return out
 
     @app.get("/api/models/probes", dependencies=[Depends(auth)])
     async def model_probes():

@@ -51,7 +51,7 @@ def install_command(version: str) -> str:
     return (f"cd {ROOT}/{REMOTE} && echo {version} > VERSION && mkdir -p \"$HOME/.claude/skills/cad-drawing/examples\" && "
             f"cp -f drawkit.py drawauto.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
             f"cp -f examples/*.json \"$HOME/.claude/skills/cad-drawing/examples/\" 2>/dev/null; "
-            f"M=\"$HOME/.config/aiw/drawkit-ready-v1\"; if [ ! -f \"$M\" ]; then "
+            f"M=\"$HOME/.config/aiw/drawkit-ready-v2\"; if [ ! -f \"$M\" ]; then "
             f"python3 drawkit.py ensure && mkdir -p \"$(dirname $M)\" && touch \"$M\"; else echo deps-ok; fi; "
             f"python3 -c 'import ezdxf, PIL, numpy' ")
 

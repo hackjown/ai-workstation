@@ -34,6 +34,8 @@ VERIFY_ROUNDS = int(os.environ.get("AIW_DRAW_VERIFY_ROUNDS", "3"))
 INTENT_WINDOW = int(os.environ.get("AIW_DRAW_INTENT_WINDOW", "4"))
 INTENT_SIM = float(os.environ.get("AIW_DRAW_INTENT_SIM", "0.18"))
 REFUSALS_MAX = int(os.environ.get("AIW_DRAW_REFUSALS_MAX", "6"))
+ROUND_READS = int(os.environ.get("AIW_DRAW_ROUND_READS", "4"))     # targeted reads per failed build round (3.8.9)
+QUIET_STEPS = int(os.environ.get("AIW_DRAW_QUIET_STEPS", "10"))    # after the user's 继续: no re-pause this long
 FACTS = "cad/facts.json"
 STOP_NOTE = "停止分析，立即根据已有 facts 写 spec 并生成。"
 
@@ -103,6 +105,15 @@ class DrawPhase:
         self.nudges = 0
         self.refusals = 0
         self.dirty = False           # facts changed since last saved on the computer
+        # 3.8.9 (task-3fc): the guard must know a spec exists and what the build said
+        self.spec_written = False
+        self.last_ok = None          # None: never built; True / False: the last drawing_build passed / failed
+        self.last_errors: list = []
+        self.round_reads = 0         # reads since the last build (VERIFY / BUILD: targeted at the errors)
+        self.resumes = 0             # times the user said 继续 after a pause
+        self.quiet = 0               # decisions left without a re-pause (after 继续)
+        self.auto_runs = 0           # deterministic pipeline runs
+        self.must_deliver = False    # verify rounds / budget used up: deliver the best draft
 
     # ---- facts -----------------------------------------------------------------------------------------------
     def note(self, kind: str, key: str, value, confirmed: bool = False) -> str:
@@ -153,6 +164,12 @@ class DrawPhase:
                         "pixels + the chains in facts), or files_write cad/spec.json yourself, then drawing_build. "
                         "Where a fact is missing, write your best value and list it in `uncertain`; do not read the "
                         "image again." % (self.read_budget, STOP_NOTE))
+        if self.phase in (BUILD, VERIFY) and is_read(tool, args) and self.last_ok is False:
+            if self.round_reads >= ROUND_READS:
+                self.refusals += 1
+                return ("REFUSED: %d targeted reads after the failed build are used. Fix cad/spec.json from what you have "
+                        "and drawing_build again (it auto-repairs chain boxes and rooms), or call drawing_auto for the "
+                        "deterministic draft." % ROUND_READS)
         if self.phase in (VERIFY, DELIVER) and tool in ("read_image",) and self.verify >= VERIFY_ROUNDS:
             return ("REFUSED: %d verify rounds done. send_file the PNG and DXF and finish with done, listing what is "
                     "still uncertain." % self.verify)
@@ -161,20 +178,32 @@ class DrawPhase:
     def after(self, tool: str, args: dict, ok: bool, text: str = "") -> None:
         if is_read(tool, args) and self.phase == READ:
             self.reads += 1
+        elif is_read(tool, args):
+            self.round_reads += 1
         if ok and writes_spec(tool, args):
             self.progress += 1
+            self.spec_written = True
             if self.phase == READ:
                 self.phase = SPEC
             self.forced = False
         if tool == "drawing_build" and ok:
             self.builds += 1
             self.progress += 1
+            self.spec_written = True
+            self.round_reads = 0
+            self.last_ok = "ALL CHECKS PASS" in (text or "")
+            m = re.search(r"ERRORS: (.*)", text or "")
+            self.last_errors = [e.strip() for e in m.group(1).split(" | ")][:12] if m else []
+            if not self.last_ok and self.builds >= VERIFY_ROUNDS:
+                self.must_deliver = True
             if "ALL CHECKS PASS" in (text or "") or "STOP ITERATING" in (text or ""):
                 self.phase = VERIFY if self.phase != DELIVER else DELIVER
             elif self.phase in (READ, SPEC):
                 self.phase = BUILD
             if self.phase == VERIFY:
                 self.verify += 1
+                if self.verify >= VERIFY_ROUNDS:
+                    self.must_deliver = True
         if tool == "send_file" and ok and self.phase in (VERIFY, BUILD):
             self.phase = DELIVER
         if tool == "files_write" and ok:
@@ -206,6 +235,11 @@ class DrawPhase:
         ar = tool + " " + json.dumps(args or {}, ensure_ascii=False)[:300]
         self.intents.append((th, ar, self.progress))
         self.intents = self.intents[-12:]
+        if self.quiet > 0:                       # just resumed by the user: a fresh start, no re-pause
+            self.quiet -= 1
+            return None
+        if self.phase in (BUILD, VERIFY) and self.last_ok is False and self.round_reads < ROUND_READS and is_read(tool, args):
+            return None                          # reading what the build report flagged is the job right now
         if self.refusals >= REFUSALS_MAX:
             self.refusals = 0
             self.nudges = max(self.nudges, 2) + 1
@@ -224,6 +258,31 @@ class DrawPhase:
             return "escalate" if self.nudges > 2 else "nudge"
         return None
 
+    # ---- 3.8.9: tell the truth when stuck, and start over properly on 继续 ---------------------------------------
+    def stuck(self) -> tuple:
+        """(kind, detail) describing where the drawing really is."""
+        if self.last_ok is False:
+            errs = "；".join(_short_err(e) for e in self.last_errors[:4]) or "见核对报告"
+            return ("drawing_verify", f"spec 已生成并出过 {self.builds} 次图，但核对未通过：{errs}。")
+        if self.builds and self.last_ok:
+            return ("drawing_verify", f"图已生成且核对通过（{self.builds} 次），但模型还在反复看图，没有交付。")
+        if self.spec_written:
+            return ("drawing_verify", "spec 已写好，但还没生成图纸，模型在反复分析。")
+        return ("drawing_loop", "连续多轮都在重复分析同一件事（看图、裁图、问标签位置），没有写 spec 也没有生成图。"
+                                "已提醒两次仍在循环。")
+
+    def resume(self) -> None:
+        """the user said 继续: counters reset, a fresh budget, no re-pause for QUIET_STEPS decisions."""
+        self.resumes += 1
+        self.nudges = 0
+        self.refusals = 0
+        self.intents = []
+        self.reads = 0
+        self.round_reads = 0
+        self.forced = False
+        self.quiet = QUIET_STEPS
+        self.must_deliver = False
+
     # ---- context ----------------------------------------------------------------------------------------------
     def block(self) -> str:
         left = max(0, self.read_budget - self.reads)
@@ -234,7 +293,9 @@ class DrawPhase:
         elif self.phase == SPEC:
             head += " (write/finish cad/spec.json, then drawing_build; do not go back to reading)"
         elif self.phase == BUILD:
-            head += " (fix the spec from the build report and drawing_build again)"
+            head += (" (fix the spec from the build report and drawing_build again; up to %d targeted reads of what "
+                     "the report flags; drawing_build re-locates wrong chain boxes and regenerates bad rooms itself)"
+                     % ROUND_READS)
         elif self.phase == VERIFY:
             head += f" (verify round {self.verify}/{VERIFY_ROUNDS}: one pointed overlay check, then deliver)"
         elif self.phase == DELIVER:
@@ -249,6 +310,24 @@ class DrawPhase:
             lk = (" LOCKED (do not re-read): " + ", ".join(sorted(self.locked))) if self.locked else ""
             head += f"\nFACTS so far (cad/facts.json):{lk}\n{body}"
         return head
+
+
+def _short_err(e: str) -> str:
+    """one build error in a few Chinese words for the stuck card."""
+    m = re.match(r"(\w+) chain segment (\d+): written (\d+) but the drawing measures ~(\d+)", e)
+    side = {"top": "上", "bottom": "下", "left": "左", "right": "右"}
+    if m:
+        w, me = float(m.group(3)), float(m.group(4))
+        return f"{side.get(m.group(1), m.group(1))}链第{m.group(2)}段写 {int(w)} 量得 ~{int(me)}（×{me / w:.2f}）" if w else e[:60]
+    if "not horizontal/vertical" in e:
+        return e.split(":")[0].replace("room ", "房间") + " 不是直角多边形"
+    if "overlap by" in e:
+        return e.replace("rooms ", "房间 ").replace(" and ", "/").split(" overlap")[0] + " 重叠"
+    if "not on any wall" in e:
+        return "有门窗不在墙上"
+    if "crossed by" in e:
+        return "有文字被线压住"
+    return e[:60]
 
 
 def _side_hint(text: str, box) -> str:
@@ -295,12 +374,15 @@ def archive_command(spec: str) -> str:
             f'"$(dirname {q(spec)})"/report.json; do [ -e "$f" ] && mv -- "$f" "$d/"; done; echo "$d"')
 
 
-def auto_command(image: str, out: str, chains_from: str, labels: Optional[str], task: str, debug: str) -> str:
+def auto_command(image: str, out: str, chains_from: str, labels: Optional[str], task: str, debug: str,
+                 from_spec: Optional[str] = None) -> str:
     q = lambda s: "'" + str(s).replace("'", "'\\''") + "'"   # noqa: E731
     cmd = (f'cd "${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}" && python3 .aiw/cad-drawing/drawkit.py auto {q(image)} '
            f'--chains {q(chains_from)} --out {q(out)} --debug {q(debug)} --task {q(task)} --install-ocr')
     if labels:
         cmd += f" --labels {q(labels)}"
+    if from_spec:
+        cmd += f" --from-spec {q(from_spec)}"
     return cmd
 
 

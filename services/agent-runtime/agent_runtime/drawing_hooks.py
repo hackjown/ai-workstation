@@ -2,6 +2,7 @@
 loop only calls them at a few points. Every function takes the AgentLoop as `L`."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -63,26 +64,142 @@ def hidden(L) -> tuple:
 
 
 async def pre_tool(L, decision):
-    """-> (None, None) to run the tool | ("skip", note) | ("escalate", detail)."""
+    """-> (None, None) to run the tool | ("skip", note) | ("escalate", (kind, detail)) | ("converge", why).
+
+    3.8.9 (task-3fc): the old guard said 「没有动手写 spec」 after the spec had been written AND built, and paused
+    again right after each 继续. Now: in BUILD / VERIFY reads aimed at the build errors have a budget; when the
+    model loops after a spec exists, the deterministic pipeline runs (and then the best draft is delivered)
+    instead of a pause; only a task with no spec at all and no way to make one asks the user."""
     dp = getattr(L, "_dphase", None)
     if not dp:
         return None, None
+    if dp.must_deliver and decision.tool not in ("send_file", "done", "drawing_build"):
+        return "converge", f"{_dp.VERIFY_ROUNDS} 轮核对已用完"
     st = dp.intent(decision.thought or "", decision.tool, decision.args or {})
-    if st == "escalate":
-        L._draw_escalations += 1
-        return "escalate", ("连续多轮都在重复分析同一件事（看图、裁图、问标签位置），没有写 spec 也没有生成图。"
-                            "已提醒两次仍在循环。")
+    if st == "escalate" or (st == "nudge" and dp.nudges >= 2 and (dp.spec_written or dp.resumes)):
+        if dp.spec_written or dp.builds or dp.auto_runs == 0:
+            return "converge", dp.stuck()[1]
+        L._draw_escalations += 1             # no spec and the pipeline could not make one: ask the user
+        return "escalate", dp.stuck()
     if st == "nudge":
         L.history.append(f"{L.step}. {decision.tool} SKIPPED: the last {_dp.INTENT_WINDOW} steps repeat the same analysis "
                          "with nothing new written")
+        if dp.spec_written and dp.last_ok is False:
+            return "skip", ("Your last steps repeat the same analysis. The spec exists and the build reported: "
+                            + " | ".join(dp.last_errors[:6]) + ". Fix exactly those in cad/spec.json and drawing_build "
+                            "again (it re-locates chain boxes and regenerates bad rooms by itself), or call drawing_auto.")
         return "skip", (_dp.STOP_NOTE + " Your last steps repeat the same analysis and nothing new was written. The "
                         "findings are in FACTS. Call drawing_auto (draft from the image) or files_write cad/spec.json now, "
                         "then drawing_build.")
     refusal = dp.gate(decision.tool, decision.args or {})
     if refusal:
-        L.history.append(f"{L.step}. {decision.tool} REFUSED: read budget used up, write the spec")
+        L.history.append(f"{L.step}. {decision.tool} REFUSED: " + ("read budget used up, write the spec" if dp.phase == _dp.READ
+                                                                   else "targeted-read budget used, fix and rebuild"))
         return "skip", refusal
     return None, None
+
+
+async def on_resume(L, note: str) -> str:
+    """the user answered 继续 to a drawing pause: fresh counters + budget, AND a different strategy: the
+    deterministic pipeline runs now (auto chains -> grid rooms -> names from the facts -> build -> auto-repair)."""
+    dp = getattr(L, "_dphase", None) or _dp.DrawPhase()
+    L._dphase = dp
+    dp.resume()
+    res = await auto_pipeline(L, "the user said 继续")
+    L.history.append(f"{L.step}. (继续: deterministic pipeline) -> {res.splitlines()[0][:200]}")
+    if dp.last_ok and getattr(L, "_cad_file", None):     # it passes: deliver now instead of another round
+        await deliver_best(L, "确定性流水线一次通过")
+        return note
+    return (note + "\n\nSWITCHED STRATEGY (the user's 继续): the deterministic pipeline ran for you:\n" + res +
+            "\nDo not re-read the image. If the build passed, send_file the PNG, DXF and PDF and finish with done; if it "
+            "still reports errors, fix only those in cad/spec.json and drawing_build once more.")
+
+
+async def converge(L, why: str) -> bool:
+    """never pause in a loop: run the deterministic pipeline once (if it has not run since the last pause), and if
+    the drawing still does not pass, deliver the best draft with what is unconfirmed. True when the task ended."""
+    dp = getattr(L, "_dphase", None) or _dp.DrawPhase()
+    L._dphase = dp
+    if dp.auto_runs <= dp.resumes and not dp.must_deliver:
+        res = await auto_pipeline(L, why)
+        dp.quiet = _dp.QUIET_STEPS
+        L.history.append(f"{L.step}. (stuck: {why[:80]} -> deterministic pipeline) -> {res.splitlines()[0][:200]}")
+        L._converge_note = ("You were looping, so the deterministic pipeline ran instead:\n" + res +
+                            "\nDo not re-read the image: send_file the PNG, DXF and PDF and finish with done (list what "
+                            "is unconfirmed), or fix only the listed errors once.")
+        if dp.last_ok:
+            return await deliver_best(L, why)
+        return False
+    if not getattr(L, "_cad_file", None):      # nothing was ever built: nothing to deliver yet
+        return False
+    return await deliver_best(L, why)
+
+
+async def deliver_best(L, why: str) -> bool:
+    """send the best draft (PNG, DXF, PDF) with a list of what is unconfirmed, and finish the task."""
+    from aiw_protocols import TaskStatus
+    dp = getattr(L, "_dphase", None) or _dp.DrawPhase()
+    dxf = getattr(L, "_cad_file", None)
+    sent = []
+    if dxf:
+        stem = dxf[:-4] if dxf.lower().endswith(".dxf") else dxf
+        for p in (stem + ".png", dxf, stem + ".pdf"):
+            r = await L.tools.run("send_file", {"path": p}, intent="deliver the best draft")
+            if not (r.success and isinstance(r.result, dict)):
+                continue
+            if check_delivery(L, r.result):
+                continue
+            await L._deliver_file(r.result)
+            record_delivery(L, r.result)
+            sent.append(Path(p).name)
+    unc = await _uncertain(L)
+    ok = dp.last_ok is True
+    lines = [("图纸已生成并通过自动核对。" if ok else "已交付目前最好的草稿（自动核对还有未通过的项）。") +
+             (f" 文件：{', '.join(sent)}。" if sent else " （没能取回文件，图纸在电脑的 cad/ 目录里。）")]
+    if not ok and dp.last_errors:
+        lines.append("未通过的核对：" + "；".join(_dp._short_err(e) for e in dp.last_errors[:6]))
+    if unc:
+        lines.append("待确认：" + "；".join(unc[:8]))
+    lines.append("精度说明：比例来自照片上尺寸链的刻度（逐轴拟合），墙和房间来自像素网格，门窗按墙上的缺口推断；"
+                 "照片本身不完全按比例时，个别墙位可能有 ±100–300 mm 偏差。")
+    if not ok:
+        lines.append(f"（停在这里而不是继续循环：{why}）")
+    if sent:
+        L._sent_file = sent[0]
+    dp.phase = _dp.DELIVER
+    L._finish(TaskStatus.SUCCEEDED, "\n".join(lines))
+    return True
+
+
+async def _uncertain(L) -> list:
+    try:
+        r = await L.tools.run("shell", {"command": 'cd "${VM_AGENT_FILES_ROOT:-$HOME/workspace}" && python3 -c "import json;'
+                                                   's=json.load(open(\'cad/spec.json\'));print(json.dumps(s.get(\'uncertain\') or [],'
+                                                   'ensure_ascii=False))"', "timeout": 20}, intent="read what is uncertain")
+        return json.loads(((r.result or {}).get("stdout") or "[]").strip().splitlines()[-1]) if isinstance(r.result, dict) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def auto_pipeline(L, why: str = "") -> str:
+    """auto chains -> grid rooms -> names from the facts (and the old spec) -> build (auto-repairs)."""
+    dp = getattr(L, "_dphase", None) or _dp.DrawPhase()
+    L._dphase = dp
+    dp.auto_runs += 1
+    # names the model / the user / the vision read gave (OCR-only names are re-read inside _auto with one VLM call)
+    labels = [{"name": x.get("name"), "x": (x.get("at_px") or [None, None])[0], "y": (x.get("at_px") or [None, None])[1]}
+              for x in dp.facts.get("labels") or [] if isinstance(x, dict) and x.get("by") not in (None, "ocr")]
+    labels = [x for x in labels if x["name"] and x["x"] is not None]
+    a = {"from_spec": True}
+    if labels:
+        a["labels"] = labels
+    text = await _auto(L, a)
+    if text.startswith("FAILED"):
+        return text
+    from types import SimpleNamespace
+    b = await L._drawing_build({"spec": "cad/spec.json"}, "build the deterministic draft")
+    post_tool(L, SimpleNamespace(tool="drawing_build", args={"spec": "cad/spec.json"}), not b.startswith("FAILED"), b)
+    return text.split("\nNEXT:")[0] + "\n" + b
 
 
 def post_tool(L, decision, ok: bool, text: str = "") -> None:
@@ -218,6 +335,10 @@ def grid_crop(img, box, target=1600):
 
 
 async def _auto(L, a: dict) -> str:
+    """drawkit auto: the chains are FOUND in the image (3.8.9 - the model's pixel boxes are never used), their
+    numbers come from the model's values / the facts / the old spec, tesseract (<=20 s), or one VLM read per chain
+    crop; rooms come from the wall grid, names from labels (facts, the old spec's rooms by position, OCR, or one VLM
+    read)."""
     dp = L._dphase or _dp.DrawPhase()
     L._dphase = dp
     image = str(a.get("image") or a.get("path") or dp.facts.get("source", {}).get("image") or current_upload(L) or "").strip()
@@ -228,44 +349,65 @@ async def _auto(L, a: dict) -> str:
     chains = _resolve_sides(dp.facts.get("chains") or {})
     if isinstance(a.get("chains"), list):
         chains = [c for c in a["chains"] if isinstance(c, dict)] or chains
-    if not any(c.get("side") in ("top", "bottom") for c in chains) or not any(c.get("side") in ("left", "right") for c in chains):
-        await _emit(L, "drawing_auto", False, {}, "no chains")
-        return ("FAILED: drawing_auto needs at least one horizontal and one vertical dimension chain in FACTS (read them "
-                "with drawing_read, giving side=top/bottom/left/right, or pass `chains`).")
+    # values only: a model-made box is dropped (task-3fc: left box held the wrong line, right box missed it)
+    chains = [{"side": c["side"], "values": c["values"]} for c in chains
+              if c.get("side") in ("top", "bottom", "left", "right") and c.get("values")]
     err = await L._ensure_drawkit()
     if err:
         return f"FAILED: {err}"
     await L.tools.run("files_write", {"path": "cad/auto_chains.json", "content": json.dumps({"chains": chains}, ensure_ascii=False)},
-                      intent="save the chains for the draft")
+                      intent="save the chain values for the draft")
     r = await L.tools.run("shell", {"command": 'cd "${VM_AGENT_FILES_ROOT:-$HOME/workspace}" && [ -e cad/spec.json ] && echo exists; true',
                                     "timeout": 20}, intent="is there a spec already")
     exists = "exists" in (((r.result or {}).get("stdout") or "") if isinstance(r.result, dict) else "")
-    out = "cad/spec.draft.json" if exists else "cad/spec.json"
+    from_spec = "cad/spec.json" if (exists and a.get("from_spec")) else None
+    out = "cad/spec.json" if (not exists or from_spec) else "cad/spec.draft.json"
+    if from_spec:
+        await L.tools.run("shell", {"command": 'cd "${VM_AGENT_FILES_ROOT:-$HOME/workspace}" && cp -f cad/spec.json cad/spec.prev.json',
+                                    "timeout": 20}, intent="keep the previous spec")
+        from_spec = "cad/spec.prev.json"
     labels = None
     if isinstance(a.get("labels"), list) and a["labels"]:
         await L.tools.run("files_write", {"path": "cad/auto_labels.json", "content": json.dumps({"labels": a["labels"]}, ensure_ascii=False)},
                           intent="save the room labels")
         labels = "cad/auto_labels.json"
-    cmd = _dp.auto_command(image, out, "cad/auto_chains.json", labels, L._root_id, "cad/auto_debug.png")
-    r = await L.tools.run("shell", {"command": cmd, "timeout": 900}, intent="draft the spec from the image")
-    res = r.result if isinstance(r.result, dict) else {}
-    rep = _dp.parse_auto(res.get("stdout") or "")
-    if rep and rep.get("ok") and len(rep.get("labels") or []) < 2 and labels is None:
-        # no printed labels the OCR could read: ask the vision model ONCE, on a gridded crop, for JSON positions
-        labs = await _vlm_labels(L, image, rep)
-        if labs:
+
+    async def run(lab):
+        cmd = _dp.auto_command(image, out, "cad/auto_chains.json", lab, L._root_id, "cad/auto_debug.png", from_spec)
+        rr = await L.tools.run("shell", {"command": cmd, "timeout": 900}, intent="draft the spec from the image")
+        res_ = rr.result if isinstance(rr.result, dict) else {}
+        return _dp.parse_auto(res_.get("stdout") or ""), res_
+    rep, res = await run(labels)
+    if rep and rep.get("need_values"):
+        # the chains were found but no number could be read: one strict-JSON VLM read per chain crop
+        got = await _vlm_chain_values(L, image, rep)
+        if got:
+            have = {c["side"] for c in chains}
+            chains += [{"side": k, "values": v} for k, v in got.items() if k not in have]
+            await L.tools.run("files_write", {"path": "cad/auto_chains.json", "content": json.dumps({"chains": chains}, ensure_ascii=False)},
+                              intent="save the chain values for the draft")
+            rep, res = await run(labels)
+    unnamed = any(x.get("name") == "房间?" for x in (rep or {}).get("rooms") or [])
+    if rep and rep.get("ok") and labels is None and (len(rep.get("labels") or []) < 8 or unnamed):
+        # OCR read none or only some of the printed names (task-3fc: 7 of 11): ask the vision model ONCE, on a
+        # gridded crop, for JSON positions; an OCR hit of the same name nearby keeps its sharper position
+        ocr = [x for x in rep.get("labels") or [] if x.get("x") is not None]
+        labs = _merge_labels(await _vlm_labels(L, image, rep), ocr)
+        if len(labs) > len(ocr):
             await L.tools.run("files_write", {"path": "cad/auto_labels.json", "content": json.dumps({"labels": labs}, ensure_ascii=False)},
                               intent="save the room labels")
-            cmd = _dp.auto_command(image, out, "cad/auto_chains.json", "cad/auto_labels.json", L._root_id, "cad/auto_debug.png")
-            r = await L.tools.run("shell", {"command": cmd, "timeout": 900}, intent="draft the spec with the labels")
-            res = r.result if isinstance(r.result, dict) else {}
-            rep = _dp.parse_auto(res.get("stdout") or "") or rep
+            rep2, res2 = await run("cad/auto_labels.json")
+            rep, res = (rep2, res2) if rep2 else (rep, res)
     if not rep or not rep.get("ok"):
         tail = (rep or {}).get("error") or ((res.get("stderr") or "") + (res.get("stdout") or ""))[-800:]
         await _emit(L, "drawing_auto", False, {}, str(tail)[:200])
         return f"FAILED: drawkit auto: {tail}"
     for lab in rep.get("labels") or []:
         dp.note("labels", lab.get("name"), {"name": lab.get("name"), "at_px": [lab.get("x"), lab.get("y")], "by": lab.get("by")})
+    for c in rep.get("chains") or []:
+        if c.get("values"):
+            dp.facts["chains"][c["side"]] = {"values": c["values"], "by": c.get("by"), "line_px": c.get("line_px")}
+            dp.locked.add(f"chains:{c['side']}")
     dp.note("source", "image", image)
     dp.note("source", "md5", rep.get("md5"))
     dp.after("drawing_auto", a, True, "")
@@ -273,12 +415,58 @@ async def _auto(L, a: dict) -> str:
     L._acted = True
     await _emit(L, "drawing_auto", True, {"rooms": len(rep.get("rooms") or []), "out": out})
     rooms = "; ".join(f"{x['name']} {x['box']}" for x in rep.get("rooms") or [])
-    return (f"DRAFT written to {out} ({len(rep.get('rooms') or [])} rooms, debug image cad/auto_debug.png): {rooms}. "
-            f"Axis lines x {rep.get('x_lines')} y {rep.get('y_lines')} (not on a chain mark: x {rep.get('x_unsnapped')}, "
-            f"y {rep.get('y_unsnapped')}). Uncertain: {rep.get('uncertain') or 'none'}.\nNEXT: CORRECT the draft, do not "
-            f"re-derive it: files_read {out}, fix only what is wrong (a missing or misplaced wall, a room named 房间?), add "
-            "doors and windows from the photo, set title/subtitle, files_write it" +
-            (" to cad/spec.json" if out != "cad/spec.json" else "") + ", then drawing_build.")
+    ch = "; ".join(f"{c['side']} {c.get('values')} ({c.get('by')}, line at {c.get('line_px')} px)" for c in rep.get("chains") or [])
+    return (f"DRAFT written to {out} ({len(rep.get('rooms') or [])} rectilinear rooms from the wall grid, debug image "
+            f"cad/auto_debug.png): {rooms}.\nChains found in the image: {ch}. Checks: {rep.get('checks') or []}. "
+            f"Openings placed: {rep.get('openings') or {}}. Uncertain: {rep.get('uncertain') or 'none'}.\nNEXT: CORRECT the "
+            f"draft, do not re-derive it: only rename a room that is 房间? or wrongly named (names come from labels), set "
+            f"title/subtitle" + (" and write it to cad/spec.json" if out != "cad/spec.json" else "") + ", then drawing_build.")
+
+
+def _merge_labels(vlm: list, ocr: list, near: float = 60.0) -> list:
+    out = []
+    used = set()
+    for v in vlm or []:
+        k = next((i for i, o in enumerate(ocr) if i not in used and o.get("name") == v.get("name")
+                  and abs(o["x"] - v["x"]) <= near and abs(o["y"] - v["y"]) <= near), None)
+        if k is not None:
+            used.add(k); out.append({"name": v["name"], "x": ocr[k]["x"], "y": ocr[k]["y"], "by": "ocr+vlm"})
+        else:
+            out.append(v)
+    out += [dict(o) for i, o in enumerate(ocr) if i not in used]
+    return out
+
+
+async def _vlm_chain_values(L, image: str, rep: dict) -> dict:
+    """one strict-JSON VLM read per chain crop whose numbers OCR could not read: {side: [values]}."""
+    eyes = getattr(L, "vision_llm", None) or getattr(L, "llm", None)
+    if eyes is None or not hasattr(eyes, "describe"):
+        return {}
+    img, err = await L._load_ws_image(image)
+    if img is None:
+        return {}
+    out = {}
+    for side, box in (rep.get("chain_boxes") or {}).items():
+        n = (rep.get("segments") or {}).get(side)
+        try:
+            crop = grid_crop(img, box, target=1400)
+            if side in ("left", "right"):
+                crop = crop.rotate(-90, expand=True)
+            buf = io.BytesIO(); crop.convert("RGB").save(buf, "JPEG", quality=90)
+            q = (f"这是户型图的一条尺寸链（{n} 段）。按从{'左到右' if side in ('top', 'bottom') else '上到下（图已旋转，按图中从左到右）'}"
+                 f"列出每一段上印的数字（毫米），只输出 JSON：{{\"values\": [..{n} 个整数..]}}")
+            text = await asyncio.wait_for(eyes.describe("你是严谨的读图员，只报告图上真实存在的数字，只输出 JSON。", q,
+                                                        base64.b64encode(buf.getvalue()).decode(), 300), 60)
+        except Exception:  # noqa: BLE001
+            continue
+        m = re.search(r"\{.*\}", text or "", re.S)
+        try:
+            vals = [int(v) for v in json.loads(m.group(0)).get("values")] if m else []
+        except (ValueError, TypeError, AttributeError):
+            vals = []
+        if vals and (not n or len(vals) == n):
+            out[side] = vals
+    return out
 
 
 async def _vlm_labels(L, image: str, rep: dict) -> list:

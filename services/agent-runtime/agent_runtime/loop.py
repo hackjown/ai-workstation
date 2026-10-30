@@ -595,7 +595,8 @@ class AgentLoop:
             blind = self._last_tool in _NO_SCREEN_TOOLS and self.step > 1
             # shell/file work (analyse a video, convert a file, write a script) needs no first look at the desktop:
             # every task used to open with a screenshot + vision description of an empty Debian desktop
-            first_blind = self.step == 1 and self._desktop_free and not self.control.resumed_after_takeover
+            first_blind = (self.step == 1 and (self._desktop_free or getattr(self, "_dphase", None) is not None)
+                           and not self.control.resumed_after_takeover)   # a drawing reads files, not the desktop
             blind = blind or first_blind
             # a CAD batch that went through needs no fresh look (screenshot + vision cost ~15 s a step);
             # look again every 4th batch so a drawing error is still caught
@@ -812,9 +813,19 @@ class AgentLoop:
                 continue
 
             gate, gnote = await _dh.pre_tool(self, decision)
+            if gate == "converge":   # 3.8.9: looping after a spec exists -> deterministic pipeline, then deliver
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="换方法：确定性流水线出图")
+                if await _dh.converge(self, gnote):
+                    return
+                note, failures = getattr(self, "_converge_note", None) or gnote, 0
+                continue
             if gate == "escalate":
-                n = await self._escalate("drawing_loop", gnote)
+                kind, detail = gnote if isinstance(gnote, tuple) else ("drawing_loop", gnote)
+                n = await self._escalate(kind, detail)
                 if n is None:
+                    return
+                n = await _dh.on_resume(self, n)   # 继续 = a fresh budget AND the deterministic pipeline
+                if self.task.status in (TaskStatus.SUCCEEDED,):
                     return
                 note, failures = n, 0
                 continue
@@ -841,6 +852,10 @@ class AgentLoop:
 
             outcome = None
             run_args, fixed = self._fix_paths(decision.tool, decision.args)
+            if (decision.tool == "shell" and isinstance(run_args, dict) and _OCR_RE.search(str(run_args.get("command") or ""))
+                    and float(run_args.get("timeout") or 60) > float(os.environ.get("AIW_OCR_TIMEOUT", "20"))):
+                # task-3fc: tesseract on the whole photo hung for 60 s; an OCR call gets 20 s, then falls back
+                run_args = dict(run_args, timeout=float(os.environ.get("AIW_OCR_TIMEOUT", "20")))
             if fixed:
                 self.history.append(f"{self.step}. (path fixed: /home/user/workspace → {self.home}/workspace; "
                                     "write ~/workspace next time)")
@@ -2553,7 +2568,10 @@ def _ws_rel(p: str) -> str:
 
 
 _GUESSED_HOME = re.compile(r"(/home/(?:user|aiw|ubuntu|debian)/)workspace(?=/|\b)")
-_NO_SCREEN_TOOLS = {"read_image", "image_edit", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch"}
+_NO_SCREEN_TOOLS = {"read_image", "image_edit", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
+                    # 3.8.9 (task-3fc): file-only drawing steps; a desktop look + vision description cost 12-15 s each
+                    "drawing_auto", "drawing_build", "drawing_note", "drawing_read"}
+_OCR_RE = re.compile(r"\b(tesseract|rapidocr|paddleocr|easyocr)\b", re.I)
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "dispatch", "open_app"}
 
 

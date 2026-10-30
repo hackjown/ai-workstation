@@ -12,7 +12,7 @@ description: 任何技术图纸（户型平面图、施工图、机械零件、�
 `examples/xinda-g-108.spec.json`（**通用示例**，只用来看 spec 怎么写：信达海天下 G 户型照片 → spec）、
 `examples/12-031de1aca2dd.JPG`（示例的原图）。
 
-## 铁律（3.8.8）
+## 铁律（3.8.8 / 3.8.9）
 - **每个新任务都是全新的活**：只在本任务的文件夹里工作（`cad/` 就是本任务自己的 `tasks/<任务id>/cad`）。
   **绝不**复制、重发或从以前任务的输出（spec、dxf、png、pdf、修好的图）开始——**上传文件 md5 和以前一样也不行**，
   不要拿 md5 去找旧结果。示例 spec 只是写法示例，不能当成交付或起点。只有在同一张任务卡上“继续/修改”才沿用该任务的文件夹。
@@ -25,7 +25,22 @@ description: 任何技术图纸（户型平面图、施工图、机械零件、�
 - **不要用自由提问问视觉模型“标签在哪”**：标签位置用 OCR 或一次带像素网格的 JSON 读取，`drawing_auto` 自动做。
 - **spec 记录来源**：`source.md5`（原图 md5）和 `source.task`（写它的任务）。与当前上传或当前任务不符时，`drawing_build` 报
   `STALE SPEC`，修订开始时旧 spec 会被移到 `cad/_stale/`——按当前图重新出草稿。
-- 连续几步在重复同一个分析、什么新东西都没写，会收到「停止分析，立即根据已有 facts 写 spec 并生成」；两次后会直接问用户。
+- 连续几步在重复同一个分析、什么新东西都没写，会收到「停止分析，立即根据已有 facts 写 spec 并生成」。
+
+## 确定性流水线（3.8.9，task-3fc 之后）
+- **不要猜像素框。** `drawing_auto` 自己找四条尺寸链：外墙外侧的细长线 + 线上的刻度（尺寸界线穿过或圆点/斜杠），
+  数字用 tesseract（≤20 秒）读，读不出时服务器对每条链的裁图问一次视觉模型（严格 JSON）。你只需（可选）给数值
+  `chains: [{side, values}]`；对边总和、x/y 比例、外墙框长宽比自动核对，每个轴单独拟合比例。
+- **房间来自墙网格**：粗墙像素（彩色户型图的深灰墙带、双线墙）→ 轴网（吸附尺寸链刻度）→ 每条格边测墙覆盖 →
+  直角、不重叠的房间；同一连通区里有多个标签时，按“穿墙代价”分给最近的标签（门洞不会把两个房间并成一个）。
+  门放在内墙缺口处，外墙缺口有玻璃线的是窗。**你的工作只是名字**：标签 + 大致像素位置（OCR / 一次 VLM 读 / 你第一次读图）。
+- **`drawing_build` 自动修**：某条链各段同比例偏差（框到了别的线）或量出 ~0（没框到线）→ 按数值在图上重新定位这条链；
+  房间有斜边/面积为 0/重叠 → 按墙网格重建房间、按位置保留名字（原文件存为 `*.before-repair.json`）；
+  门窗不在墙上 → 吸附到 1 m 内最近的墙边，太远就不画并列入待确认；尺寸数字避开尺寸线。另外输出 `plan.pdf`。
+- **一定收敛**：看图预算按阶段算（BUILD/VERIFY 每轮最多 4 次针对报错的读取）。卡住时说实话（「spec 已生成但核对未通过：
+  左链第1段…」）；用户点「继续」= 计数清零、新预算、并直接跑确定性流水线（自动链 → 网格房间 → 已读到的名字 →
+  生成 → 自动修），之后一段时间内不会因同一原因再暂停。最多 3 轮核对后交付最好的草稿（DXF/PNG/PDF）+ 待确认清单 + 精度说明。
+- 纯文件阶段（READ/SPEC/BUILD）不再每步截桌面 + 视觉描述；OCR 调用超过 20 秒就放弃并改用视觉读取。
 
 Agent 里有两个专用工具，优先用它们：
 - `drawing_read`：把源图某一块放大，用视觉模型**读两遍**（两种问法），自动比对；不一致会再放大读第三遍并告诉你冲突在哪。
@@ -38,8 +53,9 @@ python3 $D/drawkit.py zoom IMG --box x0,y0,x1,y1 --k 6 [--rotate 270] [--grid] -
 python3 $D/drawkit.py ticks IMG --side left --box x0,y0,x1,y1   # 尺寸线 + 刻度/尺寸界线的像素位置
 python3 $D/drawkit.py fit cad/spec.json              # 像素↔mm 拟合、逐段残差、对边闭合检查
 python3 $D/drawkit.py axes cad/spec.json --out cad/axes.png      # 轴网画在原图上，看是否压在墙上
-python3 $D/drawkit.py auto IMG --chains cad/auto_chains.json [--labels L.json] --out cad/spec.json --debug cad/auto_debug.png
-                                                     # 自动草稿：像素找墙线 + 尺寸链定比例 + 标签落进墙围单元 = 房间
+python3 $D/drawkit.py auto IMG [--chains values.json] [--labels L.json] [--from-spec old.json] --out cad/spec.json --debug cad/auto_debug.png
+                                                     # 确定性草稿：自动找尺寸链（刻度+数字）+ 墙网格房间 + 门窗缺口；
+                                                     # values.json 只需 {"chains":[{"side","values"}]}；退出码 3 = 找到链但数字没读出（need_values）
 python3 $D/drawkit.py build cad/spec.json --out cad --name plan  # 全量生成 + 检查（退出码 2 = 有错误）
 python3 $D/drawkit.py schema                         # spec 字段说明
 ```
@@ -66,9 +82,9 @@ python3 $D/drawkit.py schema                         # spec 字段说明
    x、y 比例相差 >3% 说明照片斜拍或某条链读错。
 
 ### C. 房间/构件 → spec
-6b. **楼层平面照片：先 `drawing_auto`**（尺寸链已在 FACTS 里）。它用暗像素投影找粗墙线、吸附到尺寸链的轴线，OCR 读房间名
-   （图上没印字时问一次视觉模型要 JSON 坐标），把每个标签放进它所在的墙围单元，写出 `cad/spec.json` 草稿和
-   `cad/auto_debug.png`（红=识别的墙，色块=房间）。接下来**只改草稿**：补门窗、改错的墙、给 `房间?` 起名，然后 drawing_build。
+6b. **楼层平面照片：看一次全图后就 `drawing_auto`**（不用先手工读链、不要给像素框）。它自己找链和刻度、读数字、拟合比例、
+   出墙网格房间和门窗，写出 `cad/spec.json` 草稿和 `cad/auto_debug.png`（红=识别的墙，色块=房间）。接下来**只改名字**
+   （`房间?` 或放错的名字）和标题，然后 drawing_build。
 7. 每个房间：名字取**图上的文字标签**（不要按模板“三房两厅”去套），位置取它在照片里的像素范围，按拟合的
    比例换成 mm，并吸附到最近的轴线；写成直角多边形 `poly`（或 `box`）。开敞的客厅/餐厅/玄关/过道给同一个
    `zone`，它们之间不画墙。
@@ -137,3 +153,6 @@ python3 $D/drawkit.py schema                         # spec 字段说明
 | 分析停不下来 | task-41c：200 步里 134 次 shell 裁图/扫像素、46 次 read_image，每步都从“用户说户型画错了”重新开始，第 124 步才写脚本 | 读图 ≤8 步，发现随手 drawing_note；读完链就 drawing_auto 出草稿，只改草稿 |
 | 旧 spec | cad/ 里是另一张图（G 户型）的 spec，被当成要改的图改了 ~90 步 | spec 记 source.md5 + task；不符就归档、重新出草稿 |
 | 同 md5 | 新任务上传的图和以前 md5 一样，就把以前的成品重发 | 新任务永远重新做；同 md5 也一样；重复的成品在 send_file 被拒 |
+| 像素框 | task-3fc：文字模型按描述猜链的 box_px，左链框到别的线（各段 ×1.36）、右链没框到（~0 mm），比例差 40%，build 一直不过 | 链由 drawing_auto 在图上找，模型只给数值；build 见到同比例偏差/~0 自动重新定位 |
+| 手写房间 | 过道多边形有斜边、面积 0，主卧/过道/餐厅互相重叠，门不在墙上 | 房间来自墙网格（天然直角、不重叠），模型只给名字；build 自动重建房间、门窗吸附到墙 |
+| 假“卡住” | 守卫说“没有动手写 spec”（其实已写并生成），用户点继续后立刻又停 | 卡住说明写真实状态；继续 = 清零 + 新预算 + 确定性流水线；3 轮后交付最好的草稿 |

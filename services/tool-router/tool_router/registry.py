@@ -158,16 +158,18 @@ TOOLS: list[ToolSpec] = [
               "confirmed": {"type": "boolean"},
               "items": {"type": "array", "items": {"type": "object"}, "description": "several {kind,key,value,confirmed}"}}, []),
     ToolSpec("drawing_auto", None,
-             "Floor plan from a photo: write a DRAFT spec automatically (drawkit auto). The pixel->mm scale comes from the "
-             "dimension chains in FACTS, the wall lines from thick dark pixels, room labels from OCR (or ONE vision read "
-             "of a gridded crop when the plan prints none), each label assigned to the wall-bounded cell holding it. "
-             "Writes cad/spec.json (cad/spec.draft.json when a spec exists) and cad/auto_debug.png. Then only CORRECT the "
-             "draft (doors, windows, a wrong wall) and drawing_build; do not re-derive the layout by hand.",
+             "Floor plan from a photo: the DETERMINISTIC draft (drawkit auto). It FINDS the four dimension chains itself "
+             "(long thin lines outside the outer walls and their ticks; numbers by OCR, or one vision read per chain "
+             "crop), fits the px->mm scale per axis, builds the wall grid from the thick wall pixels and makes "
+             "rectilinear, non-overlapping rooms from it; doors and windows go where the walls have gaps. Your job is "
+             "only the NAMES: room labels come from OCR, `labels`, or one vision read. Never pass pixel boxes. Writes "
+             "cad/spec.json (cad/spec.draft.json when a spec exists) and cad/auto_debug.png; then drawing_build.",
              {"image": {"type": "string", "description": "source image relative to ~/workspace (default: the upload)"},
               "labels": {"type": "array", "items": {"type": "object"},
-                         "description": "optional [{name, x, y}] room labels in source pixels"},
+                         "description": "optional [{name, x, y}] room names at their approximate source-pixel position"},
               "chains": {"type": "array", "items": {"type": "object"},
-                         "description": "optional chains [{side, values, box_px}] (default: FACTS)"}}, []),
+                         "description": "optional chain VALUES you read [{side, values}] (top/bottom/left/right); "
+                                        "the lines themselves are located automatically"}}, []),
     ToolSpec("drawing_build", None,
              "Generate the WHOLE drawing deterministically from a structured spec (JSON, schema in the cad-drawing skill: "
              "floor_plan rooms/doors/windows/furniture/dimension chains, diagram nodes/edges, or generic entities/dims). "

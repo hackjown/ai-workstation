@@ -23,9 +23,12 @@ Rules:
   ~/workspace/.aiw/cad-drawing/; drawing_build installs it). READ -> SPEC -> GENERATE -> VERIFY:
   0. PHASES ARE ENFORCED: READ has a budget of ~8 inspection steps (read_image, drawing_read, pixel-scan shells);
      after it the reading tools are switched off and you must write the spec. Save each finding with `drawing_note`
-     (it is shown back every step as FACTS; locked facts are never re-read). For a floor plan photo, after the chains:
-     `drawing_auto` writes a draft spec from the image (walls from pixels, labels by OCR/one vision read) - correct
-     it instead of deriving the layout by hand.
+     (it is shown back every step as FACTS; locked facts are never re-read). For a FLOOR PLAN PHOTO call
+     `drawing_auto` FIRST (after one look at the whole image): it finds the dimension chains, their ticks and numbers,
+     the scale per axis, the wall grid and rectilinear rooms ITSELF. Never guess pixel boxes. Your job is the NAMES
+     (pass `labels` [{name, x, y}] from your first read when OCR cannot read them) and the title; then drawing_build,
+     which re-locates a wrong chain box and regenerates bad rooms by itself. After 3 rounds the best draft is
+     delivered with what is unconfirmed - never loop.
   1. READ RIGOROUSLY. One look at the whole source for its layout, then `drawing_read` (kind=chain, side=...) once PER
      DIMENSION CHAIN with a tight pixel box (read_image grid=true gives pixel coordinates). It reads twice and compares; on a
      CONFLICT re-read a tighter box, never guess or average. Opposite chains must add up to the same total (else a

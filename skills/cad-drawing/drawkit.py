@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import os
 import shutil
 import subprocess
@@ -144,6 +145,9 @@ def cmd_ensure(_a):
         except Exception as e:  # noqa: BLE001
             ok[mod] = f"MISSING ({e})"
     ok["cjk_font"] = cjk_font() or "MISSING"
+    if not shutil.which("tesseract"):     # 3.8.9: reads the dimension digits (optional; the vision read is the fallback)
+        _apt(["tesseract-ocr"])
+    ok["tesseract"] = shutil.which("tesseract") or ""
     ok["librecad"] = shutil.which("librecad") or ""
     print(json.dumps(ok, ensure_ascii=False))
     # the font only affects the PNG preview (the DXF names its own fonts): a missing one is a warning, not a failure
@@ -679,6 +683,18 @@ class Plan:
             return best[1]
         return None
 
+    def nearest_wall(self, segs, p, tol):
+        best = None
+        for s in segs:
+            if s["o"] == "h":
+                q = (min(max(p[0], s["u"]), s["v"]), s["c"])
+            else:
+                q = (s["c"], min(max(p[1], s["u"]), s["v"]))
+            d = math.hypot(p[0] - q[0], p[1] - q[1])
+            if s["v"] - s["u"] >= 500 and (best is None or d < best[0]):
+                best = (d, s)
+        return best[1] if best and best[0] <= tol else None
+
     def openings(self, segs):
         """doors and windows resolved onto their walls: (kind, spec, wall, lo, hi)."""
         out = []
@@ -692,8 +708,24 @@ class Plan:
                     p = self.m.P(o["at"]); w = float(o.get("width", 900 if kind == "doors" else 1500))
                 s = self.find_wall(segs, p)
                 if not s:
-                    self.errors.append(f"{kind[:-1]} {o.get('id') or o.get('name') or o.get('at') or o.get('a')}: not on any wall "
-                                       f"(point {tuple(round(v) for v in p)} mm); put it on a room edge")
+                    # 3.8.9: snap to the nearest wall edge (within 1 m) instead of failing the build
+                    s = self.nearest_wall(segs, p, float(os.environ.get("DRAWKIT_SNAP_MM", "1000")))
+                    if s:
+                        q = (min(max(p[0], s["u"] + w / 2), s["v"] - w / 2) if s["v"] - s["u"] > w else (s["u"] + s["v"]) / 2,
+                             s["c"]) if s["o"] == "h" else \
+                            (s["c"], min(max(p[1], s["u"] + w / 2), s["v"] - w / 2) if s["v"] - s["u"] > w else (s["u"] + s["v"]) / 2)
+                        self.warns.append(f"{kind[:-1]} {o.get('id') or o.get('at') or o.get('a')}: snapped onto the nearest wall "
+                                          f"({tuple(round(v) for v in p)} -> {tuple(round(v) for v in q)} mm)")
+                        self.snapped = getattr(self, "snapped", 0) + 1
+                        p = q
+                if not s:
+                    msg = (f"{kind[:-1]} {o.get('id') or o.get('name') or o.get('at') or o.get('a')}: not on any wall "
+                           f"(point {tuple(round(v) for v in p)} mm)")
+                    if os.environ.get("DRAWKIT_STRICT_OPENINGS") == "1":
+                        self.errors.append(msg + "; put it on a room edge")
+                    else:   # 3.8.9: no wall within 1 m - left out and listed, the build still converges
+                        self.warns.append(msg + ": left out of the drawing (no wall within 1 m); listed as uncertain")
+                        self.spec.setdefault("uncertain", []).append(f"{kind[:-1]} at {o.get('at') or o.get('a')} 没画：附近 1 m 内没有墙")
                     continue
                 along = p[0] if s["o"] == "h" else p[1]
                 lo, hi = along - w / 2, along + w / 2
@@ -937,6 +969,13 @@ class Plan:
                 placed = self._place(sh, r, lines, H0r * min_k, strict=False)
                 self.warns.append(f"room {name}: label touches furniture or a door swing (no clear spot even at "
                                   f"{round(min_k * 100)}% size)")
+            if placed is None:   # 3.8.9: a narrow room still gets its name, smaller (a warning, never a dead end)
+                for kk in (0.45, 0.35, 0.28):
+                    placed = self._place(sh, r, lines[:1], H0r * kk, strict=False, inset_k=0.0)
+                    if placed is not None:
+                        lines = lines[:1]
+                        self.warns.append(f"room {name}: label squeezed to {round(kk * 100)}% size (narrow room)")
+                        break
             if placed is None:
                 self.errors.append(f"room {name}: no room for its label")
                 continue
@@ -954,12 +993,12 @@ class Plan:
         b1 = Sheet.tbox(cx, cy + 0.55 * h, h, lines[0]); b2 = Sheet.tbox(cx, cy - 0.75 * h, 0.7 * h, lines[1])
         return (min(b1[0], b2[0]), min(b1[1], b2[1]), max(b1[2], b2[2]), max(b1[3], b2[3]))
 
-    def _place(self, sh, r, lines, h, strict):
+    def _place(self, sh, r, lines, h, strict, inset_k=1.0):
         pts = r["pts"]
         x0 = min(p[0] for p in pts); x1 = max(p[0] for p in pts)
         y0 = min(p[1] for p in pts); y1 = max(p[1] for p in pts)
         step = max(40.0, min(x1 - x0, y1 - y0) / 24)
-        inset = min(self.t_ext / 2 + 40, 0.18 * min(x1 - x0, y1 - y0))
+        inset = inset_k * min(self.t_ext / 2 + 40, 0.18 * min(x1 - x0, y1 - y0)) + (1 - inset_k) * 30
         obst = self.obstacles.get(r["id"], [])
         if r.get("label_at"):
             ax, ay = self.m.P(r["label_at"])
@@ -1165,20 +1204,36 @@ def _chain(sh, side, pos, vals, row, ext, th, tick):
         mid = (a + b) / 2
         s = str(int(round(v))) if abs(v - round(v)) < 1e-6 else f"{v:g}"
         length = abs(b - a)
+        # 3.8.9 (task-3fc: "text '3500' is crossed by a 尺寸 line"): a spot must be free of other texts AND of
+        # dimension lines; the number slides along its segment before it is lifted further
+        first = None
         for k in range(4):
             lift = 0.35 * th + k * 1.25 * th
-            if horiz:
-                y = row + (lift + 0.55 * th if side == "top" else -(lift + 0.55 * th))
-                box = Sheet.tbox(mid, y, th, s)
+            for along in (0.0, -0.25, 0.25):
+                m_ = mid + along * length
+                if horiz:
+                    y = row + (lift + 0.55 * th if side == "top" else -(lift + 0.55 * th))
+                    box = Sheet.tbox(m_, y, th, s)
+                else:
+                    x = row - (lift + 0.55 * th) if side == "left" else row + (lift + 0.55 * th)
+                    box = Sheet.tbox(x, m_, th, s, rot=90)
+                if first is None:
+                    first = (m_, y if horiz else x)
+                if sh.free(box, pad=0.15 * th) and sh.clear(_shrink(box, 0.08), ("尺寸",)):
+                    break
             else:
-                x = row - (lift + 0.55 * th) if side == "left" else row + (lift + 0.55 * th)
-                box = Sheet.tbox(x, mid, th, s, rot=90)
-            if sh.free(box, pad=0.15 * th):
-                break
-        if horiz:
-            sh.text(mid, y, s, th, "尺寸", role="dim")
+                continue
+            break
         else:
-            sh.text(x, mid, s, th, "尺寸", rot=90, role="dim")
+            m_, v_ = first
+            if horiz:
+                y = v_
+            else:
+                x = v_
+        if horiz:
+            sh.text(m_, y, s, th, "尺寸", role="dim")
+        else:
+            sh.text(x, m_, s, th, "尺寸", rot=90, role="dim")
         if text_width(s, th) > length:
             sh.warnings.append(f"{side} chain: {s} is wider than its {round(length)} segment (number moved out)")
 
@@ -1567,7 +1622,7 @@ def chain_checks(spec, m: Model):
         for k, r in enumerate(reads):
             if [float(v) for v in r] != vals:
                 E.append(f"{c['side']} chain: read #{k + 1} {r} differs from the values {c['values']}: re-read the zoomed crop")
-        if len(reads) < 2 and not c.get("given"):
+        if len(reads) < 2 and not c.get("given") and not c.get("auto"):
             W.append(f"{c['side']} chain: read it twice (two zoomed reads) and store both in 'reads'")
     for a, b in (("top", "bottom"), ("left", "right")):
         if a in by and b in by:
@@ -1925,7 +1980,123 @@ def stale_reasons(spec, task=None):
     return out
 
 
-def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=None):
+def _room_problems(spec):
+    """room geometry a generator cannot draw: non-rectilinear, degenerate, overlapping."""
+    m = Model(spec)
+    rooms = []
+    for r in spec.get("rooms") or []:
+        pts = r.get("poly") or ([[r["box"][0], r["box"][1]], [r["box"][2], r["box"][1]], [r["box"][2], r["box"][3]],
+                                  [r["box"][0], r["box"][3]]] if r.get("box") else [])
+        rooms.append((r, pts))
+    bad = []
+    for r, pts in rooms:
+        if len(pts) < 3 or abs(poly_area(pts)) < 1e5:
+            bad.append(f"{r.get('name')}: degenerate")
+            continue
+        if any(abs(a[0] - b[0]) > 1e-6 and abs(a[1] - b[1]) > 1e-6 for a, b in _edges(pts)):
+            bad.append(f"{r.get('name')}: not rectilinear")
+    for i, (a, pa) in enumerate(rooms):
+        for b, pb in rooms[i + 1:]:
+            if len(pa) >= 3 and len(pb) >= 3 and _poly_overlap(pa, pb) > 1e4:
+                bad.append(f"{a.get('name')}/{b.get('name')}: overlap")
+    del m
+    return bad
+
+
+def repair_spec(spec):
+    """3.8.9 auto-repair before the checks, so a wrong pixel box or hand-drawn rooms never loop the model:
+    * a chain whose segments all measure the same factor off its written values (the box held another line) or ~0
+      (the box missed the line) is re-located in the image from its VALUES (drawauto.detect_chains);
+    * rooms that are not rectilinear / overlap / are degenerate are regenerated from the wall grid; their names are
+      kept by position (each old room's label point names the new cell group)."""
+    src = spec.get("source") or {}
+    img = src.get("image")
+    out = []
+    if not img or not os.path.exists(img) or spec.get("kind", "floor_plan") != "floor_plan":
+        return out
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import drawauto as da
+    probe = json.loads(json.dumps(spec))
+    fr = fit_transform(probe)
+    bad = {}
+    for e in fr["errors"]:
+        mt = re.match(r"(\w+) chain segment (\d+): written ([\d.]+) but the drawing measures ~(-?\d+) mm", e)
+        if mt:
+            bad.setdefault(mt.group(1), []).append((float(mt.group(3)), float(mt.group(4))))
+    for w in fr["warnings"]:
+        mt = re.match(r"(\w+) chain: no tick pixels", w)
+        if mt:
+            bad.setdefault(mt.group(1), [])
+    boxed = [c.get("side") for c in chain_list(spec) if c.get("box_px") and not c.get("auto")]
+    if bad or boxed:
+        for s_ in boxed:
+            bad.setdefault(s_, bad.get(s_) or None)
+        given = {c.get("side"): c.get("values") for c in chain_list(spec) if c.get("values")}
+        det = da.detect_chains(img, given=given, ocr=False)
+        by = {c["side"]: c for c in det.get("chains") or [] if c.get("values")}
+        for side, segs in bad.items():
+            if segs is None:          # a model-given box that measured fine: still use the located line, silently
+                c = next((c for c in chain_list(spec) if c.get("side") == side), None)
+                d = by.get(side)
+                if c is not None and d is not None and d.get("by") == "given":
+                    c.pop("box_px", None); c.pop("tick_candidates", None)
+                    c["ticks_px"] = d["ticks_px"]; c["auto"] = True
+                continue
+            ratios = [m_ / w_ for w_, m_ in segs if w_]
+            why = ("every segment measured ~0 mm: the box missed the line" if ratios and max(abs(r) for r in ratios) < 0.1 else
+                   f"every segment measured x{sum(ratios) / len(ratios):.2f} its value: the box held another line"
+                   if ratios and max(ratios) - min(ratios) < 0.15 * max(abs(sum(ratios) / len(ratios)), 1e-6) else
+                   "segments did not fit their values")
+            c = next((c for c in chain_list(spec) if c.get("side") == side), None)
+            d = by.get(side)
+            if c is not None and d is not None and d.get("by") == "given":
+                old = c.get("box_px")
+                c.pop("box_px", None); c.pop("tick_candidates", None)
+                c["ticks_px"] = d["ticks_px"]; c["auto"] = True
+                out.append(f"{side} chain re-located in the image ({why}; box {old} -> dimension line at "
+                           f"{d['line_px']} px, ticks {d['ticks_px']})")
+            else:
+                out.append(f"{side} chain: {why}; could not re-locate it from its values (they may be misread)")
+    probs = _room_problems(spec)
+    if probs and spec.get("y_down", True):
+        fr = fit_transform(json.loads(json.dumps(spec)), write=False)
+        T = fr.get("transform") or {}
+        if all(k in T for k in ("ax", "bx", "ay", "by")):
+            labs = []
+            for r in spec.get("rooms") or []:
+                if not r.get("name") or r.get("name") == "房间?":
+                    continue
+                if r.get("label_px"):
+                    x, y = r["label_px"]
+                else:
+                    pts = r.get("poly") or ([[r["box"][0], r["box"][1]], [r["box"][2], r["box"][3]]] if r.get("box") else [])
+                    if r.get("label_at"):
+                        mx, my = r["label_at"]
+                    elif pts:
+                        mx = sum(p[0] for p in pts) / len(pts); my = sum(p[1] for p in pts) / len(pts)
+                    else:
+                        continue
+                    x, y = T["ax"] * mx + T["bx"], T["ay"] * my + T["by"]
+                labs.append({"name": r["name"], "x": round(x, 1), "y": round(y, 1), "by": "spec"})
+            try:
+                auto, info = da.auto_spec(img, chains=chain_list(spec), transform=T, labels=labs, use_ocr=False)
+            except Exception as ex:  # noqa: BLE001
+                out.append(f"rooms could not be regenerated from the wall grid ({type(ex).__name__}: {ex})")
+                auto = None
+            if auto and len(auto["rooms"]) >= max(2, len(labs) // 2):
+                spec["rooms"] = auto["rooms"]
+                spec["no_wall"] = auto.get("no_wall") or []
+                if not spec.get("doors"):
+                    spec["doors"] = auto.get("doors") or []
+                if not spec.get("windows"):
+                    spec["windows"] = auto.get("windows") or []
+                spec.setdefault("uncertain", []).extend(u for u in auto.get("uncertain") or [] if u not in spec.get("uncertain", []))
+                out.append("rooms regenerated from the wall grid (" + "; ".join(probs[:6]) + f"): {len(spec['rooms'])} "
+                           "rectilinear rooms, names kept by position")
+    return out
+
+
+def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=None, repair=True):
     spec = load_spec(spec_path)
     if source:
         spec.setdefault("source", {})["image"] = source
@@ -1945,6 +2116,7 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
                    "this spec was not written for this image / this task: do not build or deliver it. Archive it and "
                    "write a NEW spec for the current image (drawkit.py auto gives a draft)"], "warnings": [], "info": []}
         return rep
+    repairs = repair_spec(spec) if repair and os.environ.get("DRAWKIT_NO_REPAIR") != "1" else []
     m = Model(spec)
     e, w, i = chain_checks(spec, m); E += e; W += w; I += i
     if src.get("image") and os.path.exists(src["image"]):
@@ -1959,7 +2131,7 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
     if not cjk_font():
         W.append("no Chinese font on this computer (apt install fonts-wqy-microhei): the PNG preview shows boxes for hanzi")
     rep = {"version": VERSION, "kind": spec.get("kind"), "scale": f"1:{scale}", "errors": _uniq(E), "warnings": _uniq(W),
-           "info": _uniq(I)}
+           "info": _uniq(I), "repairs": repairs}
     if spec.get("kind", "floor_plan") == "floor_plan":
         rep["rooms"] = [{"name": r.get("name"), "area_axis_m2": round(poly_area(r["pts"]) / 1e6, 2),
                          "labelled": bool(r.get("_label"))} for r in eng.rooms]
@@ -1971,6 +2143,12 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
         except Exception as ex:  # noqa: BLE001
             rep["errors"].append(f"DXF not written: {type(ex).__name__}: {ex}")
     files.update(render_png(sh, str(out_dir / f"{name}.png"), scale=scale))
+    try:   # a PDF of the sheet for delivery (Pillow; LibreCAD's own export stays optional)
+        from PIL import Image as _Im
+        _Im.open(out_dir / f"{name}.png").convert("RGB").save(out_dir / f"{name}.pdf", "PDF", resolution=150.0)
+        files["pdf"] = str(out_dir / f"{name}.pdf")
+    except Exception:  # noqa: BLE001
+        pass
     ov = overlay(spec, sh, eng, str(out_dir / "overlay.png"))
     if ov:
         files["overlay"] = ov.pop("overlay")
@@ -1981,6 +2159,20 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
     rep["ok"] = not rep["errors"]
     with open(out_dir / "report.json", "w", encoding="utf-8") as f:
         json.dump(rep, f, ensure_ascii=False, indent=1)
+    if repairs:
+        try:
+            raw = load_spec(spec_path)
+            bak = Path(spec_path).with_name(Path(spec_path).stem + ".before-repair.json")
+            with open(bak, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=1)
+            for k in ("chains", "rooms", "no_wall", "doors", "windows", "uncertain"):
+                if k in spec:
+                    raw[k] = [{kk: vv for kk, vv in c.items() if kk not in ("_drawn", "tick_candidates")} if isinstance(c, dict) else c
+                              for c in spec[k]]
+            with open(spec_path, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=1)
+        except Exception:  # noqa: BLE001
+            pass
     # keep what the fit learned (transform, matched ticks) in the spec so the next round starts from it
     if src.get("transform") or src.get("image"):
         try:
@@ -2059,6 +2251,30 @@ def cmd_auto(a):
     if isinstance(labs, dict):
         labs = labs.get("labels") or []
     image = os.path.abspath(a.image)
+    if getattr(a, "from_spec", None) and os.path.exists(a.from_spec):
+        # 3.8.9 the deterministic pipeline after a failed / looping round: the old spec gives the chain VALUES and
+        # the room NAMES by position (its geometry is not reused); a spec of another image is ignored
+        try:
+            old = load_spec(a.from_spec)
+            if (old.get("source") or {}).get("md5") in (None, file_md5(image)):
+                have = {c.get("side") for c in chains or []}
+                chains = list(chains or []) + [{"side": c["side"], "values": c["values"]} for c in chain_list(old)
+                                               if c.get("values") and c.get("side") not in have]
+                if not labs:     # names by position, in the chains' mm frame (placed with the NEW transform)
+                    for r in old.get("rooms") or []:
+                        if not r.get("name") or r["name"] == "房间?":
+                            continue
+                        if r.get("label_px"):
+                            labs.append({"name": r["name"], "x": r["label_px"][0], "y": r["label_px"][1], "by": "spec"})
+                            continue
+                        pts = r.get("poly") or ([[r["box"][0], r["box"][1]], [r["box"][2], r["box"][3]]] if r.get("box") else [])
+                        if r.get("label_at"):
+                            labs.append({"name": r["name"], "mm": list(r["label_at"]), "by": "spec"})
+                        elif pts:
+                            labs.append({"name": r["name"], "mm": [sum(p[0] for p in pts) / len(pts),
+                                                                   sum(p[1] for p in pts) / len(pts)], "by": "spec"})
+        except Exception:  # noqa: BLE001
+            pass
 
     def fit(spec):
         sp = json.loads(json.dumps(spec))
@@ -2067,6 +2283,13 @@ def cmd_auto(a):
     try:
         spec, info = da.auto_spec(image, chains=chains, transform=T, labels=labs, use_ocr=not a.no_ocr, task=a.task,
                                   allow_install=a.install_ocr, debug=a.debug, fit=fit)
+    except da.NeedValues as e:
+        segs = {c["side"]: c.get("segments") for c in e.det.get("chains") or []}
+        print("DRAWKIT_AUTO " + json.dumps({"ok": False, "error": str(e), "need_values": sorted(e.boxes),
+                                             "chain_boxes": e.boxes, "segments": segs,
+                                             "found": [c["side"] for c in e.det.get("chains") or [] if c.get("values")]},
+                                            ensure_ascii=False))
+        return 3
     except ValueError as e:
         print("DRAWKIT_AUTO " + json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
         return 2
@@ -2076,7 +2299,11 @@ def cmd_auto(a):
         with open(a.out, "w", encoding="utf-8") as f:
             json.dump(spec, f, ensure_ascii=False, indent=1)
     rooms = [{"name": r["name"], "box": r.get("box") or da.poly_box(r["poly"])} for r in spec["rooms"]]
+    det = info.get("chains_detected") or {}
     print("DRAWKIT_AUTO " + json.dumps({"ok": True, "out": a.out, "rooms": rooms, "labels": info.get("labels"),
+                                         "chains": [{k: c.get(k) for k in ("side", "values", "by", "ticks_px")}
+                                                    for c in spec["chains"]], "checks": det.get("checks"),
+                                         "openings": info.get("openings"), "wall_mode": info.get("wall_mode"),
                                          "x_lines": info.get("x_lines"), "y_lines": info.get("y_lines"),
                                          "x_unsnapped": info.get("x_unsnapped"), "y_unsnapped": info.get("y_unsnapped"),
                                          "warnings": info.get("warnings"), "uncertain": spec["uncertain"],
@@ -2134,6 +2361,7 @@ def main(argv=None):
     p = sub.add_parser("auto"); p.add_argument("image"); p.add_argument("--chains"); p.add_argument("--transform")
     p.add_argument("--labels"); p.add_argument("--no-ocr", action="store_true"); p.add_argument("--install-ocr", action="store_true")
     p.add_argument("--refit", action="store_true"); p.add_argument("--task"); p.add_argument("--out"); p.add_argument("--debug")
+    p.add_argument("--from-spec", dest="from_spec")
     p.set_defaults(f=cmd_auto)
     p = sub.add_parser("schema"); p.set_defaults(f=lambda a: print(SCHEMA) or 0)
     p = sub.add_parser("ensure"); p.set_defaults(f=cmd_ensure)

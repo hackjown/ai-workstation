@@ -289,4 +289,4 @@ def test_lesson_v2_seeded_once(tmp_path):
     les.delete(rows[0]["id"])
     Lessons(st)
     assert not [r for r in Lessons(st).items(scope="tool") if r["key"] == "read_image"]
-    assert len([r for r in les.items(scope="skill") if r["key"] == "cad-drawing"]) == 9   # v1 (6) untouched + 3 drawloop seeds
+    assert len([r for r in les.items(scope="skill") if r["key"] == "cad-drawing"]) == 11   # v1 (6) + 3 drawloop + 2 drawloop v2 seeds

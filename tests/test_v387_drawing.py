@@ -109,7 +109,19 @@ def test_door_off_any_wall_is_reported(tmp_path):
     def stray(sp):
         sp["doors"].append({"id": "x", "at": [4500, 3300], "width": 900})
     rep = dk.run_build(str(_spec(tmp_path, stray)), str(tmp_path / "out"), "plan", dxf=False)
-    assert any("door x: not on any wall" in e for e in rep["errors"])
+    # 3.8.9: a door off its wall is snapped onto the nearest wall (or left out and listed), never a dead end
+    assert not any("door x" in e for e in rep["errors"])
+    assert any("door x" in w and ("snapped onto the nearest wall" in w or "left out" in w) for w in rep["warnings"])
+    def far(sp):
+        sp["doors"].append({"id": "y", "at": [50000, 50000], "width": 900})
+    rep = dk.run_build(str(_spec(tmp_path, far)), str(tmp_path / "out"), "plan", dxf=False)
+    assert any("door y" in w and "left out" in w for w in rep["warnings"]) and rep["ok"] in (True, False)
+    os.environ["DRAWKIT_STRICT_OPENINGS"] = "1"
+    try:
+        rep = dk.run_build(str(_spec(tmp_path, far)), str(tmp_path / "out"), "plan", dxf=False)
+        assert any("door y: not on any wall" in e for e in rep["errors"])
+    finally:
+        os.environ.pop("DRAWKIT_STRICT_OPENINGS")
 
 
 def test_diagram_and_generic_kinds(tmp_path):
@@ -165,10 +177,10 @@ def test_lessons_seeded_once(tmp_path):
     st = Store(str(tmp_path / "a.db"))
     les = Lessons(st)
     rows = les.items(scope="skill")
-    assert len([r for r in rows if r["key"] == "cad-drawing"]) == 9     # 6 from 3.8.7 + 3 from 3.8.8 (drawloop seed)
+    assert len([r for r in rows if r["key"] == "cad-drawing"]) == 11    # 6 from 3.8.7 + 3 from 3.8.8 + 2 from 3.8.9
     les.delete(rows[0]["id"])
     Lessons(st)                      # a restart does not bring a deleted seed back
-    assert len([r for r in Lessons(st).items(scope="skill") if r["key"] == "cad-drawing"]) == 8
+    assert len([r for r in Lessons(st).items(scope="skill") if r["key"] == "cad-drawing"]) == 10
     block, _ = les.for_task("m1", "照着照片画户型图", ["cad-drawing"])
     assert "drawing_read" in block or "drawing_note" in block or "drawing_auto" in block
 

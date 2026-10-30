@@ -102,6 +102,27 @@ SEED_DRAW = [
     ("skill", "cad-drawing", "用自由提问让视觉模型说房间标签在哪（九宫格/百分比），每次答案不同",
      "标签位置用 OCR 或一次带像素网格的 JSON 读取（drawing_auto 自动做），写进 FACTS 锁定，不再重复问"),
 ]
+SEED_DRAW2_MARK = "lessons_seeded_drawloop_v2"
+SEED_DRAW2 = [   # 3.8.9 (task-3fc)
+    ("skill", "cad-drawing", "文字模型按描述猜尺寸链的像素框（左链框到了别的线，各段都量成 1.36 倍；右链框没框到线，量出 ~0），build 永远过不了",
+     "不要猜像素框：drawing_auto 自己在外墙外找尺寸线、刻度和数字（OCR 或每条链一次 JSON 读取），只需给数值；drawing_build 发现整条链同比例偏差或 ~0 会自动重新定位"),
+    ("skill", "cad-drawing", "手写房间多边形出现斜边、面积为 0、房间互相重叠，改了几轮还是不过",
+     "房间来自墙网格（drawing_auto），天然是直角、不重叠；模型只给名字（标签 + 大致像素位置）。drawing_build 遇到这类错误会按墙网格自动重建房间并保留名字"),
+    ("general", "", "用户点了「继续」，任务马上又因同一个原因暂停，什么都没变",
+     "继续 = 重置计数、给新的预算，并换方法（画图任务直接跑确定性流水线）；同一原因短时间内不再暂停；最多 3 轮核对后交付最好的草稿并列出待确认项"),
+]
+def _SEEDED_PROBLEMS():   # noqa: N802
+    out = [p for _s, _k, p, _f in SEED_DRAW + SEED_DRAW2]
+    for name in ("SEED", "SEED_V2", "SEEDS"):
+        for row in globals().get(name) or []:
+            if isinstance(row, (list, tuple)) and len(row) >= 3:
+                out.append(row[2])
+    return out
+
+
+# learned lessons that send the model back to guessing pixel boxes / "re-read on a bigger zoom" (task-3fc) are dropped
+PIXEL_BOX_RE = re.compile(r"(--box|box_px|bigger zoom|更大的?(放大|缩放)|放大.{0,6}重读)", re.I)
+
 # lessons that tell the model to reuse an earlier task's output are not kept (they break the fresh-job rule)
 REUSE_OLD_RE = re.compile(
     r"(md5|哈希|同一(张|个)?文件|same file|identical).{0,60}(复用|直接用|沿用|直接发|重发|再发|照搬|reuse|resend|copy|拿来用|用(之前|上次|旧)的|示例 ?spec)|"
@@ -183,6 +204,7 @@ class Lessons:
         try:
             self.seed()
             self.seed_draw()
+            self.seed_draw2()
         except Exception as e:  # noqa: BLE001
             log.warning("seeding lessons failed: %s", e)
 
@@ -218,6 +240,25 @@ class Lessons:
             if self.add(scope, key, problem, fix, "auto"):
                 n += 1
         self.store.kv_set(SEED_DRAW_MARK, {"at": time.time(), "n": n})
+        return n
+
+    def seed_draw2(self) -> int:
+        """3.8.9 lessons (kv lessons_seeded_drawloop_v2); learned cad-drawing lessons that teach pixel-box guessing go."""
+        try:
+            if self.store.kv_get(SEED_DRAW2_MARK):
+                return 0
+        except Exception:  # noqa: BLE001
+            return 0
+        for r in self.items(limit=5000):
+            if (r.get("key") == "cad-drawing" and (r.get("source") or "") != "user"
+                    and not any(r.get("problem") == sp for sp in _SEEDED_PROBLEMS())
+                    and PIXEL_BOX_RE.search(str(r.get("fix") or "")) and not _NEG_RE.search(str(r.get("fix") or ""))):
+                self.store._x("DELETE FROM lessons WHERE id=?", (r["id"],))
+        n = 0
+        for scope, key, problem, fix in SEED_DRAW2:
+            if self.add(scope, key, problem, fix, "auto"):
+                n += 1
+        self.store.kv_set(SEED_DRAW2_MARK, {"at": time.time(), "n": n})
         return n
 
     # ------------------------------------------------------------------ rows

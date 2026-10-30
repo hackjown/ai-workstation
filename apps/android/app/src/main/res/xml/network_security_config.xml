@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Aiw server usually runs on the LAN over plain HTTP (http://192.168.x.x:28000). Android cannot scope
+     cleartext to IP ranges, so it is allowed app-wide; the app only talks to the server the user entered. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

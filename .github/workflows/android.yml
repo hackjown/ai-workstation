@@ -1,0 +1,55 @@
+name: apk
+on:
+  push:
+    branches: [main]
+    paths: ["apps/android/**", "apps/ios/Info.plist", ".github/workflows/android.yml"]
+    tags: ["v*"]
+  workflow_dispatch:
+# one build at a time: an older commit finishing last must not overwrite apk-latest
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Version must match iOS
+        run: |
+          python3 - <<'PY'
+          import plistlib, pathlib
+          p = plistlib.loads(pathlib.Path("apps/ios/Info.plist").read_bytes())
+          v = dict(l.split("=", 1) for l in pathlib.Path("apps/android/version.properties").read_text().splitlines() if "=" in l and not l.startswith("#"))
+          ios = (p["CFBundleShortVersionString"], p["CFBundleVersion"]); and_ = (v["versionName"].strip(), v["versionCode"].strip())
+          print("iOS", ios, "Android", and_)
+          assert ios == and_, "apps/android/version.properties differs from apps/ios/Info.plist: run scripts/bump-version.sh"
+          PY
+      - name: Build release APK (signed with the committed sideload key)
+        run: gradle -p apps/android assembleRelease --no-daemon --stacktrace
+      - name: Check APK (aapt)
+        run: |
+          APK=apps/android/app/build/outputs/apk/release/app-release.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/aapt" dump badging "$APK" | grep -E "^(package|application-label|sdkVersion|targetSdkVersion):"
+          "$BT/apksigner" verify --print-certs "$APK" | head -5
+          cp "$APK" AIWorkstation.apk; ls -l AIWorkstation.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AIWorkstation-apk
+          path: AIWorkstation.apk
+      - name: Publish to "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-latest
+          name: Aiw Android (latest)
+          prerelease: true
+          files: AIWorkstation.apk

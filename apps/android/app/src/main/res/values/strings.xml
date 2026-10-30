@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Aiw</string>
+    <string name="setup_title">服务器设置</string>
+    <string name="setup_hint">粘贴网页地址（例如 http://192.168.50.188:28000/?token=…），或扫二维码。</string>
+    <string name="url_label">服务器地址或完整网址</string>
+    <string name="token_label">Token</string>
+    <string name="scan">扫二维码</string>
+    <string name="save">保存并连接</string>
+    <string name="notify_label">后台检查通知（约每 15 分钟）</string>
+    <string name="channel_name">需要你处理的任务</string>
+    <string name="load_failed">连不上服务器</string>
+    <string name="retry">重试</string>
+</resources>

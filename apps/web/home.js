@@ -74,19 +74,95 @@ function hFiles(files) {
     h += `<a class="filecard" href="${artUrl(f.path, true)}" download="${esc(f.name)}"><span class="iconbox">${icon("file")}</span><span class="grow"><b>${esc(f.name)}</b><div class="small">点击下载</div></span></a>`;
   return h;
 }
+/* 3.8.8: ONE card per task. It is updated in place: title + prompt, status chip, step, the latest progress line,
+   elapsed time; whatever needs you (takeover, slider, a question with buttons, a form, a confirmation) is an action
+   ON the card (answered ones collapse to a ✓ line); the result (summary + thumbnail / files) lands on it; 继续 / 修改
+   (or 补充 while it runs) attach to the same task. Older cards without data.card still render (their result was a
+   separate message). */
+const HTC_CHIP = { running: ["运行中", "live"], pending: ["运行中", "live"], paused: ["运行中", "warn"], takeover: ["等你", "warn"],
+  waiting_input: ["等你", "warn"], waiting_confirm: ["等你", "warn"], succeeded: ["已完成", "ok"], failed: ["失败", "bad"],
+  interrupted: ["失败", "bad"], stopped: ["已停止", ""], cancelled: ["已停止", ""], queued: ["排队中", "warn"] };
+function htcChip(st) { const [t, c] = HTC_CHIP[st] || (STATUS_CN[st] || [st, ""]); return `<span class="chip ${c}">${esc(t)}</span>`; }
+function hDur(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + " 秒";
+  if (s < 3600) return Math.floor(s / 60) + " 分" + (s % 60 ? " " + (s % 60) + " 秒" : "");
+  return Math.floor(s / 3600) + " 小时 " + Math.floor((s % 3600) / 60) + " 分";
+}
+function hElapsed(d, m) {
+  const st = d.started_at || (d.card ? 0 : m.created_at);
+  if (!st || d.status === "queued") return "";
+  const end = d.ended_at || (LIVE.includes(d.status || "running") ? 0 : m.updated_at);
+  return `<span class="hc-el" data-s="${st}" data-e="${end || ""}">${hDur((end || Date.now() / 1000) - st)}</span>`;
+}
+setInterval(() => {   // live elapsed time on running cards (no re-render)
+  document.querySelectorAll("#hmsgs .hc-el[data-s]").forEach((el) => { if (!el.dataset.e) el.textContent = hDur(Date.now() / 1000 - Number(el.dataset.s)); });
+}, 1000);
+function htcHead(a) {
+  if (a.kind === "confirm") return "需要你确认";
+  const k = a.ask_kind || "question";
+  return k === "takeover" ? "需要你接管" : k === "form" ? "需要你填写" : k === "escalate" ? "任务卡住了" : "任务在问你";
+}
+function htcAction(m, a) {
+  const q = (a.kind === "confirm" ? ((a.summary || {}).title || a.question) : a.question) || "";
+  if (a.resolved) return `<div class="htc-done">${icon("check")}<span>${esc(htcHead(a))}：${esc(hResolved(a.resolved))}</span></div>`;
+  if (a.stale) return `<div class="htc-done muted"><span>${esc(htcHead(a))} · 已过期</span></div>`;
+  const id = JSON.stringify(a.id);
+  let h = `<div class="htc-act"><div class="hq-k">${esc(htcHead(a))}</div><div class="hq-q">${esc(q)}</div>`;
+  if (a.kind === "confirm") {
+    const s = a.summary || {};
+    if (s.what) h += `<div class="small hq-d">${esc(s.what)}</div>`;
+    if (s.risk_cn || s.why) h += `<div class="small hq-d">${esc([s.risk_cn, s.why].filter(Boolean).join(" · "))}</div>`;
+    h += `<div class="opts"><button class="btn sm primary" onclick='hAnswer("${m.id}", {action_id: ${esc(id)}, approve: true})'>允许</button><button class="btn sm" onclick='hAnswer("${m.id}", {action_id: ${esc(id)}, approve: false})'>不允许</button></div>`;
+  } else if (a.ask_kind === "takeover") {
+    const t = a.takeover || {};
+    if (t.steps || t.reason) h += `<div class="small hq-d">${esc(t.steps || t.reason)}</div>`;
+    h += `<div class="opts"><button class="btn sm primary" onclick="hTakeover('${m.id}')">${icon("hand")}接管桌面</button>
+      <button class="btn sm" onclick='hAnswer("${m.id}", {action_id: ${esc(id)}, choice: "done"})'>完成，继续</button></div>`;
+  } else if (a.ask_kind === "form") {
+    h += `<div class="opts"><button class="btn sm primary" onclick="hForm('${m.id}')">去填写</button></div>`;
+  } else {
+    if (a.stuck && a.stuck.reason && a.question.indexOf(a.stuck.reason) < 0) h += `<div class="small hq-d">${esc(a.stuck.reason)}</div>`;
+    const opts = a.options || [];
+    if (opts.length) h += `<div class="opts">${opts.map((o, i) => `<button class="btn sm ${i === 0 ? "primary" : ""}" onclick='hAnswer("${m.id}", {action_id: ${esc(id)}, choice: ${esc(JSON.stringify(o))}})'>${esc(o)}</button>`).join("")}</div>`;
+    h += `<form class="hq-f" onsubmit="hAnswerText(event,'${m.id}',${esc(id)})"><input name="a" placeholder="${opts.length ? "或者直接告诉它…" : "回答…"}" autocomplete="off" /><button class="btn sm primary">回复</button></form>`;
+  }
+  return h + `</div>`;
+}
+function htcResult(r) {
+  if (!r || !r.text) return "";
+  const files = r.files || [], pics = files.filter((f) => f.kind === "image");
+  let h = `<div class="htc-res ${r.status === "succeeded" ? "ok" : "bad"}"><div class="hmd">${hMd(r.text)}</div>`;
+  if (pics.length) h += `<a class="htc-thumb" href="${artUrl(pics[0].path)}" target="_blank" rel="noopener"><img src="${artUrl(pics[0].path)}" alt="${esc(pics[0].name)}" loading="lazy" />${pics.length > 1 ? `<span>+${pics.length - 1}</span>` : ""}</a>`;
+  for (const f of files) if (f.kind !== "image")
+    h += `<a class="filecard" href="${artUrl(f.path, true)}" download="${esc(f.name)}"><span class="iconbox">${icon("file")}</span><span class="grow"><b>${esc(f.name)}</b><div class="small">点击下载</div></span></a>`;
+  return h + `</div>`;
+}
 function hTaskCard(m) {
   const d = m.data || {};
   const st = d.status || "running", live = LIVE.includes(st) || st === "queued";
   const pct = d.plan_total ? 100 * (d.plan_done || 0) / d.plan_total : st === "succeeded" ? 100 : live && d.step && d.max_steps ? 100 * d.step / d.max_steps : live ? 4 : 0;
-  const plan = pct ? `<div class="hc-bar"><i style="width:${Math.max(3, Math.min(100, Math.round(pct)))}%"></i></div>` : "";
+  const plan = pct && live ? `<div class="hc-bar"><i style="width:${Math.max(3, Math.min(100, Math.round(pct)))}%"></i></div>` : "";
   const step = d.step ? `第 ${d.step}${d.max_steps ? "/" + d.max_steps : ""} 步` : "";
-  const sub = [d.status_line && d.status_line !== (STATUS_CN[st] || [])[0] ? d.status_line : "", d.plan_total ? `${d.plan_done || 0}/${d.plan_total} 项` : "", live ? step : ""].filter(Boolean).join(" · ");
-  const retry = ["failed", "stopped", "interrupted"].includes(st) && d.task_id
-    ? `<button class="btn xs" onclick="event.stopPropagation();hRetry('${esc(d.task_id)}')">${icon("retry")}重试</button>` : "";
-  return hA(m, `<div class="hcard st-${esc(st)}" role="button" tabindex="0" onclick="hOpenTask('${m.id}')" onkeydown="if(event.key==='Enter')hOpenTask('${m.id}')">
+  const sub = [d.status_line && d.status_line !== (STATUS_CN[st] || [])[0] && d.status_line !== (HTC_CHIP[st] || [])[0] ? d.status_line : "",
+    d.plan_total ? `${d.plan_done || 0}/${d.plan_total} 项` : "", step, hElapsed(d, m)].filter(Boolean);
+  const tid = esc(d.task_id || m.task_id || "");
+  const head = `<div class="htc-head" role="button" tabindex="0" onclick="hOpenTask('${m.id}')" onkeydown="if(event.key==='Enter')hOpenTask('${m.id}')">
     <div class="hc-ic">${live && st === "running" ? '<span class="spin"></span>' : st === "succeeded" ? icon("check") : icon("monitor")}</div>
-    <div class="grow"><div class="hc-t">${esc(d.title || m.text || "任务")}</div><div class="hc-s">${esc(sub || "交给电脑的任务")}</div>${plan}</div>
-    <div class="hc-r">${chip(st)}${retry}<span class="hc-go">${icon("chev")}</span></div></div>`, "nm");
+    <div class="grow"><div class="hc-t">${esc(d.title || m.text || "任务")}</div>${d.prompt && d.prompt !== d.title ? `<div class="htc-p">${esc(d.prompt)}</div>` : ""}
+    <div class="hc-s">${sub.map((x) => (x.startsWith("<span") ? x : esc(x))).join(" · ") || "交给电脑的任务"}</div>${plan}</div>
+    <div class="hc-r">${htcChip(st)}<span class="hc-go">${icon("chev")}</span></div></div>`;
+  const prog = live && d.progress ? `<div class="htc-prog">${esc(d.progress)}</div>` : "";
+  const fu = d.runs > 1 ? `<div class="htc-fu">↻ 接着做${d.followup ? "：" + esc(d.followup) : ""}</div>` : "";
+  const acts = (d.actions || []).map((a) => htcAction(m, a)).join("");
+  const res = live ? "" : htcResult(d.result);
+  let foot = `<button class="link small" onclick="hOpenTask('${m.id}')">查看任务 ›</button>`;
+  if (tid && d.card) {
+    if (live && st !== "queued") foot += `<button class="btn xs" onclick="hInstruct('${tid}')">补充</button>`;
+    else if (!live) foot += `<button class="btn xs primary" onclick="hContinue('${tid}')">${icon("retry")}继续</button><button class="btn xs" onclick="hEdit('${m.id}')">修改后重新发布</button>`;
+  } else if (["failed", "stopped", "interrupted"].includes(st) && tid) foot += `<button class="btn xs" onclick="hRetry('${tid}')">${icon("retry")}重试</button>`;
+  const wait = (d.actions || []).some((a) => !a.resolved && !a.stale);
+  return hA(m, `<div class="hcard htc st-${esc(st)} ${wait ? "wait" : ""}">${head}${fu}${prog}${acts ? `<div class="htc-acts">${acts}</div>` : ""}${res}<div class="htc-foot">${foot}</div></div>`, "nm");
 }
 /* what a resolved question / form card says (3.7: the server sends resolved.text; a form answered with nothing used
    to show "已回答：null") */
@@ -229,7 +305,16 @@ function hUpsert(m, opts = {}) {
   if (!m || !m.id) return;
   const near = hNear();
   const i = HS.msgs.findIndex((x) => x.id === m.id);
-  if (i >= 0) { HS.msgs[i] = m; if (!hPatch(m)) hRender(); return; }
+  if (i >= 0) {
+    const moved = (HS.msgs[i].seq || 0) !== (m.seq || 0);
+    HS.msgs[i] = m;
+    if (moved) {   // 3.8.8: a continued task's card moves to the bottom
+      HS.msgs.sort((a, b) => (a.seq || 1e15) - (b.seq || 1e15)); hRender();
+      if (near || opts.stick) hScrollLatest(); else hUnread(true);
+      return;
+    }
+    if (!hPatch(m)) hRender(); return;
+  }
   // a real message replaces the optimistic one it stands for
   if (m.role === "user") HS.msgs = HS.msgs.filter((x) => !(x.tmp && x.text === m.text));
   if (hStaged()) { HS.stageOff = true; hStage(false); }   // something new: the chat takes over from 球球's briefing
@@ -758,7 +843,7 @@ async function hAnswer(mid, body) {
     if (r.open_task) { await hOpenTask(mid); hTakeLater(); }
   } catch (e) { toast(e.message); if (m) hSync(); }
 }
-function hAnswerText(e, mid) { e.preventDefault(); const v = e.target.a.value.trim(); if (v) hAnswer(mid, { text: v }); }
+function hAnswerText(e, mid, actionId) { e.preventDefault(); const v = e.target.a.value.trim(); if (v) hAnswer(mid, actionId ? { action_id: actionId, text: v } : { text: v }); }
 function hTakeLater() {   // the task view in takeover mode: interactive desktop, the takeover card's 完成 button below
   let n = 0;
   const t = setInterval(() => { n++; if (S.thread || n > 20) { clearInterval(t); if (!S.take) { setTake(true, true); toast("桌面已接通：直接在电脑画面上操作，做完点「完成，继续」"); } } }, 150);
@@ -775,6 +860,34 @@ async function hToTask(mid, btn) {
   try { const card = await api("POST", `/api/chat/messages/${mid}/to_task`, { machine_id: MID }); hUpsert(card, { stick: true });
     const m = hFind(mid); if (m) hUpsert({ ...m, data: { ...m.data, task_started: card.id } }); }
   catch (e) { toast("没能交给电脑：" + e.message); if (btn) { btn.disabled = false; btn.innerHTML = icon("monitor") + "交给电脑去做"; } }
+}
+/* 3.8.8: 继续 / 修改后重新发布 / 补充 straight from the card: the SAME task (its card re-arms and moves down) */
+async function hContinue(taskId) {
+  try { await api("POST", `/api/tasks/${taskId}/continue`, { text: "继续" }); toast("接着做了"); } catch (e) { toast("没能继续：" + e.message); }
+}
+function hEdit(mid) {
+  const m = hFind(mid); const d = (m && m.data) || {};
+  modal(`<div class="card"><div class="heading">修改后重新发布</div>
+    <div class="muted">改完后同一个任务接着做：做过的步骤、文件和附件都保留。</div>
+    <textarea id="hEditPrompt" rows="6" style="width:100%;margin-top:10px">${esc(d.prompt || d.title || "")}</textarea>
+    <div class="row gap" style="justify-content:flex-end;margin-top:10px"><button class="btn sm" onclick="closeOverlays()">取消</button>
+    <button class="btn sm primary" onclick="hEditGo('${esc(d.root_id || d.task_id || "")}')">改好了，重新做</button></div></div>`);
+}
+async function hEditGo(id) {
+  const p = ($("hEditPrompt").value || "").trim();
+  if (!p) return toast("要求不能是空的");
+  try { await api("POST", `/api/tasks/${id}/edit`, { prompt: p }); closeOverlays(); toast("已修改，接着做"); } catch (e) { toast("没能修改：" + e.message); }
+}
+function hInstruct(taskId) {
+  modal(`<div class="card"><div class="heading">补充要求</div><div class="muted">任务不会重来，下一步就会照着做。</div>
+    <textarea id="hInstrText" rows="4" style="width:100%;margin-top:10px"></textarea>
+    <div class="row gap" style="justify-content:flex-end;margin-top:10px"><button class="btn sm" onclick="closeOverlays()">取消</button>
+    <button class="btn sm primary" onclick="hInstructGo('${taskId}')">发送</button></div></div>`);
+}
+async function hInstructGo(id) {
+  const t = ($("hInstrText").value || "").trim(); if (!t) return;
+  try { const r = await api("POST", `/api/tasks/${id}/instruct`, { text: t }); closeOverlays(); toast(r.answered ? "已作为回答交给任务" : r.instructed ? "已交给正在做的任务" : "已接着做"); }
+  catch (e) { toast("没能发送：" + e.message); }
 }
 async function hRetry(taskId) {
   try { await api("POST", `/api/tasks/${taskId}/retry`); toast("已重新开始"); } catch (e) { toast("重试失败：" + e.message); }

@@ -234,6 +234,9 @@ async def test_chat_followup_with_upload_links_to_the_stopped_task(stack):
     text = task_text(used(made)[-1])
     assert "做成讲解动画" in text and "uploads/deck.pdf" in text and "ATTACHMENTS" in text
     assert chat.get(card["id"])["data"]["continued_by"] == run["id"]
+    # 3.8.8: the follow-up re-armed the SAME card and moved it below the user's message
+    assert new["id"] == card["id"] and new["seq"] > res["user"]["seq"] and chat.get(card["id"])["data"]["runs"] == 2
+    assert len([m for m in (await client.get("/api/chat")).json()["messages"] if m["kind"] == "task"]) == 1
 
 
 async def test_chat_asks_which_task_when_two_are_unfinished(stack):

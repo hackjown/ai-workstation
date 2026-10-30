@@ -34,6 +34,30 @@
 .hcard.st-succeeded .hc-ic { background:var(--okBg); color:var(--ok); }
 .hcard.st-waiting_input, .hcard.st-waiting_confirm, .hcard.st-takeover { border-color:var(--accLine); box-shadow:0 0 0 3px var(--accBg); }
 
+/* 3.8.8 task card v2: head row + progress, actions, result, footer on one card */
+.hcard.htc { flex-direction:column; align-items:stretch; gap:0; cursor:default; }
+.htc-head { display:flex; align-items:center; gap:12px; cursor:pointer; outline:none; }
+.htc-head:focus-visible { outline:2px solid var(--acc); outline-offset:2px; border-radius:6px; }
+.htc-p { font-size:12px; color:var(--mute); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; opacity:.85; }
+.htc-prog { font-size:12.5px; margin-top:8px; padding-left:46px; opacity:.8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.htc-fu { font-size:12px; margin-top:6px; padding-left:46px; color:var(--acc); }
+.htc-acts { margin-top:10px; display:flex; flex-direction:column; gap:6px; }
+.htc-act { border:1px solid var(--accLine); background:var(--accBg); border-radius:10px; padding:10px 12px; }
+.htc-done { font-size:12.5px; display:flex; align-items:center; gap:6px; color:var(--ok); padding:0 2px; }
+.htc-done.muted { color:var(--dim); }
+.htc-done .i { width:14px; height:14px; flex:none; }
+.htc-done span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.htc-res { margin-top:10px; padding:8px 10px; border-left:3px solid var(--ok); border-radius:4px; }
+.htc-res.bad { border-left-color:var(--bad, #d9534f); }
+.htc-res .hmd { font-size:14px; line-height:1.5; word-break:break-word; }
+.htc-res .filecard { margin-top:8px; }
+.htc-thumb { position:relative; display:inline-block; margin-top:8px; border-radius:10px; overflow:hidden; line-height:0; }
+.htc-thumb img { max-width:220px; max-height:150px; object-fit:cover; display:block; }
+.htc-thumb span { position:absolute; right:6px; bottom:6px; background:rgba(0,0,0,.6); color:#fff; font-size:12px; line-height:1; padding:4px 6px; border-radius:8px; }
+.htc-foot { display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap; }
+.htc-foot .link { margin-right:auto; padding:0; }
+.hcard.htc.wait { border-color:var(--accLine); box-shadow:0 0 0 3px var(--accBg); }
+
 /* questions / confirmations from a task */
 .hq { width:min(520px, 100%); border:1px solid var(--accLine); background:var(--accBg); border-radius:var(--r-card, 10px); padding:12px 14px; }
 .hq.off { border-color:var(--line); background:var(--panel); }

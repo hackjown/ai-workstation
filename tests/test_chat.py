@@ -196,13 +196,16 @@ async def test_task_route_makes_a_card_that_follows_the_task_and_posts_the_resul
 
     async def finished():
         h = (await client.get("/api/chat")).json()["messages"]
-        return [m for m in h if m["kind"] == "task_result"] and h
+        return next((m for m in h if m["kind"] == "task" and (m["data"].get("result") or {}).get("text")), None) and h
     h = await wait_for(finished, 15)
+    # 3.8.8: ONE card per task: the result is on it, no separate result message
+    assert [m["kind"] for m in h if m["role"] == "assistant"] == ["task"]
     c = next(m for m in h if m["kind"] == "task")
-    assert c["data"]["status"] == "succeeded" and c["data"]["step"] >= 1
-    res = next(m for m in h if m["kind"] == "task_result")
-    assert res["text"].startswith("报告写好了") and res["task_id"] == tid
-    assert [f["name"] for f in res["data"]["files"]] == ["report.md"]
+    assert c["id"] == card["id"] and c["data"]["status"] == "succeeded" and c["data"]["step"] >= 1
+    assert c["data"]["started_at"] and c["data"]["ended_at"] >= c["data"]["started_at"]
+    res = c["data"]["result"]
+    assert res["text"].startswith("报告写好了") and c["task_id"] == tid
+    assert [f["name"] for f in res["files"]] == ["report.md"]
     # the task got the chat turns as context and still opens in the normal thread view
     th = (await client.get(f"/api/threads/{c['data']['thread_id']}")).json()
     assert th["tasks"][0]["id"] == tid
@@ -217,22 +220,28 @@ async def test_escalation_shows_in_the_chat_with_buttons(stack):
 
     async def asked():
         h = (await client.get("/api/chat")).json()["messages"]
-        return next((m for m in h if m["kind"] == "ask" and not m["data"].get("stale")), None)
+        c = next(m for m in h if m["id"] == card["id"])
+        return next((a for a in c["data"].get("actions") or [] if not a.get("stale") and not a.get("resolved")), None)
     ask = await wait_for(asked, 10)
-    assert ask["data"]["ask_kind"] == "escalate"
-    assert ask["data"]["options"] == ["继续，换个方法再试", "我来接管桌面", "停止任务"]
-    c = next(m for m in (await client.get("/api/chat")).json()["messages"] if m["id"] == card["id"])
+    assert ask["ask_kind"] == "escalate" and ask["kind"] == "ask"
+    assert ask["options"] == ["继续，换个方法再试", "我来接管桌面", "停止任务"]
+    h = (await client.get("/api/chat")).json()["messages"]
+    assert not [m for m in h if m["kind"] in ("ask", "confirm", "task_result")]   # on the card, not new bubbles
+    c = next(m for m in h if m["id"] == card["id"])
     assert c["data"]["status"] == "waiting_input"
-    ok = (await client.post(f"/api/chat/messages/{ask['id']}/answer", json={"choice": "停止任务"})).json()
-    assert ok["ok"] and ok["message"]["data"]["resolved"]["answer"] == "停止任务"
-    again = await client.post(f"/api/chat/messages/{ask['id']}/answer", json={"choice": "停止任务"})
+    ok = (await client.post(f"/api/chat/messages/{card['id']}/answer",
+                            json={"action_id": ask["id"], "choice": "停止任务"})).json()
+    a2 = next(a for a in ok["message"]["data"]["actions"] if a["id"] == ask["id"])
+    assert ok["ok"] and a2["resolved"]["answer"] == "停止任务" and ok["message"]["id"] == card["id"]
+    again = await client.post(f"/api/chat/messages/{card['id']}/answer", json={"action_id": ask["id"], "choice": "停止任务"})
     assert again.status_code == 409
 
     async def ended():
         h = (await client.get("/api/chat")).json()["messages"]
-        return next((m for m in h if m["kind"] == "task_result"), None)
+        c = next(m for m in h if m["id"] == card["id"])
+        return c["data"].get("result")
     res = await wait_for(ended, 10)
-    assert res["data"]["status"] == "stopped" and res["text"].startswith("任务已停止")
+    assert res["status"] == "stopped" and res["text"].startswith("任务已停止")
 
 
 async def test_manual_task_mode_skips_the_classifier(stack):
@@ -317,28 +326,37 @@ async def test_takeover_choice_posts_a_takeover_message(stack):
     scripts.append([("fail", {"reason": "要验证码"})])
     await client.post("/api/chat/send", json={"text": "去网站上登录", "stream": False})
 
+    async def card():
+        return next(m for m in (await client.get("/api/chat")).json()["messages"] if m["kind"] == "task")
+
     async def ask_of(kind):
         async def f():
-            h = (await client.get("/api/chat")).json()["messages"]
-            return next((m for m in h if m["kind"] == "ask" and m["data"]["ask_kind"] == kind
-                         and not m["data"].get("resolved") and not m["data"].get("stale")), None)
+            c = await card()
+            return next((a for a in c["data"].get("actions") or [] if a.get("ask_kind") == kind
+                         and not a.get("resolved") and not a.get("stale")), None)
         return f
+    c0 = await card()
     esc = await wait_for(await ask_of("escalate"), 10)
-    r = (await client.post(f"/api/chat/messages/{esc['id']}/answer", json={"choice": "我来接管桌面"})).json()
+    r = (await client.post(f"/api/chat/messages/{c0['id']}/answer", json={"action_id": esc["id"], "choice": "我来接管桌面"})).json()
     assert r["open_task"] is True                  # the client jumps into the task view in takeover mode
     tk = await wait_for(await ask_of("takeover"), 10)
-    assert tk["data"]["session_id"] and tk["text"].startswith("需要你接管")
-    await client.post(f"/api/chat/messages/{tk['id']}/answer", json={"choice": "__cancel__"})
+    assert tk["session_id"] and tk["question"].startswith("需要你接管")
+    assert (await card())["data"]["status_line"] == "需要你接管"
+    # no action_id: the card's newest open action
+    await client.post(f"/api/chat/messages/{c0['id']}/answer", json={"choice": "__cancel__"})
     # 3.8.2: a cancelled takeover leaves the task paused and asks again; only 停止 ends it
     again = await wait_for(await ask_of("escalate"), 10)
-    assert again["id"] != esc["id"] and "接管没有完成" in again["text"] and again["data"].get("stuck")
-    await client.post(f"/api/chat/messages/{again['id']}/answer", json={"choice": "停止任务"})
+    assert again["id"] != esc["id"] and "接管没有完成" in again["question"] and again.get("stuck")
+    acts = (await card())["data"]["actions"]
+    assert [a["resolved"]["text"] for a in acts if a.get("resolved")][:2] == ["我来接管桌面", "已取消"]
+    await client.post(f"/api/chat/messages/{c0['id']}/answer", json={"action_id": again["id"], "choice": "停止任务"})
 
     async def ended():
-        h = (await client.get("/api/chat")).json()["messages"]
-        return next((m for m in h if m["kind"] == "task_result"), None)
+        return (await card())["data"].get("result")
     res = await wait_for(ended, 10)
-    assert res["data"]["status"] in ("stopped", "failed")
+    assert res["status"] in ("stopped", "failed")
+    h = (await client.get("/api/chat")).json()["messages"]
+    assert [m["kind"] for m in h if m["role"] == "assistant"] == ["task"]
 
 
 def test_answer_text_never_shows_null():

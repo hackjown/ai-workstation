@@ -101,7 +101,12 @@ final class HomeChat: ObservableObject {
 
     @MainActor func upsert(_ m: JSON, stick: Bool = false) {
         guard !m.s("id").isEmpty else { return }
-        if let i = index(m.s("id")) { msgs[i] = m; return }
+        if let i = index(m.s("id")) {
+            let moved = msgs[i].d("seq") != m.d("seq")
+            msgs[i] = m
+            if moved { sortMsgs(); bottomTick += 1 }   // 3.8.8: a continued task's card moves to the bottom
+            return
+        }
         if m.s("role") == "user" { msgs.removeAll { $0.b("tmp") && $0.s("text") == m.s("text") } }
         if m.s("role") != "user" && m.s("kind") == "text" { stream = nil }
         if staged { leaveStage() }   // something new: the chat takes over from 球球's briefing
@@ -224,6 +229,19 @@ final class HomeChat: ObservableObject {
             }
         } catch { err = "没能交给电脑：\(error.localizedDescription)" }
     }
+    /// 3.8.8: 继续 on a finished / stopped card: the SAME task (POST /api/tasks/{id}/continue); its card re-arms.
+    @MainActor func continueTask(_ taskId: String) async {
+        do { _ = try await API.shared.obj("POST", "/api/tasks/\(taskId)/continue", ["text": "继续"]); err = "" }
+        catch { err = "没能继续：\(error.localizedDescription)" }
+    }
+    /// 3.8.8: 修改后重新发布 (POST /edit on the task's first run) or 补充 (POST /instruct) from a card.
+    @MainActor func cardText(_ a: CardTextAsk, _ text: String) async -> String? {
+        do {
+            if a.ask.kind == .edit { _ = try await API.shared.obj("POST", "/api/tasks/\(a.rootId)/edit", ["prompt": text]) }
+            else { _ = try await API.shared.obj("POST", "/api/tasks/\(a.taskId)/instruct", ["text": text]) }
+            return nil
+        } catch { return error.localizedDescription }
+    }
     @MainActor func retry(_ taskId: String) async {
         do { _ = try await API.shared.call("POST", "/api/tasks/\(taskId)/retry"); err = "" }
         catch { err = "重试失败：\(error.localizedDescription)" }
@@ -261,6 +279,7 @@ struct HomeChatView: View {
     @StateObject private var voice = SpeechInput()
     @State private var queuedPick: JSON? = nil
     @State private var deletePick: JSON? = nil
+    @State private var cardAsk: CardTextAsk? = nil     // 3.8.8: 修改后重新发布 / 补充 on a task card
     /// 3.8.2: older pages load only after the opening jump to the newest message (the "加载更早的消息" row is on screen
     /// while the list still sits at the top, and its onAppear used to load a page and pin the view to it)
     @State private var olderOK = false
@@ -418,6 +437,9 @@ struct HomeChatView: View {
         .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { r in
             if case .success(let urls) = r { Task { for u in urls { await addFile(u) } } }
         }
+        .sheet(item: $cardAsk) { a in
+            TaskTextSheet(ask: a.ask) { text in await m.cardText(a, text) }
+        }
         .sheet(item: $preview) { p in
             if !textPreviewKind(p.url).isEmpty, textPreviewPage() != nil { FilePreviewView(url: p.url, kind: textPreviewKind(p.url)) }
             else { QuickLookView(url: p.url).ignoresSafeArea() }
@@ -453,7 +475,10 @@ struct HomeChatView: View {
             }
         } else {
             switch msg.s("kind") {
-            case "task": withAvatar(meta: false) { TaskCardRow(msg: msg, open: { open(msg, takeover: false) }, retry: { Task { await m.retry(d.s("task_id")) } }) }
+            case "task": withAvatar(meta: false) {
+                TaskCardRow(msg: msg, model: m, open: { take in open(msg, takeover: take) }, retry: { Task { await m.retry(d.s("task_id")) } },
+                            textAsk: { a in cardAsk = a }, openFile: { p, n in Task { await openFile(p, n) } })
+            }
                 .contextMenu { deleteItem(msg) }
             case "ask": withAvatar(meta: false) { AskRow(msg: msg, model: m, open: { take in open(msg, takeover: take) }) }
                 .contextMenu { deleteItem(msg) }
@@ -806,60 +831,7 @@ struct HomeChatEmpty: View {
     }
 }
 
-/// A task in the chat (3.7, CardStyle.swift): amber-tinted when finished, white / dark with an amber border while it
-/// runs, a red accent when it failed; the status line in amber, an amber progress bar; tap → the task view.
-struct TaskCardRow: View {
-    let msg: JSON
-    let open: () -> Void
-    let retry: () -> Void
-    @Environment(\.colorScheme) private var cs
-    var body: some View {
-        let d = msg.o("data")
-        let st = d.s("status").isEmpty ? "running" : d.s("status")
-        let live = isLive(st)
-        let total = d.d("plan_total"), done = d.d("plan_done")
-        let frac: Double = total > 0 ? min(1, done / total) : st == "succeeded" ? 1 : (live && d.d("max_steps") > 0 ? min(1, d.d("step") / d.d("max_steps")) : (live ? 0.04 : 0))
-        let tone = cardTone(st)
-        let bad = tone == .failed
-        Button(action: open) {
-            HStack(spacing: 12) {
-                CardIcon(st: st)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(cleanTitle(d.s("title").isEmpty ? msg.s("text") : d.s("title"))).font(.callout.weight(.semibold)).lineLimit(2)
-                        .foregroundColor(cardTitle(cs))
-                    Text((live ? "● " : "") + sub(d, st)).font(.caption).foregroundColor(cardAccent(tone, cs)).lineLimit(1)
-                    if frac > 0 { CardProgress(frac: frac, tone: tone).padding(.top, 4) }
-                }
-                Spacer(minLength: 4)
-                VStack(alignment: .trailing, spacing: 6) {
-                    Chip(text: statusText[st] ?? st, color: chipColor(st), dot: true)
-                    if bad && !d.s("task_id").isEmpty {
-                        Button("重试", action: retry).font(.caption.weight(.semibold)).buttonStyle(.bordered).tint(hAmber).controlSize(.mini)
-                    } else { Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary) }
-                }
-            }
-            .padding(.vertical, 11).padding(.leading, 14).padding(.trailing, 12)
-            .taskCardStyle(tone, cs)
-        }
-        .buttonStyle(.plain)
-        .padding(.trailing, 20)
-        .accessibilityHint("打开任务")
-    }
-    func chipColor(_ st: String) -> Color {
-        if st == "succeeded" { return cs == .dark ? hAmber : hHLLight }
-        if ["failed", "interrupted", "stopped"].contains(st) { return cardRed }
-        return cs == .dark ? hAmber : hHLLight
-    }
-    func sub(_ d: JSON, _ st: String) -> String {
-        var parts: [String] = []
-        let line = d.s("status_line")
-        if !line.isEmpty && line != statusText[st] { parts.append(line) }
-        if d.d("plan_total") > 0 { parts.append("\(Int(d.d("plan_done")))/\(Int(d.d("plan_total"))) 项") }
-        if isLive(st) && d.d("step") > 0 { parts.append("第 \(Int(d.d("step")))\(d.d("max_steps") > 0 ? "/\(Int(d.d("max_steps")))" : "") 步") }
-        if st == "queued" { parts.append("点开可立即发送或删除") }   // 3.8: the task view has 立即发送 / 删除
-        return parts.isEmpty ? "交给电脑的任务" : parts.joined(separator: " · ")
-    }
-}
+// 3.8.8: TaskCardRow (one card per task, actions + result on it) lives in TaskCardV2.swift.
 
 /// A task's question (escalation, takeover, form, free question) with buttons.
 struct AskRow: View {

@@ -9,7 +9,7 @@ SRC = IOS / "Sources"
 
 def test_version_and_camera_permissions():
     p = plistlib.loads((IOS / "Info.plist").read_bytes())
-    assert p["CFBundleShortVersionString"] == "3.8.7" and p["CFBundleVersion"] == "28"
+    assert p["CFBundleShortVersionString"] == "3.8.8" and p["CFBundleVersion"] == "29"
     for k in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription", "NSPhotoLibraryUsageDescription"):
         assert p.get(k), k
 
@@ -43,7 +43,7 @@ def test_orb_look_is_untouched():
 
 def test_swift_braces_balance():
     for f in ("HomeChat.swift", "HomeV2.swift", "MateView.swift", "API.swift", "RichText.swift", "ChatView.swift",
-              "CardStyle.swift", "DesktopView.swift", "AiwApp.swift"):
+              "CardStyle.swift", "DesktopView.swift", "AiwApp.swift", "TaskCardV2.swift"):
         t = (SRC / f).read_text(encoding="utf-8")
         t = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', t)          # strings
         t = re.sub(r"//[^\n]*", "", t)                         # comments
@@ -101,7 +101,8 @@ def test_37_fixes_are_wired():
     assert "contentInsetAdjustmentBehavior = .never" in mate
     # 2. task cards: the shared style, no forced dark scheme; the same in the task view
     assert "0xFF / 255, green: 0xF4 / 255, blue: 0xE0" in card and "func taskCardStyle" in card
-    assert ".taskCardStyle(tone, cs)" in home and "taskCardStyle(cardTone(live.status), cs" in chat
+    card2 = (SRC / "TaskCardV2.swift").read_text(encoding="utf-8")   # 3.8.8: the chat's task card moved there
+    assert ".taskCardStyle(waiting ? .live : tone, cs)" in card2 and "taskCardStyle(cardTone(live.status), cs" in chat
     assert "environment(\\.colorScheme, .dark)" not in home
     # 3. answered cards never print the raw answer
     assert "resolvedText(resolved)" in home and "<null>" in card and "func answerText" not in home

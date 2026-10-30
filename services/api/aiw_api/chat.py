@@ -16,6 +16,15 @@ every device opens it where the user left off.
   top memories for the message go into the system prompt, and it learns from each exchange in the background.
 
 No thinking and no agent steps ever go into the chat.
+
+3.8.8 (task card v2): a task is ONE card in the chat, keyed by its task (data.root_id = the first run), created when
+the task starts and updated in place (op "update" over /ws/events): title + prompt summary, status, step, the latest
+one-line progress, started_at / ended_at for the elapsed time. Whatever needs the user (takeover, slider/captcha,
+escalation, a question with option buttons, a form, a confirmation) is an entry of data.actions ON the card, answered
+with POST /api/chat/messages/{card}/answer {action_id, choice|approve|text}; answered ones collapse to a ✓ line. The
+end is data.result on the card (summary, files, thumb). A follow-up (继续 / 重试 / 补充 in the task view or the chat)
+re-arms the SAME card and moves it to the bottom (its seq is bumped). Old ask / confirm / task_result messages are
+never rewritten and still render and answer as before.
 """
 from __future__ import annotations
 
@@ -41,6 +50,8 @@ STATUS_CN = {"queued": "排队中", "pending": "准备中", "running": "进行�
              "waiting_confirm": "等你确认", "waiting_input": "等你回答", "succeeded": "已完成", "failed": "没完成",
              "stopped": "已停止", "interrupted": "被中断", "cancelled": "已取消"}
 ESC_OPTIONS = ["继续，换个方法再试", "我来接管桌面", "停止任务"]
+CARD_V = 2              # task card v2: actions + result live on the card (3.8.8)
+MAX_ACTIONS = 12        # answered actions kept on a card (the newest; the task view keeps them all)
 
 SKILL_RE = re.compile(r"^\s*【技能[:：][^】]+】")
 OFFER_RE = re.compile(r"\[\[\s*交给电脑\s*[:：]\s*(.+?)\s*\]\]", re.S)
@@ -296,12 +307,73 @@ class Chat:
                 if st in ("running", "paused", "takeover") + WAITING and not self.sessions.live_for_task(t["id"]):
                     st = "interrupted"
                 m = self.update(m["id"], data={"status": st, "status_line": STATUS_CN.get(st, st)}, push=False) or m
+            acts = (m.get("data") or {}).get("actions") or []
+            if any(not a.get("resolved") and not a.get("stale") and not self._action_pending(a) for a in acts):
+                acts = [{**a, "stale": True} if not a.get("resolved") and not a.get("stale") and not self._action_pending(a)
+                        else a for a in acts]
+                m = self.update(m["id"], data={"actions": acts}, push=False) or m
         elif m["kind"] in ("ask", "confirm") and not d.get("resolved") and not d.get("stale") and not d.get("watch_id"):
             live = self.sessions.live.get(d.get("session_id") or "")
             pending = live and (live.question_info if m["kind"] == "ask" else live.confirm_info)
             if not pending:
                 m = self.update(m["id"], data={"stale": True}, push=False) or m
         return m
+
+    def _action_pending(self, a: dict) -> bool:
+        live = self.sessions.live.get(a.get("session_id") or "")
+        if not live:
+            return False
+        return bool(live.confirm_info if a.get("kind") == "confirm" else live.question_info)
+
+    # ------------------------------------------------------------------ 3.8.8: the task card
+    def bump(self, mid: str, push: bool = True) -> Optional[dict]:
+        """Move a message to the bottom of the chat (a continued task's card): its seq becomes the newest."""
+        top = self.store._x("SELECT MAX(seq) AS s FROM chat_messages")
+        m = self.get(mid)
+        if not m:
+            return None
+        if top and top[0]["s"] and int(top[0]["s"]) > int(m["seq"]):
+            self.store._x("UPDATE chat_messages SET seq=?, updated_at=? WHERE id=?", (int(top[0]["s"]) + 1, time.time(), mid))
+            m = self.get(mid)
+        if push:
+            self._push("update", m)
+        return m
+
+    @staticmethod
+    def open_actions(card: dict) -> list[dict]:
+        return [a for a in (card.get("data") or {}).get("actions") or [] if not a.get("resolved") and not a.get("stale")]
+
+    def add_action(self, card_msg: dict, action: dict, **card_data) -> dict:
+        """Put something the user must answer on the card; an older open action of the same session is stale."""
+        acts = list((card_msg.get("data") or {}).get("actions") or [])
+        sid = action.get("session_id")
+        same = next((a for a in acts if not a.get("resolved") and not a.get("stale") and a.get("session_id") == sid
+                     and a.get("kind") == action.get("kind") and a.get("question") == action.get("question")
+                     and a.get("confirm_id") == action.get("confirm_id")), None)
+        if same:   # the same request seen twice (the catch-up at card creation and the event itself)
+            return self.update(card_msg["id"], data=card_data) if card_data else card_msg
+        acts = [{**a, "stale": True} if not a.get("resolved") and not a.get("stale") and a.get("session_id") == sid
+                and a.get("kind") == action.get("kind") else a for a in acts]
+        action = {"id": f"act-{uuid.uuid4().hex[:10]}", "at": time.time(), **action}
+        acts.append(action)
+        done = [a for a in acts if a.get("resolved") or a.get("stale")]
+        if len(done) > MAX_ACTIONS:
+            drop = {id(a) for a in done[:len(done) - MAX_ACTIONS]}
+            acts = [a for a in acts if id(a) not in drop]
+        return self.update(card_msg["id"], data={"actions": acts, **card_data}) or card_msg
+
+    def resolve_actions(self, card: dict, kind: str, ans: Any, by: Optional[str] = None, cancelled: bool = False,
+                        action_id: Optional[str] = None) -> Optional[dict]:
+        acts = list((card.get("data") or {}).get("actions") or [])
+        hit = False
+        for i, a in enumerate(acts):
+            if a.get("resolved") or a.get("stale") or a.get("kind") != kind or (action_id and a.get("id") != action_id):
+                continue
+            txt = ("已允许" if ans else "已拒绝") if kind == "confirm" else answer_text(ans, a.get("fields"), cancelled)
+            acts[i] = {**a, "resolved": {"answer": ans if not isinstance(ans, str) else ans[:200], "text": txt,
+                                         "by": by, "at": time.time()}}
+            hit = True
+        return self.update(card["id"], data={"actions": acts}) if hit else None
 
     def agent_name(self) -> str:
         prof = self.store.kv_get("profile", {}) or {}
@@ -359,7 +431,14 @@ class Chat:
                 t += f"\n（提议交给电脑：{d['offer_task']}）"
             return t
         if k == "task":
-            return f"［已交给电脑的任务「{d.get('title') or m.get('text')}」，状态：{STATUS_CN.get(d.get('status'), d.get('status'))}］"
+            t = f"［已交给电脑的任务「{d.get('title') or m.get('text')}」，状态：{STATUS_CN.get(d.get('status'), d.get('status'))}］"
+            res = d.get("result") or {}
+            if res.get("text"):
+                names = "、".join(f["name"] for f in res.get("files") or [])
+                t += "\n" + res["text"] + (f"（文件：{names}）" if names else "")
+            for a in Chat.open_actions(m)[-1:]:
+                t += f"\n［任务在{'请用户确认' if a.get('kind') == 'confirm' else '问用户'}：{str(a.get('question') or '')[:200]}］"
+            return t
         if k == "task_result":
             names = "、".join(f["name"] for f in d.get("files") or [])
             return (m.get("text") or "") + (f"（文件：{names}）" if names else "")
@@ -788,10 +867,19 @@ class Chat:
         return out
 
     def _open_ask(self) -> Optional[dict]:
-        """The newest question of a task that is still waiting for the user in this chat."""
-        for r in self.store._x("SELECT * FROM chat_messages WHERE conv=? AND kind='ask' ORDER BY seq DESC LIMIT 10", (CONV,)):
+        """The newest question of a task that is still waiting for the user in this chat: an open ask action on a task
+        card (3.8.8; returned as the card with data.action) or an old-style ask message."""
+        for r in self.store._x("SELECT * FROM chat_messages WHERE conv=? AND kind IN ('ask','task') ORDER BY seq DESC LIMIT 20",
+                               (CONV,)):
             m = _row(r)
             d = m["data"] or {}
+            if m["kind"] == "task":
+                for a in reversed(self.open_actions(m)):
+                    if a.get("kind") == "ask" and a.get("ask_kind") != "form":
+                        live = self.sessions.live.get(a.get("session_id") or "")
+                        if live and live.question_info:
+                            return {**m, "action": a}
+                continue
             if d.get("resolved") or d.get("stale") or d.get("watch_id") or d.get("pick_task") or d.get("ask_kind") == "form":
                 continue
             live = self.sessions.live.get(d.get("session_id") or "")
@@ -803,13 +891,13 @@ class Chat:
         """A message that answers a waiting task or continues an earlier one. None = route it as usual."""
         from . import continuation as _cont
         ask = self._open_ask()
-        opts = [str(o) for o in ((ask or {}).get("data") or {}).get("options") or []]
+        opts = [str(o) for o in ((ask or {}).get("action") or (ask or {}).get("data") or {}).get("options") or []]
         answers = bool(ask) and (bool(attachments) or _cont.is_followup(text) or any(o and (o in text or text in o) for o in opts)
                                  or (len(text) <= 40 and not re.search(r"[？?]\s*$", text)))
         if ask and answers and len(text) <= 300 and not _cont.NEW_TASK_RE.search(text) and (text or attachments):
             # the task asked the user something: a plain reply in the chat is the answer (task-7bd waited 600 s
             # on its question card while the user wrote in the chat, then went on alone)
-            d = ask["data"]
+            d = ask.get("action") or ask["data"]
             ans = text or "已上传附件"
             if attachments:
                 ans += "\n附件：" + "、".join(str(a.get("name") or "") for a in attachments)
@@ -825,8 +913,11 @@ class Chat:
             except KeyError:
                 ok = False
             if ok:
-                m = self.update(ask["id"], data={"resolved": {"answer": ans[:200], "text": answer_text(ans), "by": "chat_text",
-                                                              "at": time.time()}})
+                if ask.get("action"):
+                    m = self.resolve_actions(ask, "ask", ans, "chat_text", action_id=ask["action"]["id"]) or self.get(ask["id"])
+                else:
+                    m = self.update(ask["id"], data={"resolved": {"answer": ans[:200], "text": answer_text(ans),
+                                                                  "by": "chat_text", "at": time.time()}})
                 return {"route": "answer", "messages": [m]}
         if not _cont.is_followup(text, bool(attachments)):
             return None
@@ -868,12 +959,29 @@ class Chat:
         t = res["task"]
         if res.get("queued") and t["id"] == run["id"]:
             return [self.add("assistant", "text", f"「{title}」还在排队，你的补充已经加进去了", {"task_id": t["id"]})]
-        self.update(c["card"]["id"], data={"continued_by": t["id"], "status_line": "已接着做 ↓"}, push=True)
         st2 = t.get("status") or ("queued" if res.get("queued") else "running")
+        card = c["card"]
+        if card.get("kind") != "task" or not self.get(card["id"]):
+            card = self.card_for(t["id"], res.get("thread_id") or t.get("thread_id")) or card
+        if card.get("kind") == "task" and self.get(card["id"]):
+            # 3.8.8: the follow-up attaches to the SAME card, re-armed and moved to the bottom
+            cur = self.get(card["id"])
+            fresh_run = (cur["data"] or {}).get("task_id") != t["id"]
+            data = {"task_id": t["id"], "thread_id": res.get("thread_id") or t.get("thread_id"),
+                    "session_id": t.get("session_id") or (cur["data"] or {}).get("session_id"),
+                    "machine_id": t.get("machine_id"), "title": title, "status": st2,
+                    "status_line": "接着做 · " + STATUS_CN.get(st2, st2), "continues": c["root"],
+                    "continued_by": t["id"], "root_id": c["root"], "card": CARD_V}
+            if fresh_run:
+                data.update(step=0, result=None, ended_at=None, started_at=time.time(),
+                            runs=int((cur["data"] or {}).get("runs") or 1) + 1, followup=one_line(text, 60) or None)
+            self.update(card["id"], data=data, task_id=t["id"], push=False)
+            return [self.bump(card["id"])]
         card = self.add("assistant", "task", title, {
             "task_id": t["id"], "thread_id": res.get("thread_id") or t.get("thread_id"), "session_id": t.get("session_id"),
             "machine_id": t.get("machine_id"), "title": title, "status": st2, "status_line": "接着做 · " + STATUS_CN.get(st2, st2),
-            "step": 0, "continues": c["root"], "origin": (user or {}).get("id")}, task_id=t["id"])
+            "step": 0, "continues": c["root"], "root_id": c["root"], "card": CARD_V, "started_at": time.time(),
+            "origin": (user or {}).get("id")}, task_id=t["id"])
         return [card]
 
     # ------------------------------------------------------------------ tasks from the chat
@@ -894,10 +1002,32 @@ class Chat:
         t = res["task"]
         self.sessions._link_attachments(attachments, t["id"], res.get("thread_id") or t.get("thread_id"))
         st = t.get("status") or ("queued" if res.get("queued") else "running")
-        return self.add("assistant", "task", title, {
+        card = self.add("assistant", "task", title, {
             "task_id": t["id"], "thread_id": res.get("thread_id") or t.get("thread_id"), "session_id": t.get("session_id"),
             "machine_id": t.get("machine_id"), "title": title, "status": st, "status_line": STATUS_CN.get(st, st),
-            "step": 0, "max_steps": t.get("max_steps"), "origin": origin}, task_id=t["id"])
+            "step": 0, "max_steps": t.get("max_steps"), "origin": origin, "card": CARD_V, "root_id": t.get("continues") or t["id"],
+            "prompt": one_line(SKILL_RE.sub("", prompt), 120), "started_at": time.time() if st != "queued" else None,
+            "actions": []}, task_id=t["id"])
+        return self._catch_up_sync(card)
+
+    def _catch_up_sync(self, card: dict) -> dict:
+        """Events of a task that starts at once can fire before its card exists (submit returns after the run began):
+        a question / confirmation already waiting is put on the card now, so nothing that needs the user is lost."""
+        tid = card.get("task_id")
+        live = self.sessions.live_for_task(tid) if tid and self.sessions else None
+        if not live:
+            return card
+        task = live.task
+        sid = live.id
+        if live.confirm_info and not any(a.get("kind") == "confirm" for a in (card["data"] or {}).get("actions") or []):
+            self.background(self.on_task_event(task, sid, {"type": "agent.confirm_required", "data": live.confirm_info}))
+        elif live.question_info and not any(a.get("kind") == "ask" for a in (card["data"] or {}).get("actions") or []):
+            qi = dict(live.question_info)
+            stuck = getattr(getattr(live, "loop", None), "_stuck", None)
+            if stuck and not qi.get("form"):
+                qi["stuck"] = stuck
+            self.background(self.on_task_event(task, sid, {"type": "agent.input_required", "data": qi}))
+        return card
 
     async def _push_files(self, attachments: list, machine_id: Optional[str]) -> list:
         """Chat attachments live on the API host (local_only uploads); a task needs them on its computer."""
@@ -937,6 +1067,12 @@ class Chat:
 
     def card_for(self, task_id: str, thread_id: Optional[str]) -> Optional[dict]:
         r = self.store._x("SELECT * FROM chat_messages WHERE kind='task' AND task_id=? ORDER BY seq DESC LIMIT 1", (task_id,))
+        if not r:   # 3.8.8: the card is keyed by the task (its first run): a later run of it finds the same card
+            from . import continuation as _cont
+            root = _cont.root_id(self.store, task_id)
+            if root != task_id:
+                r = self.store._x("SELECT * FROM chat_messages WHERE kind='task' AND (task_id=? OR data LIKE ?) "
+                                  "ORDER BY seq DESC LIMIT 1", (root, f'%"root_id": "{root}"%'))
         if not r and thread_id:   # a retry / follow-up in the task view: the same card follows the newest task
             r = self.store._x("SELECT * FROM chat_messages WHERE kind='task' AND data LIKE ? ORDER BY seq DESC LIMIT 1",
                               (f'%"thread_id": "{thread_id}"%',))
@@ -950,19 +1086,30 @@ class Chat:
         d = msg.get("data") or {}
         cd = card["data"]
         base = {"task_id": task.id, "thread_id": cd.get("thread_id") or task.thread_id, "session_id": sid,
-                "title": cd.get("title") or card.get("text")}
+                "title": cd.get("title") or card.get("text"), "card": CARD_V,
+                "root_id": cd.get("root_id") or getattr(task, "continues", None) or task.id}
         if typ == "task.cancelled":   # 3.8.2: taken out of the queue (删除): the card says so instead of 排队中 forever
             self.update(card["id"], data={**base, "status": "cancelled", "status_line": "已从排队中删除",
-                                          "queue": None}, task_id=task.id)
+                                          "queue": None, "ended_at": time.time()}, task_id=task.id)
             return
         if typ == "task.started":
-            self.update(card["id"], data={**base, "status": "running", "status_line": "进行中", "step": 0,
-                                          "max_steps": task.max_steps}, task_id=task.id)
+            new_run = bool(cd.get("task_id")) and cd.get("task_id") != task.id
+            data = {**base, "status": "running", "status_line": "进行中", "step": 0, "max_steps": task.max_steps,
+                    "ended_at": None}
+            if new_run or not cd.get("started_at") or cd.get("result"):
+                data.update(started_at=time.time(), result=None, progress=None)
+            if new_run:   # a retry / continue from the task view: the same card follows it, at the bottom
+                data["runs"] = int(cd.get("runs") or 1) + 1
+                self.update(card["id"], data=data, task_id=task.id, push=False)
+                self.bump(card["id"])
+            else:
+                self.update(card["id"], data=data, task_id=task.id)
         elif typ == "agent.decision":
             step = msg.get("step") or cd.get("step") or 0
             status = cd.get("status") if cd.get("status") in WAITING else "running"
-            if step != cd.get("step") or status != cd.get("status"):
-                self.update(card["id"], data={**base, "step": step, "status": status,
+            prog = one_line(str(d.get("thought") or ""), 60) or cd.get("progress")
+            if step != cd.get("step") or status != cd.get("status") or prog != cd.get("progress"):
+                self.update(card["id"], data={**base, "step": step, "status": status, "progress": prog,
                                               "status_line": self._line(cd, status)}, task_id=task.id)
         elif typ in ("agent.plan", "agent.plan_update"):
             steps = d.get("plan") if typ == "agent.plan" else cd.get("plan")
@@ -976,6 +1123,7 @@ class Chat:
         elif typ in ("agent.input_answered", "agent.confirm_answered"):
             kind = "confirm" if typ == "agent.confirm_answered" else "ask"
             ans = d.get("approve") if kind == "confirm" else d.get("answer")
+            # old-style question messages (before 3.8.8) still get their ✓
             for r in self.store._x("SELECT * FROM chat_messages WHERE kind=? AND task_id=? ORDER BY seq DESC LIMIT 3",
                                    (kind, task.id)):
                 m = _row(r)
@@ -984,17 +1132,19 @@ class Chat:
                         answer_text(ans, m["data"].get("fields"), bool(d.get("cancelled")))
                     self.update(m["id"], data={"resolved": {"answer": ans if not isinstance(ans, str) else ans[:200],
                                                             "text": txt, "by": d.get("by"), "at": time.time()}})
+            card = self.resolve_actions(self.get(card["id"]) or card, kind, ans, d.get("by"), bool(d.get("cancelled"))) or card
             self.update(card["id"], data={**base, "status": "running", "status_line": self._line(cd, "running"),
                                           "stuck": None})
         elif typ == "agent.confirm_required":
             s = d.get("summary") or {}
-            self.add("assistant", "confirm", s.get("title") or d.get("reason") or "需要你确认", {
-                **base, "summary": {k: s.get(k) for k in ("title", "what", "risk", "risk_cn", "why", "chips", "category")},
-                "confirm_id": d.get("id"), "task_allow": d.get("task_allow")}, task_id=task.id)
-            self.update(card["id"], data={**base, "status": "waiting_confirm", "status_line": "等你确认"})
+            q = s.get("title") or d.get("reason") or "需要你确认"
+            self.add_action(card, {
+                "kind": "confirm", "ask_kind": "confirm", "question": q, "session_id": sid, "task_id": task.id,
+                "summary": {k: s.get(k) for k in ("title", "what", "risk", "risk_cn", "why", "chips", "category")},
+                "confirm_id": d.get("id"), "task_allow": d.get("task_allow")},
+                **base, status="waiting_confirm", status_line="等你确认")
         elif typ == "task.end":
             st = msg.get("status") or "failed"
-            self.update(card["id"], data={**base, "status": st, "status_line": STATUS_CN.get(st, st)}, task_id=task.id)
             files = files_of(msg.get("files") or [])
             res = msg.get("result") or ""
             line = one_line(res)
@@ -1006,8 +1156,15 @@ class Chat:
                 text = line or "任务没有完成。"
                 if not text.startswith(("任务没", "没", "抱歉")):
                     text = "任务没有完成：" + text
-            self.add("assistant", "task_result", text, {**base, "status": st, "files": files,
-                                                        "has_more": len(res.strip()) > len(line) + 2}, task_id=task.id)
+            thumb = next((f["path"] for f in files if f["kind"] == "image"), None)
+            acts = [{**a, "stale": True} if not a.get("resolved") and not a.get("stale") else a
+                    for a in (self.get(card["id"]) or card)["data"].get("actions") or []]
+            # 3.8.8: the result is ON the card (no separate 球球 message); the push notification is sessions' own
+            self.update(card["id"], data={**base, "status": st, "status_line": STATUS_CN.get(st, st), "ended_at": time.time(),
+                                          "actions": acts, "stuck": None,
+                                          "result": {"text": text, "status": st, "files": files, "thumb": thumb,
+                                                     "has_more": len(res.strip()) > len(line) + 2, "at": time.time()}},
+                        task_id=task.id)
 
     def _line(self, cd: dict, status: str) -> str:
         return cd.get("current") or STATUS_CN.get(status, status)
@@ -1024,25 +1181,27 @@ class Chat:
             kind, text = "escalate", q
         else:
             kind, text = "question", q
-        data = {"task_id": task.id, "thread_id": card["data"].get("thread_id") or task.thread_id, "session_id": sid,
-                "title": card["data"].get("title"), "ask_kind": kind, "question": q, "options": opts}
+        data = {"kind": "ask", "task_id": task.id, "session_id": sid, "ask_kind": kind, "question": text, "options": opts}
         if kind == "takeover":
             data["takeover"] = {k: form.get(k) for k in ("site", "url", "steps", "reason", "machine", "machine_id", "action_cn")}
         if kind == "form":
             data["form_title"] = form.get("title")
-            # labels only (the answer card shows 标签：值); which fields are secret, never their values
+            # labels only (the answer line shows 标签：值); which fields are secret, never their values
             data["fields"] = [{"key": f.get("key"), "label": f.get("label"), "secret": bool(f.get("secret"))}
                               for f in form.get("fields") or [] if isinstance(f, dict)][:20]
         stuck = d.get("stuck") if isinstance(d.get("stuck"), dict) else None
         if stuck:   # 3.8.2: a stuck task is paused, not ended; the card says why and what the user can do
             data["stuck"] = stuck
-        self.add("assistant", "ask", text, data, task_id=task.id)
         line = "需要你接管" if kind == "takeover" else (stuck or {}).get("line") or "等你回答"
-        self.update(card["id"], data={"status": "waiting_input", "status_line": line, "stuck": stuck})
+        # 3.8.8: on the card itself, not a new message (the push notification comes from sessions._notify)
+        self.add_action(self.get(card["id"]) or card, data, status="waiting_input", status_line=line, stuck=stuck,
+                        thread_id=card["data"].get("thread_id") or task.thread_id, session_id=sid)
 
     async def answer(self, mid: str, choice: Optional[str] = None, approve: Optional[bool] = None,
-                     text: Optional[str] = None) -> dict:
+                     text: Optional[str] = None, action_id: Optional[str] = None) -> dict:
         m = self.get(mid)
+        if m and m["kind"] == "task":
+            return await self.answer_action(m, action_id, choice, approve, text)
         if not m or m["kind"] not in ("ask", "confirm"):
             raise KeyError(mid)
         d = m["data"]
@@ -1088,6 +1247,37 @@ class Chat:
         return {"ok": True, "message": m, "open_task": isinstance(ans, str) and "接管" in ans}
 
 
+    async def answer_action(self, card: dict, action_id: Optional[str], choice: Optional[str] = None,
+                            approve: Optional[bool] = None, text: Optional[str] = None) -> dict:
+        """3.8.8: answer what a task card asks (its data.actions entry). No action_id = its newest open action."""
+        acts = (card.get("data") or {}).get("actions") or []
+        a = next((x for x in acts if x.get("id") == action_id), None) if action_id else \
+            next(iter(reversed(self.open_actions(card))), None)
+        if not a:
+            raise KeyError(action_id or card["id"])
+        if a.get("resolved"):
+            raise ValueError("这个问题已经回答过了")
+        sid = a.get("session_id") or ""
+        kind = a.get("kind") or "ask"
+        try:
+            if kind == "confirm":
+                ans: Any = bool(approve)
+                ok = self.sessions.answer_confirm(sid, ans)
+            else:
+                ans = (choice if choice is not None else text) or ""
+                if not ans.strip():
+                    raise ValueError("回答是空的")
+                ok = self.sessions.answer_question(sid, ans)
+        except KeyError:
+            ok = False
+        if not ok:
+            self.update(card["id"], data={"actions": [{**x, "stale": True} if x.get("id") == a["id"] else x
+                                                      for x in (self.get(card["id"]) or card)["data"].get("actions") or []]})
+            raise ValueError("这个问题已经过期（任务已经不在等这个回答了）")
+        m = self.resolve_actions(self.get(card["id"]) or card, kind, ans, "chat", action_id=a["id"]) or self.get(card["id"])
+        return {"ok": True, "message": m, "action_id": a["id"], "open_task": isinstance(ans, str) and "接管" in ans}
+
+
 OPT_RETRY_WATCH = "立即重试"
 
 
@@ -1109,6 +1299,7 @@ class ChatIn(BaseModel):
     stream: bool = True
 
 class AnswerIn(BaseModel):
+    action_id: Optional[str] = None     # 3.8.8: which action of a task card
     choice: Optional[str] = None
     approve: Optional[bool] = None
     text: Optional[str] = None
@@ -1186,7 +1377,7 @@ def mount(app, chat: Chat, auth) -> None:
     @app.post("/api/chat/messages/{mid}/answer", dependencies=dep)
     async def chat_answer(mid: str, body: AnswerIn):
         try:
-            return await chat.answer(mid, body.choice, body.approve, body.text)
+            return await chat.answer(mid, body.choice, body.approve, body.text, body.action_id)
         except KeyError:
             raise HTTPException(404)
         except ValueError as e:

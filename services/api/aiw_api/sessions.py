@@ -339,7 +339,8 @@ class SessionManager:
             steps, secs = _es.step_cap(), _es.time_cap()
         steps, secs = _budget(run_prompt, int(steps or 0), float(secs or 0), ctx)
         task = Task(id=row["id"], prompt=run_prompt, machine_id=row["machine_id"], thread_id=row.get("thread_id"),
-                    source=row.get("source") or "chat", max_steps=steps, timeout_s=secs)
+                    source=row.get("source") or "chat", max_steps=steps, timeout_s=secs,
+                    continues=(row.get("continues") if row.get("continues") and row.get("continues") != row["id"] else None))
         task.context = ctx
         return await self.start(task, allow_busy=allow_busy)
 

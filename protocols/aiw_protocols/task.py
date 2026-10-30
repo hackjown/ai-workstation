@@ -34,3 +34,4 @@ class Task(BaseModel):
     thread_id: Optional[str] = None
     context: Optional[str] = None      # earlier turns of the thread + memory, prepended for the model
     source: str = "chat"               # chat | routine | retry | resume
+    continues: Optional[str] = None    # 3.8.8: root task this run continues (same task card): it inherits its folder

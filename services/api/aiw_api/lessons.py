@@ -90,6 +90,32 @@ SEED_V2 = [
     ("tool", "read_image", "读图报 5xx（HTTP 500/502/503 @ 网关）或超时，换格式/缩小图片也一样",
      "读图报 5xx = 服务故障，不要转换图片；告诉用户检查服务（设置 › 模型 › 视觉模型，或 /api/vision/test）"),
 ]
+# 3.8.8: from task-41c (the model analysed for 200 steps) and the user's fresh-job rule (2026-10-30)
+SEED_DRAW_MARK = "lessons_seeded_drawloop_v1"
+SEED_DRAW = [
+    ("general", "", "新任务的上传文件和以前的 md5 相同，于是直接复用/重发以前任务的成品（spec、dxf、png、修好的图）",
+     "每个新任务都是全新的活：在本任务文件夹里重新做，绝不复制或重发以前任务的输出；同 md5 也一样。只有同一任务卡上的继续/修改才沿用该任务的文件夹"),
+    ("skill", "cad-drawing", "每一步都从用户那句纠正重新开始分析，反复裁图问标签位置，200 步没写 spec",
+     "读图阶段最多约 8 步，每个发现马上 drawing_note 记进 FACTS（每步都会显示）；读完尺寸链就 drawing_auto 出草稿，只改草稿，然后 drawing_build"),
+    ("skill", "cad-drawing", "cad/ 里的旧 spec.json 是另一张图（另一户型）的，被当成要修改的图改了 100 步",
+     "spec 记录 source.md5 和 task；与当前上传/任务不符就归档旧 spec，按当前图重新出草稿（drawing_build 会报 STALE SPEC）"),
+    ("skill", "cad-drawing", "用自由提问让视觉模型说房间标签在哪（九宫格/百分比），每次答案不同",
+     "标签位置用 OCR 或一次带像素网格的 JSON 读取（drawing_auto 自动做），写进 FACTS 锁定，不再重复问"),
+]
+# lessons that tell the model to reuse an earlier task's output are not kept (they break the fresh-job rule)
+REUSE_OLD_RE = re.compile(
+    r"(md5|哈希|同一(张|个)?文件|same file|identical).{0,60}(复用|直接用|沿用|直接发|重发|再发|照搬|reuse|resend|copy|拿来用|用(之前|上次|旧)的|示例 ?spec)|"
+    r"(复用|沿用|直接用|照搬|reuse).{0,30}(上次|之前|旧|earlier|previous|示例).{0,20}(结果|输出|spec|图|文件|output)", re.I)
+
+
+_NEG_RE = re.compile(r"绝不|不要|不能|不得|禁止|别再|never|do not|don't|must not", re.I)
+
+
+def reuses_old_output(text: str) -> bool:
+    """a lesson whose FIX tells the model to reuse / resend an earlier task's output (not one that forbids it)."""
+    t = text or ""
+    return bool(REUSE_OLD_RE.search(t)) and not _NEG_RE.search(t)
+
 
 SECRET_VALUE_RE = re.compile(
     r"((密码|口令|passw(or)?d|pwd|验证码|校验码|动态码|token|api[ _-]?key|secret|私钥|cvv|cvc|支付密码)\s*(是|为|[:：=])\s*\S{3,}|"
@@ -156,6 +182,7 @@ class Lessons:
         ensure_table(store)
         try:
             self.seed()
+            self.seed_draw()
         except Exception as e:  # noqa: BLE001
             log.warning("seeding lessons failed: %s", e)
 
@@ -174,6 +201,23 @@ class Lessons:
                     k += 1
             self.store.kv_set(mark, {"at": time.time(), "n": k})
             n += k
+        return n
+
+    def seed_draw(self) -> int:
+        """3.8.8 lessons (kv lessons_seeded_drawloop_v1), and the learned ones that say 'same md5 -> reuse' are removed."""
+        try:
+            if self.store.kv_get(SEED_DRAW_MARK):
+                return 0
+        except Exception:  # noqa: BLE001
+            return 0
+        n = 0
+        for r in self.items(limit=5000):
+            if reuses_old_output(str(r.get("fix") or "")):
+                self.store._x("DELETE FROM lessons WHERE id=?", (r["id"],))
+        for scope, key, problem, fix in SEED_DRAW:
+            if self.add(scope, key, problem, fix, "auto"):
+                n += 1
+        self.store.kv_set(SEED_DRAW_MARK, {"at": time.time(), "n": n})
         return n
 
     # ------------------------------------------------------------------ rows
@@ -228,6 +272,8 @@ class Lessons:
             key = ""
         problem, fix = _clip(problem), _clip(fix)
         if not fix or looks_secret(problem + " " + fix):
+            return None
+        if reuses_old_output(fix):   # the user's fresh-job rule: never learn "same md5 -> reuse the old result"
             return None
         if not problem:
             problem = fix[:60]

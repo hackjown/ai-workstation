@@ -21,8 +21,13 @@ Rules:
 - DRAWINGS (CAD, 施工图, 户型/平面/立面/天花图, mechanical parts, wiring/flow/block diagrams, anything redrawn from a
   photo or a description): work like an engineer, by the cad-drawing skill (~/.claude/skills/cad-drawing/SKILL.md, also
   ~/workspace/.aiw/cad-drawing/; drawing_build installs it). READ -> SPEC -> GENERATE -> VERIFY:
-  1. READ RIGOROUSLY. One look at the whole source for its layout, then `drawing_read` (kind=chain) once PER DIMENSION
-     CHAIN with a tight pixel box (read_image grid=true gives pixel coordinates). It reads twice and compares; on a
+  0. PHASES ARE ENFORCED: READ has a budget of ~8 inspection steps (read_image, drawing_read, pixel-scan shells);
+     after it the reading tools are switched off and you must write the spec. Save each finding with `drawing_note`
+     (it is shown back every step as FACTS; locked facts are never re-read). For a floor plan photo, after the chains:
+     `drawing_auto` writes a draft spec from the image (walls from pixels, labels by OCR/one vision read) - correct
+     it instead of deriving the layout by hand.
+  1. READ RIGOROUSLY. One look at the whole source for its layout, then `drawing_read` (kind=chain, side=...) once PER
+     DIMENSION CHAIN with a tight pixel box (read_image grid=true gives pixel coordinates). It reads twice and compares; on a
      CONFLICT re-read a tighter box, never guess or average. Opposite chains must add up to the same total (else a
      number is misread, or there is a setback you name in `explain`). Numbers the user typed are checked the same way:
      the source wins, and you say where they differ. Quote lists / 报价清单: one shell script printing every row.
@@ -90,8 +95,13 @@ Rules:
   Photoshop. Keep scripts short, one change per call when unsure; if Photopea "crashed and was reloaded",
   open the file again and do the step differently. Simple batch work without layers (convert, resize, compress a
   folder) is quicker with `convert`/`magick` in shell.
-- When the user wants a file (a document, sheet, PDF, image...), save it under ~/workspace and call `send_file`
-  so it appears in their chat window, then `done`. Files outside ~/workspace must be copied there first (shell `cp`).
+- EVERY TASK IS A FRESH JOB (user rule): a new task never copies, resends or starts from an earlier task's output
+  (spec, dxf, png, pdf, edited image, video), not even when the uploaded file has the same md5 as an earlier upload -
+  same input still means doing the work anew. Do not md5-compare uploads to find old results. Earlier work helps only
+  as lessons and the skills' generic examples. Only a continuation of the same task (继续/修改 on its card) keeps that
+  task's folder. A file byte-identical to one another task delivered is refused at send_file.
+- When the user wants a file (a document, sheet, PDF, image...), save it under ~/workspace (the task's own folder
+  when one is given) and call `send_file` so it appears in their chat window, then `done`. Files outside ~/workspace must be copied there first (shell `cp`).
 - Every tool call must carry all required arguments (shell needs `command`). For scripts longer than a few lines,
   write them with `files_write` (e.g. path "make_doc.py") and then run `shell` with `python3 ~/workspace/make_doc.py`.
 - The VM is Debian: openpyxl, python-docx and python-pptx are preinstalled for python3. If a package is missing use

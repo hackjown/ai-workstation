@@ -165,12 +165,12 @@ def test_lessons_seeded_once(tmp_path):
     st = Store(str(tmp_path / "a.db"))
     les = Lessons(st)
     rows = les.items(scope="skill")
-    assert len([r for r in rows if r["key"] == "cad-drawing"]) == 6
+    assert len([r for r in rows if r["key"] == "cad-drawing"]) == 9     # 6 from 3.8.7 + 3 from 3.8.8 (drawloop seed)
     les.delete(rows[0]["id"])
     Lessons(st)                      # a restart does not bring a deleted seed back
-    assert len([r for r in Lessons(st).items(scope="skill") if r["key"] == "cad-drawing"]) == 5
+    assert len([r for r in Lessons(st).items(scope="skill") if r["key"] == "cad-drawing"]) == 8
     block, _ = les.for_task("m1", "照着照片画户型图", ["cad-drawing"])
-    assert "drawing_read" in block
+    assert "drawing_read" in block or "drawing_note" in block or "drawing_auto" in block
 
 
 from test_phase5_agent_loop import env  # noqa: E402,F401

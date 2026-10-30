@@ -8,8 +8,24 @@ description: 任何技术图纸（户型平面图、施工图、机械零件、�
 
 像一个靠谱的工程师那样画图：**先把源图读准、记下来，再一次性生成；错了改 spec 重新生成，不在图上打补丁。**
 
-本文件夹：`drawkit.py`（读图 + 生成 + 检查的一体化工具）、`examples/xinda-g-108.spec.json`（完整示例：
-信达海天下 G 户型照片 → spec）、`examples/12-031de1aca2dd.JPG`（示例的原图）。
+本文件夹：`drawkit.py`（读图 + 生成 + 检查的一体化工具）、`drawauto.py`（`drawkit.py auto`：从照片自动出 spec 草稿）、
+`examples/xinda-g-108.spec.json`（**通用示例**，只用来看 spec 怎么写：信达海天下 G 户型照片 → spec）、
+`examples/12-031de1aca2dd.JPG`（示例的原图）。
+
+## 铁律（3.8.8）
+- **每个新任务都是全新的活**：只在本任务的文件夹里工作（`cad/` 就是本任务自己的 `tasks/<任务id>/cad`）。
+  **绝不**复制、重发或从以前任务的输出（spec、dxf、png、pdf、修好的图）开始——**上传文件 md5 和以前一样也不行**，
+  不要拿 md5 去找旧结果。示例 spec 只是写法示例，不能当成交付或起点。只有在同一张任务卡上“继续/修改”才沿用该任务的文件夹。
+  与别的任务交付过的文件字节完全相同的文件，send_file 会被拒绝。
+- **阶段是代码强制的**：READ（最多约 8 步看图/裁图/像素扫描）→ SPEC（必须写出 cad/spec.json）→ BUILD → VERIFY（≤3 轮）→ DELIVER。
+  读图预算用完后读图工具会被关掉，只能根据已有 FACTS 写 spec。
+- **发现马上记下**：每读到一条尺寸链、一个标签位置、一组墙线，就 `drawing_note` 记进 `cad/facts.json`。FACTS 每一步都会
+  显示在任务说明里（旧步骤滚出历史也不会丢）；`confirmed=true` 的会锁定，不要重读。`drawing_read` 两遍一致的链自动记入并锁定
+  （调用时写上 `side`）。
+- **不要用自由提问问视觉模型“标签在哪”**：标签位置用 OCR 或一次带像素网格的 JSON 读取，`drawing_auto` 自动做。
+- **spec 记录来源**：`source.md5`（原图 md5）和 `source.task`（写它的任务）。与当前上传或当前任务不符时，`drawing_build` 报
+  `STALE SPEC`，修订开始时旧 spec 会被移到 `cad/_stale/`——按当前图重新出草稿。
+- 连续几步在重复同一个分析、什么新东西都没写，会收到「停止分析，立即根据已有 facts 写 spec 并生成」；两次后会直接问用户。
 
 Agent 里有两个专用工具，优先用它们：
 - `drawing_read`：把源图某一块放大，用视觉模型**读两遍**（两种问法），自动比对；不一致会再放大读第三遍并告诉你冲突在哪。
@@ -22,6 +38,8 @@ python3 $D/drawkit.py zoom IMG --box x0,y0,x1,y1 --k 6 [--rotate 270] [--grid] -
 python3 $D/drawkit.py ticks IMG --side left --box x0,y0,x1,y1   # 尺寸线 + 刻度/尺寸界线的像素位置
 python3 $D/drawkit.py fit cad/spec.json              # 像素↔mm 拟合、逐段残差、对边闭合检查
 python3 $D/drawkit.py axes cad/spec.json --out cad/axes.png      # 轴网画在原图上，看是否压在墙上
+python3 $D/drawkit.py auto IMG --chains cad/auto_chains.json [--labels L.json] --out cad/spec.json --debug cad/auto_debug.png
+                                                     # 自动草稿：像素找墙线 + 尺寸链定比例 + 标签落进墙围单元 = 房间
 python3 $D/drawkit.py build cad/spec.json --out cad --name plan  # 全量生成 + 检查（退出码 2 = 有错误）
 python3 $D/drawkit.py schema                         # spec 字段说明
 ```
@@ -48,6 +66,9 @@ python3 $D/drawkit.py schema                         # spec 字段说明
    x、y 比例相差 >3% 说明照片斜拍或某条链读错。
 
 ### C. 房间/构件 → spec
+6b. **楼层平面照片：先 `drawing_auto`**（尺寸链已在 FACTS 里）。它用暗像素投影找粗墙线、吸附到尺寸链的轴线，OCR 读房间名
+   （图上没印字时问一次视觉模型要 JSON 坐标），把每个标签放进它所在的墙围单元，写出 `cad/spec.json` 草稿和
+   `cad/auto_debug.png`（红=识别的墙，色块=房间）。接下来**只改草稿**：补门窗、改错的墙、给 `房间?` 起名，然后 drawing_build。
 7. 每个房间：名字取**图上的文字标签**（不要按模板“三房两厅”去套），位置取它在照片里的像素范围，按拟合的
    比例换成 mm，并吸附到最近的轴线；写成直角多边形 `poly`（或 `box`）。开敞的客厅/餐厅/玄关/过道给同一个
    `zone`，它们之间不画墙。
@@ -113,3 +134,6 @@ python3 $D/drawkit.py schema                         # spec 字段说明
 | 画法 | 在 LibreCAD 里逐批手打坐标，几十步在挪文字 | 文字位置由生成器按几何计算（避让 + 缩字号），不靠试错 |
 | 修改 | ERASE 窗口留下孤立图元或误删墙 | 永远从 spec 整张重新生成 |
 | 核对 | “看起来差不多”的视觉意见 | overlay 叠图 + report.json 自动检查，再做一次有针对性的视觉复核；最多 3 轮 |
+| 分析停不下来 | task-41c：200 步里 134 次 shell 裁图/扫像素、46 次 read_image，每步都从“用户说户型画错了”重新开始，第 124 步才写脚本 | 读图 ≤8 步，发现随手 drawing_note；读完链就 drawing_auto 出草稿，只改草稿 |
+| 旧 spec | cad/ 里是另一张图（G 户型）的 spec，被当成要改的图改了 ~90 步 | spec 记 source.md5 + task；不符就归档、重新出草稿 |
+| 同 md5 | 新任务上传的图和以前 md5 一样，就把以前的成品重发 | 新任务永远重新做；同 md5 也一样；重复的成品在 send_file 被拒 |

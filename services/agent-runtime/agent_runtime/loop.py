@@ -24,6 +24,7 @@ from tool_router.registry import BOS_TOOLS, SUBAGENT_TOOLS
 
 from . import cad as _cad
 from . import drawing as _draw
+from . import drawing_hooks as _dh
 from . import video as _video
 from . import image_edit as _ie
 from . import image_brief as _ib
@@ -99,6 +100,7 @@ class AgentLoop:
         self._checkin = _es.checkin_steps()   # soft valve: pause and ask after this many steps without progress
         self._progress_at = 0                 # the step of the last visible progress
         self._pages_seen: set = set()
+        _dh.init(self)   # 3.8.8: per-task work folder, delivered-file index, drawing phases
         self._waited = 0.0  # seconds spent waiting on the user (ask_user, confirmations): not counted toward timeout
         self._last_image: Optional[str] = None  # newest image_edit output, delivered if the task runs out of time
         self.validator = Validator()
@@ -380,6 +382,7 @@ class AgentLoop:
             await self.emit(EventType.PLAN, plan=self.plan_steps, done=sorted(self.plan_done))
         elif self.cfg.make_plan and _needs_action(self.task.prompt):
             plan_job = asyncio.create_task(self._plan())  # plan in parallel with the first step, not before it
+        await _dh.start(self)
         if self._cad_mode == "revise":
             await self._cad_revise_start()
         elif self._cad_task and not self._cad_resuming():
@@ -449,6 +452,12 @@ class AgentLoop:
             spec = ((r.result or {}).get("stdout") or "").strip() if isinstance(r.result, dict) else ""
         except Exception:  # noqa: BLE001
             spec = ""
+        why = await _dh.stale_spec(self, spec) if spec else None
+        if why:   # task-41c: the G-plan spec of another image was revised for 100 steps against the A3-1 photo
+            self.history.append(f"0. STALE SPEC {spec} archived to cad/_stale/: {why}. This is a NEW drawing for the "
+                                "current image: drawing_read the chains (side=...), drawing_auto for a draft, correct it, "
+                                "drawing_build.")
+            return
         if spec:
             self.history.append(
                 f"0. REVISION of a GENERATED drawing: its spec is {spec}. files_read it, change only what the user named "
@@ -802,6 +811,17 @@ class AgentLoop:
                 note = "Paused before acting; previous decision discarded. Re-assess."
                 continue
 
+            gate, gnote = await _dh.pre_tool(self, decision)
+            if gate == "escalate":
+                n = await self._escalate("drawing_loop", gnote)
+                if n is None:
+                    return
+                note, failures = n, 0
+                continue
+            if gate == "skip":
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="停止重复分析：先写 spec 再生成")
+                note = gnote
+                continue
             self._page_click(decision)
             self._last_tool = decision.tool
             await self.emit(EventType.ACTION, tool=decision.tool, args=decision.args)
@@ -814,6 +834,8 @@ class AgentLoop:
             handled = await self._loop_tool(decision)
             if handled is not None:
                 self.history.append(f"{self.step}. {decision.tool}({_args_short(decision.args)}) -> {handled}")
+                _dh.post_tool(self, decision, not str(handled).startswith(("FAILED", "REFUSED", "CONFLICT")), str(handled))
+                await _dh.save_facts(self)
                 note = None
                 continue
 
@@ -848,8 +870,17 @@ class AgentLoop:
                     if sv and len(sv) >= 3:
                         t = t.replace(sv, "••••")
                 outcome.result["text"] = t
+            refused = (_dh.check_delivery(self, outcome.result) if decision.tool == "send_file" and outcome.success
+                       and isinstance(outcome.result, dict) else None)
+            if refused:   # the user's rule: an earlier task's output is never delivered again
+                await self.emit(EventType.ACTION_RESULT, tool="send_file", success=False, error="same file as an earlier task", result={})
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="拒绝交付：和以前任务的成品完全相同")
+                self.history.append(f"{self.step}. send_file({decision.args.get('path')}) -> {refused}")
+                note = refused
+                continue
             if decision.tool == "send_file" and outcome.success and isinstance(outcome.result, dict):
                 await self._deliver_file(outcome.result)
+                _dh.record_delivery(self, outcome.result)
                 outcome.result = {k: v for k, v in outcome.result.items() if k != "content_b64"}
                 outcome.result["sent_to_user"] = True
                 self._sent_file = Path(outcome.result.get("path") or "file").name
@@ -887,6 +918,7 @@ class AgentLoop:
             v = self.validator.check(outcome.action, outcome.success, outcome.error, before, after)
             await self.emit(EventType.VALIDATION, success=v.success, change=v.changed, message=v.message)
             self.history.append(_hist_line(self.step, decision, outcome, v.message))
+            _dh.post_tool(self, decision, outcome.success, "")
             if outcome.action == "browseros.call":
                 self._bos_front = decision.tool == "bos_tabs" and (decision.args or {}).get("action") == "front" and outcome.success
                 if outcome.success:   # which BrowserOS page the task is on, so a screenshot can find it
@@ -978,7 +1010,7 @@ class AgentLoop:
         return desc
 
     def _task_with_plan(self) -> str:
-        base = self.task_text
+        base = self.task_text + _dh.task_block(self)
         if self._images_read:
             base += ("\n\nIMAGES ALREADY READ (do not read again; their content is in cad/plan.md or above): "
                      + ", ".join(self._images_read))
@@ -1033,6 +1065,8 @@ class AgentLoop:
             return await self._drawing_read(a)
         if t == "drawing_build":
             return await self._drawing_build(a, decision.thought)
+        if t in ("drawing_note", "drawing_auto"):
+            return await _dh.tool(self, decision)
         if t == "cad_command":
             return await self._cad_command(a, decision.thought)
         if t == "shell" and self._cad_task and _LIBRECAD_PROC.search(str(a.get("command") or "")):
@@ -1244,7 +1278,8 @@ class AgentLoop:
         """Instead of failing: ask for a takeover (captcha/login wall on the page) or ask the user what to do.
         Returns the note to continue with, or None when the task has ended (stopped by the user, nobody answered,
         or nobody can be asked) - always with a full report as the result. See escalate.py."""
-        page = await self._page_now()
+        # a drawing task never opened a page: do not quote whatever tab the browser had open (task-41c showed JD)
+        page = await self._page_now() if (getattr(self, "_last_page", None) or not self._cad_task) else {}
         stall = getattr(self, "_stall", None) or _es.Stall()
         self._stall = stall
         blocked = stall.blocked or ("验证" if kind == "blocked" else "")
@@ -2204,7 +2239,7 @@ class AgentLoop:
         if err:
             await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=False, error=err[:200], result={})
             return f"FAILED: {err}"
-        r = await self.tools.run("shell", {"command": _draw.build_command(spec, out, name, a.get("source")), "timeout": 600},
+        r = await self.tools.run("shell", {"command": _draw.build_command(spec, out, name, a.get("source"), task=self._root_id), "timeout": 600},
                                  intent=intent or "generate the drawing from the spec")
         res = r.result if isinstance(r.result, dict) else {}
         rep = _draw.parse_result(res.get("stdout") or "")
@@ -2212,6 +2247,10 @@ class AgentLoop:
             tail = ((res.get("stderr") or "") + (res.get("stdout") or ""))[-1500:]
             await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=False, error=tail[-200:], result={})
             return f"FAILED: drawkit could not build {spec}:\n{tail}\nFix the spec (see `drawkit.py schema`) and call again."
+        if rep.get("stale"):
+            await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=False, error="stale spec", result={})
+            return ("FAILED: " + " | ".join(rep.get("errors") or []) + f"\nNEXT: move {spec} away (it is another image's or "
+                    "another task's), then drawing_auto for a draft of THIS image, correct it, drawing_build.")
         self._draw_rounds += 1
         self._drawkit_built = True
         self._acted = True
@@ -2247,6 +2286,7 @@ class AgentLoop:
 
     def _hidden_tools(self) -> tuple:
         hide = [] if _cad.script_drawing_allowed(self.task.prompt) else ["cad_draw"]
+        hide.extend(_dh.hidden(self))
         if not self.dispatcher:
             hide.append("dispatch")
         if not self.bos_enabled:

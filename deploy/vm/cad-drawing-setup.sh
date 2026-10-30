@@ -8,7 +8,7 @@ if [ "${1:-}" = "check" ]; then test -f "$D/drawkit.py" && python3 -c "import ez
 BASE="${AIW_RAW:-https://raw.githubusercontent.com/hackjown/ai-workstation/main}/skills/cad-drawing"
 LOCAL="$HOME/ai-workstation/skills/cad-drawing"
 mkdir -p "$D/examples"
-for f in SKILL.md drawkit.py examples/xinda-g-108.spec.json; do
+for f in SKILL.md drawkit.py drawauto.py examples/xinda-g-108.spec.json; do
   if ! curl -fsSL --retry 3 --connect-timeout 15 -o "$D/$f.tmp" "$BASE/$f"; then
     [ -f "$LOCAL/$f" ] || { echo "cannot fetch $f"; rm -f "$D/$f.tmp"; exit 1; }
     cp "$LOCAL/$f" "$D/$f.tmp"

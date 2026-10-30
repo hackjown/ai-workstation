@@ -144,7 +144,30 @@ TOOLS: list[ToolSpec] = [
               "box": {"type": "array", "items": {"type": "number"},
                       "description": "[x0,y0,x1,y1] in the image's pixels: just the chain (its line, ticks and numbers) or one room"},
               "kind": {"type": "string", "enum": ["chain", "text"]},
+              "side": {"type": "string", "enum": ["top", "bottom", "left", "right"],
+                       "description": "which chain this is (an agreed read is saved to FACTS under this side and locked)"},
               "question": {"type": "string", "description": "optional extra hint, e.g. '共 6 段'"}}, ["path", "box"]),
+    ToolSpec("drawing_note", None,
+             "Save a finding about the source drawing to FACTS (cad/facts.json), which is shown to you EVERY step, so it "
+             "is never lost when old steps scroll away. kind: chains (key=side, value={values, box_px}), labels (key=room "
+             "name, value={name, at_px:[x,y]}), walls (key e.g. 'x', value=[px or mm list]), source, notes. "
+             "confirmed=true locks it (two agreeing reads or the user said so): it is not to be re-read. Use `items` for "
+             "several at once.",
+             {"kind": {"type": "string", "enum": ["chains", "labels", "walls", "source", "notes"]},
+              "key": {"type": "string"}, "value": {"description": "the finding (number list, object or text)"},
+              "confirmed": {"type": "boolean"},
+              "items": {"type": "array", "items": {"type": "object"}, "description": "several {kind,key,value,confirmed}"}}, []),
+    ToolSpec("drawing_auto", None,
+             "Floor plan from a photo: write a DRAFT spec automatically (drawkit auto). The pixel->mm scale comes from the "
+             "dimension chains in FACTS, the wall lines from thick dark pixels, room labels from OCR (or ONE vision read "
+             "of a gridded crop when the plan prints none), each label assigned to the wall-bounded cell holding it. "
+             "Writes cad/spec.json (cad/spec.draft.json when a spec exists) and cad/auto_debug.png. Then only CORRECT the "
+             "draft (doors, windows, a wrong wall) and drawing_build; do not re-derive the layout by hand.",
+             {"image": {"type": "string", "description": "source image relative to ~/workspace (default: the upload)"},
+              "labels": {"type": "array", "items": {"type": "object"},
+                         "description": "optional [{name, x, y}] room labels in source pixels"},
+              "chains": {"type": "array", "items": {"type": "object"},
+                         "description": "optional chains [{side, values, box_px}] (default: FACTS)"}}, []),
     ToolSpec("drawing_build", None,
              "Generate the WHOLE drawing deterministically from a structured spec (JSON, schema in the cad-drawing skill: "
              "floor_plan rooms/doors/windows/furniture/dimension chains, diagram nodes/edges, or generic entities/dims). "
@@ -303,7 +326,7 @@ BY_NAME = {t.name: t for t in TOOLS}
 BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "read_image", "photopea", "image_edit"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

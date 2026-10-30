@@ -21,6 +21,9 @@ AIW "cad-drawing" skill helper. One file, Python 3.8+, needs numpy + Pillow (+ e
         report.json with the automatic checks. Exit code 0 = all checks pass, 2 = errors listed in the report.
     check SPEC        the checks only (no files).
     schema            print the spec schema summary.
+  auto IMG --chains SPEC_OR_FACTS [--labels L.json] [--out cad/spec.json] [--debug cad/auto_debug.png] [--task ID]
+        DRAFT spec from the image: wall lines from pixels, pixel->mm from the chains, rooms = wall-bounded cells
+        holding a label (OCR if rapidocr is installed, else the labels file). Then only CORRECT the draft.
   ensure              install numpy / Pillow / ezdxf and a Chinese font when missing.
 
 Spec kinds: floor_plan (rooms -> walls, doors, windows, furniture, dimension chains), diagram (boxes + connectors,
@@ -1898,7 +1901,31 @@ def librecad_export(view_dxf, out_dir):
 
 # ============================================================================================ commands
 
-def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True):
+def file_md5(path):
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def stale_reasons(spec, task=None):
+    """why this spec does not belong to the current image / task (empty = it does). The spec records the md5 of the
+    image it was read from and the task (work folder) that wrote it; `drawkit auto` and every build stamp both."""
+    src = spec.get("source") or {}
+    out = []
+    img = src.get("image")
+    if src.get("md5") and img and os.path.exists(img):
+        cur = file_md5(img)
+        if cur != src["md5"]:
+            out.append(f"it was read from an image with md5 {src['md5'][:8]}, but {os.path.basename(img)} is {cur[:8]}")
+    if task and src.get("task") and str(src["task"]) != str(task):
+        out.append(f"it belongs to task {src['task']}, this is task {task} (a new task always starts a new spec)")
+    return out
+
+
+def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=None):
     spec = load_spec(spec_path)
     if source:
         spec.setdefault("source", {})["image"] = source
@@ -1911,6 +1938,13 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True):
     out_dir = Path(out_dir or base)
     out_dir.mkdir(parents=True, exist_ok=True)
     E, W, I = [], [], []
+    stale = stale_reasons(spec, task)
+    if stale:   # task-41c: a G-plan spec from an earlier image was "revised" for 100 steps against the A3-1 photo
+        rep = {"version": VERSION, "kind": spec.get("kind"), "ok": False, "stale": True, "files": {},
+               "errors": ["STALE SPEC: " + r for r in stale] + [
+                   "this spec was not written for this image / this task: do not build or deliver it. Archive it and "
+                   "write a NEW spec for the current image (drawkit.py auto gives a draft)"], "warnings": [], "info": []}
+        return rep
     m = Model(spec)
     e, w, i = chain_checks(spec, m); E += e; W += w; I += i
     if src.get("image") and os.path.exists(src["image"]):
@@ -1948,10 +1982,15 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True):
     with open(out_dir / "report.json", "w", encoding="utf-8") as f:
         json.dump(rep, f, ensure_ascii=False, indent=1)
     # keep what the fit learned (transform, matched ticks) in the spec so the next round starts from it
-    if src.get("transform"):
+    if src.get("transform") or src.get("image"):
         try:
             raw = load_spec(spec_path)
-            raw.setdefault("source", {})["transform"] = src["transform"]
+            if src.get("transform"):
+                raw.setdefault("source", {})["transform"] = src["transform"]
+            if src.get("image") and os.path.exists(src["image"]) and not (raw.get("source") or {}).get("md5"):
+                raw.setdefault("source", {})["md5"] = file_md5(src["image"])
+            if task and not (raw.get("source") or {}).get("task"):
+                raw.setdefault("source", {})["task"] = task
             if isinstance(raw.get("chains"), list):
                 with open(spec_path, "w", encoding="utf-8") as f:
                     json.dump(raw, f, ensure_ascii=False, indent=1)
@@ -1969,7 +2008,7 @@ def _uniq(xs):
 
 
 def cmd_build(a):
-    rep = run_build(a.spec, a.out, a.name, a.source, not a.no_dxf)
+    rep = run_build(a.spec, a.out, a.name, a.source, not a.no_dxf, task=a.task or os.environ.get("DRAWKIT_TASK"))
     print("DRAWKIT_RESULT " + json.dumps(rep, ensure_ascii=False))
     return 0 if rep["ok"] else 2
 
@@ -1990,6 +2029,60 @@ def cmd_fit(a):
             json.dump(spec, f, ensure_ascii=False, indent=1)
     print(json.dumps(rep, ensure_ascii=False))
     return 0 if not rep["errors"] else 2
+
+
+def _read_json_arg(v):
+    if not v:
+        return None
+    if os.path.exists(v):
+        with open(v, encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(v)
+
+
+def cmd_auto(a):
+    """draft spec from the image: walls from pixels, scale from the chains, rooms from labels (see drawauto.py)."""
+    need("numpy"); need("PIL", "pillow")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import drawauto as da
+    src = _read_json_arg(a.chains) or {}
+    chains = src.get("chains") if isinstance(src, dict) else src
+    if isinstance(chains, dict):          # facts.json keeps chains by side
+        chains = [dict(v, side=k) for k, v in chains.items() if isinstance(v, dict)]
+    T = None
+    if a.transform:
+        v = [float(t) for t in a.transform.split(",")]
+        T = dict(zip(("ax", "bx", "ay", "by"), v))
+    elif isinstance(src, dict) and (src.get("source") or {}).get("transform") and not a.refit:
+        T = src["source"]["transform"]
+    labs = _read_json_arg(a.labels) or []
+    if isinstance(labs, dict):
+        labs = labs.get("labels") or []
+    image = os.path.abspath(a.image)
+
+    def fit(spec):
+        sp = json.loads(json.dumps(spec))
+        sp["source"]["image"] = image
+        return fit_transform(sp)
+    try:
+        spec, info = da.auto_spec(image, chains=chains, transform=T, labels=labs, use_ocr=not a.no_ocr, task=a.task,
+                                  allow_install=a.install_ocr, debug=a.debug, fit=fit)
+    except ValueError as e:
+        print("DRAWKIT_AUTO " + json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        return 2
+    spec["source"]["image"] = a.image          # keep the path as given (relative to ~/workspace)
+    if a.out:
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(spec, f, ensure_ascii=False, indent=1)
+    rooms = [{"name": r["name"], "box": r.get("box") or da.poly_box(r["poly"])} for r in spec["rooms"]]
+    print("DRAWKIT_AUTO " + json.dumps({"ok": True, "out": a.out, "rooms": rooms, "labels": info.get("labels"),
+                                         "x_lines": info.get("x_lines"), "y_lines": info.get("y_lines"),
+                                         "x_unsnapped": info.get("x_unsnapped"), "y_unsnapped": info.get("y_unsnapped"),
+                                         "warnings": info.get("warnings"), "uncertain": spec["uncertain"],
+                                         "debug": info.get("debug"), "md5": spec["source"]["md5"],
+                                         "plan_px": info.get("plan_px"), "transform": spec["source"].get("transform")}, ensure_ascii=False))
+    return 0
 
 
 SCHEMA = """spec (JSON). Lengths in mm. Floor plans read from a photo use y_down=true: y grows DOWN from the top axis,
@@ -2035,8 +2128,13 @@ def main(argv=None):
     p = sub.add_parser("axes"); p.add_argument("spec"); p.add_argument("--out", required=True); p.add_argument("--k", default=3)
     p.set_defaults(f=cmd_axes)
     p = sub.add_parser("build"); p.add_argument("spec"); p.add_argument("--out"); p.add_argument("--name", default="plan")
-    p.add_argument("--source"); p.add_argument("--no-dxf", action="store_true"); p.set_defaults(f=cmd_build)
+    p.add_argument("--source"); p.add_argument("--no-dxf", action="store_true"); p.add_argument("--task")
+    p.set_defaults(f=cmd_build)
     p = sub.add_parser("check"); p.add_argument("spec"); p.add_argument("--out"); p.set_defaults(f=cmd_check)
+    p = sub.add_parser("auto"); p.add_argument("image"); p.add_argument("--chains"); p.add_argument("--transform")
+    p.add_argument("--labels"); p.add_argument("--no-ocr", action="store_true"); p.add_argument("--install-ocr", action="store_true")
+    p.add_argument("--refit", action="store_true"); p.add_argument("--task"); p.add_argument("--out"); p.add_argument("--debug")
+    p.set_defaults(f=cmd_auto)
     p = sub.add_parser("schema"); p.set_defaults(f=lambda a: print(SCHEMA) or 0)
     p = sub.add_parser("ensure"); p.set_defaults(f=cmd_ensure)
     a = ap.parse_args(argv)

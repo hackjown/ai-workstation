@@ -71,6 +71,7 @@ KIND_TEXT = {
     "blocked": "页面出现了需要真人处理的验证",
     "error": "运行中出现了错误",
     "vision_down": "读图服务（视觉模型）不可用",
+    "drawing_loop": "模型反复分析同一件事，没有动手写 spec、生成图纸",
 }
 
 OPT_RETRY, OPT_TAKEOVER, OPT_STOP = "继续，换个方法再试", "我来接管桌面", "停止任务"

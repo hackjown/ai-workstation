@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 
 KIT_DIR = Path(os.environ.get("AIW_DRAWKIT_DIR") or Path(__file__).resolve().parents[3] / "skills" / "cad-drawing")
-KIT_FILES = ("drawkit.py", "drawauto.py", "SKILL.md", "examples/xinda-g-108.spec.json")
+KIT_FILES = ("drawkit.py", "drawauto.py", "drawtrace.py", "SKILL.md", "examples/xinda-g-108.spec.json")
 REMOTE = ".aiw/cad-drawing"          # under the computer's ~/workspace (files_write root)
 ROOT = '"${VM_AGENT_FILES_ROOT:-$HOME/workspace}"'
 MAX_ROUNDS = int(os.environ.get("AIW_DRAW_MAX_ROUNDS", "3"))
@@ -49,9 +49,9 @@ def version_probe() -> str:
 def install_command(version: str) -> str:
     """after the files are written: mirror them as a skill folder and make sure the dependencies are there."""
     return (f"cd {ROOT}/{REMOTE} && echo {version} > VERSION && mkdir -p \"$HOME/.claude/skills/cad-drawing/examples\" && "
-            f"cp -f drawkit.py drawauto.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
+            f"cp -f drawkit.py drawauto.py drawtrace.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
             f"cp -f examples/*.json \"$HOME/.claude/skills/cad-drawing/examples/\" 2>/dev/null; "
-            f"M=\"$HOME/.config/aiw/drawkit-ready-v2\"; if [ ! -f \"$M\" ]; then "
+            f"M=\"$HOME/.config/aiw/drawkit-ready-v3\"; if [ ! -f \"$M\" ]; then "
             f"python3 drawkit.py ensure && mkdir -p \"$(dirname $M)\" && touch \"$M\"; else echo deps-ok; fi; "
             f"python3 -c 'import ezdxf, PIL, numpy' ")
 
@@ -87,9 +87,13 @@ def summary(rep: dict, rounds: int, out_dir: str = "cad") -> str:
         lines.append("warnings: " + " | ".join(rep["warnings"][:8]))
     if rep.get("info"):
         lines.append("info: " + " | ".join(rep["info"][:5]))
-    if rep.get("overlay_score"):
+    if rep.get("verify"):
+        v = rep["verify"]
+        lines.append(f"verify against the source: wall precision {v.get('wall_precision')}, recall {v.get('wall_recall')} "
+                     f"(±{v.get('tolerance_mm')} mm), {v.get('labels_checked', 0)} room names checked; diff image {rel(files.get('diff', ''))}")
+    elif rep.get("overlay_score"):
         lines.append(f"overlay: {rep['overlay_score']}")
-    names = [rel(files[k]) for k in ("png", "dxf", "overlay", "librecad_pdf") if files.get(k)]
+    names = [rel(files[k]) for k in ("png", "pdf", "dxf", "dwg", "diff", "overlay", "librecad_pdf") if files.get(k)]
     lines.append("files: " + ", ".join(names) + f", {out_dir}/report.json")
     return "\n".join(lines)
 

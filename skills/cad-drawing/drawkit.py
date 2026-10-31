@@ -144,6 +144,16 @@ def cmd_ensure(_a):
             ok[mod] = getattr(m, "__version__", "ok")
         except Exception as e:  # noqa: BLE001
             ok[mod] = f"MISSING ({e})"
+    # 3.9.2 deterministic tracer (drawtrace.py): OpenCV for the geometry, RapidOCR (onnxruntime) for the text
+    for mod, pipn in (("cv2", "opencv-python-headless"), ("rapidocr_onnxruntime", "rapidocr-onnxruntime")):
+        try:
+            need(mod, pipn, None)
+            ok[mod] = "ok"
+        except Exception as e:  # noqa: BLE001
+            ok[mod] = f"missing ({e}); drawing_auto falls back to the grid pipeline"
+    if not _oda_converter() and os.environ.get("DRAWKIT_INSTALL_ODA", "1") == "1":
+        _install_oda()
+    ok["dwg_converter"] = _oda_converter() or (shutil.which("dxf2dwg") or "none (bash cad-drawing-setup.sh dwg)")
     ok["cjk_font"] = cjk_font() or "MISSING"
     if not shutil.which("tesseract"):     # 3.8.9: reads the dimension digits (optional; the vision read is the fallback)
         _apt(["tesseract-ocr"])
@@ -582,6 +592,8 @@ class Plan:
             pts = _norm_poly(self.m, r.get("poly") or self._rect_poly(r.get("box")))
             self.rooms.append(dict(r, pts=pts, id=r.get("id") or r.get("name")))
         self.by_id = {r["id"]: r for r in self.rooms}
+        # 3.9.2: walls traced from the source pixels (drawtrace) are used as they are, not derived from rooms
+        self.traced = spec.get("wall_mode") == "traced" and bool(spec.get("walls_traced"))
 
     def _rect_poly(self, b):
         if not b:
@@ -591,6 +603,16 @@ class Plan:
 
     # ---- walls from the room polygons
     def wall_segments(self):
+        if self.traced:
+            out = []
+            for e in self.spec.get("walls_traced") or []:
+                a, b = self.m.P(e["a"]), self.m.P(e["b"])
+                t = float(e.get("t", self.t_int))
+                if abs(a[1] - b[1]) < 1e-6:
+                    out.append({"o": "h", "c": a[1], "u": min(a[0], b[0]), "v": max(a[0], b[0]), "t": t, "rooms": []})
+                elif abs(a[0] - b[0]) < 1e-6:
+                    out.append({"o": "v", "c": a[0], "u": min(a[1], b[1]), "v": max(a[1], b[1]), "t": t, "rooms": []})
+            return out
         xs = sorted({p[0] for r in self.rooms for p in r["pts"]})
         ys = sorted({p[1] for r in self.rooms for p in r["pts"]})
         segs = {}
@@ -786,7 +808,9 @@ class Plan:
         segs = self.wall_segments()
         self.segs = segs
         rects = self.wall_rects(segs)
-        ops = self.openings(segs)
+        # traced walls already have their door / window gaps, and the door leaves, arcs and glazing are traced
+        # line work: drawing symbols on top would double them
+        ops = self.openings(segs) if (not self.traced or self.spec.get("draw_openings")) else []
         holes = []
         for kind, o, s, lo, hi in ops:
             h = s["t"] / 2 + 1
@@ -805,7 +829,21 @@ class Plan:
                 self._window(sh, o, s, lo, hi)
         for f in self.spec.get("furniture") or []:
             self._furniture(sh, f)
+        for e in self.spec.get("hollow_walls") or []:        # 3.9.2: walls the source draws hollow (two lines)
+            a, b, t = self.m.P(e["a"]), self.m.P(e["b"]), float(e.get("t") or self.t_int)
+            for side in (-0.5, 0.5):
+                if abs(a[1] - b[1]) < 1e-6:
+                    sh.poly([(a[0], a[1] + side * t), (b[0], b[1] + side * t)], False, "墙体", 0.3)
+                else:
+                    sh.poly([(a[0] + side * t, a[1]), (b[0] + side * t, b[1])], False, "墙体", 0.3)
+        for pl in self.spec.get("traced_lines") or []:      # 3.9.2: the source's thin line work, as drawn
+            if len(pl) >= 2:
+                sh.poly([self.m.P(p) for p in pl], False, "家具", 0.13)
         self._labels(sh, scale)
+        for fl in self.spec.get("free_labels") or []:
+            p = self.m.P(fl["at"])
+            sh.text(p[0], p[1], fl["text"], float(fl.get("h") or 0.8 * float(self.spec.get("label_height_mm", 4.0)) * scale),
+                    "房间名", role="room")
         self._dims(sh, scale)
         return sh
 
@@ -961,6 +999,18 @@ class Plan:
             placed = None
             k = 1.0
             H0r = float(r.get("label_height_mm", 0)) * scale or H0
+            if self.traced and r.get("label_at"):
+                p = self.m.P(r["label_at"])
+                pts = r["pts"]
+                hh = float(r.get("label_h") or H0r)      # the source's own text height (model mm) when traced
+                for _ in range(6):     # as large as fits the room's width, never moved off the source's position
+                    b = self._block(p[0], p[1], lines[:1], hh)
+                    if b[2] - b[0] <= 0.9 * (max(q[0] for q in pts) - min(q[0] for q in pts)):
+                        break
+                    hh *= 0.8
+                sh.text(p[0], p[1], lines[0], hh, "房间名", role="room", owner=r["id"])
+                r["_label"] = (p[0], p[1], hh)
+                continue
             while k >= min_k - 1e-9 and placed is None:
                 h = H0r * k
                 placed = self._place(sh, r, lines, h, strict=True)
@@ -1058,6 +1108,15 @@ class Plan:
             c["_drawn"] = [round(v) for v in c.get("values")]
 
     def envelope(self):
+        if self.traced and getattr(self, "segs", None):
+            xs, ys = [], []
+            for s_ in self.segs:
+                h_ = s_["t"] / 2
+                if s_["o"] == "h":
+                    xs += [s_["u"], s_["v"]]; ys += [s_["c"] - h_, s_["c"] + h_]
+                else:
+                    xs += [s_["c"] - h_, s_["c"] + h_]; ys += [s_["u"], s_["v"]]
+            return (min(xs), min(ys), max(xs), max(ys))
         xs = [p[0] for r in self.rooms for p in r["pts"]]; ys = [p[1] for r in self.rooms for p in r["pts"]]
         h = self.t_ext / 2
         return (min(xs) - h, min(ys) - h, max(xs) + h, max(ys) + h)
@@ -1081,7 +1140,17 @@ class Plan:
             for b in self.rooms[i + 1:]:
                 ov = _poly_overlap(a["pts"], b["pts"])
                 if ov > 1e4:
-                    E.append(f"rooms {a.get('name')} and {b.get('name')} overlap by {ov / 1e6:.2f} m²")
+                    (W if self.traced else E).append(f"rooms {a.get('name')} and {b.get('name')} overlap by {ov / 1e6:.2f} m²")
+        if self.traced:      # traced walls: the comparison with the source (verify) replaces the room-derived checks
+            deg = {}
+            for a, b in self.wall_edges:
+                for p in (a, b):
+                    k = (round(p[0], 1), round(p[1], 1))
+                    deg[k] = deg.get(k, 0) + 1
+            odd = [k for k, v in deg.items() if v % 2]
+            if odd:
+                E.append(f"wall outline not closed at {odd[:4]}")
+            return E, W, I
         # walls closed: every vertex of the wall outline joins an even number of edges
         deg = {}
         for a, b in self.wall_edges:
@@ -1622,7 +1691,7 @@ def chain_checks(spec, m: Model):
         for k, r in enumerate(reads):
             if [float(v) for v in r] != vals:
                 E.append(f"{c['side']} chain: read #{k + 1} {r} differs from the values {c['values']}: re-read the zoomed crop")
-        if len(reads) < 2 and not c.get("given") and not c.get("auto"):
+        if len(reads) < 2 and not c.get("given") and not c.get("auto") and c.get("by") != "ocr":
             W.append(f"{c['side']} chain: read it twice (two zoomed reads) and store both in 'reads'")
     for a, b in (("top", "bottom"), ("left", "right")):
         if a in by and b in by:
@@ -1788,9 +1857,15 @@ def _font(size):
 
 def render_png(sh, path, px_per_mm_paper=6.0, scale=100):
     from PIL import Image, ImageDraw
+    Image.MAX_IMAGE_PIXELS = None
     x0, y0, x1, y1 = getattr(sh, "frame", None) or sh.extents()
     k = px_per_mm_paper / scale          # px per model mm
     Wp, Hp = int((x1 - x0) * k) + 2, int((y1 - y0) * k) + 2
+    cap = float(os.environ.get("DRAWKIT_PNG_MAX_PX", "40000000"))
+    if Wp * Hp > cap:    # task-778: a 245 M px sheet crashed the build (DecompressionBombError); keep it printable
+        r = math.sqrt(cap / float(Wp * Hp))
+        px_per_mm_paper *= r; k *= r
+        Wp, Hp = int((x1 - x0) * k) + 2, int((y1 - y0) * k) + 2
     im = Image.new("RGB", (Wp, Hp), "white")
     d = ImageDraw.Draw(im)
     T = lambda p: ((p[0] - x0) * k, (y1 - p[1]) * k)
@@ -1853,8 +1928,10 @@ def overlay(spec, sh, eng, out, k=3):
     T0 = src.get("transform")
     if not (src.get("image") and T0 and os.path.exists(src["image"])):
         return None
+    Image.MAX_IMAGE_PIXELS = None
     base = Image.open(src["image"]).convert("RGB")
     W, H = base.size
+    k = max(1, min(k, int(math.sqrt(36e6 / float(max(1, W * H))))))
     big = base.resize((W * k, H * k), Image.LANCZOS)
     big = Image.blend(big, Image.new("RGB", big.size, "white"), 0.45)
     d = ImageDraw.Draw(big, "RGBA")
@@ -1934,6 +2011,141 @@ def cmd_axes(a):
     im.save(a.out)
     print(json.dumps({"out": a.out, "fit": rep}, ensure_ascii=False))
     return 0
+
+
+def _oda_converter():
+    """ODA File Converter: $ODA_CONVERTER, PATH, or the usual install places (deb / AppImage in ~/tools)."""
+    cands = [os.environ.get("ODA_CONVERTER"), shutil.which("ODAFileConverter"),
+             "/usr/bin/ODAFileConverter", "/opt/ODAFileConverter/ODAFileConverter",
+             str(Path.home() / "tools" / "ODAFileConverter" / "AppRun"),
+             str(Path.home() / "tools" / "ODAFileConverter.AppImage")]
+    for c in cands:
+        if c and os.path.exists(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def _install_oda():
+    """best effort, once: ODA File Converter (free, Linux x86-64) unpacked into ~/tools/ODAFileConverter, plus xvfb."""
+    import platform
+    if platform.machine() not in ("x86_64", "AMD64"):
+        return None
+    mark = Path.home() / ".config/aiw/oda-tried"
+    if mark.exists():
+        return None
+    mark.parent.mkdir(parents=True, exist_ok=True); mark.touch()
+    url = os.environ.get("ODA_URL_APPIMAGE") or ("https://www.opendesign.com/guestfiles/get?filename="
+                                               "ODAFileConverter_QT6_lnxX64_11dll.AppImage")
+    tools = Path.home() / "tools"
+    tools.mkdir(exist_ok=True)
+    app = tools / "ODAFileConverter.AppImage"
+    try:
+        subprocess.run(["curl", "-fsSL", "--retry", "3", "-o", str(app), url], timeout=600, check=True)
+        app.chmod(0o755)
+        subprocess.run([str(app), "--appimage-extract"], cwd=str(tools), capture_output=True, timeout=600, check=True)
+        if (tools / "ODAFileConverter").exists():
+            shutil.rmtree(tools / "ODAFileConverter")
+        (tools / "squashfs-root").rename(tools / "ODAFileConverter")
+    except Exception:  # noqa: BLE001
+        return None
+    if not shutil.which("xvfb-run"):
+        _apt(["xvfb", "xauth"])
+    return _oda_converter()
+
+
+def _oda_run(exe, in_dir, out_dir, ver, typ, timeout=180):
+    cmd = [exe, str(in_dir), str(out_dir), ver, typ, "0", "1"]
+    env = dict(os.environ)
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    if not env.get("DISPLAY") and shutil.which("xvfb-run") and os.environ.get("ODA_XVFB", "1") == "1":
+        cmd = ["xvfb-run", "-a"] + cmd
+    return subprocess.run(cmd, capture_output=True, timeout=timeout, env=env)
+
+
+def export_dwg(dxf_path, version="ACAD2018"):
+    """DXF -> DWG with ODA File Converter (LibreDWG dxf2dwg as the fallback), then a ROUND TRIP check: the DWG is
+    converted back to DXF and its entities / layers / extents must equal the DXF's. Returns {"dwg", "by", "check"}
+    or {"error"}."""
+    import tempfile
+    dxf_path = Path(dxf_path)
+    dwg = dxf_path.with_suffix(".dwg")
+    exe = _oda_converter()
+    by = None
+    try:
+        if exe:
+            with tempfile.TemporaryDirectory() as ti, tempfile.TemporaryDirectory() as to:
+                shutil.copy(dxf_path, Path(ti) / dxf_path.name)
+                _oda_run(exe, ti, to, version, "DWG")
+                got = Path(to) / dxf_path.with_suffix(".dwg").name
+                if got.exists() and got.stat().st_size > 0:
+                    shutil.copy(got, dwg); by = "ODA File Converter " + version
+        if not by and shutil.which("dxf2dwg"):
+            subprocess.run(["dxf2dwg", "-y", "-o", str(dwg), str(dxf_path)], capture_output=True, timeout=180)
+            if dwg.exists() and dwg.stat().st_size > 0:
+                by = "LibreDWG dxf2dwg"
+    except Exception as ex:  # noqa: BLE001
+        return {"error": f"{type(ex).__name__}: {ex}"}
+    if not by:
+        return {"error": "no DWG converter on this computer (install ODA File Converter: bash deploy/vm/cad-drawing-setup.sh dwg)"}
+    chk = dwg_roundtrip(dxf_path, dwg, exe)
+    if chk.get("error"):
+        try:
+            dwg.unlink()
+        except OSError:
+            pass
+        return {"error": "the DWG failed its round-trip check: " + chk["error"]}
+    return {"dwg": str(dwg), "by": by, "check": chk.get("summary")}
+
+
+def _dxf_stats(path):
+    ezdxf = need("ezdxf", "ezdxf", "python3-ezdxf")
+    doc = ezdxf.readfile(str(path))
+    msp = doc.modelspace()
+    kinds = {}
+    xs, ys = [], []
+    for e in msp:
+        kinds[e.dxftype()] = kinds.get(e.dxftype(), 0) + 1
+        try:
+            if e.dxftype() == "LINE":
+                xs += [e.dxf.start.x, e.dxf.end.x]; ys += [e.dxf.start.y, e.dxf.end.y]
+            elif e.dxftype() == "LWPOLYLINE":
+                for p in e.get_points("xy"):
+                    xs.append(p[0]); ys.append(p[1])
+        except Exception:  # noqa: BLE001
+            pass
+    ext = (min(xs), min(ys), max(xs), max(ys)) if xs else None
+    return {"n": len(msp), "kinds": kinds, "layers": sorted(l.dxf.name for l in doc.layers), "ext": ext}
+
+
+def dwg_roundtrip(dxf_path, dwg_path, exe=None):
+    """DWG -> DXF again and compare with the source DXF."""
+    import tempfile
+    exe = exe or _oda_converter()
+    with tempfile.TemporaryDirectory() as ti, tempfile.TemporaryDirectory() as to:
+        shutil.copy(dwg_path, Path(ti) / Path(dwg_path).name)
+        back = Path(to) / Path(dwg_path).with_suffix(".dxf").name
+        try:
+            if exe:
+                _oda_run(exe, ti, to, "ACAD2018", "DXF")
+            elif shutil.which("dwg2dxf"):
+                subprocess.run(["dwg2dxf", "-y", "-o", str(back), str(Path(ti) / Path(dwg_path).name)],
+                               capture_output=True, timeout=180)
+        except Exception as ex:  # noqa: BLE001
+            return {"error": f"read-back failed ({type(ex).__name__})"}
+        if not back.exists():
+            return {"error": "the DWG could not be read back"}
+        try:
+            a, b = _dxf_stats(dxf_path), _dxf_stats(back)
+        except Exception as ex:  # noqa: BLE001
+            return {"error": f"read-back DXF unreadable ({type(ex).__name__}: {ex})"}
+    if abs(a["n"] - b["n"]) > max(2, 0.005 * a["n"]):
+        return {"error": f"{a['n']} entities in the DXF, {b['n']} in the DWG"}
+    miss = [l for l in a["layers"] if l not in b["layers"]]
+    if miss:
+        return {"error": "layers missing in the DWG: " + ", ".join(miss[:5])}
+    if a["ext"] and b["ext"] and max(abs(u - v) for u, v in zip(a["ext"], b["ext"])) > 1.0:
+        return {"error": f"extents differ: {a['ext']} vs {b['ext']}"}
+    return {"summary": f"read back: {b['n']} entities, {len(b['layers'])} layers, same extents"}
 
 
 def librecad_export(view_dxf, out_dir):
@@ -2116,10 +2328,11 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
                    "this spec was not written for this image / this task: do not build or deliver it. Archive it and "
                    "write a NEW spec for the current image (drawkit.py auto gives a draft)"], "warnings": [], "info": []}
         return rep
-    repairs = repair_spec(spec) if repair and os.environ.get("DRAWKIT_NO_REPAIR") != "1" else []
+    traced = bool((spec.get("source") or {}).get("trace")) and spec.get("wall_mode") == "traced"
+    repairs = repair_spec(spec) if (repair and not traced and os.environ.get("DRAWKIT_NO_REPAIR") != "1") else []
     m = Model(spec)
     e, w, i = chain_checks(spec, m); E += e; W += w; I += i
-    if src.get("image") and os.path.exists(src["image"]):
+    if src.get("image") and os.path.exists(src["image"]) and not traced:
         fr = fit_transform(spec, write=True)
         E += fr["errors"]; W += fr["warnings"]
         if fr.get("transform"):
@@ -2128,10 +2341,22 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
     e, w, i = eng.checks(sh); E += e; W += w; I += i
     e, w = text_checks(sh, eng); E += e; W += w
     W += sh.warnings
+    verify_m = None
+    if traced and os.environ.get("DRAWKIT_NO_VERIFY") != "1":
+        # 3.9.2: the drawing is compared with the SOURCE pixels (walls, room names, dimensions); hard thresholds
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import drawtrace as _dt
+            e, w, i, verify_m = _dt.verify(spec, eng, src.get("image"), out_png=str(out_dir / "diff.png"))
+            E += e; W += w; I += i
+        except Exception as ex:  # noqa: BLE001
+            E.append(f"verify could not run ({type(ex).__name__}: {ex}): the drawing is unchecked against the source")
     if not cjk_font():
         W.append("no Chinese font on this computer (apt install fonts-wqy-microhei): the PNG preview shows boxes for hanzi")
     rep = {"version": VERSION, "kind": spec.get("kind"), "scale": f"1:{scale}", "errors": _uniq(E), "warnings": _uniq(W),
            "info": _uniq(I), "repairs": repairs}
+    if verify_m is not None:
+        rep["verify"] = verify_m
     if spec.get("kind", "floor_plan") == "floor_plan":
         rep["rooms"] = [{"name": r.get("name"), "area_axis_m2": round(poly_area(r["pts"]) / 1e6, 2),
                          "labelled": bool(r.get("_label"))} for r in eng.rooms]
@@ -2142,9 +2367,19 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
             files.update(write_dxf(sh, str(out_dir / f"{name}.dxf")))
         except Exception as ex:  # noqa: BLE001
             rep["errors"].append(f"DXF not written: {type(ex).__name__}: {ex}")
+    if dxf and files.get("dxf") and os.environ.get("DRAWKIT_DWG", "1") == "1":
+        dw = export_dwg(files["dxf"])
+        if dw.get("dwg"):
+            files["dwg"] = dw["dwg"]
+            rep["info"] = _uniq(rep["info"] + [f"DWG written ({dw.get('by')}; {dw.get('check')})"])
+        elif dw.get("error"):
+            rep["warnings"].append("DWG not written: " + dw["error"])
+    if verify_m and verify_m.get("diff_png"):
+        files["diff"] = verify_m["diff_png"]
     files.update(render_png(sh, str(out_dir / f"{name}.png"), scale=scale))
     try:   # a PDF of the sheet for delivery (Pillow; LibreCAD's own export stays optional)
         from PIL import Image as _Im
+        _Im.MAX_IMAGE_PIXELS = None
         _Im.open(out_dir / f"{name}.png").convert("RGB").save(out_dir / f"{name}.pdf", "PDF", resolution=150.0)
         files["pdf"] = str(out_dir / f"{name}.pdf")
     except Exception:  # noqa: BLE001
@@ -2232,9 +2467,84 @@ def _read_json_arg(v):
     return json.loads(v)
 
 
+def _auto_trace(a):
+    """3.9.2: the deterministic tracer (drawtrace.py). Returns the DRAWKIT_AUTO dict, or raises with the reason."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import drawtrace as dt
+    image = os.path.abspath(a.image)
+    hints = {}
+    if getattr(a, "mm_per_px", None):
+        hints["mm_per_px"] = float(a.mm_per_px)
+    spec, info, tr = dt.trace(image, task=a.task, image_rel=a.image, hints=hints, debug=a.debug)
+    if not spec["walls_traced"]:
+        raise ValueError("no walls traced")
+    if a.out:
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(spec, f, ensure_ascii=False, indent=1)
+    rooms = [{"name": r["name"], "box": [min(p[0] for p in r["poly"]), min(p[1] for p in r["poly"]),
+                                         max(p[0] for p in r["poly"]), max(p[1] for p in r["poly"])]} for r in spec["rooms"]]
+    return {"ok": True, "out": a.out, "wall_mode": "traced", "rooms": rooms, "labels": info["labels"],
+            "chains": [{k: c.get(k) for k in ("side", "values", "by", "line_px")} for c in spec["chains"]],
+            "checks": [f"mm/px x {info['mm_per_px'][0]}, y {info['mm_per_px'][1]}"],
+            "openings": info["gaps"], "walls": info["walls"], "traced_lines": len(spec.get("traced_lines") or []),
+            "warnings": info["warnings"], "uncertain": spec["uncertain"], "debug": a.debug,
+            "md5": spec["source"]["md5"], "transform": spec["source"]["transform"]}
+
+
+def _ocr_chain_values(image, e):
+    """{side: [values]} read by RapidOCR from the chain crops of a NeedValues; {} when OCR is unavailable."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import drawtrace as dt
+        import cv2
+        import numpy as np
+    except Exception:  # noqa: BLE001
+        return {}
+    im = cv2.imdecode(np.fromfile(image, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if im is None:
+        return {}
+    segs = {c["side"]: c.get("segments") for c in e.det.get("chains") or []}
+    out = {}
+    for side, box in (e.boxes or {}).items():
+        x0, y0, x1, y1 = [int(v) for v in box]
+        crop = im[max(0, y0):y1, max(0, x0):x1]
+        if crop.size == 0:
+            continue
+        crop = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        try:
+            texts = dt.ocr(crop)
+        except Exception:  # noqa: BLE001
+            return {}
+        vert = side in ("left", "right")
+        nums = []
+        for t, sc, b, o in texts:
+            if sc < 0.6 or (o == "v") != vert:
+                continue
+            for v in dt.parse_number(t):
+                if 300 <= v <= 30000:
+                    nums.append(((b[1] + b[3]) / 2 if vert else (b[0] + b[2]) / 2, v))
+        nums.sort()
+        vals = [v for _, v in nums]
+        if vals and (not segs.get(side) or len(vals) == segs[side]):
+            out[side] = vals
+    return out
+
+
 def cmd_auto(a):
-    """draft spec from the image: walls from pixels, scale from the chains, rooms from labels (see drawauto.py)."""
+    """draft spec from the image. 3.9.2: the deterministic tracer first (walls / openings / line work from the
+    pixels, scale and room names from OCR, no vision model); the wall-grid pipeline (drawauto.py) when the tracer
+    cannot read this image (no dimension numbers it can read, no wall network, OpenCV/OCR missing)."""
     need("numpy"); need("PIL", "pillow")
+    trace_err = None
+    if os.environ.get("DRAWKIT_TRACE", "1") == "1" and not getattr(a, "legacy", False):
+        try:
+            out = _auto_trace(a)
+            print("DRAWKIT_AUTO " + json.dumps(out, ensure_ascii=False))
+            return 0
+        except Exception as ex:  # noqa: BLE001
+            trace_err = f"{type(ex).__name__}: {ex}"
+            print(f"drawtrace not used: {trace_err}", file=sys.stderr)
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import drawauto as da
     src = _read_json_arg(a.chains) or {}
@@ -2280,9 +2590,21 @@ def cmd_auto(a):
         sp = json.loads(json.dumps(spec))
         sp["source"]["image"] = image
         return fit_transform(sp)
+    def run_auto(chains):
+        return da.auto_spec(image, chains=chains, transform=T, labels=labs, use_ocr=not a.no_ocr, task=a.task,
+                            allow_install=a.install_ocr, debug=a.debug, fit=fit)
     try:
-        spec, info = da.auto_spec(image, chains=chains, transform=T, labels=labs, use_ocr=not a.no_ocr, task=a.task,
-                                  allow_install=a.install_ocr, debug=a.debug, fit=fit)
+        try:
+            spec, info = run_auto(chains)
+        except da.NeedValues as e0:
+            # 3.9.2: read each found chain's numbers with RapidOCR on its crop (2x, vertical chains rotated) before
+            # anyone asks a vision model; used only when the count equals the measured segments
+            got = _ocr_chain_values(image, e0)
+            if not got:
+                raise
+            have = {c.get("side") for c in chains or []}
+            chains = list(chains or []) + [{"side": k, "values": v} for k, v in got.items() if k not in have]
+            spec, info = run_auto(chains)
     except da.NeedValues as e:
         segs = {c["side"]: c.get("segments") for c in e.det.get("chains") or []}
         print("DRAWKIT_AUTO " + json.dumps({"ok": False, "error": str(e), "need_values": sorted(e.boxes),
@@ -2301,6 +2623,7 @@ def cmd_auto(a):
     rooms = [{"name": r["name"], "box": r.get("box") or da.poly_box(r["poly"])} for r in spec["rooms"]]
     det = info.get("chains_detected") or {}
     print("DRAWKIT_AUTO " + json.dumps({"ok": True, "out": a.out, "rooms": rooms, "labels": info.get("labels"),
+                                         "trace_error": trace_err,
                                          "chains": [{k: c.get(k) for k in ("side", "values", "by", "ticks_px")}
                                                     for c in spec["chains"]], "checks": det.get("checks"),
                                          "openings": info.get("openings"), "wall_mode": info.get("wall_mode"),
@@ -2359,6 +2682,8 @@ def main(argv=None):
     p.set_defaults(f=cmd_build)
     p = sub.add_parser("check"); p.add_argument("spec"); p.add_argument("--out"); p.set_defaults(f=cmd_check)
     p = sub.add_parser("auto"); p.add_argument("image"); p.add_argument("--chains"); p.add_argument("--transform")
+    p.add_argument("--legacy", action="store_true", help="skip the tracer, use the wall-grid pipeline")
+    p.add_argument("--mm-per-px", dest="mm_per_px", help="scale for the tracer when the image has no dimension numbers")
     p.add_argument("--labels"); p.add_argument("--no-ocr", action="store_true"); p.add_argument("--install-ocr", action="store_true")
     p.add_argument("--refit", action="store_true"); p.add_argument("--task"); p.add_argument("--out"); p.add_argument("--debug")
     p.add_argument("--from-spec", dest="from_spec")

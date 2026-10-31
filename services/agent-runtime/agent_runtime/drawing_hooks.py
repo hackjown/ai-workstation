@@ -388,7 +388,8 @@ async def _auto(L, a: dict) -> str:
                               intent="save the chain values for the draft")
             rep, res = await run(labels)
     unnamed = any(x.get("name") == "房间?" for x in (rep or {}).get("rooms") or [])
-    if rep and rep.get("ok") and labels is None and (len(rep.get("labels") or []) < 8 or unnamed):
+    traced = bool(rep and rep.get("wall_mode") == "traced")
+    if rep and rep.get("ok") and labels is None and not traced and (len(rep.get("labels") or []) < 8 or unnamed):
         # OCR read none or only some of the printed names (task-3fc: 7 of 11): ask the vision model ONCE, on a
         # gridded crop, for JSON positions; an OCR hit of the same name nearby keeps its sharper position
         ocr = [x for x in rep.get("labels") or [] if x.get("x") is not None]
@@ -414,6 +415,15 @@ async def _auto(L, a: dict) -> str:
     await save_facts(L)
     L._acted = True
     await _emit(L, "drawing_auto", True, {"rooms": len(rep.get("rooms") or []), "out": out})
+    if traced:
+        rooms = ", ".join(x["name"] for x in rep.get("rooms") or [])
+        ch = "; ".join(f"{c['side']} {c.get('values')}" for c in rep.get("chains") or [])
+        return (f"TRACED from the pixels into {out} (deterministic: {rep.get('walls')} walls, openings {rep.get('openings')}, "
+                f"{rep.get('traced_lines')} traced lines; room names by OCR: {rooms or 'none'}; dimensions by OCR: {ch}; "
+                f"debug image cad/auto_debug.png). Warnings: {rep.get('warnings') or 'none'}. Uncertain: {rep.get('uncertain') or 'none'}.\n"
+                f"NEXT: drawing_build spec={out} right away" + (" (after moving it to cad/spec.json)" if out != "cad/spec.json" else "")
+                + ". Only set title/subtitle if you know them; do not move walls, rooms or labels - drawing_build compares "
+                  "the result with the source pixels itself.")
     rooms = "; ".join(f"{x['name']} {x['box']}" for x in rep.get("rooms") or [])
     ch = "; ".join(f"{c['side']} {c.get('values')} ({c.get('by')}, line at {c.get('line_px')} px)" for c in rep.get("chains") or [])
     return (f"DRAFT written to {out} ({len(rep.get('rooms') or [])} rectilinear rooms from the wall grid, debug image "

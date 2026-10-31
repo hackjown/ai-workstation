@@ -1609,6 +1609,28 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             live.subscribers.discard(ws)
 
     # ------------------------------------------------------------- artifacts + web console
+    def _artifact_path(path: str) -> str:
+        real = os.path.realpath(path)
+        if not real.startswith(os.path.realpath(settings.artifacts_dir) + os.sep) or not os.path.isfile(real):
+            raise HTTPException(404)
+        return real
+
+    from . import office_preview as _office
+    office = _office.OfficePreview(settings.artifacts_dir, sessions, store)
+    app.state.office_preview = office
+
+    @app.get("/api/artifacts/preview", dependencies=[Depends(auth)])
+    async def artifact_preview(path: str):
+        """v3.9.2: an Office document as PDF (LibreOffice on this host or on a computer), cached by md5 + mtime."""
+        real = _artifact_path(path)
+        try:
+            pdf = await office.pdf(real)
+        except _office.PreviewError as e:
+            return JSONResponse({"error": str(e), "code": e.code}, status_code=e.status)
+        name = os.path.splitext(os.path.basename(real))[0] + ".pdf"
+        return FileResponse(pdf, media_type="application/pdf", headers={
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(name)}", "Cache-Control": "private, max-age=3600"})
+
     @app.get("/api/artifacts", dependencies=[Depends(auth)])
     async def artifact(path: str, download: bool = False, member: str = "", images: bool = False):
         real = os.path.realpath(path)

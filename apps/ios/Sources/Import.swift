@@ -9,8 +9,9 @@ let aiwAppGroup = "group.com.hackjown.aiworkstation"
 ///    with a file URL (Info.plist: CFBundleDocumentTypes, LSSupportsOpeningDocumentsInPlace = NO).
 ///  - The share sheet (AiwShare extension): it drops a batch in <group>/Import/<id>/ and opens aiw://import?id=…;
 ///    batches are also picked up whenever the app becomes active, in case that open did not happen.
-/// Everything is copied to tmp/AiwImport first; the new-chat composer (ChatView) takes it and uploads it
-/// through the normal /api/uploads path, like the composer's "+" › 文件.
+/// Everything is copied to tmp/AiwImport first; v3.9.2: the app goes back to the chat (RootView.toChatForImport) and
+/// its composer (HomeChatView.takeImports) uploads each file through the same /api/uploads/raw path as "+" › 文件 and
+/// shows it as an attachment chip. Nothing is sent and no task starts until the user sends a message.
 final class ImportCenter: ObservableObject {
     static let shared = ImportCenter()
     @Published private(set) var tick = 0

@@ -7,6 +7,8 @@ import UIKit
 // mdview/mdview.html (copied from apps/web by build-ipa.sh: the same markdown-it + DOMPurify + mdview.js/css the web
 // app uses). Light/dark follow the app's appearance (prefers-color-scheme), the body size follows Dynamic Type.
 // Everything else (PDF, images, Office) still opens in QuickLook.
+// v3.9.2: Office files (Word / Excel / PowerPoint / Pages / Numbers / Keynote) are opened by QuickLook from the ORIGINAL
+// downloaded file, which renders them natively with their real formatting; no PDF conversion on iOS.
 
 /// "md", "json", "text" or "" (not ours, use QuickLook).
 func textPreviewKind(_ url: URL) -> String {
@@ -16,6 +18,15 @@ func textPreviewKind(_ url: URL) -> String {
     case "txt", "log", "csv", "tsv", "yaml", "yml", "ini", "toml", "py", "js", "sh", "xml": return "text"
     default: return ""
     }
+}
+
+/// The name the downloaded copy is saved under: QuickLook picks its renderer from the extension, so a card title
+/// without one ("周报") borrows the extension of the file on the server ("…/周报.docx").
+func previewFileName(_ name: String, path: String) -> String {
+    let base = (name as NSString).lastPathComponent.isEmpty ? (path as NSString).lastPathComponent : (name as NSString).lastPathComponent
+    let ext = (path as NSString).pathExtension
+    if (base as NSString).pathExtension.isEmpty && !ext.isEmpty { return base + "." + ext }
+    return base.isEmpty ? "file" : base
 }
 
 /// The bundled page, or nil when this build has no mdview folder (then QuickLook is used).

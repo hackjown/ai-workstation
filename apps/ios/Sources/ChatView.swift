@@ -223,7 +223,6 @@ struct ChatView: View {
     @State private var pendingKind: AttachKind? = nil
     @State private var showSkills = false
     @Environment(\.colorScheme) private var cs
-    @ObservedObject private var inbox = ImportCenter.shared
     @StateObject private var pin = BottomPin()
     @Environment(\.scenePhase) private var phase
 
@@ -320,9 +319,8 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showCamera) { CameraPicker(done: { img in Task { await uploadImage(img) } }, video: { u in Task { await uploadFile(u) } }).ignoresSafeArea() }
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
-        // files sent here from WeChat「用其他应用打开」or the share sheet (Import.swift); only the new-chat home takes them
-        .task { await takeImports() }
-        .onChange(of: inbox.tick) { _ in Task { await takeImports() } }
+        // v3.9.2: files from WeChat「用其他应用打开」or the share sheet (Import.swift) go to the chat composer
+        // (HomeChatView.takeImports), never to a task view
         .overlay(alignment: .top) {
             if !toast.isEmpty {
                 Text(toast).font(.footnote.weight(.medium)).lineLimit(2).multilineTextAlignment(.center)
@@ -440,45 +438,6 @@ struct ChatView: View {
         } catch { m.err = "\(name) 上传失败：" + error.localizedDescription; return false }
     }
 
-    /// Take what other apps handed to Aiw and add it to this (new) conversation's composer, one upload at a time.
-    func takeImports() async {
-        guard m.threadId == nil, inbox.hasPending, !importing else { return }
-        importing = true
-        let got = inbox.take()
-        if !got.texts.isEmpty {
-            let t = got.texts.joined(separator: "\n")
-            draft.text = draft.text.isEmpty ? t : draft.text + "\n" + t
-        }
-        var added: [String] = []
-        var refused: [String] = []
-        for f in got.files {
-            defer { inbox.discard(f) }
-            let name = f.lastPathComponent
-            var src = f
-            let size = (try? FileManager.default.attributesOfItem(atPath: f.path)[.size] as? Int) ?? 0
-            let isVideo = UTType(filenameExtension: f.pathExtension)?.conforms(to: .movie) ?? false
-            if isVideo && size > 38 * 1024 * 1024 {
-                uploading = true; upName = "正在压缩 \(name)"; upProgress = 0
-                let small = await shrinkVideo(f)
-                uploading = false; upName = ""
-                guard let s2 = small else { refused.append(name); continue }
-                src = s2
-            } else if size > 40 * 1024 * 1024 {
-                refused.append(name); continue
-            }
-            defer { if src != f { try? FileManager.default.removeItem(at: src) } }
-            guard let d = try? Data(contentsOf: src, options: .mappedIfSafe) else { refused.append(name); continue }
-            let upload = src == f ? name : (name as NSString).deletingPathExtension + ".mp4"
-            if await send(name: upload, data: d) { added.append(upload) }
-        }
-        var msg: [String] = []
-        if !added.isEmpty { msg.append("已添加附件：" + added.joined(separator: "、")) }
-        if !refused.isEmpty { msg.append(refused.joined(separator: "、") + " 超过 40MB 或读取失败，没有添加") }
-        if added.isEmpty && refused.isEmpty && !got.texts.isEmpty { msg.append("已填入分享的内容") }
-        if !msg.isEmpty { showToast(msg.joined(separator: "\n")) }
-        importing = false
-        if inbox.hasPending { await takeImports() }   // more arrived while uploading
-    }
     func showToast(_ t: String) {
         withAnimation { toast = t }
         let shown = t
@@ -859,7 +818,7 @@ struct TaskBlock: View {
         downloading = path
         defer { downloading = "" }
         guard let (tmp, _) = try? await URLSession.shared.download(from: u) else { return }
-        let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent(previewFileName(name, path: path))
         try? FileManager.default.removeItem(at: dest)
         try? FileManager.default.moveItem(at: tmp, to: dest)
         preview = Preview(url: dest)

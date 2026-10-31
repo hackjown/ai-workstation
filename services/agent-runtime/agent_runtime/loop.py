@@ -2301,14 +2301,25 @@ class AgentLoop:
                         result={k: rep.get(k) for k in ("ok", "scale", "errors", "warnings", "overlay_score", "files")})
         text = _draw.summary(rep, self._draw_rounds, out)
         png, ov = rel(files.get("png") or name + ".png"), (rel(files["overlay"]) if files.get("overlay") else None)
-        if rep.get("ok"):
+        deliver = " and ".join(rel(files[k]) for k in ("png", "pdf", "dxf", "dwg") if files.get(k)) or f"{png} and {self._cad_file}"
+        if rep.get("ok") and rep.get("verify"):
+            # 3.9.2 traced drawing: compared with the source pixels by code (walls, names, dimensions) - no visual
+            # "looks about right" round; deliver every format, DWG included
+            nxt = (f"\nNEXT: the drawing matches the source (verify passed). send_file {deliver} and finish with done "
+                   "(the dimensions read, the verify numbers, what is uncertain). Do not re-read or edit it.")
+        elif rep.get("verify") and self._draw_rounds < _draw.MAX_ROUNDS:
+            nxt = ("\nNEXT: verify found differences from the source (see the errors and the diff image: red = in the "
+                   "source but not drawn, blue = drawn but not in the source). The geometry is traced from the pixels: do "
+                   "NOT hand-edit walls. Call drawing_auto again (it re-traces), then drawing_build; if the same error "
+                   "comes back, deliver with the error listed as uncertain.")
+        elif rep.get("ok"):
             nxt = (f"\nNEXT: " + (f"read_image path={ov} once with a pointed question (红色墙线与照片的墙哪里没对上？哪个房间名放错了？"
                                     f"有没有漏掉的门窗/房间？). " if ov and self._draw_rounds <= _draw.MAX_ROUNDS else "")
                    + f"If it matches, send_file {png} and {self._cad_file} and finish with done (chains read, any numbers "
                    "that differ from what the user said, the checks, what is still uncertain). If something is off, fix "
                    "cad/spec.json and call drawing_build again (the whole drawing is regenerated; never ERASE).")
         elif self._draw_rounds >= _draw.MAX_ROUNDS:
-            nxt = (f"\nSTOP ITERATING ({self._draw_rounds} rounds): send_file {png} and {self._cad_file} and finish with done, "
+            nxt = (f"\nSTOP ITERATING ({self._draw_rounds} rounds): send_file {deliver} and finish with done, "
                    "listing the remaining check errors and what is uncertain. Do not loop further.")
         else:
             nxt = ("\nNEXT: fix these in cad/spec.json (a misread chain number: re-read that chain with drawing_read; a text "

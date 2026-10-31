@@ -283,6 +283,9 @@ struct HomeChatView: View {
     /// 3.8.2: older pages load only after the opening jump to the newest message (the "加载更早的消息" row is on screen
     /// while the list still sits at the top, and its onAppear used to load a page and pin the view to it)
     @State private var olderOK = false
+    /// v3.9.2: files / text shared from other apps (Import.swift) become pending attachments of this composer
+    @ObservedObject private var inbox = ImportCenter.shared
+    @State private var importing = false
 
     var liveStatus: String {
         m.msgs.last(where: { $0.s("kind") == "task" && isLive($0.o("data").s("status")) })?.o("data").s("status") ?? ""
@@ -401,7 +404,8 @@ struct HomeChatView: View {
                 } label: { Image(systemName: "plus").font(.system(size: 19, weight: .medium)) }.accessibilityLabel("菜单")
             }
         }
-        .task { if !m.loaded { await m.load() }; if text.isEmpty { text = draft } }
+        .task { if !m.loaded { await m.load() }; if text.isEmpty { text = draft }; await takeImports() }
+        .onChange(of: inbox.tick) { _ in Task { await takeImports() } }
         .onDisappear { voice.stop() }
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .refreshable { await m.load() }
@@ -753,7 +757,7 @@ struct HomeChatView: View {
     func openFile(_ path: String, _ name: String) async {
         guard let u = API.shared.artifactURL(path) else { return }
         guard let (tmp, _) = try? await URLSession.shared.download(from: u) else { m.err = "下载失败：\(name)"; return }
-        let dest = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        let dest = FileManager.default.temporaryDirectory.appendingPathComponent(previewFileName(name, path: path))
         try? FileManager.default.removeItem(at: dest)
         try? FileManager.default.moveItem(at: tmp, to: dest)
         preview = Preview(url: dest)
@@ -789,6 +793,27 @@ struct HomeChatView: View {
         do { try FileManager.default.copyItem(at: u, to: dst) } catch { m.err = "读不了 \(u.lastPathComponent)"; return }
         let type = UTType(filenameExtension: u.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
         await uploadFile(dst, name: u.lastPathComponent, type: type)
+    }
+    /// v3.9.2: what other apps handed to Aiw (share sheet, 「用其他应用打开」) -> attachment chips in this composer,
+    /// uploaded one by one through uploadFile like "+" › 文件. Nothing is sent: the user writes a message and sends it.
+    @MainActor func takeImports() async {
+        guard inbox.hasPending, !importing else { return }
+        importing = true
+        m.leaveStage()
+        let got = inbox.take()
+        if !got.texts.isEmpty {
+            let t = got.texts.joined(separator: "\n")
+            text = text.isEmpty ? t : text + "\n" + t
+        }
+        for f in got.files {
+            let type = UTType(filenameExtension: f.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+            await uploadFile(f, name: f.lastPathComponent, type: type)
+            inbox.discard(f)
+        }
+        importing = false
+        focused = true
+        pin.toEnd(follow: 2)
+        if inbox.hasPending { await takeImports() }   // more arrived while uploading
     }
     func uploadData(_ data: Data, name: String, type: String) async {
         let dst = FileManager.default.temporaryDirectory.appendingPathComponent(name)

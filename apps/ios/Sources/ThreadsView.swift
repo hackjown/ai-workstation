@@ -37,9 +37,10 @@ struct RootView: View {
                 }
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
-        // a file from another app (Open In / share sheet): a blank task view, whose composer picks it up
-        .onChange(of: inbox.tick) { _ in toTaskForImport() }
-        .onAppear { toTaskForImport(); openDeep() }
+        // v3.9.2: a file from another app (Open In / share sheet): back to the chat (HomeChatView), whose composer
+        // adds it as an attachment like its own "+" › 文件 (no task is started or opened)
+        .onChange(of: inbox.tick) { _ in toChatForImport() }
+        .onAppear { toChatForImport(); openDeep() }
         // 3.8 push deep links (DeepLink.swift): warm (onChange) and cold launch (onAppear, once signed in)
         .onChange(of: links.pending) { _ in openDeep() }
         .sheet(item: $sheet) { s in
@@ -95,10 +96,11 @@ struct RootView: View {
             path = [.task(tid, takeover: takeover)]
         } catch { path = [] }   // gone (deleted): the chat
     }
-    func toTaskForImport() {
+    func toChatForImport() {
         guard inbox.hasPending else { return }
         sheet = nil; showSettings = false
-        path = [.newTask]
+        path = []
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NotificationCenter.default.post(name: .aiwShowChat, object: nil) }
     }
 }
 

@@ -996,7 +996,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.put("/api/settings/notify", dependencies=[Depends(auth)])
     async def put_notify(body: dict):
-        cfg = {k: (str(body.get(k) or "").strip() or None) for k in ("bark_url", "ntfy_url", "webhook_url", "public_url", "link_mode")}
+        cfg = {k: (str(body.get(k) or "").strip() or None) for k in ("bark_url", "ntfy_url", "webhook_url", "public_url", "link_mode", "bark_sound")}
         if cfg["link_mode"] not in (None, "app", "web"):
             raise HTTPException(400, "link_mode is app or web")
         if cfg["public_url"] and not cfg["public_url"].startswith(("http://", "https://")):
@@ -1016,6 +1016,23 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.post("/api/settings/notify/test", dependencies=[Depends(auth)])
     async def test_notify():
         return await notifier.notify("test", "Aiw", "通知测试成功：点这条会打开 Aiw 的聊天")
+
+    @app.post("/api/settings/notify/test_sounds", dependencies=[Depends(auth)])
+    async def test_sounds():
+        """3.9.0: one Bark push per ringtone, 3 s apart, so each spoken sound can be checked on the phone."""
+        from . import notify as _n
+        samples = [("confirm", "需要你确认", ""), ("input", "需要你填写资料", ""), ("input", "需要你接管桌面", "takeover/x"),
+                   ("input", "任务卡住了，等你处理", ""), ("input", "Agent 在问你", ""), ("done", "任务完成", ""),
+                   ("failed", "任务失败", ""), ("watch", "追踪提醒", ""), ("watch_error", "监控出错", ""),
+                   ("xhs_warning", "小红书", ""), ("test", "Aiw", "")]
+
+        async def run():
+            for kind, title, path in samples:
+                snd = _n.sound_for(kind, title, path)
+                await notifier._push(f"铃声测试：{title}", f"这条的铃声是 {snd}", kind, path or "chat")
+                await asyncio.sleep(3)
+        asyncio.create_task(run())
+        return {"sent": len(samples), "sounds": [_n.sound_for(k, t, p) for k, t, p in samples]}
 
     # ------------------------------------------------------------- secrets (encrypted, masked)
     @app.get("/api/secrets", dependencies=[Depends(auth)])

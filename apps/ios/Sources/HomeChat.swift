@@ -416,6 +416,9 @@ struct HomeChatView: View {
         }
         .onChange(of: text) { t in draft = t; onText(t) }
         .onChange(of: m.staged) { on in if on { Task { await m.loadGreeting() } } }
+        // 3.9.0: a reply / new task finished streaming: the rows above were swapped (tmp message, 正在想…, task
+        // card), so land on the real end again
+        .onChange(of: m.sending) { on in if !on && !m.staged { pin.toEnd(follow: 2) } }
         .onChange(of: photos) { items in
             guard !items.isEmpty else { return }
             let list = items; photos = []

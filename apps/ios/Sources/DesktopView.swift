@@ -1,10 +1,21 @@
 import SwiftUI
 import UserNotifications
 import WebKit
+import ImageIO
 
 extension Notification.Name {
     /// A computer was renamed or picked in the 电脑 sheet: pickers and the switcher bar reload their list.
     static let aiwMachinesChanged = Notification.Name("aiwMachinesChanged")
+}
+
+/// A downsampled, already-decoded image (ImageIO thumbnail + preparingForDisplay), safe to call off the main thread.
+func aiwDecodeScreenshot(_ d: Data, maxSide: CGFloat) -> UIImage? {
+    guard let src = CGImageSourceCreateWithData(d as CFData, [kCGImageSourceShouldCache: false] as CFDictionary) else { return nil }
+    let opts: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceShouldCacheImmediately: true,
+                                 kCGImageSourceCreateThumbnailWithTransform: true, kCGImageSourceThumbnailMaxPixelSize: maxSide]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return UIImage(data: d) }
+    let img = UIImage(cgImage: cg)
+    return img.preparingForDisplay() ?? img
 }
 
 /// The agent's computer, pinned above the conversation: a live picture while you watch, the real desktop when you take over.
@@ -19,6 +30,9 @@ struct DesktopPane: View {
     @State private var taking = false
     @State private var busy = false
     @State private var machines: [JSON] = []
+    @State private var grabbing = false
+    @State private var keyboard = false
+    @State private var lastGrab = Date.distantPast
     @Environment(\.scenePhase) var phase
     private let timer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
@@ -80,7 +94,14 @@ struct DesktopPane: View {
             Task { await takeover() }
         }
         .onChange(of: liveSession) { s in if s != nil { withAnimation { open = true } } }
-        .onReceive(timer) { _ in if open && phase == .active && !taking { Task { await grab() } } }
+        // 3.9.0 typing lag: one picture at a time, and every 6 s instead of 1.5 s while the keyboard is up
+        .onReceive(timer) { _ in
+            guard open && phase == .active && !taking && !grabbing else { return }
+            if keyboard && Date().timeIntervalSince(lastGrab) < 6 { return }
+            Task { await grab() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in keyboard = true }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in keyboard = false }
         .fullScreenCover(isPresented: $taking) {
             TakeoverView(liveSession: liveSession) { Task { await handBack() } }
         }
@@ -100,9 +121,14 @@ struct DesktopPane: View {
         guard let u = api.url("/api/machines/\(api.machine)/screenshot") else { return }
         var r = URLRequest(url: u, timeoutInterval: 12)
         r.setValue("Bearer \(api.token)", forHTTPHeaderField: "Authorization")
+        grabbing = true; lastGrab = Date()
+        defer { grabbing = false }
         guard let (d, resp) = try? await URLSession.shared.data(for: r) else { note = "连不上电脑"; return }
-        if (resp as? HTTPURLResponse)?.statusCode == 200, let img = UIImage(data: d) { image = img; note = "" }
-        else { note = "电脑未就绪" }
+        // 3.9.0: decode off the main thread, scaled to the pane (a full-size desktop PNG decoded on the main thread
+        // every 1.5 s is what made typing stutter in the task view)
+        let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+        let img = ok ? await Task.detached(priority: .utility) { aiwDecodeScreenshot(d, maxSide: 1280) }.value : nil
+        if let img = img { image = img; note = "" } else { note = "电脑未就绪" }
     }
     func takeover() async {
         busy = true; defer { busy = false }

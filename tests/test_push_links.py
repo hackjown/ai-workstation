@@ -29,7 +29,7 @@ def test_bark_request_app_and_web(monkeypatch):
     monkeypatch.delenv("AIW_PUSH_LINK", raising=False)
     u, p = N.bark_request("https://api.day.app/KEY/", "任务完成", "好了", "done", "task/t1", {})
     assert u == "https://api.day.app/KEY/%E4%BB%BB%E5%8A%A1%E5%AE%8C%E6%88%90/%E5%A5%BD%E4%BA%86"
-    assert p == {"url": "aiw://task/t1", "group": "任务"}          # no public url: no icon, app link
+    assert p == {"url": "aiw://task/t1", "group": "任务", "sound": "aiw-wancheng"}   # no public url: no icon, app link; 3.9.0 voice
     _, p = N.bark_request("https://api.day.app/KEY", "t", "b", "confirm", "task/t1", {"public_url": "https://aiw.example.com/"})
     assert p["url"] == "aiw://task/t1" and p["icon"] == "https://aiw.example.com/icon-180.png"
     assert p["group"] == "需要你" and p["level"] == "timeSensitive"

@@ -1,6 +1,7 @@
 """3.9.0: task-c987469146 fixes (false JD captcha, vision on demand, continuations, installed skills, export redaction)
 and computer roles (each cloud computer has a job, new tasks go to the one that fits, the local VM stays out)."""
 import os
+from pathlib import Path
 import re
 import subprocess
 from types import SimpleNamespace
@@ -203,3 +204,31 @@ async def test_preflight_installs_a_missing_skill_once():
     assert any("先安装" in (m or "") for m in msgs)
     note2 = await SessionManager._skill_preflight(me, task, Comp(), emit, "s1")
     assert state["setups"] == 1 and "huashu-motion: installed" in note2
+
+
+def test_bark_sound_per_push_kind(monkeypatch):
+    from aiw_api import notify as N
+    monkeypatch.delenv("AIW_BARK_SOUND", raising=False)
+    assert N.sound_for("confirm") == "aiw-shouquan"
+    assert N.sound_for("input", "需要你填写资料") == "aiw-tianxie"
+    assert N.sound_for("input", "需要你接管桌面", "takeover/m1?task=t") == "aiw-jieguan"
+    assert N.sound_for("input", "任务卡住了，等你处理") == "aiw-kazhu"
+    assert N.sound_for("input", "Agent 在问你") == "aiw-huida"
+    assert N.sound_for("done") == "aiw-wancheng" and N.sound_for("failed") == "aiw-shibai"
+    assert N.sound_for("watch") == "aiw-jiangjia" and N.sound_for("xhs_login") == "aiw-xiaohongshu"
+    assert N.sound_for("test") == "aiw-tixing"
+    _, p = N.bark_request("https://api.day.app/KEY", "需要你确认", "b", "confirm", "task/t1", {})
+    assert p["sound"] == "aiw-shouquan"
+    _, p = N.bark_request("https://api.day.app/KEY", "t", "b", "done", "task/t1", {"bark_sound": "off"})
+    assert "sound" not in p
+    root = Path(__file__).resolve().parents[1] / "apps" / "web" / "sounds"
+    for name, _t in N.SOUNDS.values():
+        assert (root / f"{name}.caf").stat().st_size > 10000
+
+
+def test_ios_task_composer_is_isolated():
+    src = (Path(__file__).resolve().parents[1] / "apps" / "ios" / "Sources" / "ChatView.swift").read_text(encoding="utf-8")
+    assert "struct TaskComposerInput: View" in src and "@StateObject private var box = ComposerBox()" in src
+    assert "@State private var text = \"\"\n    @State private var attach" not in src
+    pane = (Path(__file__).resolve().parents[1] / "apps" / "ios" / "Sources" / "DesktopView.swift").read_text(encoding="utf-8")
+    assert "Task.detached(priority: .utility) { aiwDecodeScreenshot(" in pane

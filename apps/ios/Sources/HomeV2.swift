@@ -608,6 +608,7 @@ final class BottomPin: ObservableObject {
     private var unseen = false
     private var followUntil = Date.distantPast
     private var holdUntil = Date.distantPast   // a jump is under way: the frames in between do not unpin
+    private var lastFix = Date.distantPast
     /// scrolls the ScrollViewReader to the "end" anchor (set by the view; animated or not)
     var jumpAction: ((Bool) -> Void)?
 
@@ -621,6 +622,8 @@ final class BottomPin: ObservableObject {
         DispatchQueue.main.async { self.jumpAction?(animated) }
         // once more after layout: rows measured late (pictures, lazy rows) move the end after the first jump
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { if self.pinned { self.jumpAction?(false) } }
+        // 3.9.0: and once more when a tall task card has been measured (the chat went blank after a new task)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { if self.pinned { self.jumpAction?(false) } }
     }
     /// Something new arrived (a message, a streamed piece, a task). `own`: the user's own send.
     func newContent(own: Bool = false) {
@@ -630,6 +633,17 @@ final class BottomPin: ObservableObject {
     func metrics(_ mm: ScrollMetrics, live: Bool) {
         let grew = last.contentH > 0 && abs(mm.contentH - last.contentH) > 0.5
         last = mm
+        // 3.9.0 blank chat after a new task: the lazy list shrank under a scroll position past its new end (the
+        // "正在想…" row and the temporary message gave way to the task card), so the screen showed nothing until you
+        // scrolled up. When the content's end is well above the visible bottom while the content is taller than the
+        // screen, we are scrolled into empty space: go back to the real end.
+        if pinned, bottom > 0, mm.contentH > bottom * 0.8, mm.endY < bottom - BottomPin.near,
+           Date().timeIntervalSince(lastFix) > 0.4 {
+            lastFix = Date()
+            holdUntil = max(holdUntil, Date().addingTimeInterval(0.2))
+            DispatchQueue.main.async { self.jumpAction?(false) }
+            return
+        }
         if grew && pinned && (live || Date() < followUntil) {
             holdUntil = max(holdUntil, Date().addingTimeInterval(0.1))
             DispatchQueue.main.async { self.jumpAction?(false) }

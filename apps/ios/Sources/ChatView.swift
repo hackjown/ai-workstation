@@ -199,7 +199,12 @@ struct ChatView: View {
     let onThread: (String) -> Void
     let fromParent: Bool
     @Environment(\.dismiss) private var dismiss
-    @State private var text = ""
+    // 3.9.0 typing lag in the task view: the draft and the mic live in a box ChatView does not observe (no @Published
+    // on the box), so a keystroke or the mic's level re-renders only the input row (TaskComposerInput), not every
+    // TaskBlock and the desktop pane above it. Before, each letter rebuilt the whole thread.
+    @StateObject private var box = ComposerBox()
+    private var draft: ComposerDraft { box.draft }
+    private var voice: SpeechInput { box.voice }
     @State private var attach: [JSON] = []
     @State private var photo: PhotosPickerItem?
     @State private var showPhotos = false
@@ -214,13 +219,11 @@ struct ChatView: View {
     @State private var upProgress: Double = 0
     @State private var toast = ""
     @State private var importing = false
-    @StateObject private var voice = SpeechInput()
     @State private var showAttach = false
     @State private var pendingKind: AttachKind? = nil
     @State private var showSkills = false
     @Environment(\.colorScheme) private var cs
     @ObservedObject private var inbox = ImportCenter.shared
-    @FocusState private var focused: Bool
     @StateObject private var pin = BottomPin()
     @Environment(\.scenePhase) private var phase
 
@@ -387,44 +390,25 @@ struct ChatView: View {
                     }
                 }
             }
-            HStack(alignment: .bottom, spacing: 6) {
-                Button { focused = false; showAttach = true } label: {
-                    Group { if uploading { ProgressView().tint(hAmber) } else { Image(systemName: "plus").font(.system(size: 22, weight: .light)).foregroundColor(hAmber) } }
-                        .frame(width: 36, height: 36)
-                }.accessibilityLabel("添加：拍照、视频、文件、技能")
-                TextField("和电脑说点什么，点 + 加文件或技能", text: $text, axis: .vertical)
-                    .lineLimit(1...6).focused($focused).padding(.vertical, 8)
-                // 3.8: empty -> the mic (voice input, Speech.swift); listening -> stop; text -> send
-                if voice.active {
-                    MicButton(voice: voice) { voice.stop() }
-                } else if sending || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Button { Task { await send() } } label: {
-                        Group { if sending { ProgressView().tint(hInk) } else { Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold)) } }
-                            .foregroundColor(hInk).frame(width: 36, height: 36).background(hAmber).clipShape(Circle())
-                    }.disabled(sending).accessibilityLabel(liveSession != nil ? "排队发送" : "发送")
-                } else {
-                    MicButton(voice: voice) { voice.toggle(current: text) { text = $0 } }
-                }
-            }
-            .padding(.leading, 4).padding(.trailing, 6).padding(.vertical, 5)
-            .background(Color(.systemBackground))
-            .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(focused ? hAmber.opacity(0.6) : Color(.separator), lineWidth: 1))
-            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-            if !voice.error.isEmpty { Text(voice.error).font(.caption).foregroundColor(.orange).frame(maxWidth: .infinity, alignment: .leading) }
+            TaskComposerInput(draft: draft, voice: voice, uploading: uploading, sending: sending, queued: liveSession != nil,
+                              onPlus: { showAttach = true }, onSend: { await send() })
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(.bar)
         .onDisappear { voice.stop() }
     }
 
-    func send() async {
+    @discardableResult
+    func send() async -> Bool {
         if voice.active { voice.stop() }
-        var p = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var p = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !picked.isEmpty { p = "【技能：\(picked.joined(separator: "、"))】\n" + p }
         if !attach.isEmpty { p += "\n\n附件（已放到电脑上）：\n" + attach.map { "- " + $0.s("vm_path") }.joined(separator: "\n") }
         sending = true
-        if await m.send(p) { text = ""; attach = []; picked = []; focused = false; pin.toEnd(follow: 3) }
+        let ok = await m.send(p)
+        if ok { draft.text = ""; attach = []; picked = []; pin.toEnd(follow: 3) }
         sending = false
+        return ok
     }
 
     func skillTitle(_ id: String) -> String { skills.first { $0.s("id") == id }?.s("title") ?? id }
@@ -463,7 +447,7 @@ struct ChatView: View {
         let got = inbox.take()
         if !got.texts.isEmpty {
             let t = got.texts.joined(separator: "\n")
-            text = text.isEmpty ? t : text + "\n" + t
+            draft.text = draft.text.isEmpty ? t : draft.text + "\n" + t
         }
         var added: [String] = []
         var refused: [String] = []
@@ -994,6 +978,55 @@ struct TaskTextSheet: View {
             let e = await send(text.trimmingCharacters(in: .whitespacesAndNewlines))
             busy = false
             if let e = e { err = e } else { dismiss() }
+        }
+    }
+}
+
+
+/// 3.9.0: what ChatView holds but never observes (the box publishes nothing): the draft and the mic.
+final class ComposerBox: ObservableObject {
+    let draft = ComposerDraft()
+    let voice = SpeechInput()
+}
+final class ComposerDraft: ObservableObject { @Published var text = "" }
+
+/// 3.9.0: the task view's input row on its own, so typing re-renders this row only.
+struct TaskComposerInput: View {
+    @ObservedObject var draft: ComposerDraft
+    @ObservedObject var voice: SpeechInput
+    let uploading: Bool
+    let sending: Bool
+    let queued: Bool
+    let onPlus: () -> Void
+    let onSend: () async -> Bool
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(alignment: .bottom, spacing: 6) {
+                Button { focused = false; onPlus() } label: {
+                    Group { if uploading { ProgressView().tint(hAmber) } else { Image(systemName: "plus").font(.system(size: 22, weight: .light)).foregroundColor(hAmber) } }
+                        .frame(width: 36, height: 36)
+                }.accessibilityLabel("添加：拍照、视频、文件、技能")
+                TextField("和电脑说点什么，点 + 加文件或技能", text: $draft.text, axis: .vertical)
+                    .lineLimit(1...6).focused($focused).padding(.vertical, 8)
+                // 3.8: empty -> the mic (voice input, Speech.swift); listening -> stop; text -> send
+                if voice.active {
+                    MicButton(voice: voice) { voice.stop() }
+                } else if sending || !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button { Task { if await onSend() { focused = false } } } label: {
+                        Group { if sending { ProgressView().tint(hInk) } else { Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold)) } }
+                            .foregroundColor(hInk).frame(width: 36, height: 36).background(hAmber).clipShape(Circle())
+                    }.disabled(sending).accessibilityLabel(queued ? "排队发送" : "发送")
+                } else {
+                    MicButton(voice: voice) { let d = draft; voice.toggle(current: d.text) { d.text = $0 } }
+                }
+            }
+            .padding(.leading, 4).padding(.trailing, 6).padding(.vertical, 5)
+            .background(Color(.systemBackground))
+            .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(focused ? hAmber.opacity(0.6) : Color(.separator), lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+            if !voice.error.isEmpty { Text(voice.error).font(.caption).foregroundColor(.orange).frame(maxWidth: .infinity, alignment: .leading) }
         }
     }
 }

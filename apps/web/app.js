@@ -887,8 +887,13 @@ async function loadSettings() {
     <div class="muted">任务完成、失败、需要确认或回答、追踪触发时推送。iPhone 推荐 Bark。</div>
     <div class="kv"><span class="muted">Bark 地址</span><input name="bark_url" value="${esc(notify.bark_url || "")}" placeholder="https://api.day.app/你的key" />
     <span class="muted">ntfy 主题</span><input name="ntfy_url" value="${esc(notify.ntfy_url || "")}" placeholder="https://ntfy.sh/aiw-xxxx" />
-    <span class="muted">Webhook</span><input name="webhook_url" value="${esc(notify.webhook_url || "")}" placeholder="POST {title, body}" /></div>
+    <span class="muted">Webhook</span><input name="webhook_url" value="${esc(notify.webhook_url || "")}" placeholder="POST {title, body}" />
+    <span class="muted">Bark 铃声</span><select name="bark_sound"><option value="on"${notify.bark_sound === "off" ? "" : " selected"}>女声语音（按推送类型）</option><option value="off"${notify.bark_sound === "off" ? " selected" : ""}>Bark 默认铃声</option></select></div>
+    <details class="muted" style="margin:6px 0"><summary>女声铃声：第一次用要先在 Bark 里上传（点开看步骤）</summary>
+      <div style="margin-top:6px">在 iPhone 上点下面每个文件，存到「文件」App；再打开 Bark › 设置 › 铃声 › 上传铃声，选这些 .caf 文件。上传后点「测试全部铃声」逐个听。</div>
+      <div class="row gap wrap" style="margin-top:6px">${[["aiw-shouquan","请授权"],["aiw-tianxie","请填写资料"],["aiw-jieguan","请接管桌面"],["aiw-kazhu","任务卡住了"],["aiw-huida","有问题需要你回答"],["aiw-wancheng","任务完成"],["aiw-shibai","任务失败了"],["aiw-jiangjia","价格提醒"],["aiw-jiankong","监控出错了"],["aiw-xiaohongshu","小红书需要你处理"],["aiw-tixing","小秘提醒"]].map(([f, t]) => `<a class="btn xs" href="sounds/${f}.caf" download>${t}</a>`).join("")}</div></details>
     <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="api('POST','/api/settings/notify/test').then(()=>toast('已发送测试通知'))">发送测试</button>
+    <button type="button" class="btn" onclick="api('POST','/api/settings/notify/test_sounds').then(r=>toast('正在逐个推送 '+r.sent+' 种铃声，每 3 秒一条'))">测试全部铃声</button>
     <button type="button" class="btn" onclick="Notification.requestPermission().then(p=>toast('浏览器通知：'+p))">允许浏览器通知</button></div></form>
 
   <div class="card sec" id="sInteg"><h3>${icon("plug")} 集成</h3>
@@ -1001,7 +1006,7 @@ async function detectVmIp() {
   catch (err) { toast("检测失败：" + (err.message || err)); }
 }
 async function saveNotify(e) { e.preventDefault(); const f = e.target; await api("PUT", "/api/settings/notify", { bark_url: f.bark_url.value, ntfy_url: f.ntfy_url.value, webhook_url: f.webhook_url.value,
-  public_url: f.public_url ? f.public_url.value : undefined, link_mode: f.link_mode ? f.link_mode.value : undefined }); toast("已保存"); }
+  public_url: f.public_url ? f.public_url.value : undefined, link_mode: f.link_mode ? f.link_mode.value : undefined, bark_sound: f.bark_sound ? f.bark_sound.value : undefined }); toast("已保存"); }
 async function addMcp(e) {
   e.preventDefault(); const f = e.target; const cur = (await api("GET", "/api/integrations")).mcp_servers || [];
   cur.push({ name: f.name.value, url: f.url.value, headers: f.hk.value ? { [f.hk.value]: f.hv.value } : {} });

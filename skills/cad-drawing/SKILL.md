@@ -34,6 +34,8 @@ task-778：照片只有总尺寸「约9800 / 约10900」，视觉模型估的墙
 - **交付**：`plan.png`、`plan.pdf`、`plan.dxf`、`plan.dwg`（ODA File Converter 转 ACAD2018，**转完再转回 DXF 比对图元数、图层、范围**，
   不一致就不交 DWG 并说明）、`diff.png`。电脑上没有转换器时 `drawkit.py ensure` 会自动装到 `~/tools/ODAFileConverter`（x86-64），
   或 `bash deploy/vm/cad-drawing-setup.sh dwg`。全部在电脑（VM）上，不进 API 的 Docker 镜像。
+  装好后 `python3 drawkit.py ensure` 会真转一张带中文名的小图（`dwg_works`）；DWG 没生成时报告里会写出 ODA 自己的报错，
+  `python3 drawkit.py dwgtest` 逐种启动方式（xvfb-run / DISPLAY / offscreen）试一遍并打印结果。不要说"本机没有转换器"，照报告原话说。
 
 ## 铁律（3.8.8 / 3.8.9）
 - **每个新任务都是全新的活**：只在本任务的文件夹里工作（`cad/` 就是本任务自己的 `tasks/<任务id>/cad`）。

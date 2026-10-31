@@ -54,12 +54,30 @@ CARD_V = 2              # task card v2: actions + result live on the card (3.8.8
 MAX_ACTIONS = 12        # answered actions kept on a card (the newest; the task view keeps them all)
 
 SKILL_RE = re.compile(r"^\s*【技能[:：][^】]+】")
+# v3.9.3: a message with attachments that asks to DO something with them goes straight to the computer
+ATT_TASK_RE = re.compile(r"转换|转成|转为|导出|导入|生成|画|描|绘|出图|改成|修改|编辑|处理|剪|合并|拆分|压缩|批量|打印|上传|"
+                         r"安装|运行|执行|做成|做一|帮我做|按(照)?(这|附件|文件|图)|照着|根据(这|附件|文件|图)|"
+                         r"convert|export|edit|render|trace", re.I)
+ATT_CHAT_RE = re.compile(r"^(这|那|它)?(是什么|写了什么|讲了什么|说了什么|什么意思)|总结|概括|翻译|解释|读一下|看看(内容|写)", re.I)
+
+
+def attachments_want_task(text: str, attachments: list) -> bool:
+    """Attachments + an action on them (not only 'what does it say') = a task for the computer."""
+    if not attachments:
+        return False
+    t = (text or "").strip()
+    if ATT_CHAT_RE.search(t) and not ATT_TASK_RE.search(t):
+        return False
+    return bool(ATT_TASK_RE.search(t))
+
+
 OFFER_RE = re.compile(r"\[\[\s*交给电脑\s*[:：]\s*(.+?)\s*\]\]", re.S)
 
 ROUTE_PROMPT = """你是消息分流器（ROUTE）。用户在和私人助理聊天；助理背后有一台能操作的电脑（浏览器、文件、软件、下单、注册、画图、做视频、批量处理等）。
 判断用户这条最新消息要的是：
 - "chat"：聊天、提问、咨询、解释、写一段文字、出主意、查一下任务进度、问知识或网上的信息（助理能联网搜索、读网页、读文件）。
 - "task"：明确要电脑去动手办一件事（打开网站操作、登录、填表、下单、下载、做/改文件、画图、剪视频、在电脑上安装或运行东西、定时去做某事）。
+消息带附件、并要求对附件动手（转换、修改、画图、剪辑、按附件去做、导入到软件里等）选 "task"；只问附件里写了什么选 "chat"。
 拿不准就选 "chat"。
 只输出一行 JSON：{"route": "chat" 或 "task", "title": "≤16 个字的任务标题（chat 时留空）"}"""
 
@@ -211,6 +229,7 @@ def parse_route(text: str) -> dict:
 
 class Chat:
     def __init__(self, store, sessions, notifier=None, settings=None, secrets=None):
+        self.last_notice = None   # v3.9.3: the "用了备用电脑" message start_task wrote, for send() to show
         self.store, self.sessions, self.notifier = store, sessions, notifier
         self.settings, self.secrets = settings, secrets
         ensure_tables(store)
@@ -630,10 +649,12 @@ class Chat:
             self._compacting = False
 
     # ------------------------------------------------------------------ routing
-    async def classify(self, text: str, cands: Optional[list] = None) -> dict:
+    async def classify(self, text: str, cands: Optional[list] = None, attachments: Optional[list] = None) -> dict:
         recent = "\n".join(f"{'用户' if r['role'] == 'user' else '助理'}：{(self.render(r) or '')[:160]}"
                            for r in self.window(3)[:-1])
         user = (f"最近的聊天：\n{recent}\n\n" if recent else "") + f"最新消息：{text[:1500]}"
+        if attachments:
+            user += "\n（这条消息带附件：" + "、".join(str(a.get("name") or "") for a in attachments[:10]) + "）"
         system = ROUTE_PROMPT
         if cands:   # 3.8.5: the classifier may also say "this continues task n"
             system += ROUTE_TASKS.format(tasks="\n".join(
@@ -684,8 +705,11 @@ class Chat:
                 route = {"route": mode, "title": ""}
             elif SKILL_RE.match(text):   # a skill picked with "/" (or the + menu) runs on the computer, like the old skills menu
                 route = {"route": "task", "title": "", "skill": True}
+            elif attachments_want_task(text, attachments):   # v3.9.3: shared files + "帮我转成…" go straight to the computer
+                route = {"route": "task", "title": ""}
             else:
-                route = await self.classify(text, [c for c in cands if c["run"]["status"] not in ("succeeded",)] or cands)
+                route = await self.classify(text, [c for c in cands if c["run"]["status"] not in ("succeeded",)] or cands,
+                                            attachments)
             if route.get("route") == "continue":
                 pool = [c for c in cands if c["run"]["status"] not in ("succeeded",)] or cands
                 n = int(route.get("task") or 0)
@@ -700,18 +724,22 @@ class Chat:
                 return {"route": "continue", "user": user, "messages": msgs}
             await say("route", route)
             if route["route"] == "task":
+                self.last_notice = None
                 card = await self.start_task(text, route.get("title") or "", machine_id, attachments, origin=user["id"])
+                note, self.last_notice = self.last_notice, None
+                if note:   # v3.9.3: "用了备用电脑" shows in the chat, before the card
+                    await say("message", note)
                 await say("task" if card["kind"] == "task" else "message", card)
-                out = {"route": "task", "user": user, "messages": [card]}
+                out = {"route": "task", "user": user, "messages": ([note] if note else []) + [card]}
             else:
                 await say("status", {"text": "正在想…"})
-                m = await self._reply_cancellable(text, say)
+                m = await self._reply_cancellable(text, say, attachments)
                 await say("message", m)
                 out = {"route": "chat", "user": user, "messages": [m]}
         self.background(self.after_exchange(user, out["messages"]))
         return out
 
-    async def _reply_cancellable(self, text: str, say) -> dict:
+    async def _reply_cancellable(self, text: str, say, attachments: Optional[list] = None) -> dict:
         """The reply runs as its own task so 停止 (POST /api/chat/cancel) can end it; what streamed so far is kept."""
         shown: list[str] = []
         if self._stop_next:
@@ -724,7 +752,7 @@ class Chat:
 
         async def status(t):
             await say("status", {"text": t})
-        job = asyncio.get_running_loop().create_task(self.reply(text, delta, status))
+        job = asyncio.get_running_loop().create_task(self.reply(text, delta, status, attachments))
         self._reply_job = job
         try:
             return await job
@@ -763,7 +791,7 @@ class Chat:
             except Exception as e:  # noqa: BLE001
                 log.warning("memory learn: %s", e)
 
-    async def reply(self, text: str, on_delta=None, on_status=None) -> dict:
+    async def reply(self, text: str, on_delta=None, on_status=None, attachments: Optional[list] = None) -> dict:
         tools = await self.tools()
         if self.memory and hasattr(self.memory, "prepare"):   # embeds the question when an embedding model is set
             try:
@@ -810,11 +838,14 @@ class Chat:
             if not body:
                 body = "嗯，我在。"
             data = {"offer_task": offer} if offer else {}
+            if offer and attachments:   # v3.9.3: 交给电脑去做 carries the files the user sent with the request
+                data["offer_attachments"] = attachments[:10]
             return self.add("assistant", "text", body, data)
         except Exception as e:  # noqa: BLE001  never silent: say what went wrong and offer the computer instead
             log.warning("chat reply failed: %s", e)
             return self.add("assistant", "text", f"抱歉，模型这次没有回应（{type(e).__name__}: {str(e)[:120]}）。"
-                            "可以稍后再发一次，或者点下面的按钮交给电脑去做。", {"error": True, "offer_task": text[:500]})
+                            "可以稍后再发一次，或者点下面的按钮交给电脑去做。", {"error": True, "offer_task": text[:500],
+                                                                  **({"offer_attachments": attachments[:10]} if attachments else {})})
 
     # ------------------------------------------------------------------ tools for the chat
     async def tools(self) -> dict:
@@ -1092,12 +1123,21 @@ class Chat:
     async def start_task(self, prompt: str, title: str = "", machine_id: Optional[str] = None,
                          attachments: Optional[list] = None, origin: Optional[str] = None, source: str = "chat") -> dict:
         prompt = (prompt or "").strip()
+        notice = None
         if source == "chat":   # aiw-roles-1: a new task goes to the computer whose role fits it
             try:
                 from . import roles as _roles
-                machine_id = _roles.pick(self.sessions, prompt, machine_id) or machine_id
+                names = " ".join(str(x.get("name") or "") for x in (attachments or []) if isinstance(x, dict))
+                # v3.9.3: a cloud computer in its 8-hour cooldown hands the task to the local backup computer
+                machine_id, notice = await _roles.pick_live(self.sessions, (prompt + " " + names).strip(), machine_id)
             except Exception as e:  # noqa: BLE001
                 log.warning("roles: %s", e)
+        if notice:
+            try:
+                from . import roles as _roles
+                self.last_notice = self.add("assistant", "text", _roles.notice_text(notice), {"backup_vm": notice})
+            except Exception as e:  # noqa: BLE001
+                log.warning("backup notice: %s", e)
         attachments = await self._push_files(attachments or [], machine_id)
         vm = [a.get("vm_path") for a in attachments if a.get("vm_path")]
         if vm:
@@ -1118,7 +1158,7 @@ class Chat:
             "title": title, "status": st, "status_line": STATUS_CN.get(st, st),
             "step": 0, "max_steps": t.get("max_steps"), "origin": origin, "card": CARD_V, "root_id": t.get("continues") or t["id"],
             "prompt": one_line(SKILL_RE.sub("", prompt), 120), "started_at": time.time() if st != "queued" else None,
-            "actions": []}, task_id=t["id"])
+            "actions": [], **({"backup_vm": notice} if notice else {})}, task_id=t["id"])
         return self._catch_up_sync(card)
 
     def _catch_up_sync(self, card: dict) -> dict:
@@ -1170,11 +1210,25 @@ class Chat:
             raise KeyError(mid)
         if m["data"].get("task_started"):
             return self.get(m["data"]["task_started"]) or m
+        att = list(m["data"].get("offer_attachments") or []) or self._attachments_before(m)
         async with self._lock:
-            card = await self.start_task(m["data"]["offer_task"], "", machine_id, origin=mid)
+            card = await self.start_task(m["data"]["offer_task"], "", machine_id, att, origin=mid)
             if card["kind"] == "task":
                 self.update(mid, data={"task_started": card["id"]})
         return card
+
+    def _attachments_before(self, m: dict, look: int = 4) -> list:
+        """v3.9.3: an offer made before offer_attachments existed (or by a model that ignored them): the files of the
+        user's message(s) right before it, so 交给电脑去做 never loses what the user sent."""
+        rows = self.store._x("SELECT * FROM chat_messages WHERE conv=? AND seq<? ORDER BY seq DESC LIMIT ?",
+                             (CONV, m.get("seq") or 0, look))
+        for r in (_row(x) for x in rows):
+            if r["role"] == "user":
+                att = (r.get("data") or {}).get("attachments") or []
+                if att:
+                    return [a for a in att if isinstance(a, dict)][:10]
+                break   # the nearest user message had none: do not reach further back
+        return []
 
     def card_for(self, task_id: str, thread_id: Optional[str]) -> Optional[dict]:
         r = self.store._x("SELECT * FROM chat_messages WHERE kind='task' AND task_id=? ORDER BY seq DESC LIMIT 1", (task_id,))

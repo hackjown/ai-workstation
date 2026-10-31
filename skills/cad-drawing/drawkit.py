@@ -135,6 +135,42 @@ def cjk_font():
     return ""
 
 
+def dwg_smoke(verbose=False):
+    """v3.9.3: convert a tiny drawing with a Chinese file name, the way drawing_build does, and say whether it worked."""
+    import tempfile
+    ezdxf = need("ezdxf", "ezdxf", "python3-ezdxf")
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "测试图.dxf"
+        doc = ezdxf.new("R2010")
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (1000, 0)); msp.add_line((1000, 0), (1000, 1000)); msp.add_text("客厅").set_placement((200, 200))
+        doc.saveas(str(p))
+        res = export_dwg(p)
+        if verbose:
+            exe = _oda_converter()
+            res["variants"] = []
+            if exe:
+                for tag, pre, env in _oda_variants(exe):
+                    with tempfile.TemporaryDirectory() as ti, tempfile.TemporaryDirectory() as to:
+                        shutil.copy(p, Path(ti) / "aiw_plan.dxf")
+                        try:
+                            r = subprocess.run(pre + [ti, to, "ACAD2018", "DWG", "0", "1"], capture_output=True,
+                                               timeout=120, env=env)
+                            msg = ((r.stderr or b"") + (r.stdout or b"")).decode("utf-8", "replace").strip()[-300:]
+                            rc = r.returncode
+                        except Exception as ex:  # noqa: BLE001
+                            msg, rc = f"{type(ex).__name__}: {ex}", None
+                        res["variants"].append({"how": tag, "rc": rc, "wrote_dwg": (Path(to) / "aiw_plan.dwg").exists(),
+                                                "said": msg})
+        return res
+
+
+def cmd_dwgtest(_a):
+    r = dwg_smoke(verbose=True)
+    print(json.dumps(r, ensure_ascii=False, indent=1))
+    return 0 if r.get("dwg") else 1
+
+
 def cmd_ensure(_a):
     ok = {}
     for mod, pipn, aptn in (("numpy", "numpy", "python3-numpy"), ("PIL", "pillow", "python3-pil"),
@@ -144,6 +180,12 @@ def cmd_ensure(_a):
             ok[mod] = getattr(m, "__version__", "ok")
         except Exception as e:  # noqa: BLE001
             ok[mod] = f"MISSING ({e})"
+    try:   # v3.9.3: Debian/Ubuntu's python3-ezdxf is 0.18; the DXF/DWG round trip is tested on 1.x
+        v = tuple(int(x) for x in re.findall(r"\d+", str(ok.get("ezdxf")))[:2])
+        if v and v < (1, 1) and _pip(["ezdxf>=1.1"]):
+            ok["ezdxf"] = str(ok["ezdxf"]) + " -> upgraded to 1.x (next run)"
+    except Exception:  # noqa: BLE001
+        pass
     # 3.9.2 deterministic tracer (drawtrace.py): OpenCV for the geometry, RapidOCR (onnxruntime) for the text
     for mod, pipn in (("cv2", "opencv-python-headless"), ("rapidocr_onnxruntime", "rapidocr-onnxruntime")):
         try:
@@ -154,6 +196,12 @@ def cmd_ensure(_a):
     if not _oda_converter() and os.environ.get("DRAWKIT_INSTALL_ODA", "1") == "1":
         _install_oda()
     ok["dwg_converter"] = _oda_converter() or (shutil.which("dxf2dwg") or "none (bash cad-drawing-setup.sh dwg)")
+    if (_oda_converter() or shutil.which("dxf2dwg")) and os.environ.get("DRAWKIT_DWG_SMOKE", "1") == "1":
+        try:   # v3.9.3: installed is not the same as working: convert a small drawing for real
+            sm = dwg_smoke()
+            ok["dwg_works"] = ("yes (" + str(sm.get("by")) + ")") if sm.get("dwg") else ("NO: " + str(sm.get("error"))[:300])
+        except Exception as e:  # noqa: BLE001
+            ok["dwg_works"] = f"NO: {type(e).__name__}: {e}"
     ok["cjk_font"] = cjk_font() or "MISSING"
     if not shutil.which("tesseract"):     # 3.8.9: reads the dimension digits (optional; the vision read is the fallback)
         _apt(["tesseract-ocr"])
@@ -1679,6 +1727,23 @@ def _shrink(b, k):
     return (b[0] + dx, b[1] + dy, b[2] - dx, b[3] - dy)
 
 
+def _chains_same_scale(ca, cb, tol=0.03):
+    """mm per pixel of two chains, from their own end ticks; the shared value when they agree within tol, else None.
+    Two chains read at the same scale whose pixel lengths differ as much as their numbers do measure two different
+    edges (a balcony, a bay), not a misread."""
+    def mpp(c):
+        px = [p for p in (c.get("ticks_px") or []) if isinstance(p, (int, float))]
+        vals = [float(v) for v in c.get("values") or []]
+        if len(px) < 2 or not vals or (c.get("ticks_px") or [None])[0] is None or (c.get("ticks_px") or [None])[-1] is None:
+            return None
+        span = abs(float(c["ticks_px"][-1]) - float(c["ticks_px"][0]))
+        return sum(vals) / span if span > 20 else None
+    a, b = mpp(ca), mpp(cb)
+    if not a or not b or abs(a - b) / max(a, b) > tol:
+        return None
+    return round((a + b) / 2, 3)
+
+
 def chain_checks(spec, m: Model):
     E, W, I = [], [], []
     ch = chain_list(spec)
@@ -1699,8 +1764,12 @@ def chain_checks(spec, m: Model):
             if abs(ma[0] - mb[0]) > 1 or abs(ma[-1] - mb[-1]) > 1:
                 msg = (f"{a} chain spans {round(ma[0])}..{round(ma[-1])} but {b} spans {round(mb[0])}..{round(mb[-1])}"
                        f" (sum {round(ma[-1] - ma[0])} vs {round(mb[-1] - mb[0])})")
+                same = _chains_same_scale(by[a], by[b])
                 if by[a].get("explain") or by[b].get("explain"):
                     I.append(msg + " - explained: " + (by[a].get("explain") or by[b].get("explain")))
+                elif same:   # v3.9.3: the pixels say the two chains really are different lengths: a setback
+                    I.append(msg + f" - a setback measured on the image (both chains {same} mm/px, the "
+                             "lengths differ in pixels too): accepted, no 'explain' needed")
                 else:
                     E.append(msg + ": opposite chains must add up to the same total, or say why in 'explain' (a setback)")
             else:
@@ -2053,32 +2122,56 @@ def _install_oda():
     return _oda_converter()
 
 
-def _oda_run(exe, in_dir, out_dir, ver, typ, timeout=180):
-    cmd = [exe, str(in_dir), str(out_dir), ver, typ, "0", "1"]
+def _oda_variants(exe):
+    """v3.9.3: the ways to start ODA File Converter, most likely first. A desktop VM has a DISPLAY the agent may not
+    be allowed to use, and Qt's offscreen plugin is missing from some builds, so each one is tried in turn."""
     env = dict(os.environ)
-    env.setdefault("QT_QPA_PLATFORM", "offscreen")
-    if not env.get("DISPLAY") and shutil.which("xvfb-run") and os.environ.get("ODA_XVFB", "1") == "1":
-        cmd = ["xvfb-run", "-a"] + cmd
-    return subprocess.run(cmd, capture_output=True, timeout=timeout, env=env)
+    out = []
+    xvfb = shutil.which("xvfb-run")
+    if xvfb and os.environ.get("ODA_XVFB", "1") == "1":
+        e = {k: v for k, v in env.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY", "QT_QPA_PLATFORM")}
+        out.append(("xvfb-run", [xvfb, "-a", "-s", "-screen 0 1280x1024x24", exe], e))
+    if env.get("DISPLAY"):
+        out.append(("DISPLAY " + env["DISPLAY"], [exe], {k: v for k, v in env.items() if k != "QT_QPA_PLATFORM"}))
+    out.append(("offscreen", [exe], {**env, "QT_QPA_PLATFORM": "offscreen"}))
+    return out
+
+
+def _oda_run(exe, in_dir, out_dir, ver, typ, timeout=180, want=None):
+    """Run the converter until `want` (the expected output file) appears. Returns (variant used, last stderr)."""
+    last = ""
+    for tag, pre, env in _oda_variants(exe):
+        try:
+            r = subprocess.run(pre + [str(in_dir), str(out_dir), ver, typ, "0", "1"], capture_output=True,
+                               timeout=timeout, env=env)
+            last = ((r.stderr or b"") + (r.stdout or b"")).decode("utf-8", "replace").strip()[-400:]
+        except subprocess.TimeoutExpired:
+            last = f"timed out after {timeout}s"
+        except OSError as ex:
+            last = f"{type(ex).__name__}: {ex}"
+        if want is None or (Path(want).exists() and Path(want).stat().st_size > 0):
+            return tag, last
+        last = f"[{tag}] {last or 'no output file, no message'}"
+    return None, last
 
 
 def export_dwg(dxf_path, version="ACAD2018"):
     """DXF -> DWG with ODA File Converter (LibreDWG dxf2dwg as the fallback), then a ROUND TRIP check: the DWG is
-    converted back to DXF and its entities / layers / extents must equal the DXF's. Returns {"dwg", "by", "check"}
-    or {"error"}."""
+    converted back to DXF and compared with the source. v3.9.3: the file goes through ODA under an ASCII name (a
+    Chinese file name made it write nothing), every way to start it is tried, and a failure says what ODA said."""
     import tempfile
     dxf_path = Path(dxf_path)
     dwg = dxf_path.with_suffix(".dwg")
     exe = _oda_converter()
-    by = None
+    by, why = None, ""
     try:
         if exe:
             with tempfile.TemporaryDirectory() as ti, tempfile.TemporaryDirectory() as to:
-                shutil.copy(dxf_path, Path(ti) / dxf_path.name)
-                _oda_run(exe, ti, to, version, "DWG")
-                got = Path(to) / dxf_path.with_suffix(".dwg").name
-                if got.exists() and got.stat().st_size > 0:
-                    shutil.copy(got, dwg); by = "ODA File Converter " + version
+                shutil.copy(dxf_path, Path(ti) / "aiw_plan.dxf")
+                got = Path(to) / "aiw_plan.dwg"
+                tag, why = _oda_run(exe, ti, to, version, "DWG", want=got)
+                if tag and got.exists() and got.stat().st_size > 0:
+                    shutil.copy(got, dwg); by = f"ODA File Converter {version} ({tag})"
         if not by and shutil.which("dxf2dwg"):
             subprocess.run(["dxf2dwg", "-y", "-o", str(dwg), str(dxf_path)], capture_output=True, timeout=180)
             if dwg.exists() and dwg.stat().st_size > 0:
@@ -2086,6 +2179,9 @@ def export_dwg(dxf_path, version="ACAD2018"):
     except Exception as ex:  # noqa: BLE001
         return {"error": f"{type(ex).__name__}: {ex}"}
     if not by:
+        if exe:
+            return {"error": f"ODA File Converter is installed ({exe}) but wrote no DWG: {why or 'no message'}. "
+                             "Run `python3 drawkit.py dwgtest` on this computer for the details"}
         return {"error": "no DWG converter on this computer (install ODA File Converter: bash deploy/vm/cad-drawing-setup.sh dwg)"}
     chk = dwg_roundtrip(dxf_path, dwg, exe)
     if chk.get("error"):
@@ -2122,13 +2218,13 @@ def dwg_roundtrip(dxf_path, dwg_path, exe=None):
     import tempfile
     exe = exe or _oda_converter()
     with tempfile.TemporaryDirectory() as ti, tempfile.TemporaryDirectory() as to:
-        shutil.copy(dwg_path, Path(ti) / Path(dwg_path).name)
-        back = Path(to) / Path(dwg_path).with_suffix(".dxf").name
+        shutil.copy(dwg_path, Path(ti) / "aiw_plan.dwg")
+        back = Path(to) / "aiw_plan.dxf"
         try:
             if exe:
-                _oda_run(exe, ti, to, "ACAD2018", "DXF")
+                _oda_run(exe, ti, to, "ACAD2018", "DXF", want=back)
             elif shutil.which("dwg2dxf"):
-                subprocess.run(["dwg2dxf", "-y", "-o", str(back), str(Path(ti) / Path(dwg_path).name)],
+                subprocess.run(["dwg2dxf", "-y", "-o", str(back), str(Path(ti) / "aiw_plan.dwg")],
                                capture_output=True, timeout=180)
         except Exception as ex:  # noqa: BLE001
             return {"error": f"read-back failed ({type(ex).__name__})"}
@@ -2690,6 +2786,7 @@ def main(argv=None):
     p.set_defaults(f=cmd_auto)
     p = sub.add_parser("schema"); p.set_defaults(f=lambda a: print(SCHEMA) or 0)
     p = sub.add_parser("ensure"); p.set_defaults(f=cmd_ensure)
+    p = sub.add_parser("dwgtest"); p.set_defaults(f=cmd_dwgtest)
     a = ap.parse_args(argv)
     return a.f(a)
 

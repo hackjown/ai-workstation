@@ -299,15 +299,19 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if not store.machine(body.machine_id):
             raise HTTPException(404, "machine not found")
         try:
-            mid = body.machine_id
+            mid, notice = body.machine_id, None
             if not body.thread_id or body.new_task:   # aiw-roles-1: a new task goes to the computer whose role fits it
                 try:
                     from . import roles as _roles
-                    mid = _roles.pick(sessions, body.prompt.strip(), mid) or mid
+                    mid, notice = await _roles.pick_live(sessions, body.prompt.strip(), mid)   # v3.9.3: cooldown -> backup
+                    mid = mid or body.machine_id
                 except Exception as e:  # noqa: BLE001
                     logging.getLogger("aiw").warning("roles: %s", e)
-            return await sessions.submit(body.prompt.strip(), mid, body.thread_id, max_steps=body.max_steps,
-                                         timeout_s=body.timeout_s, isolated=body.isolated, link_thread=not body.new_task)
+            res = await sessions.submit(body.prompt.strip(), mid, body.thread_id, max_steps=body.max_steps,
+                                        timeout_s=body.timeout_s, isolated=body.isolated, link_thread=not body.new_task)
+            if notice:
+                res = {**res, "backup_vm": notice, "notice": _roles.notice_text(notice)}
+            return res
         except RuntimeError as e:
             raise HTTPException(409, str(e))
 

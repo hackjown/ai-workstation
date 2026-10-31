@@ -396,7 +396,8 @@ async function submitPrompt(e) {
     localStorage.removeItem(draftKey());
     if (iso) { localStorage.removeItem("aiw_iso"); $("isoToggle").checked = false; }
     S.threadId = r.thread_id; localStorage.setItem("aiw_thread", r.thread_id);
-    if (r.queued) toast("已加入队列");
+    if (r.notice) toast(r.notice);   // v3.9.3: a cooling cloud computer handed this to the backup computer
+    else if (r.queued) toast("已加入队列");
     refreshThread(true); loadThreads();
   } catch (err) {
     S.thread.tasks = S.thread.tasks.filter((t) => t !== tmp); renderChat();

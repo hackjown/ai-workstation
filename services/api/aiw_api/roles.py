@@ -180,6 +180,68 @@ def pick(sessions, prompt: str, current: Optional[str]) -> Optional[str]:
     return min(clouds, key=lambda m: _load(sessions, m))
 
 
+# ---------------------------------------------------------------- v3.9.3: cooldown -> the local backup computer
+COOL_CHECK_S = 8          # how long the InstaBox state lookup may take before the cloud one is taken as available
+
+
+async def cooldown_left(sessions, mid: str) -> float:
+    """Seconds an InstaBox computer still sits in its forced cooldown (after 8 h of running); 0 when it can run.
+    A paused machine (30 idle minutes) is NOT cooling: the task wakes it as before."""
+    cloud = getattr(sessions, "cloud", None)
+    if not cloud or not cloud.is_cloud(mid):
+        return 0.0
+    try:
+        import asyncio
+        from .cloud import _cooldown_left
+        st = await asyncio.wait_for(cloud.state(mid, max_age=60), COOL_CHECK_S)
+        return _cooldown_left(st.get("cooldown_until"))
+    except Exception:  # noqa: BLE001  unknown means try it: wake() still says why when it cannot start
+        return 0.0
+
+
+def backup_of(sessions) -> Optional[str]:
+    """The local computer that stands in for a cooling cloud one: kv machine_roles.backup, else the first local."""
+    c = sessions.store.kv_get(KEY, None) or {}
+    clouds = set(cloud_ids(sessions)) | set((getattr(sessions, "cloud", None) and sessions.cloud.entries() or {}).keys())
+    local = [m["id"] for m in sessions.store.machines() if m["id"] not in clouds]
+    want = c.get("backup")
+    if want and want in local:
+        return want
+    return local[0] if local else None
+
+
+async def pick_live(sessions, prompt: str, current: Optional[str]) -> tuple:
+    """pick(), then: when the chosen cloud computer is in its cooldown, the task goes to the local backup computer
+    (where it queues behind what is already there, in order). Returns (machine id, notice or None)."""
+    mid = pick(sessions, prompt, current) or current
+    if not mid:
+        return mid, None
+    left = await cooldown_left(sessions, mid)
+    if left <= 0:
+        return mid, None
+    bk = backup_of(sessions)
+    if not bk:
+        return mid, None
+    from datetime import datetime, timedelta, timezone
+    until = (datetime.now(timezone.utc) + timedelta(seconds=left)).astimezone(timezone(timedelta(hours=8)))
+    m, b = sessions.store.machine(mid) or {}, sessions.store.machine(bk) or {}
+    ahead = 1 if sessions.busy_session(bk) else 0
+    try:
+        ahead += sum(1 for r in sessions.store.tasks_by_status(("queued",)) if r.get("machine_id") == bk)
+    except Exception:  # noqa: BLE001
+        pass
+    return bk, {"cooling": mid, "cooling_name": m.get("name") or mid, "backup": bk, "backup_name": b.get("name") or bk,
+                "minutes": int(left // 60) + 1, "until": f"{until:%H:%M}", "ahead": ahead}
+
+
+def notice_text(n: dict) -> str:
+    t = (f"云电脑「{n['cooling_name']}」在 8 小时后的冷却期，约 {n['minutes']} 分钟后（北京时间 {n['until']}）才能再开，"
+         f"这次改用备用电脑「{n['backup_name']}」执行。")
+    if n.get("ahead"):
+        t += f"它前面还有 {n['ahead']} 个任务，会按顺序排队执行。"
+    return t
+
+
 def annotate(sessions, roster: list[dict], own: Optional[str] = None) -> list[dict]:
     """Roster for dispatch: each cloud computer's role; the local VM left out (unless it is the task's own)."""
     c = cfg(sessions.store)

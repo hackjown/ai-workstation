@@ -176,6 +176,31 @@ def _set_vm_ip(store, mid: str, ip: str) -> dict:
     return m
 
 
+# An exported task log is shared for debugging: passwords the agent wrote into scripts (ssh.connect(password=...),
+# sshpass -p, user:pass@host URLs, API keys) are masked so the file can be sent to anyone.
+_SECRET_RES = [
+    (re.compile(r"""(?i)\b(password|passwd|pwd|passphrase|secret|token|api[_-]?key|access[_-]?key)(\s*["']?\s*[:=]\s*)(["']?)([^"'\s,;)}\]]{2,})"""),
+     lambda m: m.group(1) + m.group(2) + m.group(3) + "***"),
+    (re.compile(r"(sshpass\s+-p\s*)(['\"]?)[^\s'\"]+\2"), lambda m: m.group(1) + m.group(2) + "***" + m.group(2)),
+    (re.compile(r"(\b[a-z][a-z0-9+.-]*://[^:/\s@]+:)([^@\s/]+)@", re.I), lambda m: m.group(1) + "***@"),
+    (re.compile(r"\b(sk-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]{12,}"), lambda m: m.group(1) + "***"),
+    (re.compile(r"(?i)(Authorization\s*[:=]\s*[\"']?Bearer\s+)[A-Za-z0-9._-]+"), lambda m: m.group(1) + "***"),
+]
+
+
+def _redact(obj):
+    if isinstance(obj, str):
+        for rx, fn in _SECRET_RES:
+            obj = rx.sub(fn, obj)
+        return obj
+    if isinstance(obj, dict):
+        return {k: ("***" if isinstance(v, str) and re.search(r"(?i)^(password|passwd|secret|token|api_?key)$", str(k)) else _redact(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj
+
+
 def _apply_saved_vm_ip(store, settings) -> None:
     """The address saved in 设置 beats AIW_VM_IP from .env, so a new DHCP lease needs no .env edit or restart."""
     net = store.kv_get("vm_net", {}) or {}
@@ -274,7 +299,14 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if not store.machine(body.machine_id):
             raise HTTPException(404, "machine not found")
         try:
-            return await sessions.submit(body.prompt.strip(), body.machine_id, body.thread_id, max_steps=body.max_steps,
+            mid = body.machine_id
+            if not body.thread_id or body.new_task:   # aiw-roles-1: a new task goes to the computer whose role fits it
+                try:
+                    from . import roles as _roles
+                    mid = _roles.pick(sessions, body.prompt.strip(), mid) or mid
+                except Exception as e:  # noqa: BLE001
+                    logging.getLogger("aiw").warning("roles: %s", e)
+            return await sessions.submit(body.prompt.strip(), mid, body.thread_id, max_steps=body.max_steps,
                                          timeout_s=body.timeout_s, isolated=body.isolated, link_thread=not body.new_task)
         except RuntimeError as e:
             raise HTTPException(409, str(e))
@@ -404,8 +436,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             d = {k: v for k, v in d.items() if k not in ("screenshot", "screenshot_b64", "image", "content_b64")}
             steps.append({"type": e.get("type"), "step": e.get("step"), "at": e.get("ts"), **d})
         settings = store.kv_get("models", {}) or {}
-        return {"exported_at": time.time(), "server_version": os.environ.get("AIW_VERSION", "dev")[:7], "task": base["task"], "models": {k: v for k, v in settings.items() if "key" not in k.lower()},
-                "events": steps, "receipts": base["actions"], "files": [f.get("path") for f in base["files"]]}
+        return _redact({"exported_at": time.time(), "server_version": os.environ.get("AIW_VERSION", "dev")[:7], "task": base["task"], "models": {k: v for k, v in settings.items() if "key" not in k.lower()},
+                        "events": steps, "receipts": base["actions"], "files": [f.get("path") for f in base["files"]]})
 
     # ------------------------------------------------------------- threads
     def _thread_full(tid: str) -> dict:
@@ -1126,6 +1158,24 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         return st
 
     # ------------------------------------------------------------- skills (composer "+" menu)
+    @app.get("/api/machine_roles", dependencies=[Depends(auth)])   # aiw-roles-1
+    async def machine_roles_get():
+        from . import roles as _roles
+        return _roles.show(sessions)
+
+    @app.put("/api/machine_roles", dependencies=[Depends(auth)])
+    async def machine_roles_put(body: dict = Body(...)):
+        from . import roles as _roles
+        c = _roles.cfg(store)
+        for k in ("enabled", "exclude_local", "lan_to_local", "strict"):
+            if k in body:
+                c[k] = bool(body[k])
+        for mid, r in (body.get("machines") or {}).items():
+            if r in _roles.ROLES and store.machine(mid):
+                c["machines"][mid] = r
+        store.kv_set(_roles.KEY, c)
+        return _roles.show(sessions)
+
     @app.get("/api/skills", dependencies=[Depends(auth)])
     async def get_skills():
         from agent_runtime import skills as _skills

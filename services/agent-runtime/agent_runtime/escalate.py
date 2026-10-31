@@ -93,9 +93,28 @@ def is_look(tool: str, args: Optional[dict] = None) -> bool:
 
 
 def blocked_hint(text: str) -> str:
-    """The wall's own words ('刷新验证码', 'captcha') when text shows one, else ''."""
-    m = BLOCKED.search(text or "")
-    return m.group(0) if m else ""
+    """The wall's own words ('刷新验证码', 'captcha') when text shows one, else ''.
+    aiw-fix-1: a negated mention ("当前无弹窗或验证码", "no captcha") is not a wall."""
+    t = text or ""
+    for m in BLOCKED.finditer(t):
+        pre = re.split(r"[。；;\n!！?？]", t[max(0, m.start() - 14):m.start()])[-1]
+        if re.search(r"无|没有|未|不|并非|no\b|not\b|without", pre, re.I):
+            continue
+        return m.group(0)
+    return ""
+
+
+# aiw-fix-1: only these tools show a web page / the screen; shell stdout, file contents (a sing-box config with a
+# "recaptcha" rule set, a script) and the vision text of a tab the task never used are not a captcha wall
+PAGE_TOOLS = {"screenshot", "click", "double_click", "right_click", "type", "keypress", "scroll", "drag", "move",
+              "click_element", "open_app"}
+NAV_TOOLS = {"bos_navigate", "browser_open", "browser_navigate"}
+RELOAD_TOOLS = NAV_TOOLS | {"bos_tabs"}
+
+
+def page_tool(tool: str) -> bool:
+    t = str(tool or "")
+    return t in PAGE_TOOLS or t.startswith(("bos_", "browser_"))
 
 
 class Stall:
@@ -106,28 +125,39 @@ class Stall:
         self.blocked = ""        # the wall's wording, while it is on the page
         self.blocked_looks = 0
         self.nudged = False
+        self.handled = set()     # aiw-fix-1: walls the user already cleared on this page
 
-    def reset(self):
+    def reset(self, handled: bool = False):
+        keep = set(getattr(self, "handled", set()))
+        if handled and self.blocked:
+            keep.add(self.blocked.lower())
         self.__init__()
+        self.handled = keep
 
     def feed(self, tool: str, args: Optional[dict], result_text: str = "") -> Optional[str]:
         """After each step: None, 'nudge' (tell the model) or 'blocked' / 'stall' (ask the user)."""
-        hint = blocked_hint(result_text) if result_text else ""
+        if tool in NAV_TOOLS:          # a new page: a wall there is a new one
+            self.handled = set()
+        on_page = page_tool(tool)
+        hint = blocked_hint(result_text) if (result_text and on_page) else ""
+        if hint and hint.lower() in self.handled:
+            hint = ""
         if hint:
             self.blocked = hint
         if is_look(tool, args):
             self.looks += 1
-            if self.blocked:
+            if self.blocked and on_page:
                 self.blocked_looks += 1
         else:
             # a real action; reloading / reopening the same wall page does not count as getting past it
-            if tool not in ("bos_navigate", "bos_tabs", "browser_open", "browser_navigate") or not self.blocked:
+            if tool not in RELOAD_TOOLS or not self.blocked:
                 self.looks = 0
                 self.nudged = False
             if tool == "bos_act" and not hint:
                 self.blocked, self.blocked_looks = "", 0
-            elif self.blocked and tool != "bos_act":   # reloading / reopening the wall page
+            elif self.blocked and tool in RELOAD_TOOLS:   # reloading / reopening the wall page
                 self.blocked_looks += 1
+            # shell / files / other non-page work never counts as looking at the wall
         if self.blocked and self.blocked_looks >= BLOCKED_LOOKS:
             return "blocked"
         if self.looks >= STALL_ESCALATE:

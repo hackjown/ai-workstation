@@ -311,7 +311,8 @@ class SessionManager:
                 mname = (self.store.machine(row["machine_id"]) or {}).get("name")
                 resume = _cont.resume_block(self.store, row, mname)
                 plan = _cont.last_plan([r for r in self.store.continuations(row["continues"]) if r["id"] != row["id"]])
-                if plan and (self.store.kv_get(f"task_run:{row['id']}", {}) or {}).get("mode") != "edit":
+                if (plan and (self.store.kv_get(f"task_run:{row['id']}", {}) or {}).get("mode") != "edit"
+                        and "用户补充：" not in (run_prompt or "")):   # aiw-fix-1: new words get a new plan
                     self.store.kv_set(f"task_seed_plan:{row['id']}", plan)
             except Exception as e:  # noqa: BLE001  a broken history never blocks the run
                 log.warning("resume context: %s", e)
@@ -730,6 +731,11 @@ class SessionManager:
                     hold = cloud.hold(task.machine_id)
                     computer = self.computer(task.machine_id)   # a restarted agent means a fresh connection
                 sx = system_extra
+                if not cleanup:   # skills an earlier task installed on this computer (cached 5 min per computer)
+                    try:
+                        sx += await self._installed_skills(task, computer)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("installed skills: %s", e)
                 can_dispatch = not parent_id and not cleanup and len(self.store.machines()) > 1
                 if can_dispatch:
                     try:
@@ -761,6 +767,10 @@ class SessionManager:
                         sx += (f"\nTHIS COMPUTER: home folder {home}, workspace {home}/workspace (uploads in "
                                f"{home}/workspace/uploads). Write paths as ~/workspace/... or $HOME/workspace/... "
                                "(Python: os.path.expanduser). Never write /home/user/... or any other guessed home.")
+                    try:   # 3.9.0: the skills this task uses are checked, and installed when missing, before it starts
+                        sx += await self._skill_preflight(task, computer, emit, sid)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("skill preflight: %s", e)
                     llm, routed = self._task_llm(task.prompt)
                     if routed:
                         await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": f"视频任务，改用视频模型 {routed}"}))
@@ -979,6 +989,70 @@ class SessionManager:
         for ws in dead:
             live.subscribers.discard(ws)
 
+    async def _installed_skills(self, task: Task, computer) -> str:
+        from agent_runtime import skills as _skills
+        cache = self.__dict__.setdefault("_skill_cache", {})
+        hit = cache.get(task.machine_id)
+        fresh = bool(re.search(r"skill|技能", task.prompt or "", re.I))   # an install task re-reads the list
+        if hit and not fresh and time.time() - hit[0] < 300:
+            items = hit[1]
+        else:
+            r = await computer.execute("shell.exec", {"command": _skills.INSTALLED_PROBE, "timeout": 15}, observe=False, timeout=25)
+            res = getattr(r, "result", None)
+            items = _skills.parse_installed(str((res if isinstance(res, dict) else {}).get("stdout") or ""))
+            cache[task.machine_id] = (time.time(), items)
+        b = _skills.installed_brief(items, task.prompt)
+        return ("\n" + b) if b else ""
+
+    async def _skill_preflight(self, task: Task, computer, emit, sid: str) -> str:
+        """Check each skill the task uses on its computer; run the setup of a missing one (AIW_SKILL_SETUP_TIMEOUT,
+        default 900 s). Returns a note for the agent. AIW_SKILL_PREFLIGHT=0 leaves it all to the agent as before."""
+        if os.environ.get("AIW_SKILL_PREFLIGHT", "1") == "0":
+            return ""
+        from agent_runtime import skills as _skills
+        items = _skills.preflight(task.prompt, self.store.kv_get("skills_custom", []) or [])
+        if not items:
+            return ""
+        limit = float(os.environ.get("AIW_SKILL_SETUP_TIMEOUT", "900") or 900)
+
+        async def sh(cmd: str, t: float):
+            r = await computer.execute("shell.exec", {"command": cmd, "timeout": int(t)}, observe=False, timeout=t + 30)
+            res = getattr(r, "result", None)
+            res = res if isinstance(res, dict) else {}
+            code = res.get("exit_code", res.get("returncode", 0 if getattr(r, "success", False) else 1))
+            return (code == 0 and bool(getattr(r, "success", True))), str(res.get("stdout") or "") + str(res.get("stderr") or "")
+
+        notes, installed = [], False
+        for it in items:
+            ok, _ = await sh(it["check"], 20)
+            if ok:
+                notes.append(f"{it['id']}: installed")
+                continue
+            if not it["setup"]:
+                notes.append(f"{it['id']}: NOT installed and has no setup command; tell the user it is missing")
+                continue
+            await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": f"这台电脑还没装 {it['title']}，先安装（只装这一次）…"}))
+            ok, out = await sh(f"({it['setup']}) 2>&1 | tail -40", limit)
+            ok = (await sh(it["check"], 20))[0]   # installed is what the check says, whatever the setup printed
+            installed = installed or ok
+            await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE,
+                                  data={"text": f"{it['title']} 已装好" if ok else f"{it['title']} 自动安装没成功，交给 Agent 处理"}))
+            notes.append(f"{it['id']}: was missing, the system just installed it" if ok else
+                         f"{it['id']}: missing; the system ran `{it['setup']}` and it FAILED (last output: "
+                         f"{' '.join(out.split())[-400:]}). Fix the install once, or tell the user what blocks it")
+        if installed:
+            self.forget_installed_skills(task.machine_id)
+        return ("\nSKILL CHECK (done by the system on this computer before you started; do not check or install "
+                "these again): " + "; ".join(notes) + ".")
+
+    def forget_installed_skills(self, machine_id: Optional[str] = None):
+        """A task that installed a skill makes the next task re-read the list."""
+        cache = self.__dict__.setdefault("_skill_cache", {})
+        if machine_id:
+            cache.pop(machine_id, None)
+        else:
+            cache.clear()
+
     # ------------------------------------------------------------------ dispatch (several computers at once)
     async def _probe(self, mid: str, timeout: float = 5.0) -> bool:
         c = self._health.get(mid)
@@ -1026,7 +1100,13 @@ class SessionManager:
                 ok = await self._probe(mid, probe_timeout)
                 info.update(state="online" if ok else "offline", available=ok)
             return info
-        return list(await asyncio.gather(*(one(m) for m in self.store.machines())))
+        out = list(await asyncio.gather(*(one(m) for m in self.store.machines())))
+        try:   # aiw-roles-1: each cloud computer's role; the local VM stays out of shared work
+            from . import roles as _roles
+            out = _roles.annotate(self, out)
+        except Exception as e:  # noqa: BLE001
+            log.warning("roles: %s", e)
+        return out
 
     def children_view(self, task_id: str) -> list[dict]:
         out = []
@@ -1061,6 +1141,11 @@ class SessionManager:
         ptask = parent.task
         own = ptask.machine_id
         roster = await self.roster()
+        try:   # aiw-roles-1: an 'auto' piece goes to the computer whose role fits it
+            from . import roles as _roles
+            items = _roles.place_auto(self, [dict(it) for it in items])
+        except Exception as e:  # noqa: BLE001
+            log.warning("roles: %s", e)
         plan = _place(items, roster, own)
         names = {m["id"]: m["name"] for m in roster}
         kids: list[dict] = []
@@ -1310,13 +1395,15 @@ def roster_text(roster: list[dict], own: str) -> str:
               "busy with another task (work sent there waits in its queue)" if m.get("busy_task") else
               "asleep, woken automatically when given work" if m.get("asleep") and m.get("available") else
               "online, idle" if m.get("available") else f"{m.get('state') or 'offline'}, not usable now")
-        lines.append(f"- {m['id']} 「{m['name']}」 {m['kind']} · {st}")
+        role = f" · 角色：{m['role_title']}" if m.get("role_title") else ""   # aiw-roles-1
+        lines.append(f"- {m['id']} 「{m['name']}」 {m['kind']}{role} · {st}")
     usable = sum(1 for m in roster if m.get("available") or m["id"] == own)
     return ("COMPUTERS (this task runs on " + own + "; hand work to them with `dispatch`):\n" + "\n".join(lines) + "\n"
             "When the request has independent pieces that can run at the same time (several topics, sites, files, "
             "clients, tests or machines) or the user asks for parallel work (同时 / 并行 / 分头 / 多台电脑 / 每台电脑), "
             "call `dispatch` once with one item per piece instead of doing them one by one, then combine what comes back "
-            "into one answer (merge files if one file was asked for). Keep dependent steps, quick answers and small "
+            "into one answer (merge files if one file was asked for). Give each piece to the computer whose 角色 fits it "
+            "(name its id in `machine`; aiw-roles-1). Keep dependent steps, quick answers and small "
             "single jobs to yourself."
             + ("" if usable > 1 else " Only this computer is usable right now: dispatch would run the pieces one "
                "after another here, so do the work yourself unless the pieces are big and separate."))

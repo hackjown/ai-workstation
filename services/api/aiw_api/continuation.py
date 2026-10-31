@@ -189,6 +189,11 @@ def resume_block(store, row: dict, machine_name: Optional[str] = None) -> str:
         done = set(plan["done"])
         parts.append("PLAN SO FAR ([x] = done):\n" + "\n".join(
             f"[{'x' if i in done else ' '}] {i}. {s}" for i, s in enumerate(plan["steps"])))
+    new_words = (row.get("prompt") or "").strip()
+    if mode != "edit" and new_words and not re.fullmatch(r"[（(]?继续[^\n]{0,20}", new_words):
+        parts.append("THIS RUN'S GOAL (aiw-fix-1): " + _short(new_words, 600) + "\nThe ORIGINAL REQUEST was handled by the "
+                     "earlier runs: do not clone, install or set up again what STEPS ALREADY DONE / the files in "
+                     "~/workspace show is there (check with one ls), and do not tick plan items you did not do in this run.")
     st = prev.get("status")
     res = _short(prev.get("result") or "", 600)
     parts.append(f"LAST RUN ENDED: {st}" + (f" — {res}" if res else ""))

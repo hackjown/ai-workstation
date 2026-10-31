@@ -1074,15 +1074,30 @@ class Chat:
             return [self.bump(card["id"])]
         card = self.add("assistant", "task", title, {
             "task_id": t["id"], "thread_id": res.get("thread_id") or t.get("thread_id"), "session_id": t.get("session_id"),
-            "machine_id": t.get("machine_id"), "title": title, "status": st2, "status_line": "接着做 · " + STATUS_CN.get(st2, st2),
+            "machine_id": t.get("machine_id"), "machine_name": self._machine_label(t.get("machine_id")),
+            "title": title, "status": st2, "status_line": "接着做 · " + STATUS_CN.get(st2, st2),
             "step": 0, "continues": c["root"], "root_id": c["root"], "card": CARD_V, "started_at": time.time(),
             "origin": (user or {}).get("id")}, task_id=t["id"])
         return [card]
 
     # ------------------------------------------------------------------ tasks from the chat
+    def _machine_label(self, mid: Optional[str]) -> str:
+        """The computer a task card runs on, with its role (aiw-roles-1), for web and iOS alike."""
+        try:
+            from . import roles as _roles
+            return _roles.label(self.sessions, mid)
+        except Exception:  # noqa: BLE001
+            return mid or ""
+
     async def start_task(self, prompt: str, title: str = "", machine_id: Optional[str] = None,
                          attachments: Optional[list] = None, origin: Optional[str] = None, source: str = "chat") -> dict:
         prompt = (prompt or "").strip()
+        if source == "chat":   # aiw-roles-1: a new task goes to the computer whose role fits it
+            try:
+                from . import roles as _roles
+                machine_id = _roles.pick(self.sessions, prompt, machine_id) or machine_id
+            except Exception as e:  # noqa: BLE001
+                log.warning("roles: %s", e)
         attachments = await self._push_files(attachments or [], machine_id)
         vm = [a.get("vm_path") for a in attachments if a.get("vm_path")]
         if vm:
@@ -1099,7 +1114,8 @@ class Chat:
         st = t.get("status") or ("queued" if res.get("queued") else "running")
         card = self.add("assistant", "task", title, {
             "task_id": t["id"], "thread_id": res.get("thread_id") or t.get("thread_id"), "session_id": t.get("session_id"),
-            "machine_id": t.get("machine_id"), "title": title, "status": st, "status_line": STATUS_CN.get(st, st),
+            "machine_id": t.get("machine_id"), "machine_name": self._machine_label(t.get("machine_id")),
+            "title": title, "status": st, "status_line": STATUS_CN.get(st, st),
             "step": 0, "max_steps": t.get("max_steps"), "origin": origin, "card": CARD_V, "root_id": t.get("continues") or t["id"],
             "prompt": one_line(SKILL_RE.sub("", prompt), 120), "started_at": time.time() if st != "queued" else None,
             "actions": []}, task_id=t["id"])

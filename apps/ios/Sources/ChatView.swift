@@ -227,6 +227,11 @@ struct ChatView: View {
     init(threadId: String?, fromParent: Bool = false, onThread: @escaping (String) -> Void = { _ in }) {
         _m = StateObject(wrappedValue: ChatModel(threadId)); self.onThread = onThread; self.fromParent = fromParent
     }
+    /// aiw-roles-1: the computer the latest run in this conversation uses; the desktop pane follows it.
+    var taskMachine: String? {
+        let mid = m.tasks.last(where: { !$0.s("machine_id").isEmpty })?.s("machine_id") ?? ""
+        return mid.isEmpty || mid == "<null>" ? nil : mid
+    }
     var liveSession: String? {
         guard let t = m.tasks.last(where: { isLive($0.s("status")) }), !t.s("session_id").isEmpty else { return nil }
         return t.s("session_id")
@@ -276,7 +281,7 @@ struct ChatView: View {
                 composer
                     .reportsComposerTop()
             }
-            .safeAreaInset(edge: .top, spacing: 0) { DesktopPane(liveSession: liveSession, onChange: { await m.load() }) }
+            .safeAreaInset(edge: .top, spacing: 0) { DesktopPane(liveSession: liveSession, onChange: { await m.load() }, follow: taskMachine) }
             .onPreferenceChange(ComposerTopKey.self) { pin.composer($0) }
         }
         .navigationTitle(m.threadId == nil ? "新对话" : cleanTitle(m.title))

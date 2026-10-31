@@ -113,8 +113,9 @@ class AgentLoop:
         if self._video_task and re.search(r"huashu-motion|\bom\s|讲解|explainer", task.prompt or ""):
             self.history.append(_video.brief(task.prompt))
         self._video_rejects = 0
-        self._desktop_free = (not self._cad_task and not _GUI_TASK.search(task.prompt or "")
+        self._desktop_free = (not self._cad_task and not _GUI_TASK.search(_gui_text(task.prompt or ""))
                               and os.environ.get("AIW_ALWAYS_LOOK_FIRST", "0") != "1")
+        self._gui_used = False   # aiw-fix-1: True once the task touches the screen or a browser
         self._images_read: dict[str, tuple] = {}  # path -> (step, description, question): history keeps only ~25 steps
         self.step = 0
         self.ask, self.remember = ask, remember
@@ -412,7 +413,8 @@ class AgentLoop:
                                                        getattr(self, "_last_page", None)))
         if plan_job and not plan_job.done():
             plan_job.cancel()
-        if self.task.status == TaskStatus.SUCCEEDED and self.plan_steps and len(self.plan_done) < len(self.plan_steps):
+        if (self.task.status == TaskStatus.SUCCEEDED and self.plan_steps and len(self.plan_done) < len(self.plan_steps)
+                and os.environ.get("AIW_PLAN_AUTOTICK", "0") == "1"):   # aiw-fix-1: only what was really done is ticked
             self.plan_done = set(range(len(self.plan_steps)))
             await self.emit(EventType.PLAN_UPDATE, done=sorted(self.plan_done), note=None)
         ev = {TaskStatus.SUCCEEDED: EventType.TASK_FINISHED}.get(self.task.status, EventType.TASK_FAILED)
@@ -504,7 +506,11 @@ class AgentLoop:
 
     async def _plan(self):
         try:
-            steps = await make_plan(self.llm, self.task.prompt, self.task.context)
+            p = self.task.prompt or ""
+            m = re.search(r"【接着上次继续做】\s*用户补充[:：]\s*(.+)$", p, re.S)
+            if m and m.group(1).strip():   # aiw-fix-1: a continuation plans the new words; earlier runs did the rest
+                p = "（接着上次的任务：之前的部分已完成，不要重新规划克隆/安装等已做过的步骤）\n" + m.group(1).strip()
+            steps = await make_plan(self.llm, p, self.task.context)
         except Exception:  # noqa: BLE001
             return
         if self.task.status == TaskStatus.RUNNING and steps:
@@ -598,6 +604,12 @@ class AgentLoop:
             first_blind = (self.step == 1 and (self._desktop_free or getattr(self, "_dphase", None) is not None)
                            and not self.control.resumed_after_takeover)   # a drawing reads files, not the desktop
             blind = blind or first_blind
+            # aiw-fix-1: a desktop-free task that has not touched the screen keeps working blind - also after
+            # ask_user / a plan update - so no screenshot and no vision call until it uses a GUI/browser tool
+            if (self.step > 1 and self._desktop_free and not getattr(self, "_gui_used", False)
+                    and not self.control.resumed_after_takeover
+                    and os.environ.get("AIW_VISION_ON_DEMAND", "1") != "0"):
+                blind = True
             # a CAD batch that went through needs no fresh look (screenshot + vision cost ~15 s a step);
             # look again every 4th batch so a drawing error is still caught
             if (self._last_tool == "cad_command" and self._last_ok_cad and self.step > 1
@@ -835,6 +847,9 @@ class AgentLoop:
                 continue
             self._page_click(decision)
             self._last_tool = decision.tool
+            if (decision.tool and decision.tool not in _NO_SCREEN_TOOLS and decision.tool not in _NON_GUI_TOOLS
+                    and not str(decision.tool).startswith(("ext_", "mcp_"))):
+                self._gui_used = True   # aiw-fix-1
             await self.emit(EventType.ACTION, tool=decision.tool, args=decision.args)
             if decision.tool in _vg.TOOLS and _vg.is_open(self):   # 3.8.8: vision service down, don't call it
                 n = await _vg.gate(self, decision)
@@ -1294,7 +1309,9 @@ class AgentLoop:
         Returns the note to continue with, or None when the task has ended (stopped by the user, nobody answered,
         or nobody can be asked) - always with a full report as the result. See escalate.py."""
         # a drawing task never opened a page: do not quote whatever tab the browser had open (task-41c showed JD)
-        page = await self._page_now() if (getattr(self, "_last_page", None) or not self._cad_task) else {}
+        # aiw-fix-1: nor does a shell/file task that never touched the screen (a leftover JD tab is not its page)
+        page = await self._page_now() if (getattr(self, "_last_page", None) or
+                                          (not self._cad_task and getattr(self, "_gui_used", True))) else {}
         stall = getattr(self, "_stall", None) or _es.Stall()
         self._stall = stall
         blocked = stall.blocked or ("验证" if kind == "blocked" else "")
@@ -1317,7 +1334,7 @@ class AgentLoop:
                                              f"页面出现「{blocked}」验证，Aiw 过不去，需要你来完成")
             self.history.append(f"{self.step}. request_takeover(auto: {blocked}) -> {r}")
             if r.startswith("the user handled it"):
-                stall.reset()
+                stall.reset(handled=True)   # aiw-fix-1: the same wall on the same page is not raised again
                 return ("The user completed the verification on the desktop. Re-read the page now (bos_snapshot of the page "
                         "you were on) and continue the task from there.")
         q = _es.question(kind, detail, page, blocked)
@@ -1357,7 +1374,7 @@ class AgentLoop:
                 self._time_up = False
             self._mark_progress()
             self._rep, self._prev_sig = 0, None
-            stall.reset()
+            stall.reset(handled=(kind == "blocked"))   # aiw-fix-1
             hint = "" if reply in (_es.OPT_RETRY, _es.OPT_FIXED, None) else f" The user said: {reply!r}. Follow it."
             self.history.append(f"{self.step}. (asked the user: {_es.KIND_TEXT.get(kind, kind)}; they chose to go on)")
             return (f"You were stuck ({kind}: {str(detail)[:200]}). The user wants you to continue.{hint} Do NOT repeat what "
@@ -2501,6 +2518,22 @@ _GUI_TASK = re.compile(
     r"填写|表单|上网|搜索|百度|谷歌|google|bing|淘宝|京东|微信|小红书|抖音|b站|bilibili|youtube|"
     r"https?://|www\.|\.com\b|\.cn\b|librecad|gimp|inkscape|libreoffice|wps|photopea|vs ?code|应用|软件里|app\b|"
     r"\bopen\b|\bclick\b|\bbrowse|\bwebsite|\bdesktop|\bscreen|\blog ?in\b|\bsign ?in\b|\bsearch\b", re.I)
+_GIT_URL = re.compile(r"https?://(?:www\.)?(?:github\.com|gitee\.com|gitlab\.com|raw\.githubusercontent\.com|codeberg\.org)/\S*", re.I)
+
+
+def _gui_text(prompt: str) -> str:
+    """aiw-fix-1: the words that decide whether a task needs the desktop. A git URL to clone/install is not a web
+    page to open, and a continuation is judged by the user's new words, not the original (already done) request."""
+    p = prompt or ""
+    m = re.search(r"【接着上次继续做】\s*用户补充[:：]\s*(.+)$", p, re.S)
+    if m and m.group(1).strip():
+        p = m.group(1)
+    return _GIT_URL.sub(" ", p)
+
+
+_NON_GUI_TOOLS = {"ask_user", "update_plan", "remember", "done", "fail", "wait", "request_takeover"}
+
+
 _VIDEO_TASK = re.compile(r"视频|讲解片|宣传片|发布片|动画片|动效|huashu-motion|\bvideo\b|\.mp4\b|explainer", re.I)
 _IMAGE_TASK = re.compile(r"\.(png|jpe?g|webp|heic|bmp)\b.*|图片|照片|效果图|P图|修图|改图", re.I | re.S)
 

@@ -178,7 +178,7 @@
 .htok { display:inline-flex; align-items:center; gap:4px; background:#2a1d08; border:1px solid var(--h-amber); color:var(--h-hl); font-size:13px; font-weight:600;
   border-radius:12px; padding:3px 5px 3px 9px; white-space:nowrap; }
 .htok button { border:0; background:none; color:var(--h-hl); cursor:pointer; font-size:15px; line-height:1; padding:0 3px; }
-#hSendBtn.stop { background:#333; animation:none; } #hSendBtn.stop svg { fill:var(--h-amber); stroke:var(--h-amber); }
+/* 3.9.0: the home chat stop button is the task composer's (amber + pulse, dark square) — see the end of this file */
 .attachments .chip.up { opacity:.85; } .hpct { font-size:11px; font-weight:700; color:var(--acc); margin-left:4px; }
 
 /* "/" skill picker, above the input */
@@ -355,3 +355,9 @@ html[data-theme=light] .hhist { background:#fff; color:#b8680c; border-color:rgb
 .hrow:not(.u) > .hdel { right:0; }
 @media (hover:hover) { .hrow:hover > .hdel { display:block; } }
 .hrow.hdel-on > .hdel { display:block; }
+
+/* 3.9.0 send / stop, one look on the home chat and inside a task: amber circle, pulse, a dark square of normal size
+   (the 10/24 square was drawn in a 14 px icon = 6 px, lost in a 40 px button; 28 px icon = a ~13 px rounded square). */
+.send.stop, #hSendBtn.stop { background:var(--acc); color:#141414; animation:sendPulse 1.8s ease-out infinite; }
+.send.stop svg, #hSendBtn.stop svg { width:28px; height:28px; fill:#141414; stroke:#141414; stroke-width:1.5; stroke-linejoin:round; }
+@media (prefers-reduced-motion:reduce) { .send.stop, #hSendBtn.stop { animation:none; box-shadow:0 0 0 3px var(--accLine); } }

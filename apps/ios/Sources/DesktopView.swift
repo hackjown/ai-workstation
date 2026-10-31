@@ -12,6 +12,7 @@ struct DesktopPane: View {
     @EnvironmentObject var api: API
     let liveSession: String?          // session of the task running in this thread, if any
     let onChange: () async -> Void
+    var follow: String? = nil         // aiw-roles-1: the computer this conversation's task runs on; picked when it changes
     @State private var open = false
     @State private var image: UIImage?
     @State private var note = ""
@@ -63,7 +64,11 @@ struct DesktopPane: View {
         }
         .background(.bar)
         .overlay(Divider(), alignment: .bottom)
-        .onAppear { if liveSession != nil { open = true } }
+        .onAppear {
+            if liveSession != nil { open = true }
+            if let f = follow, f != api.machine { pick(f) }
+        }
+        .onChange(of: follow) { f in if let f = f, f != api.machine { pick(f) } }
         .task { machines = (try? await api.list("/api/machines")) ?? [] }
         .onReceive(NotificationCenter.default.publisher(for: .aiwMachinesChanged)) { _ in
             Task { machines = (try? await api.list("/api/machines")) ?? [] }

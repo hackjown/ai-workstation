@@ -118,6 +118,9 @@ struct TaskCardHead: View {
                     Text(jstr(d, "prompt")).font(.caption).foregroundColor(.secondary).lineLimit(1)
                 }
                 CardSubLine(msg: msg).foregroundColor(cardAccent(tone, cs))
+                if !d.s("machine_name").isEmpty {   // aiw-roles-1: the computer (and its role) this task runs on
+                    Label(d.s("machine_name"), systemImage: "desktopcomputer").font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                }
                 if isLive(st) { CardProgress(frac: frac(d, st), tone: tone).padding(.top, 3) }
             }
             Spacer(minLength: 4)

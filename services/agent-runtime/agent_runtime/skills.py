@@ -211,13 +211,91 @@ def auto(prompt: str) -> list[str]:
     return [s["id"] for s in CATALOG if s.get("auto") and re.search(s["auto"], text, re.I)]
 
 
+GIT_SKILL = re.compile(r"https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?=[/\s#?]|[^\x00-\x7f]|$)")
+
+
+def git_skills(prompt: str) -> list[tuple]:
+    """aiw-fix-1: skill repos named by URL ("安装 https://github.com/linkease/kai-skills 这个skill")."""
+    if not re.search(r"skill|技能", prompt or "", re.I):
+        return []
+    out: list[tuple] = []
+    for m in GIT_SKILL.finditer(prompt or ""):
+        if (m.group(1), m.group(2)) not in out:
+            out.append((m.group(1), m.group(2)))
+    return out
+
+
+# Skills already installed on a computer (npx skills add / git clone into ~/.claude/skills ...). Read from the computer
+# itself at the start of a task, so a skill installed by an earlier task is known to every later one (the analysis of
+# task-c987469146: kai-skills was installed, yet the next run hand-wrote paramiko scripts and grepped for credentials).
+INSTALLED_PROBE = (
+    'for d in "$HOME/.claude/skills" "$HOME/.workbuddy/skills" "$HOME/.agents/skills"; do '
+    '[ -d "$d" ] && find -L "$d" -maxdepth 3 -name SKILL.md 2>/dev/null; done | sort -u | head -60 | '
+    'while IFS= read -r f; do '
+    'n=$(sed -n "s/^name:[[:space:]]*//p" "$f" | head -1); '
+    'ds=$(sed -n "s/^description:[[:space:]]*//p" "$f" | head -1 | cut -c1-180); '
+    'printf "SKILL|%s|%s|%s\n" "$f" "$n" "$ds"; done'
+)
+
+
+def parse_installed(stdout: str) -> list[dict]:
+    out, seen = [], set()
+    for line in (stdout or "").splitlines():
+        if not line.startswith("SKILL|"):
+            continue
+        parts = line.split("|", 3) + ["", "", ""]
+        path, name, desc = parts[1].strip(), parts[2].strip().strip("'\""), parts[3].strip().strip("'\"")
+        if not path:
+            continue
+        name = name or path.rstrip("/").split("/")[-2]
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append({"name": name, "path": path, "desc": desc})
+    return out
+
+
+def installed_brief(items: list[dict], prompt: str = "", limit: int = 3000) -> str:
+    """System-prompt block naming the skills installed on this computer; the ones the request's words touch come first."""
+    if not items:
+        return ""
+    words = {w for w in re.findall(r"[a-z0-9][a-z0-9_.-]{2,}|[\u4e00-\u9fff]{2,}", (prompt or "").lower())}
+
+    def hit(it: dict) -> int:
+        text = (it["name"] + " " + it["desc"] + " " + it["path"]).lower()
+        return sum(1 for w in words if w in text)
+
+    items = sorted(items, key=lambda it: -hit(it))
+    lines = ["SKILLS INSTALLED ON THIS COMPUTER (an earlier task installed them; never clone or install them again). "
+             "When one fits the job, read its SKILL.md first and use its own scripts/commands and the connection details "
+             "it documents instead of writing your own code or searching old scripts for credentials:"]
+    size = len(lines[0])
+    for it in items:
+        ln = f"- {it['name']}: {it['desc'][:180] or '(no description)'} ({it['path']})"
+        if size + len(ln) > limit:
+            lines.append(f"- … {len(items) - len(lines) + 1} more under ~/.claude/skills")
+            break
+        lines.append(ln)
+        size += len(ln)
+    return "\n".join(lines)
+
+
 def brief(prompt: str, custom: Optional[list[dict]] = None) -> str:
     names = picked(prompt)
     names += [n for n in mentioned(prompt, custom) if n.lower() not in [x.lower() for x in names]]
     names += [n for n in auto(prompt) if n.lower() not in [x.lower() for x in names]]
-    if not names:
+    gh = git_skills(prompt)
+    if not names and not gh:
         return ""
     lines = ["The user picked these skills for this task; use them instead of improvising:"]
+    for owner, repo in gh:
+        lines.append(
+            f"- {repo} (skill repo github.com/{owner}/{repo}): FIRST check whether it is already installed: "
+            f"`find ~/.claude/skills ~/.workbuddy/skills ~/.agents/skills ~/workspace/{repo} -maxdepth 3 -name SKILL.md 2>/dev/null`. "
+            "If its skills are there, do NOT clone or install it again (an earlier run may have done it): read the SKILL.md "
+            "files that fit the job and use that skill's own scripts/commands for the work instead of writing your own "
+            "(say in the summary which skill you used). Only if nothing is there: "
+            f"`npx -y skills add {owner}/{repo} -g -a claude-code -s '*' -y --copy`, once, then list what it installed.")
     for n in names:
         s = _find(n, custom or [])
         if not s:
@@ -236,6 +314,39 @@ def brief(prompt: str, custom: Optional[list[dict]] = None) -> str:
             line += ". " + s["note"]
         lines.append(line + ".")
     return "\n".join(lines)
+
+
+# 3.9.0 pre-flight: before the agent starts, the system checks each skill the task uses and runs its setup when it
+# is missing, so the agent never starts by improvising an install (or skipping it). `check` exits 0 when installed.
+CHECKS = {
+    "officecli": "test -x ~/.local/bin/officecli && test -f ~/.workbuddy/skills/officecli/SKILL.md",
+    "librecad": "command -v librecad >/dev/null",
+    "photocraft": "command -v photocraft-cli >/dev/null || test -x ~/.local/bin/photocraft-cli",
+}
+
+
+def used(prompt: str, custom: Optional[list[dict]] = None) -> list[str]:
+    """Every skill a task uses: picked with "/" or "+", named in words, or needed by the request itself."""
+    names = picked(prompt)
+    names += [n for n in mentioned(prompt, custom) if n.lower() not in [x.lower() for x in names]]
+    names += [n for n in auto(prompt) if n.lower() not in [x.lower() for x in names]]
+    return names
+
+
+def preflight(prompt: str, custom: Optional[list[dict]] = None) -> list[dict]:
+    """[{id, check, setup}] for the skills this task uses that can be checked on the computer."""
+    out = []
+    for n in used(prompt, custom):
+        s = _find(n, custom or [])
+        if not s:
+            continue
+        sid = s.get("id") or n
+        check = s.get("check") or CHECKS.get(sid) or (f"test -f {s['path']}/SKILL.md" if s.get("path") else "")
+        if not check:
+            continue
+        setup = s.get("setup") or (f"npx -y skills add {s['source']} -g -a claude-code -s '*' -y --copy" if s.get("source") else "")
+        out.append({"id": sid, "title": s.get("title") or sid, "check": check, "setup": setup})
+    return out
 
 
 def listing(custom: Optional[list[dict]] = None) -> list[dict]:

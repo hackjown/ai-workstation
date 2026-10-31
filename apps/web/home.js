@@ -145,7 +145,7 @@ function hTaskCard(m) {
   const plan = pct && live ? `<div class="hc-bar"><i style="width:${Math.max(3, Math.min(100, Math.round(pct)))}%"></i></div>` : "";
   const step = d.step ? `第 ${d.step}${d.max_steps ? "/" + d.max_steps : ""} 步` : "";
   const sub = [d.status_line && d.status_line !== (STATUS_CN[st] || [])[0] && d.status_line !== (HTC_CHIP[st] || [])[0] ? d.status_line : "",
-    d.plan_total ? `${d.plan_done || 0}/${d.plan_total} 项` : "", step, hElapsed(d, m)].filter(Boolean);
+    d.plan_total ? `${d.plan_done || 0}/${d.plan_total} 项` : "", step, hElapsed(d, m), d.machine_name || ""].filter(Boolean);
   const tid = esc(d.task_id || m.task_id || "");
   const head = `<div class="htc-head" role="button" tabindex="0" onclick="hOpenTask('${m.id}')" onkeydown="if(event.key==='Enter')hOpenTask('${m.id}')">
     <div class="hc-ic">${live && st === "running" ? '<span class="spin"></span>' : st === "succeeded" ? icon("check") : icon("monitor")}</div>

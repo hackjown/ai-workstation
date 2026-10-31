@@ -125,6 +125,14 @@ function newThread() { S.threadId = null; S.thread = null; localStorage.removeIt
 async function openThread(id) {
   S.threadId = id; localStorage.setItem("aiw_thread", id);
   go("chat"); await refreshThread(true); loadDraft(); loadThreads();
+  followTaskMachine();
+}
+/* aiw-roles-1: tasks go to the computer whose role fits them, so the desktop pane shows the computer of the task you
+   opened (the latest run in this conversation), not whichever computer was picked last */
+function followTaskMachine() {
+  const ts = ((S.thread && S.thread.tasks) || []).filter((t) => t.machine_id && t.status !== "cancelled");
+  const mid = ts.length ? ts[ts.length - 1].machine_id : "";
+  if (mid && mid !== MID && (S.machines || []).some((m) => m.id === mid)) pickMachine(mid);
 }
 async function refreshThread(scroll) {
   if (!S.threadId) { S.thread = null; renderChat(); return; }

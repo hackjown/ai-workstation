@@ -18,10 +18,12 @@ install_dwg() {
   local deb="${ODA_URL_DEB:-${base}ODAFileConverter_QT6_lnxX64_11dll.deb}"
   local app="${ODA_URL_APPIMAGE:-${base}ODAFileConverter_QT6_lnxX64_11dll.AppImage}"
   if [ "$(uname -m)" != "x86_64" ]; then echo "ODA File Converter needs x86_64 (this is $(uname -m)); DWG export stays off"; return 0; fi
-  local SUDO=""; [ "$(id -u)" = "0" ] || { command -v sudo >/dev/null && sudo -n true 2>/dev/null && SUDO="sudo"; }
+  # v3.9.4: sudo that asks for a password is fine when a person runs this in a terminal (the local VM)
+  local SUDO=""; [ "$(id -u)" = "0" ] || { command -v sudo >/dev/null && { sudo -n true 2>/dev/null || [ -t 0 ]; } && SUDO="sudo"; }
   if [ -n "$SUDO" ] || [ "$(id -u)" = "0" ]; then
     $SUDO apt-get update -qq || true
-    $SUDO apt-get install -y -qq xvfb xauth libxkbcommon-x11-0 libxcb-cursor0 >/dev/null || true
+    $SUDO apt-get install -y -qq xvfb xauth libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
+      libxcb-render-util0 libxcb-xinerama0 libxcb-image0 libxcb-shape0 >/dev/null || true
     if curl -fsSL --retry 3 -o /tmp/oda.deb "$deb"; then
       $SUDO apt-get install -y -qq /tmp/oda.deb >/dev/null && echo "ODA File Converter installed (deb)" && return 0
     fi
@@ -32,6 +34,15 @@ install_dwg() {
   (cd "$HOME/tools" && rm -rf squashfs-root ODAFileConverter && ./ODAFileConverter.AppImage --appimage-extract >/dev/null \
      && mv squashfs-root ODAFileConverter)
   echo "ODA File Converter unpacked into $HOME/tools/ODAFileConverter (xvfb-run is used when there is no display)"
+  xvfb_check
+}
+
+xvfb_check() {
+  # ODA's Qt build ships only the xcb plugin: it needs an X server. Without a desktop session that is Xvfb.
+  if ! command -v xvfb-run >/dev/null; then
+    echo "!! xvfb-run is missing, so ODA cannot start without a desktop. Run:"
+    echo "   sudo apt-get install -y xvfb xauth libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-render-util0 libxcb-xinerama0"
+  fi
 }
 
 BASE="${AIW_RAW:-https://raw.githubusercontent.com/hackjown/ai-workstation/main}/skills/cad-drawing"
@@ -45,6 +56,6 @@ for f in SKILL.md drawkit.py drawauto.py drawtrace.py examples/xinda-g-108.spec.
   mv "$D/$f.tmp" "$D/$f"
 done
 chmod +x "$D/drawkit.py"
+if [ "${1:-}" = "dwg" ]; then install_dwg; fi   # v3.9.4: before ensure, so its dwg_works test sees the new converter
 python3 "$D/drawkit.py" ensure || echo "some dependencies are missing (see above); drawkit tries again on first use"
-[ "${1:-}" = "dwg" ] && install_dwg
 echo "cad-drawing installed in $D"

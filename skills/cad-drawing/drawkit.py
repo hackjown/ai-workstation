@@ -2125,7 +2125,9 @@ def _install_oda():
 def _oda_variants(exe):
     """v3.9.3: the ways to start ODA File Converter, most likely first. A desktop VM has a DISPLAY the agent may not
     be allowed to use, and Qt's offscreen plugin is missing from some builds, so each one is tried in turn."""
-    env = dict(os.environ)
+    # OpenCV (imported earlier in this process) points Qt at its own plugin folder: ODA must use its bundled one
+    env = {k: v for k, v in os.environ.items() if k not in ("QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH",
+                                                            "QT_QPA_FONTDIR", "LD_PRELOAD")}
     out = []
     xvfb = shutil.which("xvfb-run")
     if xvfb and os.environ.get("ODA_XVFB", "1") == "1":
@@ -2133,13 +2135,21 @@ def _oda_variants(exe):
         out.append(("xvfb-run", [xvfb, "-a", "-s", "-screen 0 1280x1024x24", exe], e))
     if env.get("DISPLAY"):
         out.append(("DISPLAY " + env["DISPLAY"], [exe], {k: v for k, v in env.items() if k != "QT_QPA_PLATFORM"}))
+    else:   # v3.9.4: an SSH shell or the agent service on a desktop VM: the desktop's own X server, when it lets us in
+        for n in sorted(Path("/tmp/.X11-unix").glob("X*")) if Path("/tmp/.X11-unix").is_dir() else []:
+            e = {k: v for k, v in env.items() if k != "QT_QPA_PLATFORM"}
+            e["DISPLAY"] = ":" + n.name[1:]
+            xa = Path.home() / ".Xauthority"
+            if xa.exists():
+                e.setdefault("XAUTHORITY", str(xa))
+            out.append(("DISPLAY " + e["DISPLAY"], [exe], e))
     out.append(("offscreen", [exe], {**env, "QT_QPA_PLATFORM": "offscreen"}))
     return out
 
 
 def _oda_run(exe, in_dir, out_dir, ver, typ, timeout=180, want=None):
     """Run the converter until `want` (the expected output file) appears. Returns (variant used, last stderr)."""
-    last = ""
+    last, tried = "", []
     for tag, pre, env in _oda_variants(exe):
         try:
             r = subprocess.run(pre + [str(in_dir), str(out_dir), ver, typ, "0", "1"], capture_output=True,
@@ -2152,7 +2162,10 @@ def _oda_run(exe, in_dir, out_dir, ver, typ, timeout=180, want=None):
         if want is None or (Path(want).exists() and Path(want).stat().st_size > 0):
             return tag, last
         last = f"[{tag}] {last or 'no output file, no message'}"
-    return None, last
+        tried.append(last[:220])
+    if not shutil.which("xvfb-run"):
+        tried.append("xvfb-run is not installed: sudo apt-get install -y xvfb xauth (ODA needs an X server)")
+    return None, " | ".join(tried)
 
 
 def export_dwg(dxf_path, version="ACAD2018"):

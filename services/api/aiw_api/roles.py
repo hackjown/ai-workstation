@@ -184,6 +184,20 @@ def pick(sessions, prompt: str, current: Optional[str]) -> Optional[str]:
 COOL_CHECK_S = 8          # how long the InstaBox state lookup may take before the cloud one is taken as available
 
 
+def _seconds_until(until) -> float:
+    """seconds until an ISO time (InstaBox cooldownUntil, UTC); 0 when absent, unreadable or past."""
+    from datetime import datetime, timezone
+    if not until:
+        return 0.0
+    try:
+        t = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return max(0.0, (t - datetime.now(timezone.utc)).total_seconds())
+    except ValueError:
+        return 0.0
+
+
 async def cooldown_left(sessions, mid: str) -> float:
     """Seconds an InstaBox computer still sits in its forced cooldown (after 8 h of running); 0 when it can run.
     A paused machine (30 idle minutes) is NOT cooling: the task wakes it as before."""
@@ -192,9 +206,8 @@ async def cooldown_left(sessions, mid: str) -> float:
         return 0.0
     try:
         import asyncio
-        from .cloud import _cooldown_left
         st = await asyncio.wait_for(cloud.state(mid, max_age=60), COOL_CHECK_S)
-        return _cooldown_left(st.get("cooldown_until"))
+        return _seconds_until(st.get("cooldown_until"))
     except Exception:  # noqa: BLE001  unknown means try it: wake() still says why when it cannot start
         return 0.0
 

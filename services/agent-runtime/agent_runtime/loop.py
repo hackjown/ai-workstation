@@ -83,6 +83,16 @@ class AgentLoop:
         self._drawkit_built = False    # the drawing in cad/ was generated from a spec (layout check bypassed)
         self._cad_task = self._cad_mode is not None
         self._cad_file: Optional[str] = None  # the DXF this task saves to (a revision edits it in place)
+        try:
+            from .skills import is_designer_task as _is_designer
+            self._designer_task = _is_designer(task.prompt or "")
+        except Exception:  # noqa: BLE001
+            self._designer_task = False
+        if self._designer_task and config is None:  # 3.9.8: recognise + check rounds + 8~15 min QA run
+            if self.cfg.max_steps > 0:
+                self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_HPD_MAX_STEPS", "300")))
+            if self.cfg.timeout_s > 0:
+                self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_HPD_TIMEOUT", "7200")))
         if self._cad_task and config is None:  # drawing a set in the GUI takes hundreds of steps
             if self.cfg.max_steps > 0:
                 self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400")))

@@ -117,7 +117,9 @@ def normalize_jd(url: str) -> str:
 
 def is_risk_limit(url: str, text: str = "") -> bool:
     """JD's risk-control page (活动火爆 请选购其他商品 我知道了): not a captcha, nothing the user can solve there."""
-    return "/common/limit.html" in (url or "") or any(t in (text or "")[:3000] for t in RISK_TEXT)
+    # v9: cfe.m.jd.com/privatedomain/risk_handler is JD's verify interstitial: the tab is redirected mid-read
+    return ("/common/limit.html" in (url or "") or "risk_handler" in (url or "")
+            or any(t in (text or "")[:3000] for t in RISK_TEXT))
 
 
 def jd_login_state(cookies: list, now: float | None = None) -> dict:
@@ -946,7 +948,11 @@ SIGNED_JS = r"""
 ROW_JS = r"""
 (sku => {
   const T = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
-  const links = [...document.querySelectorAll('a[href*="' + sku + '"], [data-sku="' + sku + '"], [data-skuid="' + sku + '"], [skuid="' + sku + '"], [data-id="' + sku + '"]')];
+  let links = [...document.querySelectorAll('a[href*="' + sku + '"], [data-sku="' + sku + '"], [data-skuid="' + sku + '"], [skuid="' + sku + '"], [data-id="' + sku + '"], img[src*="' + sku + '"]')];
+  if (!links.length) {   // v9: the new cart (React) keeps the sku in other attributes (data-*, id, key-like values)
+    for (const el of document.querySelectorAll('body *')) { if (el.children.length > 40) continue;
+      for (const at of el.attributes) { if (at.value && at.value.length < 400 && at.value.includes(sku)) { links.push(el); break; } }
+      if (links.length >= 6) break; } }
   const rows = [];
   for (const a of links) { let e = a, best = null;
     for (let i = 0; i < 9 && e && e !== document.body; i++, e = e.parentElement) { const t = T(e);
@@ -1346,14 +1352,33 @@ def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 
     own API answers that carry it. Read only: nothing is clicked there."""
     one = {"route": name, "asked_url": url}
     captured.clear()
-    try:
-        ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, cap(15, 3))
-    except Exception as e:  # noqa: BLE001
-        one["error"] = f"{type(e).__name__}: {e}"[:160]
+    err = None
+    for k in range(2):   # v9: the item page may still be redirecting (risk_handler): stop it, then navigate
+        try:
+            try:
+                ws.call("Page.stopLoading", {}, 3)
+            except Exception:  # noqa: BLE001
+                pass
+            ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, cap(12, 3))
+            err = None
+            break
+        except Exception as e:  # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"[:160]
+            time.sleep(1.0)
+    if err:
+        one["error"] = err
         return {"try": one, "price": None}
     end, snap = time.time() + cap(wait, 6), {}
+    n = 0
     while time.time() < end:
         time.sleep(1.2)
+        n += 1
+        if n > 2:   # v9: a long cart (100+ rows) renders rows lazily: scroll so this sku's row is drawn
+            try:
+                ws.eval("(()=>{window.scrollBy(0, innerHeight*1.5);for(const e of document.querySelectorAll('[class*=list],[class*=List],main'))"
+                        "{if(e.scrollHeight>e.clientHeight+50)e.scrollTop+=e.clientHeight*1.5;}return 1})()", 3)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             snap = json.loads(ws.eval(f"({ROW_JS})({json.dumps(sku)})", cap(6, 1)) or "{}")
         except Exception:  # noqa: BLE001
@@ -1390,7 +1415,7 @@ def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 
     return {"try": one, "price": None}
 
 
-ROUTE_MIN_S = {"cart": 20.0, "follow": 14.0}   # v8: a page route starts only with this much of the budget left
+ROUTE_MIN_S = {"cart": 24.0, "follow": 14.0}   # v8: a page route starts only with this much of the budget left
 
 
 def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool, signed_done: bool = False) -> dict:
@@ -1408,7 +1433,7 @@ def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool, si
             tries.append({"route": name, "skipped": "no_time", "price": False})
             continue
         st(name)
-        r = page_route(ws, name, url, sku, captured)
+        r = page_route(ws, name, url, sku, captured, wait=16 if name == "cart" else 10)
         tries.append(r["try"])
         if r["price"]:
             return {"alt": tries, "alt_price": r["price"]}

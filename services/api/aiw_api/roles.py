@@ -89,7 +89,7 @@ def label(sessions, mid: Optional[str]) -> str:
 
 # A skill the user picked decides the role before any keyword does (3.9.0).
 SKILL_ROLE = {"huashu-motion": "media", "video-remake": "media",
-              "huashu-design": "design", "librecad": "design", "cad-drawing": "design", "photocraft": "design",
+              "huashu-design": "design", "librecad": "design", "cad-drawing": "design", "house-plan-designer": "design", "photocraft": "design",
               "photopea": "design",
               "officecli": "office", "reverse-engineer-anything": "office", "dev": "office", "signup": "office",
               "xhs": "office"}

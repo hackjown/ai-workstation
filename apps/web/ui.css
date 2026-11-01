@@ -611,3 +611,12 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 
 /* 3.8.5: a 继续 / 修改 run of the task above */
 .chip.run-tag { font-size: 11px; padding: 1px 7px; margin-right: 4px; background: rgba(232,160,80,.18); color: var(--accent, #c87618); border-radius: 999px; }
+
+/* v3.9.7 运维主机行：地址不再压到「每条都确认」上 */
+.rw.rhost{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) auto}
+.rw.rhost .mach{min-width:0}
+.rw.rhost .mach>div{min-width:0;display:flex;flex-direction:column}
+.rw.rhost .mach .mono{font-size:12px;color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rw.rhost .v{align-items:flex-start}
+.rw.rhost .t{display:flex;gap:6px}
+@media (max-width:720px){.rw.rhost{grid-template-columns:1fr}.rw.rhost .t{justify-content:flex-start}}

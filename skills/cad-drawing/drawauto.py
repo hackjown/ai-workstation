@@ -479,6 +479,7 @@ def auto_spec(image, chains=None, transform=None, labels=None, use_ocr=True, tas
         raise ValueError("no pixel->mm transform: read the dimension chains first (drawing_read) and pass them with "
                          "--chains, or give --transform ax,bx,ay,by")
     spec["source"]["transform"] = {k: round(float(v), 6) for k, v in T.items() if k in ("ax", "bx", "ay", "by")}
+    spec["source"]["transform_note"] = "px = ax*mm + bx (mm -> image px); mm = (px - bx) / ax. free_labels accept at_px."
 
     def marks(sides):
         ms = set()
@@ -572,6 +573,7 @@ def auto_spec(image, chains=None, transform=None, labels=None, use_ocr=True, tas
         if c is None or c not in reg_of:
             info["warnings"].append(f"label {lab['name']} at ({lab['x']},{lab['y']}) px is outside every detected room")
             spec["uncertain"].append(f"标签「{lab['name']}」(像素 {lab['x']:.0f},{lab['y']:.0f}) 不在识别出的任何房间里，请核对该处墙线")
+            spec.setdefault("free_labels", []).append({"text": lab["name"], "at_px": [lab["x"], lab["y"]]})  # 3.9.6: never drop a name
             continue
         by_reg.setdefault(reg_of[c], []).append((lab, c))
     rooms = []
@@ -600,9 +602,12 @@ def auto_spec(image, chains=None, transform=None, labels=None, use_ocr=True, tas
             rooms.append({"id": rid("room"), "name": "房间?", "poly": poly, "confidence": "low", "auto": True})
             spec["uncertain"].append(f"房间 {poly_box(poly)} 没有读到文字标签：按原图补上名字")
             continue
+        groups = None
         if mode == "thick":
             groups = split_by_walls(cells, [c0 for _lb, c0 in lab], g, xs, ys)
-        else:      # faint ridge walls (a photo): coverage is too noisy to route by; nearest label (3.8.8)
+            if any(not groups.get(k) for k in range(len(lab))):
+                groups = None   # 3.9.6 (task-ab7): open plan (客厅+厨房+玄关, no wall between): split by nearest label
+        if groups is None:      # faint ridge walls (a photo): coverage is too noisy to route by; nearest label (3.8.8)
             groups = {k: [] for k in range(len(lab))}
             for c in cells:
                 px, py = ccenter(c)
@@ -616,7 +621,8 @@ def auto_spec(image, chains=None, transform=None, labels=None, use_ocr=True, tas
                     groups[k].append(c0)
         zone = None      # 3.8.9: walls between rooms of one region are decided per shared edge (open_edges)
         for k, (lb, _c0) in enumerate(lab):
-            if not groups[k]:
+            if not groups.get(k):    # 3.9.6: two names in one cell - keep the name as text, never drop it
+                spec.setdefault("free_labels", []).append({"text": lb["name"], "at_px": [lb["x"], lb["y"]]})
                 continue
             for c in groups[k]:
                 cell_room[c] = len(rooms)

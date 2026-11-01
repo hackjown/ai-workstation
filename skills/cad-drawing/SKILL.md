@@ -184,3 +184,10 @@ python3 $D/drawkit.py schema                         # spec 字段说明
 | 只有总尺寸 | 图上只有「约9800mm」「约10900mm」，模型说“四条尺寸链 OCR 读不出” | 总尺寸也是尺寸链：OCR 读数 + 尺寸线刻度到刻度量长度 |
 | 出图崩溃 | PNG 2.45 亿像素触发 DecompressionBombError，两次 build 失败后模型自己写脚本出图 | PNG 自动限到 4000 万像素，Pillow 不再拦 |
 | 假“卡住” | 守卫说“没有动手写 spec”（其实已写并生成），用户点继续后立刻又停 | 卡住说明写真实状态；继续 = 清零 + 新预算 + 确定性流水线；3 轮后交付最好的草稿 |
+
+## 3.9.6 补名字 / 补文字（续做任务）
+- `source.transform` 是 **mm → 像素**：`px = ax*mm + bx`；像素换毫米要用 `mm = (px - bx) / ax`，不要反着乘。
+- 开敞空间（客厅+餐厅+厨房+玄关之间没有墙）不要新加互相重叠的房间多边形；在 spec 里加
+  `"free_labels": [{"text": "客厅", "at_px": [420, 950]}]`（或 `at` 用毫米），再 `drawing_build`。
+- 确定性流水线（drawing_auto --from-spec）现在会保留旧 spec 的所有房间名和 free_labels，一个名字都不会丢；
+  找不到房间的名字会自动变成 free_labels 并列入「待确认」。

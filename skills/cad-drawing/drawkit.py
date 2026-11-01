@@ -888,8 +888,14 @@ class Plan:
             if len(pl) >= 2:
                 sh.poly([self.m.P(p) for p in pl], False, "家具", 0.13)
         self._labels(sh, scale)
+        T = (self.spec.get("source") or {}).get("transform") or {}
         for fl in self.spec.get("free_labels") or []:
-            p = self.m.P(fl["at"])
+            at = fl.get("at")
+            if at is None and fl.get("at_px") and T.get("ax"):   # 3.9.6: a point read on the image (px = a*mm + b)
+                at = [(fl["at_px"][0] - T["bx"]) / T["ax"], (fl["at_px"][1] - T["by"]) / T["ay"]]
+            if at is None:
+                continue
+            p = self.m.P(at)
             sh.text(p[0], p[1], fl["text"], float(fl.get("h") or 0.8 * float(self.spec.get("label_height_mm", 4.0)) * scale),
                     "房间名", role="room")
         self._dims(sh, scale)
@@ -2679,9 +2685,18 @@ def cmd_auto(a):
                 have = {c.get("side") for c in chains or []}
                 chains = list(chains or []) + [{"side": c["side"], "values": c["values"]} for c in chain_list(old)
                                                if c.get("values") and c.get("side") not in have]
-                if not labs:     # names by position, in the chains' mm frame (placed with the NEW transform)
+                # 3.9.6 (task-ab7): ALWAYS carry the old spec's names, also when labels were passed - a name the
+                # user asked for in a follow-up (客厅/厨房) was wiped by the pipeline because facts labels existed
+                have_n = {x.get("name") for x in labs}
+                for fl in old.get("free_labels") or []:
+                    if fl.get("text") and fl["text"] not in have_n:
+                        if fl.get("at_px"):
+                            labs.append({"name": fl["text"], "x": fl["at_px"][0], "y": fl["at_px"][1], "by": "spec"})
+                        elif fl.get("at"):
+                            labs.append({"name": fl["text"], "mm": list(fl["at"]), "by": "spec"})
+                if True:
                     for r in old.get("rooms") or []:
-                        if not r.get("name") or r["name"] == "房间?":
+                        if not r.get("name") or r["name"] == "房间?" or r["name"] in have_n:
                             continue
                         if r.get("label_px"):
                             labs.append({"name": r["name"], "x": r["label_px"][0], "y": r["label_px"][1], "by": "spec"})

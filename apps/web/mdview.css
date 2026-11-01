@@ -116,3 +116,11 @@ html[data-theme=dark]{
 .ofv-spin{width:28px;height:28px;margin:0 auto 12px;border:3px solid rgba(0,0,0,.12);border-top-color:#b4690f;border-radius:50%;animation:ofvspin .8s linear infinite}
 @keyframes ofvspin{to{transform:rotate(360deg)}}
 @media (max-width:760px){ .mdm-office .mdm-b{padding:0} .mdm-h .mdm-pdf{padding:7px 8px;font-size:12px} }
+
+/* v3.9.8 HTML deliverables (装修设计器 …) run in the app: a near-full-screen sandboxed frame */
+.mdm-html{padding:12px}
+.mdm-html .mdm-box{width:100%;height:100%;max-width:none}
+.mdm-html .mdm-b{flex:1;min-height:0;padding:0;overflow:hidden;display:flex;background:#fff}
+.mdm-frame{flex:1;width:100%;height:100%;border:0;background:#fff}
+.mdm-html .mdm-box:fullscreen{border-radius:0}
+@media (max-width:760px){ .mdm-html{padding:0} }

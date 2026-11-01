@@ -10,6 +10,15 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+# 3.9.8: a floor plan turned into the interactive renovation designer (house-plan-designer), not a CAD redraw.
+DESIGNER_AUTO = (r"house-?plan-?designer|装修设计器|户型设计器|设计器(网页|html)|"
+                 r"(户型|平面|结构|cad|dxf|图纸)[^。\n]{0,40}(3d|三维|鸟瞰|漫游|设计器|做成网页|转成网页|生成网页|网页版|html|家具布置|装修方案)|"
+                 r"(3d|三维|鸟瞰|漫游)[^。\n]{0,12}(户型|装修|看房)|floor ?plan (to|into) 3d")
+
+
+def is_designer_task(prompt: str) -> bool:
+    return bool(re.search(DESIGNER_AUTO, prompt or "", re.I))
+
 MARK = re.compile(r"【技能[:：]\s*([^】]+)】")
 
 SEARCH_DIRS = "~/.claude/skills ~/.workbuddy/skills ~/.codebuddy/skills ~/.agents/skills"
@@ -83,6 +92,23 @@ CATALOG: list[dict] = [
      "note": ("New drawings follow the cad-drawing method: read each dimension chain with drawing_read, write "
               "cad/spec.json, generate with drawing_build. LibreCAD (cad_command) is the viewer and the editor for "
               "small manual tweaks only.")},
+    {"id": "house-plan-designer", "title": "户型图 → 装修设计器", "icon": "ruler",
+     "desc": "户型图（酷家乐/贝壳/售楼处图、手绘尺寸图、CAD 矢量 PDF/DXF、原始结构图）还原成单文件 HTML 装修设计器：2D + 3D 漫游 + 家具 + 水电/吊顶/铺装/拆改 + 管线自动排布 + 报价 + PDF/DXF 施工图",
+     "path": "~/.claude/skills/house-plan-designer",
+     "auto": DESIGNER_AUTO,
+     "check": ("test -f ~/.claude/skills/house-plan-designer/assets/template.html && "
+               "python3 ~/.claude/skills/house-plan-designer/scripts/aiw_hpd.py doctor | grep -q '\"ok\": true'"),
+     "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/house-plan-designer-setup.sh "
+               "-o /tmp/hpds.sh && bash /tmp/hpds.sh"),
+     "note": ("Read the AIW section at the top of SKILL.md first, then the upstream flow under it, and "
+              "reference/spec-format.md before writing the HouseSpec. Steps: `python3 ~/.claude/skills/house-plan-designer/"
+              "scripts/aiw_hpd.py doctor` (ensure when not ok); work in ~/workspace/hpd/<name>/; if this task already has "
+              "cad/spec.json from cad-drawing, start with `aiw_hpd.py from-cad cad/spec.json -o hpd/<name>/spec.json`, otherwise "
+              "recognise with the skill's analyze.py / cadvec.py / cadsplit.py (never vision-model coordinates); loop "
+              "`aiw_hpd.py make <spec> --out hpd/<name>/work --name <name>` until HPD_RESULT clean=true (read overlay.png and "
+              "plan2d.png every round, at most 5 rounds); furnish + autoElec as SKILL.md step 5; deliver with `make ... --final "
+              "hpd/<name>` then `aiw_hpd.py qa <html> --out hpd/<name>/qa` (lite+quick on the VM); send_file the HTML, plan2d "
+              "and view3d PNGs; never edit assets/template.html. Do not use drawing_auto / drawing_build for this job.")},
     {"id": "cad-drawing", "title": "照图出图 CAD", "icon": "ruler",
      "desc": "照着照片或描述画技术图纸（户型/施工图、零件、接线/流程图）：精读尺寸 → 结构化 spec → 自动生成 DXF/PNG → 叠图核对",
      "path": "~/.claude/skills/cad-drawing",
@@ -208,7 +234,10 @@ def _find(name: str, custom: list[dict]) -> Optional[dict]:
 def auto(prompt: str) -> list[str]:
     """Skills a task needs whether or not it was picked (a sign-up must ask for the data, never invent it)."""
     text = strip(prompt or "")
-    return [s["id"] for s in CATALOG if s.get("auto") and re.search(s["auto"], text, re.I)]
+    out = [s["id"] for s in CATALOG if s.get("auto") and re.search(s["auto"], text, re.I)]
+    if "house-plan-designer" in out:      # the designer reads the plan itself; the CAD redraw phases would fight it
+        out = [n for n in out if n not in ("cad-drawing", "librecad")]
+    return out
 
 
 GIT_SKILL = re.compile(r"https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?=[/\s#?]|[^\x00-\x7f]|$)")

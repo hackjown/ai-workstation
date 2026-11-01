@@ -216,7 +216,7 @@ loadSettings = async function () {
     </form>
     <form class="rows" id="sRemote" onsubmit="rhAdd(event)">
       <div class="rw head"><div class="k">运维主机 · 授权 Agent 远程执行命令</div><div>${rhosts.length ? `<span class="chip ok">${rhosts.length} 台已授权</span>` : '<span class="chip">未授权</span>'}</div></div>
-      ${rhosts.map((h) => `<div class="rw"><div class="k"><div class="mach"><span class="ic">${icon("monitor")}</span><div><b>${esc(h.name)}</b><span class="mono">${esc(h.user || "root")}@${esc(h.host)}:${esc(h.port || 22)}</span></div></div></div>
+      ${rhosts.map((h) => `<div class="rw rhost"><div class="k"><div class="mach"><span class="ic">${icon("monitor")}</span><div><b>${esc(h.name)}</b><span class="mono">${esc(h.user || "root")}@${esc(h.host)}:${esc(h.port || 22)}</span></div></div></div>
         <div class="v"><div class="segsw"><label><input type="radio" name="m_${h.id}" ${h.mode !== "auto" ? "checked" : ""} onchange="rhMode('${h.id}','confirm')">每条都确认</label><label><input type="radio" name="m_${h.id}" ${h.mode === "auto" ? "checked" : ""} onchange="rhMode('${h.id}','auto')">只读免确认</label></div><span class="small" id="rhT_${h.id}">${h.has_password ? "密码已加密保存" : "未保存密码"}</span></div>
         <div class="t"><button type="button" class="btn sm" onclick="rhTest('${h.id}')">测试</button><button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="rhDel('${h.id}')">移除</button></div></div>`).join("")}
       <details class="more" ${rhosts.length ? "" : "open"}><summary>${icon("chev")}添加主机<span class="cnt">PVE、LXC、NAS、服务器</span></summary>

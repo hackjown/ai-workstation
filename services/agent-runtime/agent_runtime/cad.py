@@ -1204,6 +1204,12 @@ def cad_mode(prompt: str, context: str | None = None) -> str | None:
     drawing task). A follow-up in a drawing thread is a revision unless it asks for a redraw or is a whole new brief:
     the user re-sent the full 12-sheet prompt in the same thread before, and that must still start fresh."""
     p = prompt or ""
+    try:                                   # 3.9.8: 户型图 → 装修设计器 is its own skill, not a CAD redraw
+        from .skills import is_designer_task
+        if is_designer_task(p):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
     in_thread = bool(_CAD_CONTEXT.search(context or ""))
     full_brief = len(p) > 600 or "FRAME|" in p or "要出的图" in p
     if in_thread and not full_brief and not _CAD_REDRAW.search(p) and (is_cad_task(p) or (_CAD_REVISE.search(p) and _CAD_TOPIC.search(p))):

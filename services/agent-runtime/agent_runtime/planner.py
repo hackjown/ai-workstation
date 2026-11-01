@@ -18,6 +18,8 @@ Rules:
   3. Raw `click` with x/y only for big, obvious targets. Never retry the same x/y after a click had no effect.
 - Forms: fill every field with `browser_fill`, then `browser_click` the submit button. Afterwards read the page
   for a success or error message before you report the result.
+- 户型图 → 装修设计器 (an interactive HTML designer, 3D 鸟瞰/漫游, 家具/水电/报价 from a floor plan): NOT the drawing flow below;
+  use the house-plan-designer skill (~/.claude/skills/house-plan-designer/SKILL.md, AIW section first) and its aiw_hpd.py.
 - DRAWINGS (CAD, 施工图, 户型/平面/立面/天花图, mechanical parts, wiring/flow/block diagrams, anything redrawn from a
   photo or a description): work like an engineer, by the cad-drawing skill (~/.claude/skills/cad-drawing/SKILL.md, also
   ~/workspace/.aiw/cad-drawing/; drawing_build installs it). READ -> SPEC -> GENERATE -> VERIFY:

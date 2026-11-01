@@ -11,6 +11,10 @@ with absolute xdotool calls on the VM display (vm_agent/computer/remote_input.py
   {"t": "scroll", "x": 812, "y": 403, "dx": 0, "dy": 3}        # wheel notches, dy > 0 = down
   {"t": "text",   "text": "你好 abc"}                           # committed text, typed as unicode
   {"t": "key",    "key": "ctrl+c"}                             # one key or combo, xdotool names (Return, BackSpace, …)
+  {"t": "paste",  "text": "…", "key": "ctrl+v"}                # 3.9.10: put text on the VM clipboard (xclip), then
+                                                               # press key ("ctrl+shift+v" in a terminal, "" = only copy)
+
+paste always goes through one shell command (paste_script), whatever the vm-agent version, so no agent update is needed.
 """
 from __future__ import annotations
 
@@ -19,6 +23,8 @@ from typing import Optional
 
 BUTTONS = {"left": 1, "middle": 2, "right": 3}
 MAX_TEXT = 2000
+MAX_PASTE = 100_000
+PASTE_KEYS = ("ctrl+v", "ctrl+shift+v", "shift+Insert", "")
 MAX_SCROLL = 30
 _KEY = re.compile(r"^[A-Za-z0-9_]{1,24}(\+[A-Za-z0-9_]{1,24}){0,4}$")
 
@@ -67,6 +73,16 @@ def clean(op, size: Optional[tuple[int, int]] = None) -> Optional[dict]:
             return None
         s = "".join(ch for ch in s if ch in "\n\t" or ord(ch) >= 32)[:MAX_TEXT]
         return {"t": "text", "text": s} if s else None
+    if t == "paste":
+        s = op.get("text")
+        if not isinstance(s, str) or not s:
+            return None
+        s = "".join(ch for ch in s if ch in "\n\t\r" or ord(ch) >= 32)[:MAX_PASTE]
+        k = op.get("key", "ctrl+v")
+        k = k.replace(" ", "") if isinstance(k, str) else "ctrl+v"
+        if k not in PASTE_KEYS:
+            k = "ctrl+v"
+        return {"t": "paste", "text": s, "key": k} if s else None
     if t == "key":
         k = op.get("key")
         if not isinstance(k, str) or not _KEY.match(k.replace(" ", "")):
@@ -158,6 +174,21 @@ def xdotool_script(ops: list[dict]) -> str:
     return DISPLAY_GUARD + " && ".join(cmds) if cmds else ""
 
 
+def paste_script(op: dict) -> str:
+    """3.9.10: one shell command that puts op["text"] on the VM's CLIPBOARD (and PRIMARY) selection with xclip
+    (xsel when there is no xclip), then presses op["key"] in the focused window. The text travels base64-encoded, so
+    quotes, newlines and Chinese arrive unchanged. Without either tool it is typed instead (short text only)."""
+    import base64
+    import shlex
+    b64 = base64.b64encode(op["text"].encode("utf-8")).decode()
+    put = (f"printf %s {b64} | base64 -d > \"$f\" && "
+           "if command -v xclip >/dev/null 2>&1; then xclip -selection clipboard -i \"$f\" >/dev/null 2>&1 && xclip -selection primary -i \"$f\" >/dev/null 2>&1; "
+           "elif command -v xsel >/dev/null 2>&1; then xsel -bi < \"$f\" >/dev/null 2>&1 && xsel -pi < \"$f\" >/dev/null 2>&1; "
+           f"else xdotool type --delay 30 -- {shlex.quote(op['text'][:MAX_TEXT])}; exit $?; fi")
+    key = f" && sleep 0.15 && xdotool key --clearmodifiers -- {shlex.quote(xkey(op['key']))}" if op.get("key") else ""
+    return DISPLAY_GUARD + 'f=$(mktemp) && trap \'rm -f "$f"\' EXIT && ' + put + key
+
+
 def budget(ops: list[dict]) -> float:
     """Seconds one batch may take on the VM: a little per op, more for typed text (70 ms a Chinese character)."""
     s = 6.0 + 0.25 * len(ops)
@@ -166,4 +197,6 @@ def budget(ops: list[dict]) -> float:
             s += sum(len(r) * (0.09 if w else 0.02) for r, w in text_runs(op["text"]))
         elif op["t"] == "click":
             s += 0.1 * (op.get("count") or 1)
+        elif op["t"] == "paste":
+            s += 4.0
     return min(120.0, s)

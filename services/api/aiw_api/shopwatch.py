@@ -253,6 +253,7 @@ def embedded_price(items: list) -> Optional[dict]:
 
 RISK_ALT_NOTE = "京东风控限流，已自动换方式读价"
 ROUTE_CN = {"signed": "京东签名价格接口", "cart": "购物车", "follow": "我的关注"}
+TAB_ROUTE_CN = {"cart": "已打开的购物车页", "follow": "已打开的我的关注页"}
 
 
 def _alt_result(alt: dict) -> dict:
@@ -308,6 +309,15 @@ def _parse_snapshot(snap: dict) -> dict:
     frames = " ".join(snap.get("frames") or [])
     risk = bool(snap.get("risk_limit") or is_risk_limit(url, text) or snap.get("mobile_blocked"))
     alt = snap.get("alt_price") if isinstance(snap.get("alt_price"), dict) else None
+    if snap.get("route") in ("tab", "cart_first") and alt and (alt.get("price") or alt.get("final_price")):
+        # v10: read off the cart / 我的关注 tab already open (or the cart first): the item page was never opened
+        res.update(_alt_result(alt), route=snap.get("route"))
+        res["title"] = clean_name(alt.get("name") or "") or ""
+        res["note"] = ("价格从" + (TAB_ROUTE_CN.get(alt.get("src"), "已打开的页面") if snap.get("route") == "tab"
+                                  else "购物车") + "读出，没有打开商品页")
+        if alt.get("stale"):
+            res["note"] += "（刷新后没读到，用的是刷新前的价格）"
+        return res
     if (risk or snap.get("route") == "alt") and alt and (alt.get("price") or alt.get("final_price")):
         # v7: the item page was limited / sent to the mobile page (or skipped during the cool-down): another route
         res.update(_alt_result(alt), risk=risk or bool(snap.get("cooling")), route=snap.get("route") or "auto")
@@ -899,8 +909,8 @@ async def desktop_read(computer, sessions, w: dict) -> Optional[dict]:
 # ----------------------------------------------------------------------------- the scheduled check
 LIVE_TASK = ("queued", "running", "paused", "takeover", "waiting_confirm", "waiting_input")
 FAIL_STATES = ("error", "no_price", "no_browser")
-PROBE_TIMEOUT = 160         # hard cap for one probe run (the shell command is killed after this)
-PROBE_BUDGET = 115          # v8: the probe's own budget; it stops each stage in time and answers well before the cap
+PROBE_TIMEOUT = 200         # hard cap for one probe run (the shell command is killed after this)
+PROBE_BUDGET = 150          # v8: the probe's own budget; it stops each stage in time and answers well before the cap
 RISK_BACKOFF_MIN = 2 * 3600  # JD's 活动火爆 page: look again much later, more checks only keep it on
 
 
@@ -1042,13 +1052,17 @@ def diag_hints(raw: dict, r: dict) -> list[str]:
     for a in raw.get("alt") or []:
         if not isinstance(a, dict) or a.get("price"):
             continue
-        name = {"signed": "京东签名接口", "cart": "购物车", "follow": "我的关注"}.get(a.get("route"), a.get("route"))
+        name = {"signed": "京东签名接口", "cart": "购物车", "follow": "我的关注", "tab_cart": "已打开的购物车页",
+                "tab_follow": "已打开的我的关注页"}.get(a.get("route"), a.get("route"))
         why = ("没登录" if a.get("login") else "风控页" if a.get("risk_limit") else
+               "页面没有响应（一直没加载完）" if a.get("missing") == "no_answer" or a.get("no_answer") else
                "列表里没有这个商品" if a.get("missing") == "not_listed" else
                (a.get("refused") or a.get("error") or (f"HTTP {a.get('status')}" if a.get("status") else "没读到")))
         h.append(f"{name}：{str(why)[:60]}")
     if r.get("status") in ("need_login", "login") or (raw.get("profile") or {}).get("logged_in") is False:
         h.append("读价用的浏览器没有京东登录 Cookie（pt_key / thor）")
+    if raw.get("hung"):
+        h.append("商品页标签卡住不响应（一直没加载完），已关掉它，换新标签页读购物车 / 我的关注")
     if r.get("status") == "no_price":
         if raw.get("title_from") == "document.title" and not raw.get("sel") and not raw.get("cand"):
             h.append("商品信息区没有渲染出来（标题只来自 document.title，没有任何价格元素）")

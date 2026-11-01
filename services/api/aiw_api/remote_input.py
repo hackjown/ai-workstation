@@ -29,7 +29,7 @@ import logging
 import time
 from typing import Optional
 
-from aiw_protocols.input_ops import budget, clean, coalesce, xdotool_script
+from aiw_protocols.input_ops import budget, clean, coalesce, paste_script, xdotool_script
 from fastapi import WebSocket, WebSocketDisconnect
 
 log = logging.getLogger("aiw.input")
@@ -152,6 +152,26 @@ class InputPump:
         return r
 
     async def apply(self, ops: list[dict]) -> None:
+        """3.9.10: a paste op is its own shell command (any agent version); the ops around it keep their order."""
+        if any(o["t"] == "paste" for o in ops):
+            run: list[dict] = []
+            for o in ops:
+                if o["t"] != "paste":
+                    run.append(o)
+                    continue
+                await self._apply(run)
+                run = []
+                t = budget([o])
+                r = await self._call("shell.exec", {"command": paste_script(o), "timeout": t}, timeout=t + 4)
+                if not r.success or int((r.result or {}).get("exit_code") or 0) != 0:
+                    res = r.result or {}
+                    raise RuntimeError(r.error or (res.get("stderr") or "").strip()[:200] or f"paste exit {res.get('exit_code')}")
+                self.applied += 1
+            await self._apply(run)
+            return
+        await self._apply(ops)
+
+    async def _apply(self, ops: list[dict]) -> None:
         if not ops:
             return
         t = budget(ops)
@@ -203,6 +223,19 @@ def mount(app, store, sessions, auth, ws_ok) -> None:
             raise HTTPException(502, f"input failed: {e}"[:300])
         return {"ok": True, "accepted": n, "applied": p.applied, "legacy": bool(p.legacy), "mode": p.mode,
                 "width": (p.size or (0, 0))[0], "height": (p.size or (0, 0))[1]}
+
+    @app.get("/api/machines/{mid}/clipboard", dependencies=[Depends(auth)])
+    async def machine_clipboard(mid: str):
+        """3.9.10: the VM's clipboard text (copied there with Ctrl+C), for the 「复制到本机」 button."""
+        c = computer(mid)
+        if not c:
+            raise HTTPException(404, "no such computer")
+        from aiw_protocols.input_ops import DISPLAY_GUARD
+        cmd = DISPLAY_GUARD + ("(xclip -selection clipboard -o 2>/dev/null || xsel -bo 2>/dev/null) | head -c 200000")
+        r = await c.execute("shell.exec", {"command": cmd, "timeout": 8}, timeout=12)
+        if not r.success:
+            raise HTTPException(502, f"clipboard: {r.error}"[:300])
+        return {"ok": True, "text": (r.result or {}).get("stdout") or ""}
 
     @app.websocket("/ws/input/{mid}")
     async def ws_input(ws: WebSocket, mid: str):

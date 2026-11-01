@@ -602,6 +602,8 @@
     btn("^C", "复制 Ctrl+C", function () { clearMods(); outKey("ctrl+c"); });
     btn("^V", "粘贴 Ctrl+V", function () { clearMods(); outKey("ctrl+v"); });
     btn("^A", "全选 Ctrl+A", function () { clearMods(); outKey("ctrl+a"); });
+    if (win.aiwPasteToVM || (win.parent && win.parent.aiwPasteToVM))   // 3.9.10: text from this phone into the VM
+      btn("贴", "把手机剪贴板的文字粘贴到电脑", function () { clearMods(); (win.aiwPasteToVM || win.parent.aiwPasteToVM)(); });
     sep();
     var zoomBtn = btn("1:1", "缩放复位", function () { st.z = 1; st.px = 0; st.py = 0; paint(); }, true);
     var landBtn = btn("横屏", "横屏全屏", function () { setLandscape(!st.landscape); }, true);

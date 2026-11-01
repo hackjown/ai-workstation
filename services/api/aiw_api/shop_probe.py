@@ -12,6 +12,16 @@ The API ships this file to ~/.config/aiw/shop/probe.py and runs one command per 
   probe.py url                                      the visible tab's URL
   probe.py profile                                  which Chrome profile answers and whether it is logged in to JD
 
+v10 (2026-11-01): on ai-linux-001 the item tab never finished loading (readyState 'loading', 233 elements) and its
+renderer stopped answering: the signed API, the unsigned APIs, the screenshot and then the cart route (navigated in
+that same frozen tab, so it read nothing and said 'not listed') each waited out a Runtime.evaluate timeout, while the
+user's own cart tab on the same screen showed every price. v10 reads JD's cart / 我的关注 tabs the user already has
+open FIRST (attached, never navigated or closed; reloaded once so the price is current, the pre-reload reading kept as
+a fallback) and opens no new tab when that prices the sku. A sku priced from the cart before goes to the cart first
+next time (~/.config/aiw/shop/routes.json). A tab whose page stops answering is dropped at once (no more evaluates
+sent to it) and the alt routes run in a fresh tab. The render wait is up to 30 s (skeleton cut-off 12 s), the
+budget 150 s, and a cart page that never answered is reported as 'no_answer', not 'not_listed'.
+
 v8 (2026-10-30): one time budget per run (--budget, default 115 s; the server's hard cap is 160 s) with short
 per-stage timeouts (no socket read blocks past its call's timeout) and a SIGALRM watchdog that stops the running stage
 and still prints the partial snapshot with stage_error. The render wait is at most 15 s and stops after ~6 s on a
@@ -61,12 +71,12 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "9"
+PROBE_VERSION = "10"
 
 # v8: one time budget for the whole probe run (the server's hard cap is 160 s; the probe aims to answer by ~120 s).
 # Each stage takes what it needs out of what is left; the cart / 我的关注 routes run only while time remains, and a
 # watchdog (SIGALRM at budget + 12 s) stops whatever is running so the partial result is still printed.
-DEFAULT_BUDGET = 115.0
+DEFAULT_BUDGET = 150.0
 BUDGET = {"end": 0.0, "total": 0.0}
 
 
@@ -1094,7 +1104,7 @@ def kw_price(snap: dict) -> bool:
 
 STAGE_CN = {"connect": "连接浏览器", "open": "打开商品页", "wait": "等待价格渲染", "front": "切到前台渲染", "read": "读取价格",
             "net": "读取页面自己的价格接口", "api": "调用价格接口", "shot": "保存诊断截图", "mobile": "试移动版商品页",
-            "resolve": "解析短链接", "signed": "用京东签名接口读价", "cart": "从购物车读价", "follow": "从我的关注读价",
+            "resolve": "解析短链接", "tab": "从已打开的购物车页读价", "fresh": "换新标签页", "signed": "用京东签名接口读价", "cart": "从购物车读价", "follow": "从我的关注读价",
             "done": "完成"}
 
 
@@ -1368,23 +1378,9 @@ def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 
     if err:
         one["error"] = err
         return {"try": one, "price": None}
-    end, snap = time.time() + cap(wait, 6), {}
-    n = 0
-    while time.time() < end:
-        time.sleep(1.2)
-        n += 1
-        if n > 2:   # v9: a long cart (100+ rows) renders rows lazily: scroll so this sku's row is drawn
-            try:
-                ws.eval("(()=>{window.scrollBy(0, innerHeight*1.5);for(const e of document.querySelectorAll('[class*=list],[class*=List],main'))"
-                        "{if(e.scrollHeight>e.clientHeight+50)e.scrollTop+=e.clientHeight*1.5;}return 1})()", 3)
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            snap = json.loads(ws.eval(f"({ROW_JS})({json.dumps(sku)})", cap(6, 1)) or "{}")
-        except Exception:  # noqa: BLE001
-            continue
-        if snap.get("login") or snap.get("rows") or is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
-            break
+    snap, answered = scan_rows(ws, sku, wait)
+    if not answered:
+        one["no_answer"] = True   # v10: the page never answered a read: not the same as 'this sku is not listed'
     one.update(url=(snap.get("url") or "")[:200], login=bool(snap.get("login")), rows=len(snap.get("rows") or []),
                n_links=snap.get("n_links"), n_elems=snap.get("n_elems"))
     if is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
@@ -1411,11 +1407,205 @@ def page_route(ws, name: str, url: str, sku: str, captured: dict, wait: float = 
             one["from"] = "net"
             return {"try": one, "price": {**got, "src": name}}
     one["price"] = False
-    one["missing"] = "not_listed" if not one.get("login") else "login"
+    one["missing"] = "login" if one.get("login") else "no_answer" if one.get("no_answer") else "not_listed"
     return {"try": one, "price": None}
 
 
-ROUTE_MIN_S = {"cart": 24.0, "follow": 14.0}   # v8: a page route starts only with this much of the budget left
+SCROLL_LIST_JS = ("(()=>{window.scrollBy(0, innerHeight*1.5);for(const e of document.querySelectorAll('[class*=list],[class*=List],main'))"
+                  "{if(e.scrollHeight>e.clientHeight+50)e.scrollTop+=e.clientHeight*1.5;}return 1})()")
+
+
+def scan_rows(ws, sku: str, wait: float, scroll_after: int = 2) -> tuple[dict, bool]:
+    """Read this sku's row on the cart / 我的关注 page in ws for up to `wait` s (scrolling a long, lazily drawn list)
+    -> (snap, answered). v10: answered is False when not one read came back (a frozen or still-blank page); two
+    timed-out reads in a row stop the scan (the page is not answering, more reads only burn the budget)."""
+    end, snap = time.time() + cap(wait, 6), {}
+    n, answered, timeouts = 0, False, 0
+    while time.time() < end:
+        if n:
+            time.sleep(1.2)
+        n += 1
+        if n > scroll_after:   # v9: a long cart (100+ rows) renders rows lazily: scroll so this sku's row is drawn
+            try:
+                ws.eval(SCROLL_LIST_JS, cap(3))
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            snap = json.loads(ws.eval(f"({ROW_JS})({json.dumps(sku)})", cap(6, 1)) or "{}")
+            answered, timeouts = True, 0
+        except TimeoutError:
+            timeouts += 1
+            if timeouts >= 2:
+                break
+            continue
+        except Exception:  # noqa: BLE001 - navigating; retry
+            continue
+        if snap.get("login") or snap.get("rows") or is_risk_limit(snap.get("url") or "", snap.get("text") or ""):
+            break
+    return snap, answered
+
+
+def alive(ws, timeout: float = 3.0) -> bool:
+    """v10: does the page in ws still run scripts? (a frozen renderer times out every Runtime.evaluate)"""
+    try:
+        ws.eval("1", cap(timeout))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# ----------------------------------------------------------------------------- v10: tabs the user already has open
+TAB_KINDS = (("cart", re.compile(r"^https?://cart\.jd\.com/", re.I)), ("follow", re.compile(r"^https?://t\.jd\.com/follow", re.I)))
+TAB_WAIT_S = 30.0
+def routes_file() -> str:
+    return os.path.expanduser(os.environ.get("AIW_SHOP_ROUTES") or "~/.config/aiw/shop/routes.json")
+
+
+def open_jd_list_tabs(page_list: list) -> list[tuple[str, dict]]:
+    """The cart / 我的关注 tabs already open in the browser, cart first: [(kind, page)]."""
+    found = []
+    for kind, rx in TAB_KINDS:
+        for p in page_list or []:
+            if rx.search(str(p.get("url") or "")) and p.get("webSocketDebuggerUrl"):
+                found.append((kind, p))
+    return found
+
+
+def _tab_events(ws, captured: dict):
+    """Keep the cart / follow API answers the reloaded page asks for (bodies read the moment they finish)."""
+    def on_event(m):
+        meth, prm = m.get("method"), m.get("params") or {}
+        if meth == "Network.responseReceived" and len(captured) < 40:
+            u = str((prm.get("response") or {}).get("url") or "")
+            if "cart" in u.lower() or "follow" in u.lower() or PRICE_NET_RE.search(u):
+                captured[prm.get("requestId")] = {"url": u, "status": (prm.get("response") or {}).get("status")}
+        elif meth == "Network.loadingFinished" and prm.get("requestId") in captured and len(ws.bodies) < 30:
+            rid = prm.get("requestId")
+
+            def keep(msg, _rid=rid):
+                res = msg.get("result") or {}
+                text = res.get("body") or ""
+                if res.get("base64Encoded"):
+                    text = base64.b64decode(text).decode("utf-8", "replace")
+                if text:
+                    ws.bodies[_rid] = text[:300000]
+            ws.request("Network.getResponseBody", {"requestId": rid}, keep)
+    return on_event
+
+
+def _net_row_price(ws, captured: dict, sku: str) -> dict | None:
+    try:
+        ws.pump(0.3)
+    except Exception:  # noqa: BLE001
+        pass
+    for rid in list(captured)[:30]:
+        text, why = body_of(ws, rid, 2)
+        if why or sku not in text:
+            continue
+        got = price_of_items(text, sku)
+        if got:
+            nm = name_of(text, sku)
+            return {**got, **({"name": nm} if nm else {})}
+    return None
+
+
+def read_open_tab(kind: str, page: dict, sku: str, reload: bool = True) -> dict:
+    """v10: this sku's price on a cart / 我的关注 tab the user already has open. The tab is attached, read, reloaded
+    once (so the price is the current one; JD redraws the list with fresh prices) and read again; it is never
+    navigated elsewhere, closed or brought forward. The pre-reload reading is kept when the reload shows nothing."""
+    one = {"route": "tab_" + kind, "url": str(page.get("url") or "")[:200], "reused": True}
+    try:
+        ws = WS(page["webSocketDebuggerUrl"], 6)
+    except Exception as e:  # noqa: BLE001
+        one.update(error=f"{type(e).__name__}: {e}"[:120], price=False)
+        return {"try": one, "price": None}
+    try:
+        if not alive(ws, 4):
+            one.update(no_answer=True, price=False, missing="no_answer")
+            return {"try": one, "price": None}
+        snap, _ = scan_rows(ws, sku, 10, scroll_after=1)
+        pre = row_price(snap.get("rows") or [])
+        one["rows_before"] = len(snap.get("rows") or [])
+        if snap.get("login"):
+            one.update(login=True, price=False, missing="login")
+            return {"try": one, "price": None}
+        got, how = None, ""
+        if reload and budget_left() > 25:
+            captured = {}
+            ws.on_event = _tab_events(ws, captured)
+            try:
+                ws.call("Network.enable", {"maxTotalBufferSize": 20_000_000, "maxResourceBufferSize": 5_000_000}, 5)
+                ws.call("Page.reload", {"ignoreCache": False}, 8)
+                one["reloaded"] = True
+                time.sleep(2.0)
+                snap2, answered = scan_rows(ws, sku, TAB_WAIT_S, scroll_after=2)
+                got = row_price(snap2.get("rows") or [])
+                how = "row" if got else ""
+                if not got:
+                    got = _net_row_price(ws, captured, sku)
+                    how = "net" if got else ""
+                if not answered:
+                    one["no_answer_after_reload"] = True
+            except Exception as e:  # noqa: BLE001
+                one["reload_error"] = f"{type(e).__name__}: {e}"[:120]
+            finally:
+                try:
+                    ws.call("Network.disable", {}, 3)
+                except Exception:  # noqa: BLE001
+                    pass
+        if not got and pre:
+            got, how = pre, "row_before_reload"
+            one["stale"] = bool(one.get("reloaded"))
+        try:
+            ws.eval("window.scrollTo(0, 0); 1", 2)
+        except Exception:  # noqa: BLE001
+            pass
+        if got:
+            one.update(price=True, **{"from": how})
+            return {"try": one, "price": {**got, "src": kind, **({"stale": True} if one.get("stale") else {})}}
+        one.update(price=False, missing="not_listed")
+        return {"try": one, "price": None}
+    finally:
+        ws.close()
+
+
+def remembered_route(sku: str, path: str = "") -> str:
+    try:
+        with open(path or routes_file()) as f:
+            return str((json.load(f).get(sku) or {}).get("route") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def remember_route(sku: str, route: str, path: str = "") -> None:
+    """v10: which route priced this sku last (cart / follow / item), so the next check starts there."""
+    if not sku:
+        return
+    path = path or routes_file()
+    try:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        if route:
+            data[sku] = {"route": route, "at": int(time.time())}
+        else:
+            data.pop(sku, None)
+        if len(data) > 500:
+            data = dict(sorted(data.items(), key=lambda kv: -int((kv[1] or {}).get("at") or 0))[:500])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+ROUTE_MIN_S = {"cart": 20.0, "follow": 14.0}   # v8: a page route starts only with this much of the budget left
 
 
 def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool, signed_done: bool = False) -> dict:
@@ -1433,7 +1623,7 @@ def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool, si
             tries.append({"route": name, "skipped": "no_time", "price": False})
             continue
         st(name)
-        r = page_route(ws, name, url, sku, captured, wait=16 if name == "cart" else 10)
+        r = page_route(ws, name, url, sku, captured, wait=30 if name == "cart" else 16)
         tries.append(r["try"])
         if r["price"]:
             return {"alt": tries, "alt_price": r["price"]}
@@ -1448,9 +1638,9 @@ def alt_routes(ws, sku: str, area: str, captured: dict, st, on_jd_page: bool, si
     return {"alt": tries}
 
 
-SKELETON_AFTER_S = 6.0      # v8: a generic-title page with no product module this long is not going to render
+SKELETON_AFTER_S = 12.0     # v8: a generic-title page with no product module this long is not going to render
 SKELETON_MAX_ELEMS = 600
-WAIT_MAX_S = 15.0           # v8: the render wait never takes more than this (v7: up to ~36 s with slow evals)
+WAIT_MAX_S = 30.0           # v8: the render wait never takes more than this (v7: up to ~36 s with slow evals)
 SHOT_MAX_S = 5.0
 
 
@@ -1473,6 +1663,19 @@ def _watchdog(total: float):
         return lambda: signal.setitimer(signal.ITIMER_REAL, 0)
     except (ImportError, ValueError, AttributeError, OSError):   # not the main thread / no signals: soft budget only
         return lambda: None
+
+
+class _Done(Exception):
+    """v10: the price is known before the item page (an open cart tab / the cart first): skip to the result."""
+
+
+def _attach(tid: str) -> "WS":
+    for _ in range(20):
+        ps = [p for p in pages() if p.get("id") == tid]
+        if ps:
+            return WS(ps[0]["webSocketDebuggerUrl"])
+        time.sleep(0.2)
+    raise RuntimeError("background tab did not appear")
 
 
 def cmd_probe(a):
@@ -1506,17 +1709,28 @@ def cmd_probe(a):
     blocked, chain, env = [], [], {}
     stage_error, signed_done = "", False
     bws = browser_ws()
-    tid = bws.call("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
-    try:
-        ws = None
-        for _ in range(20):
-            ps = [p for p in pages() if p.get("id") == tid]
-            if ps:
-                ws = WS(ps[0]["webSocketDebuggerUrl"])
+    tid, ws, hung, tab_tries = None, None, False, []
+    if jd and os.environ.get("AIW_SHOP_TABS", "1") != "0":
+        # v10: the cart / 我的关注 tab the user already has open, before any new tab (JD renders it; the item page
+        # in a fresh tab may never finish loading)
+        try:
+            open_tabs = open_jd_list_tabs(pages())
+        except Exception:  # noqa: BLE001
+            open_tabs = []
+        for kind, pg in open_tabs[:3]:
+            if budget_left() < 20:
                 break
-            time.sleep(0.2)
-        if ws is None:
-            raise RuntimeError("background tab did not appear")
+            st("tab", kind=kind)
+            r = read_open_tab(kind, pg, sku, reload=os.environ.get("AIW_SHOP_TAB_RELOAD", "1") != "0")
+            tab_tries.append(r["try"])
+            if r["price"]:
+                snap.update(alt_price=r["price"], route="tab", jd_sku=sku, url=pg.get("url") or "", alt=tab_tries)
+                break
+    try:
+        if snap.get("alt_price"):
+            raise _Done()
+        tid = bws.call("Target.createTarget", {"url": "about:blank", "background": True})["targetId"]
+        ws = _attach(tid)
 
         def on_event(m):
             meth, prm = m.get("method"), m.get("params") or {}
@@ -1586,13 +1800,25 @@ def cmd_probe(a):
             if prof["dir"]:
                 prof["dir_from"] = "chrome://version"
         picked = None
+        if tab_tries:
+            snap["alt"] = list(tab_tries)
+        cart_first = route != "alt" and remembered_route(sku) == "cart" and not any(
+            t.get("route") == "tab_cart" for t in tab_tries)
+        if cart_first:
+            # v10: this sku was priced from the cart last time: the cart page first, the item page only if that fails
+            st("cart")
+            r = page_route(ws, "cart", CART_URL, sku, captured, wait=30)
+            snap.setdefault("alt", []).append(r["try"])
+            if r["price"]:
+                snap.update(alt_price=r["price"], route="cart_first", jd_sku=sku)
+                raise _Done()
         if route != "alt":
             st("open")
             ws.call("Page.navigate", {"url": url, "referrer": JD_HOME, "transitionType": "link"}, cap(20, 30))
             st("wait")
             t_wait = time.time()
             end = t_wait + min(float(a.wait), WAIT_MAX_S, max(1.0, budget_left() - 60))
-            last_sig, i = None, 0
+            last_sig, i, stuck = None, 0, 0
             while time.time() < end:
                 if blocked:
                     break
@@ -1603,7 +1829,15 @@ def cmd_probe(a):
                 time.sleep(0.3)
                 i += 1
                 try:
-                    snap = json.loads(ws.eval(EXTRACT_JS, cap(6)) or "{}")
+                    snap = {**json.loads(ws.eval(EXTRACT_JS, cap(6)) or "{}"), **({"alt": snap["alt"]} if snap.get("alt") else {})}
+                    stuck = 0
+                except TimeoutError:
+                    stuck += 1
+                    if stuck >= 2 and not alive(ws):   # v10: the renderer stopped answering: drop this tab
+                        hung = True
+                        snap["hung"] = True
+                        break
+                    continue
                 except Exception:  # noqa: BLE001 - navigating; retry
                     time.sleep(0.9)
                     continue
@@ -1676,7 +1910,10 @@ def cmd_probe(a):
         cookies = None
         if jd:
             snap["jd_sku"] = snap.get("jd_sku") or sku
-            if page_ok and not has_jd_price(snap) and not kw_price(snap):
+            if page_ok and not hung and not has_jd_price(snap) and not kw_price(snap) and not alive(ws):
+                hung = True   # v10: the page loaded nothing and stopped answering: every evaluate would time out
+                snap["hung"] = True
+            if page_ok and not hung and not has_jd_price(snap) and not kw_price(snap):
                 # v8: the signed API first (proven on 102: it priced the item when the page showed nothing), then the
                 # page's own answers (bodies read at loadingFinished), then the unsigned APIs if time is left
                 if "jd.com" in (snap.get("url") or url):
@@ -1693,13 +1930,13 @@ def cmd_probe(a):
                     snap["net"], got = net_prices(ws, captured, snap["jd_sku"])
                     if got:
                         snap["api_price"] = got
-                    elif "jd.com" in (snap.get("url") or url) and budget_left() > 30:
+                    elif "jd.com" in (snap.get("url") or url) and budget_left() > 30 and alive(ws):
                         st("api")
                         snap.update(jd_api_price(ws, snap["jd_sku"]))
         priced = (has_jd_price(snap) or kw_price(snap) or bool(snap.get("api_price"))) if jd else \
             bool(snap.get("sel") or len(snap.get("cand") or []) >= 1)
         need_diag = not page_ok or not priced
-        if (a.shot or need_diag) and route != "alt" and (a.shot or budget_left() > 25):
+        if (a.shot or need_diag) and route != "alt" and not hung and (a.shot or budget_left() > 25):
             # v8: at most ~5 s, never when the price is already known (v7: 27 s on 102)
             st("shot")
             t_shot = time.time()
@@ -1716,11 +1953,32 @@ def cmd_probe(a):
             except Exception as e:  # noqa: BLE001
                 snap["shot_error"] = str(e)[:160]
         if cookies is None:
-            cookies = read_cookies(bws, ws)
+            cookies = read_cookies(bws, None if hung else ws)
         if jd and not login_page and (route == "alt" or not page_ok or not priced):
             # v7: limited, redirected to the mobile page, or no price: another route, once each
             area = jd_area("ipLoc-djd=" + _cookie_value(cookies, "ipLoc-djd")) if cookies else "1_72_2799_0"
-            got_alt = alt_routes(ws, sku, area, captured, st, on_jd_page=on_item, signed_done=signed_done)
+            if hung:
+                # v10: a frozen tab cannot be navigated either (v9 read the cart 'in' it and found nothing): a new tab
+                st("fresh")
+                try:
+                    bws.call("Target.closeTarget", {"targetId": tid}, 3)
+                except Exception:  # noqa: BLE001
+                    pass
+                ws.close()
+                tid = bws.call("Target.createTarget", {"url": "about:blank", "background": True}, 8)["targetId"]
+                ws = _attach(tid)
+                ws.on_event = on_event
+                for m, prm in (("Page.enable", {}), ("Network.enable", {"maxTotalBufferSize": 20_000_000,
+                                                                        "maxResourceBufferSize": 5_000_000})):
+                    try:
+                        ws.call(m, prm, 5)
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    ws.call("Page.addScriptToEvaluateOnNewDocument", {"source": STEALTH_JS}, 5)
+                except Exception:  # noqa: BLE001
+                    pass
+            got_alt = alt_routes(ws, sku, area, captured, st, on_jd_page=on_item and not hung, signed_done=signed_done)
             got_alt["alt"] = (snap.get("alt") or []) + got_alt.get("alt", [])
             snap.update(got_alt)
             if snap.get("alt_price") and not a.shot:
@@ -1734,16 +1992,20 @@ def cmd_probe(a):
         snap["snippets"] = snippets(snap)
         snap["net_seen"] = len(captured)
         ws.close()
+    except _Done:
+        if ws is not None:
+            ws.close()
     except OutOfTime:
         # v8: the budget ran out in the middle of a stage: say which, keep everything read so far
         cur = st.list[-1] if st.list else {}
         stage_error = f"「{cur.get('label') or cur.get('stage') or '?'}」超时（总预算 {int(BUDGET['total'])} 秒用完）"
     finally:
         stop_dog()
-        try:
-            bws.call("Target.closeTarget", {"targetId": tid})
-        except Exception:  # noqa: BLE001
-            pass
+        if tid:
+            try:
+                bws.call("Target.closeTarget", {"targetId": tid})
+            except Exception:  # noqa: BLE001
+                pass
         if prev and prev != tid:   # give the user's tab back
             try:
                 bws.call("Target.activateTarget", {"targetId": prev}, 5)
@@ -1754,6 +2016,12 @@ def cmd_probe(a):
         st.finish()
     snap["stages"] = st.list
     snap["probe_version"] = PROBE_VERSION
+    if jd and sku:
+        ap = snap.get("alt_price") if isinstance(snap.get("alt_price"), dict) else {}
+        if ap.get("src") in ("cart", "follow"):
+            remember_route(sku, ap["src"])
+        elif has_jd_price(snap) or kw_price(snap):
+            remember_route(sku, "")     # the item page priced it again: back to the normal order
     snap["budget_s"] = BUDGET["total"]
     if stage_error:
         snap["stage_error"] = stage_error
@@ -1868,7 +2136,7 @@ def main():
     p.add_argument("--url", required=True)
     p.add_argument("--sku", default="")
     p.add_argument("--shot", action="store_true")
-    p.add_argument("--wait", default="20")
+    p.add_argument("--wait", default="30")
     p.add_argument("--progress", default="")
     p.add_argument("--route", default="auto", choices=("auto", "alt"))
     p.add_argument("--budget", default="")   # v8: seconds for the whole run (the server passes its own)

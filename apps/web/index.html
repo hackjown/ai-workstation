@@ -197,6 +197,8 @@
         </div>
         <div class="row gap wrap">
           <button class="btn primary" id="takeBtn" onclick="toggleTakeover()"><i data-i="hand"></i>接管桌面</button>
+          <button class="btn" onclick="deskPaste()" title="把本机剪贴板里的文字粘贴到电脑里光标所在的位置">粘贴到电脑</button>
+          <button class="btn" onclick="deskCopyBack()" title="把电脑里刚复制（Ctrl+C）的文字拿到本机剪贴板">复制到本机</button>
           <button class="btn" onclick="vmOp('start')">开机</button>
           <button class="btn" onclick="vmOp('restart')">重启</button>
           <button class="btn" onclick="vmOp('stop')">关机</button>
@@ -228,6 +230,8 @@
     <div class="card flat deskhead">
       <div class="iconbox sm"><i data-i="monitor"></i></div>
       <div class="grow"><div class="heading" id="deskTitle">Agent 电脑</div><div class="small" id="deskMode">观看模式</div></div>
+      <button class="btn sm" onclick="deskPaste()" title="粘贴到电脑">粘贴</button>
+      <button class="btn sm" onclick="deskCopyBack()" title="电脑剪贴板复制到本机">取回</button>
       <button class="btn sm" onclick="toggleTakeover()" id="takeBtn2">接管</button>
     </div>
     <div class="deskframe"><iframe id="desk" title="desktop"></iframe></div>

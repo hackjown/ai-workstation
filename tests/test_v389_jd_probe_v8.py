@@ -173,7 +173,7 @@ class SilentComp:
 async def test_a_killed_probe_still_says_its_version_and_where_it_stopped(store, chat):  # noqa: F811
     comp = SilentComp()
     raw = await sw.run_probe(comp, "probe", timeout=sw.PROBE_TIMEOUT, url=DESKTOP)
-    assert "--budget '115'" in comp.cmds[0] and "--progress" in comp.cmds[0]
+    assert "--budget '150'" in comp.cmds[0] and "--progress" in comp.cmds[0]
     assert raw["pushed_version"] == sp.PROBE_VERSION and raw["probe_version"] == "8"
     assert raw["stage_error"] == "卡在「从购物车读价」"
     r = sw.parse_snapshot(raw)
@@ -184,7 +184,7 @@ async def test_a_killed_probe_still_says_its_version_and_where_it_stopped(store,
 
 def test_budget_is_under_the_cap():
     assert sw.PROBE_BUDGET + 12 < sw.PROBE_TIMEOUT and sp.DEFAULT_BUDGET + 12 < sw.PROBE_TIMEOUT
-    assert sp.WAIT_MAX_S <= 15 and sp.SHOT_MAX_S <= 5
+    assert sp.WAIT_MAX_S <= 30 and sp.SHOT_MAX_S <= 5
 
 
 def test_errors_read_in_chinese():

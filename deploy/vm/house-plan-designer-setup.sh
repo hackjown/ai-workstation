@@ -11,6 +11,9 @@ fi
 BASE="${AIW_RAW:-https://raw.githubusercontent.com/hackjown/ai-workstation/main}/skills/house-plan-designer"
 LOCAL="$HOME/ai-workstation/skills/house-plan-designer"
 mkdir -p "$D"
+# the AIW checkout on this computer (~/ai-workstation, which also runs the VM agent: never move it) is brought up to
+# date first, so an old checkout never installs an old skill
+[ -d "$HOME/ai-workstation/.git" ] && timeout 40 git -C "$HOME/ai-workstation" pull -q --ff-only >/dev/null 2>&1 || true
 if [ -f "$LOCAL/MANIFEST" ]; then
   (cd "$LOCAL" && tar --exclude=node_modules -cf - .) | (cd "$D" && tar xf -)
 else

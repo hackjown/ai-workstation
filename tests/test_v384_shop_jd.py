@@ -201,7 +201,7 @@ def test_profile_dir_from_devtools_active_port(tmp_path):
 
 
 def test_probe_version_is_bumped():
-    assert sp.PROBE_VERSION == "9"   # v9 (2026-11-01), v8 (2026-10-30), v7 (2026-10-29): see test_v388_jd_risk_limit.py
+    assert sp.PROBE_VERSION == "10"   # v10 (2026-11-01 evening), v9 (2026-11-01), v8 (2026-10-30), v7 (2026-10-29): see test_v388_jd_risk_limit.py
 
 
 # ----------------------------------------------------------------------------- g. chrome_cdp.py

@@ -704,6 +704,54 @@ async function toggleTakeover() {
   } catch (e) { toast((want ? "接管失败：" : "交还失败：") + e.message); $("deskMode").textContent = S.take ? "你正在操作桌面" : "观看模式"; }
   finally { btns.forEach((b) => (b.disabled = false)); }
 }
+/* 3.9.10 clipboard: the viewer (noVNC / InstaBox) has no paste, so text goes to the VM's clipboard through the API
+   (xclip there) and Ctrl+V (Ctrl+Shift+V in a terminal) is pressed in the window that has the focus. */
+const PASTE_KEYS = [["ctrl+v", "Ctrl+V（浏览器、文档、大多数程序）"], ["ctrl+shift+v", "Ctrl+Shift+V（终端）"], ["", "只放进电脑剪贴板，不按键"]];
+async function sendPaste(text, key) {
+  if (!text) return;
+  if (!S.take) { toast("先点「接管」再粘贴：粘贴会在电脑里按一次 " + (key || "Ctrl+V")); return; }
+  try { await api("POST", `/api/machines/${MID}/input`, { ops: [{ t: "paste", text, key }] });
+    toast(key ? `已粘贴 ${text.length} 个字符到电脑` : "已放进电脑剪贴板"); }
+  catch (e) { toast("粘贴失败：" + e.message); }
+}
+async function deskPaste() {
+  const k = localStorage.getItem("aiw_paste_key") ?? "ctrl+v";
+  modal(`<div class="card"><div class="heading">粘贴到电脑</div>
+    <div class="muted">先在电脑里点好要粘贴的位置。在下面按 ⌘V / Ctrl+V 贴入文字，再点发送。</div>
+    <textarea id="pasteText" rows="6" style="width:100%;margin-top:10px" placeholder="在这里粘贴"></textarea>
+    <div class="row gap wrap" style="justify-content:space-between;margin-top:10px">
+      <select id="pasteKey">${PASTE_KEYS.map(([v, l]) => `<option value="${v}" ${v === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+      <span class="row gap"><button class="btn sm" onclick="closeOverlays()">取消</button>
+      <button class="btn sm primary" onclick="deskPasteGo()">发送</button></span></div></div>`);
+  const ta = $("pasteText"); ta.focus();
+  ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); deskPasteGo(); } });
+  try { if (navigator.clipboard && navigator.clipboard.readText) { const t = await navigator.clipboard.readText(); if (t && !ta.value) { ta.value = t; ta.select(); } } }
+  catch (e) { /* no permission / not https: the user pastes into the box */ }
+}
+async function deskPasteGo() {
+  const t = $("pasteText").value, key = $("pasteKey").value;
+  if (!t) { toast("还没有内容"); return; }
+  localStorage.setItem("aiw_paste_key", key); closeOverlays(); await sendPaste(t, key);
+}
+window.aiwPasteToVM = deskPaste;
+async function deskCopyBack() {
+  let t = "";
+  try { t = (await api("GET", `/api/machines/${MID}/clipboard`)).text || ""; } catch (e) { toast("读不到电脑剪贴板：" + e.message); return; }
+  if (!t) { toast("电脑剪贴板是空的：先在电脑里选中文字按 Ctrl+C"); return; }
+  try { await navigator.clipboard.writeText(t); toast(`已复制 ${t.length} 个字符到本机`); return; } catch (e) { /* not https: show it */ }
+  modal(`<div class="card"><div class="heading">电脑剪贴板</div><div class="muted">已选中，按 ⌘C / Ctrl+C 复制。</div>
+    <textarea id="clipBack" rows="6" style="width:100%;margin-top:10px" readonly></textarea>
+    <div class="row gap" style="justify-content:flex-end;margin-top:10px"><button class="btn sm" onclick="closeOverlays()">关闭</button></div></div>`);
+  const ta = $("clipBack"); ta.value = t; ta.focus(); ta.select();
+}
+// ⌘V / Ctrl+V on the AIW page itself (not inside the desktop frame, not in a text box) while taking over: straight in
+document.addEventListener("paste", (e) => {
+  const tg = e.target, typing = tg && (tg.closest && tg.closest("input,textarea,[contenteditable=true],#modal"));
+  if (!S.take || typing) return;
+  const t = (e.clipboardData && e.clipboardData.getData("text/plain")) || "";
+  if (!t) return;
+  e.preventDefault(); sendPaste(t, localStorage.getItem("aiw_paste_key") ?? "ctrl+v");
+});
 async function vmOp(op) { if (op !== "start" && !confirm("确定" + { stop: "关机", restart: "重启" }[op] + "？")) return; try { await api("POST", `/api/machines/${MID}/${op}`); toast("已发送"); refreshMachine(); } catch (e) { toast(e.message); } }
 async function snapshot() { const n = prompt("快照名称（字母开头，字母数字-_）", "snap" + new Date().toISOString().slice(0, 10).replace(/-/g, "")); if (!n) return; try { await api("POST", `/api/machines/${MID}/snapshot`, { name: n }); toast("快照已创建"); } catch (e) { toast(e.message); } }
 async function refreshMachine() {

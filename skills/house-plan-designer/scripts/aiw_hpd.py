@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import math
 import os
 import shutil
@@ -394,7 +395,29 @@ def room_closure(hs: dict, res: float = 50.0) -> dict:
             out.append(r.get("name"))
         elif area[cy, cx] == 0:
             regions.setdefault(int(comp[cy, cx]), []).append(r.get("name"))
-    return {"open": out, "shared": [v for v in regions.values() if len(v) > 1]}
+    return split_closure({"open": out, "shared": [v for v in regions.values() if len(v) > 1]})
+
+
+# 3.9.11 (task-a7b46fccd8): rooms that are open by nature. The run chased 阳台(半赠送) / 空调位 / 可拓展空间 for 100 steps.
+OPEN_BY_NATURE = re.compile(r"阳台|露台|平台|空调|设备|花园|庭院|天井|可拓展|赠送|飘窗|走廊|过道|连廊|入户")
+OPEN_PLAN = re.compile(r"客厅|餐厅|起居|客餐|玄关|门厅|过道|走廊|开放")
+
+
+def split_closure(clo: dict) -> dict:
+    """open / shared -> what needs a wall (open, shared) and what is fine as drawn (open_ok, shared_ok): a balcony, an AC
+    ledge or an expansion space is open on purpose; living + dining (+ hall) in one area is an open plan."""
+    names = lambda v: [str(x or "") for x in v]
+    open_fix = [n for n in names(clo.get("open") or []) if not OPEN_BY_NATURE.search(n)]
+    open_ok = [n for n in names(clo.get("open") or []) if OPEN_BY_NATURE.search(n)]
+    shared_fix, shared_ok = [], []
+    for grp in clo.get("shared") or []:
+        g = names(grp)
+        rest = [n for n in g if not OPEN_BY_NATURE.search(n)]
+        if len(rest) <= 1 or all(OPEN_PLAN.search(n) for n in rest):
+            shared_ok.append(g)
+        else:
+            shared_fix.append(g)
+    return {"open": open_fix, "shared": shared_fix, "open_ok": open_ok, "shared_ok": shared_ok}
 
 
 def from_image(image: str, out: str, name: str | None = None, extra: list | None = None) -> dict:
@@ -425,9 +448,12 @@ def from_image(image: str, out: str, name: str | None = None, extra: list | None
     Path(out).write_text(json.dumps(hs, ensure_ascii=False, indent=1), encoding="utf-8")
     res.update(ok=True, route="trace", cad_spec=str(cad_spec), warnings=(info.get("warnings") or [])[:4],
                open_rooms=clo["open"], shared_rooms=clo["shared"],
-               next=("make 之后看 overlay.png；open_rooms 里的房间没围合（多半是细线隔墙、栏杆没认成墙），按原图补墙；"
-                     "shared_rooms 是同一块区域里的几个名字，真有隔墙就补上，开放式（客餐厅）就保留。门（_aiw=gap）是按墙缺口补的，"
-                     "开向不对就改 hinge / into。缺的房间名补到 rooms。"))
+               open_ok=clo.get("open_ok") or [], shared_ok=clo.get("shared_ok") or [],
+               next=("直接在这个 spec.json 上改（读入→改几面墙→写回），不要另写脚本从 cad-spec 重建墙。"
+                     + ("只补 open_rooms / shared_rooms 列出的房间缺的墙；" if clo["open"] or clo["shared"] else
+                        "墙已经够用，不用补墙；")
+                     + "open_ok / shared_ok（阳台、空调位、可拓展空间、开放式客餐厅）本来就不封闭，不要补。"
+                     "make 最多 3 轮，然后第 5 步摆家具 + autoElec，再 --final 交付。门（_aiw=gap）开向不对就改 hinge / into。"))
     return res
 
 
@@ -645,6 +671,19 @@ def make(spec: str, out: str, name: str, final: str | None) -> dict:
         res["clean"] = (not rep.get("errors") and not rep.get("freeWallEnds") and not rep.get("wallsDropped")
                         and not rep.get("wallsSkewed") and not rep.get("openingsHidden")
                         and rep.get("issues_error", 0) == 0 and rep.get("issues_warn", 0) == 0)
+        # 3.9.11: good enough to furnish and deliver (free wall ends at a balcony rail or an AC ledge never go away)
+        res["can_finish"] = bool(not rep.get("errors") and not rep.get("wallsDropped") and rep.get("issues_error", 0) == 0)
+        if not final:
+            rf = out_d / ".rounds"
+            try:
+                n = int(rf.read_text() or 0) + 1 if rf.exists() else 1
+            except ValueError:
+                n = 1
+            rf.write_text(str(n))
+            res["round"] = n
+            if n >= 3 or (res["can_finish"] and not res["clean"] and n >= 2):
+                res["next"] = (f"第 {n} 轮检查：别再改墙了。按 SKILL.md 第 5 步摆家具 + autoElec（同一个 spec），然后 make --final 交付，"
+                               "剩下的问题在交付说明里写清楚。")
     else:
         res["error"] = (r2.stderr or r2.stdout)[-2000:]
     if final:

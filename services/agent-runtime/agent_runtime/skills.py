@@ -108,8 +108,9 @@ CATALOG: list[dict] = [
               "deterministic tracer inside, ~10 s) and only patch the walls its open_rooms / shared_rooms name; only when it "
               "says ok=false use `aiw_hpd.py imgcheck` (analyze.py, or the dimension-chain route it advises); PDF/DXF use "
               "cadvec.py / cadsplit.py. Never hand-measure pixel peaks or ask the vision model for coordinates; loop "
-              "`aiw_hpd.py make <spec> --out hpd/<name>/work --name <name>` until HPD_RESULT clean=true (read overlay.png and "
-              "plan2d.png every round, at most 5 rounds); furnish + autoElec as SKILL.md step 5; deliver with `make ... --final "
+              "`aiw_hpd.py make <spec> --out hpd/<name>/work --name <name>` at most 3 rounds (clean=true is best, can_finish=true is "
+              "enough; open_ok / shared_ok rooms such as 阳台 / 空调位 / 可拓展空间 stay open; patch spec.json in place, never "
+              "rebuild walls from cad-spec.json in a new script; read_image at most 4 times in all); then furnish + autoElec as SKILL.md step 5; deliver with `make ... --final "
               "hpd/<name>` then `aiw_hpd.py qa <html> --out hpd/<name>/qa` (lite+quick on the VM); send_file the HTML, plan2d "
               "and view3d PNGs; never edit assets/template.html. Do not use drawing_auto / drawing_build for this job.")},
     {"id": "cad-drawing", "title": "照图出图 CAD", "icon": "ruler",

@@ -57,9 +57,15 @@ VM 一般没有显卡：截图和验收用 SwiftShader 软件渲染（脚本已�
 python3 $HPD/scripts/aiw_hpd.py make hpd/<户型名>/spec.json --out hpd/<户型名>/work --name <户型名>
 ```
 最后一行 `HPD_RESULT {...}`：`report` 是 check.mjs 的摘要（`freeWallEnds`、`wallsDropped`、`wallsSkewed`、`openingsHidden`、
-`labelsOutsideRooms`、`issues_error/warn`、`must_fix` 原文、每个房间面积和开间进深），`clean=true` 才算过；`shots` 是
-plan2d / overlay / view3d 截图路径——**每轮都 read_image 看 overlay.png 和 plan2d.png**。改 spec（或生成脚本）后重跑，
-最多 5 轮；仍有改不掉的问题（原图就这么画）在交付时逐条说明。
+`labelsOutsideRooms`、`issues_error/warn`、`must_fix` 原文、每个房间面积和开间进深），`clean=true` 最好，`can_finish=true`
+（没有 errors / wallsDropped / issues_error）就可以往下做；`shots` 是 plan2d / overlay / view3d 截图路径。
+- **最多 3 轮 make**（`round` 字段会数），第 3 轮之后不管 clean 与否都进第 5 步摆家具，再 --final 交付，没改掉的写进交付说明。
+  task-a7b46fccd8 识别 15 秒就成功了，之后为了 clean=true make 了 11 轮、问了视觉模型 12 次 overlay、写了 7 个脚本重建墙，
+  半小时没交付——阳台栏杆、空调位、可拓展空间本来就不封闭，`freeWallEnds` 在那里永远不会归零。
+- from-image 的 `open_ok` / `shared_ok`（阳台、露台、空调位、设备平台、可拓展空间、开放式客餐厅）**不补墙**；只补 `open_rooms` /
+  `shared_rooms` 里列的。
+- **改墙 = 读入 spec.json，改那几面墙 / 洞口 / 房间名，写回**。不要另写生成脚本从 cad-spec.json / walls_traced 重建全部墙（门窗和已经对的围合会丢）。
+- overlay.png / plan2d.png 每轮最多看一次，整个任务 read_image 不超过 4 次；不要问视觉模型"哪面墙缺了、在哪"，看 report 的 must_fix。
 
 ## 3. 交付
 ```bash

@@ -88,6 +88,10 @@ class AgentLoop:
             self._designer_task = _is_designer(task.prompt or "")
         except Exception:  # noqa: BLE001
             self._designer_task = False
+        self._hpd_guard = None
+        if self._designer_task:   # 3.9.11: keep the designer job moving to delivery (hpd_guard.py)
+            from .hpd_guard import HpdGuard
+            self._hpd_guard = HpdGuard()
         if self._designer_task and config is None:  # 3.9.8: recognise + check rounds + 8~15 min QA run
             if self.cfg.max_steps > 0:
                 self.cfg.max_steps = max(self.cfg.max_steps, int(os.environ.get("AIW_HPD_MAX_STEPS", "300")))
@@ -1022,6 +1026,13 @@ class AgentLoop:
                     note = ((note + "\n") if note else "") + hint
             if stall_note:
                 note = ((note + "\n") if note else "") + stall_note
+            if self._hpd_guard is not None:
+                try:
+                    gn = self._hpd_guard.feed(decision.tool, decision.args or {}, bool(getattr(v, "success", True)), seen)
+                except Exception:  # noqa: BLE001
+                    gn = None
+                if gn:
+                    note = ((note + "\n") if note else "") + gn
 
 
     async def _look(self, shot: str, shown: tuple[int, int]) -> Optional[str]:

@@ -91,7 +91,7 @@ def test_close_ends_runs_a_free_end_to_the_next_wall_with_a_door():
     assert part["b"] == [2500, 4000]
     assert [(t, round(f), round(e)) for _, f, e, t in adds] == [("door", 3100, 4000)]
     clo = h.room_closure({"walls": walls, "rooms": [{"at": [1200, 2000], "name": "A"}, {"at": [3800, 2000], "name": "B"}]})
-    assert clo == {"open": [], "shared": []}
+    assert clo["open"] == [] and clo["shared"] == []
 
 
 def test_web_task_row_title_never_squeezed():

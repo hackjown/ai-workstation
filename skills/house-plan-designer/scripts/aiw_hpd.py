@@ -10,6 +10,11 @@
                                                 # cad-drawing 的 spec（同一任务已出过平面图时）→ HouseSpec 初稿
   python3 aiw_hpd.py make hpd/spec.json --out hpd --name 户型名 [--final 目录]
                                                 # build.py → check.mjs → 摘要；最后一行 HPD_RESULT {json}
+  python3 aiw_hpd.py from-image 原图.jpg -o hpd/draft.json [--name 户型名]
+                                                # 图片路线第一步：cad-drawing 的照图识别 → from-cad → 房间围合检查
+  python3 aiw_hpd.py imgcheck 原图.jpg --total-width W [--total-height H] --out hpd/a0
+                                                # 图片路线第一步：跑一次 analyze.py 并判断这张图能不能自动识别墙；
+                                                # 最后一行 HPD_IMGCHECK {route: analyze|dims, why, advice}
   python3 aiw_hpd.py qa 户型名-装修设计器.html --out hpd/qa [--full]
                                                 # 验收：默认 --lite --quick（VM 无显卡），--full 跑完整一遍
 
@@ -198,6 +203,234 @@ def _centroid(pts):
     return [cx / (3 * a), cy / (3 * a)]
 
 
+def _join_gaps(walls: list, ops_at: list, tol: float = 60.0, door_min: float = 550.0, door_max: float = 1300.0,
+               op_max: float = 3600.0):
+    """Join collinear wall pieces across a gap that holds an opening (≤ op_max) or is door-sized (door_min..door_max).
+    Returns (walls, [(wall, from, to)] of door-sized gaps with no opening in them)."""
+    def key(w):
+        (x1, y1), (x2, y2) = w["a"], w["b"]
+        if abs(y1 - y2) < 1e-6:
+            return "h", y1, min(x1, x2), max(x1, x2)
+        if abs(x1 - x2) < 1e-6:
+            return "v", x1, min(y1, y2), max(y1, y2)
+        return None
+    straight = [(key(w), w) for w in walls]
+    others = [w for k, w in straight if k is None]
+    out, doors = list(others), []
+    for o in ("h", "v"):
+        ws = sorted([(k, w) for k, w in straight if k and k[0] == o], key=lambda kw: kw[0][1])
+        groups: list[list] = []
+        for k, w in ws:                      # same line within tol
+            if groups and abs(groups[-1][0][0][1] - k[1]) <= tol:
+                groups[-1].append((k, w))
+            else:
+                groups.append([(k, w)])
+        for g in groups:
+            g.sort(key=lambda kw: kw[0][2])
+            line = sum(k[1] for k, _ in g) / len(g)
+            cur = None
+            for k, w in g:
+                lo, hi = k[2], k[3]
+                if cur is None:
+                    cur = {"lo": lo, "hi": hi, "t": w["t"], "w": w, "gaps": []}
+                    continue
+                gap = lo - cur["hi"]
+                has_op = any(cur["hi"] - 5 <= (p[0] if o == "h" else p[1]) <= lo + 5 and
+                             abs((p[1] if o == "h" else p[0]) - line) <= max(cur["t"], w["t"]) / 2 + 80 for p in ops_at)
+                if gap <= 0 or (has_op and gap <= op_max) or door_min <= gap <= door_max or gap < door_min and gap < 200:
+                    if gap > 0 and not has_op and door_min <= gap <= door_max:
+                        cur["gaps"].append((cur["hi"], lo))
+                    cur["hi"] = max(cur["hi"], hi)
+                    cur["t"] = max(cur["t"], w["t"])
+                    continue
+                out.append(_mk_wall(o, line, cur)); doors += [(out[-1], f, t) for f, t in cur["gaps"]]
+                cur = {"lo": lo, "hi": hi, "t": w["t"], "w": w, "gaps": []}
+            if cur:
+                out.append(_mk_wall(o, line, cur)); doors += [(out[-1], f, t) for f, t in cur["gaps"]]
+    return out, doors
+
+
+def _mk_wall(o: str, line: float, cur: dict) -> dict:
+    line = round(line, 1)
+    a, b = ([cur["lo"], line], [cur["hi"], line]) if o == "h" else ([line, cur["lo"]], [line, cur["hi"]])
+    w = {k: v for k, v in cur["w"].items() if k not in ("a", "b", "t", "openings")}
+    w.update({"a": [round(a[0], 1), round(a[1], 1)], "b": [round(b[0], 1), round(b[1], 1)], "t": cur["t"], "openings": []})
+    return w
+
+
+def _close_ends(walls: list, reach: float = 2700.0, door_min: float = 550.0, door_max: float = 1300.0) -> list:
+    """v3.9.9 (task-9c4): a traced wall that stops in mid-air (its door / its thin partition was not traced as a wall)
+    leaves the room open. Each free end of a straight wall is run on along its own direction to the first wall it
+    meets within `reach`: a short run is plain wall, a door-sized run gets a door, a longer one a hole (a pass-through
+    the room check still treats as its edge). Returns [(wall, from, to, type)] for the openings to add."""
+    def seg(w):
+        (x1, y1), (x2, y2) = w["a"], w["b"]
+        if abs(y1 - y2) < 1e-6:
+            return "h", y1, min(x1, x2), max(x1, x2)
+        if abs(x1 - x2) < 1e-6:
+            return "v", x1, min(y1, y2), max(y1, y2)
+        return None
+
+    def touches(pt, me):
+        for w in walls:
+            if w is me:
+                continue
+            k = seg(w)
+            if not k:
+                continue
+            o, line, lo, hi = k
+            pad = w["t"] / 2 + me["t"] / 2 + 60
+            u, v = (pt[0], pt[1]) if o == "h" else (pt[1], pt[0])
+            if lo - pad <= u <= hi + pad and abs(v - line) <= pad:
+                return True
+        return False
+
+    adds = []
+    for w in list(walls):
+        k = seg(w)
+        if not k:
+            continue
+        o, line, lo, hi = k
+        for end, sign in ((lo, -1), (hi, 1)):
+            pt = [end, line] if o == "h" else [line, end]
+            if touches(pt, w):
+                continue
+            best = None
+            for x in walls:
+                kx = seg(x)
+                if x is w or not kx:
+                    continue
+                ox, lx, lox, hix = kx
+                if ox == o:
+                    if abs(lx - line) <= max(w["t"], x["t"]) / 2 + 60:
+                        d = (lox - end) if sign > 0 else (end - hix)
+                        hit = lox if sign > 0 else hix
+                    else:
+                        continue
+                else:
+                    if not (lox - x["t"] / 2 <= line <= hix + x["t"] / 2):
+                        continue
+                    d = (lx - end) * sign
+                    hit = lx
+                if 0 < d <= reach and (best is None or d < best[0]):
+                    best = (d, hit)
+            if not best:
+                continue
+            d, hit = best
+            f, t = sorted((end, hit))
+            if o == "h":
+                w["a"], w["b"] = [min(lo, f), line], [max(hi, t), line]
+            else:
+                w["a"], w["b"] = [line, min(lo, f)], [line, max(hi, t)]
+            lo, hi = min(lo, f), max(hi, t)
+            if d >= door_min:
+                adds.append((w, f, t, "door" if d <= door_max else "hole"))
+    # two free ends whose runs cross (an L corner the trace lost, often with the door beside it): meet at the crossing;
+    # the longer run carries the door when it is door-sized
+    free = []
+    for w in walls:
+        k = seg(w)
+        if not k:
+            continue
+        o, line, lo, hi = k
+        for end, sign in ((lo, -1), (hi, 1)):
+            pt = [end, line] if o == "h" else [line, end]
+            if not touches(pt, w):
+                free.append((w, o, line, end, sign))
+    used = set()
+    for i, (w1, o1, l1, e1, s1) in enumerate(free):
+        for j, (w2, o2, l2, e2, s2) in enumerate(free):
+            if j <= i or o1 == o2 or i in used or j in used or w1 is w2:
+                continue
+            d1, d2 = (l2 - e1) * s1, (l1 - e2) * s2       # w1 runs to w2's line, w2 runs to w1's line
+            if not (-60 <= d1 <= reach and -60 <= d2 <= reach and max(d1, d2) > 0):
+                continue
+            runs = []
+            for w, o, l, e, sg, hit, d in ((w1, o1, l1, e1, s1, l2, d1), (w2, o2, l2, e2, s2, l1, d2)):
+                k = seg(w)
+                lo, hi = min(k[2], hit), max(k[3], hit)
+                w["a"], w["b"] = ([lo, l], [hi, l]) if o == "h" else ([l, lo], [l, hi])
+                runs.append((d, w, min(e, hit), max(e, hit)))
+            d, w, f, t = max(runs, key=lambda r: r[0])
+            if door_min <= d <= door_max:
+                adds.append((w, f, t, "door"))
+            used.update((i, j))
+    return adds
+
+
+def _kit_dir() -> Path | None:
+    for d in (Path.home() / ".claude" / "skills" / "cad-drawing", ROOT.parent / "cad-drawing",
+              Path(os.environ.get("VM_AGENT_FILES_ROOT", str(Path.home() / "workspace"))) / ".aiw" / "cad-drawing"):
+        if (d / "drawkit.py").exists():
+            return d
+    return None
+
+
+def room_closure(hs: dict, res: float = 50.0) -> dict:
+    """Which room labels sit in a closed area: walls rasterised (openings other than windows count as the room's edge,
+    as the designer does), flood fill from outside. Returns {"open": [names outside], "shared": [[names in one area]]}."""
+    import numpy as np
+    import cv2
+    ws = [w for w in hs.get("walls") or [] if w.get("a") and w.get("b")]
+    if not ws:
+        return {"open": [r.get("name") for r in hs.get("rooms") or []], "shared": []}
+    xs = [p[0] for w in ws for p in (w["a"], w["b"])]
+    ys = [p[1] for w in ws for p in (w["a"], w["b"])]
+    x0, y0 = min(xs) - 1000, min(ys) - 1000
+    W, H = int((max(xs) - x0 + 1000) / res) + 1, int((max(ys) - y0 + 1000) / res) + 1
+    g = np.zeros((H, W), np.uint8)
+    P = lambda x, y: (int(round((x - x0) / res)), int(round((y - y0) / res)))
+    for w in ws:
+        th = max(1, int(round(float(w.get("t") or 120) / res)))
+        cv2.line(g, P(*w["a"]), P(*w["b"]), 255, th + 1)
+    lab = np.zeros((H + 2, W + 2), np.uint8)
+    area = g.copy()
+    cv2.floodFill(area, lab, (0, 0), 128)
+    out, regions = [], {}
+    n, comp = cv2.connectedComponents((area == 0).astype(np.uint8), 4)
+    for r in hs.get("rooms") or []:
+        cx, cy = P(*r["at"])
+        if not (0 <= cx < W and 0 <= cy < H) or area[cy, cx] == 128:
+            out.append(r.get("name"))
+        elif area[cy, cx] == 0:
+            regions.setdefault(int(comp[cy, cx]), []).append(r.get("name"))
+    return {"open": out, "shared": [v for v in regions.values() if len(v) > 1]}
+
+
+def from_image(image: str, out: str, name: str | None = None, extra: list | None = None) -> dict:
+    """v3.9.9 (task-9c4): a clean picture goes through cad-drawing's deterministic tracer first (照图画图: walls, door /
+    window gaps, scale from the dimension numbers, room names by OCR, in seconds), then from-cad. task-9c4 skipped it,
+    hand-measured pixel peaks for 35+ steps and merged six rooms into one; the same picture traced in ~10 s."""
+    kit = _kit_dir()
+    if not kit:
+        return {"ok": False, "route": "analyze", "error": "没有 cad-drawing 技能（~/.claude/skills/cad-drawing），改用 imgcheck / analyze.py"}
+    od = Path(out).resolve().parent
+    od.mkdir(parents=True, exist_ok=True)
+    cad_spec = od / "cad-spec.json"
+    r = subprocess.run([sys.executable, str(kit / "drawkit.py"), "auto", str(Path(image).resolve()), "--out", str(cad_spec), "--install-ocr"] + list(extra or []),
+                       capture_output=True, text=True, timeout=600)
+    line = next((x for x in reversed(r.stdout.splitlines()) if x.startswith("DRAWKIT_AUTO ")), "")
+    if r.returncode != 0 or not cad_spec.exists():
+        return {"ok": False, "route": "analyze", "error": "照图识别没成功：" + (r.stderr or r.stdout)[-400:].strip(),
+                "next": "图上没有可读的尺寸数字时可加 --mm-per-px（总宽mm ÷ 外墙像素宽）再试一次；仍不行就跑 imgcheck 走 analyze / 尺寸链"}
+    info = {}
+    try:
+        info = json.loads(line.split(" ", 1)[1]) if line else {}
+    except Exception:  # noqa: BLE001
+        pass
+    res = from_cad(str(cad_spec), out, name)
+    hs = json.loads(Path(out).read_text(encoding="utf-8"))
+    clo = room_closure(hs)
+    hs.setdefault("_aiw", {})["closure"] = clo
+    Path(out).write_text(json.dumps(hs, ensure_ascii=False, indent=1), encoding="utf-8")
+    res.update(ok=True, route="trace", cad_spec=str(cad_spec), warnings=(info.get("warnings") or [])[:4],
+               open_rooms=clo["open"], shared_rooms=clo["shared"],
+               next=("make 之后看 overlay.png；open_rooms 里的房间没围合（多半是细线隔墙、栏杆没认成墙），按原图补墙；"
+                     "shared_rooms 是同一块区域里的几个名字，真有隔墙就补上，开放式（客餐厅）就保留。门（_aiw=gap）是按墙缺口补的，"
+                     "开向不对就改 hinge / into。缺的房间名补到 rooms。"))
+    return res
+
+
 def from_cad(spec_path: str, out: str, name: str | None = None) -> dict:
     """cad-drawing 的 spec 是 y 向下的 mm（y_down=true，和 HouseSpec 一样）。墙取 drawkit 的墙段（traced 或房间网格推出来的），
     门窗按位置挂到最近的墙上，房间名变成标签点，家具块换成设计器的 key。只是初稿：之后照 SKILL.md 第 4 步 check 并修。"""
@@ -205,12 +438,7 @@ def from_cad(spec_path: str, out: str, name: str | None = None) -> dict:
     spec = json.loads(sp_path.read_text(encoding="utf-8"))
     if spec.get("kind", "floor_plan") != "floor_plan":
         raise SystemExit("from-cad 只接受户型平面图 spec（kind=floor_plan）")
-    kit = None
-    for d in (Path.home() / ".claude" / "skills" / "cad-drawing", ROOT.parent / "cad-drawing",
-              Path(os.environ.get("VM_AGENT_FILES_ROOT", str(Path.home() / "workspace"))) / ".aiw" / "cad-drawing"):
-        if (d / "drawkit.py").exists():
-            kit = d
-            break
+    kit = _kit_dir()
     if not kit:
         raise SystemExit("找不到 cad-drawing 的 drawkit.py（~/.claude/skills/cad-drawing）")
     sys.path.insert(0, str(kit))
@@ -232,6 +460,17 @@ def from_cad(spec_path: str, out: str, name: str | None = None) -> dict:
                       "t": round(float(s["t"]), 1), "openings": []})
     for e in spec.get("hollow_walls") or []:
         walls.append({"a": e["a"], "b": e["b"], "t": e.get("t", plan.t_int), "bearing": False, "openings": []})
+
+    # v3.9.9 (task-9c4): drawtrace breaks a wall at every door / window, so each opening sat in a GAP between two
+    # collinear walls and attach() found no wall for any of them (8 of 8 unplaced), and the door gaps left every room
+    # open (the check merged 6 rooms into one 63 m2 shape). Collinear pieces are joined across a gap that holds an
+    # opening of the spec, or across a door-sized gap (it becomes a door), so rooms close and openings land on walls.
+    ops_at = [d["at"] for d in (spec.get("doors") or []) if d.get("at")]
+    ops_at += [w_["at"] for w_ in (spec.get("windows") or []) if w_.get("at")]
+    ops_at += [[(w_["a"][0] + w_["b"][0]) / 2, (w_["a"][1] + w_["b"][1]) / 2] for w_ in (spec.get("windows") or [])
+               if not w_.get("at") and w_.get("a") and w_.get("b")]
+    walls, gap_doors = _join_gaps(walls, ops_at)
+    end_runs = _close_ends(walls)
 
     rooms_by_id = {}
     rooms = []
@@ -288,6 +527,13 @@ def from_cad(spec_path: str, out: str, name: str | None = None) -> dict:
         elif wdw.get("a") and wdw.get("b"):
             a, b = wdw["a"], wdw["b"]
             attach([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], math.hypot(b[0] - a[0], b[1] - a[1]), {"type": "window"})
+    for w, f, t, typ in [(w, f, t, "door") for w, f, t in gap_doors] + end_runs:
+        # a gap / an open run the trace saw no door in: a plain door (or a pass-through) there, so the room closes
+        if not any(o["from"] < t and o["to"] > f for o in w["openings"]):
+            op = {"type": typ, "from": round(f, 1), "to": round(t, 1), "_aiw": "gap"}
+            if typ == "door":
+                op["hinge"] = "from"
+            w["openings"].append(op)
     for w in walls:
         if not w["openings"]:
             w.pop("openings")
@@ -424,6 +670,64 @@ def qa(html: str, out: str, full: bool) -> int:
     return rc
 
 
+def imgcheck(image: str, out: str, total_width: float | None, total_height: float | None, extra: list[str]) -> dict:
+    """v3.9.9: one analyze.py run on the ORIGINAL picture, then a verdict on whether its walls can be trusted.
+    task-3ddae3f2f2: a 534×800 售楼处效果图 (plan body ~230 px wide, a 240 wall ~5 px, furniture and coloured floors) —
+    analyze.py was rerun on crops / 2x / 5x upscales about eight times, 126 steps, and no room ever closed. A picture
+    that small is read from its dimension chains instead, from the first step."""
+    import statistics
+    cmd = [sys.executable, str(HERE / "analyze.py"), image, "--out", out]
+    if total_width:
+        cmd += ["--total-width", str(total_width)]
+    if total_height:
+        cmd += ["--total-height", str(total_height)]
+    cmd += list(extra or [])
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    res: dict = {"ok": r.returncode == 0, "analysis": out, "cmd": " ".join(cmd[1:])}
+    if r.returncode != 0:
+        res.update(route="dims", why="analyze.py 出错：" + (r.stderr or r.stdout)[-300:].strip())
+    else:
+        try:
+            a = json.load(open(os.path.join(out, "analysis.json"), encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            a = {}
+            res["error"] = str(e)
+        size = a.get("size") or [0, 0]
+        o = a.get("outline_px") or [0, 0, size[0], size[1]]
+        bw, bh = max(1, o[2] - o[0]), max(1, o[3] - o[1])
+        segs = a.get("segments_px") or []
+        t_med = statistics.median([float(x.get("t") or 0) for x in segs]) if segs else 0.0
+        chk = a.get("scale_check") or {}
+        ws, hs = chk.get("width_scale"), chk.get("height_scale")
+        spread = abs(ws - hs) / min(ws, hs) if ws and hs and min(ws, hs) > 0 else None
+        mmpx = float(a.get("mmPerPx") or 0) or None
+        wall_px = round(240.0 / mmpx, 1) if mmpx else None
+        why = []
+        if spread is not None and spread > 0.08:
+            why.append(f"按总宽、总深算的比例差 {int(spread * 100)}%（认出的外轮廓不对）")
+        if bw < 450 or bh < 350:
+            why.append(f"认出的户型主体只有 {bw}×{bh} 像素")
+        if wall_px is not None and wall_px < 7:
+            why.append(f"240 墙只有约 {wall_px} 像素")
+        if len(segs) < 8:
+            why.append(f"只认出 {len(segs)} 段墙")
+        res.update(size=size, outline_px=o, mmPerPx=round(mmpx, 3) if mmpx else None, wall240_px=wall_px,
+                   wall_t_px_median=t_med, segments=len(segs), scale_spread=round(spread, 3) if spread is not None else None,
+                   dim_lines={k: len(v) for k, v in (a.get("dims_px") or {}).items()})
+        res["route"] = "dims" if why else "analyze"
+        res["why"] = "；".join(why) or f"户型主体 {bw}×{bh} 像素，240 墙约 {wall_px} 像素，比例一致"
+    if res["route"] == "dims":
+        res["advice"] = ("这张图不要再换参数、裁剪、放大重跑 analyze.py（不会变好）。改走尺寸链：读图上上 / 下 / 左 / 右的分段尺寸数字，"
+                         "累加成 X、Y 两套轴网（毫米），按 reference/example-gen.py 的写法手写墙（外圈先闭合，内墙端点落在别的墙中线上，"
+                         "墙厚按常用值 240 / 200 / 120），门窗按原图位置写在墙上，房间名放在原图文字处；underlay 用原图并按总宽换算 mmPerPx，"
+                         "然后 make，看 overlay.png 对齐再微调。同一张图 read_image 不超过 3 次。图太小认不清的地方，在交付时说明，"
+                         "并建议用户换一张户型部分 ≥1500 像素宽、没有家具的线稿。")
+    else:
+        res["advice"] = ("用这次的 draft.json 继续第 3 步。make 之后 freeWallEnds 仍 > 8 或房间围不起来，最多再调一次 analyze.py 参数"
+                         "（--outlined / --gray-max / --crop），还不行就改走尺寸链手写，不要反复重跑。")
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -431,8 +735,13 @@ def main():
     p = sub.add_parser("from-cad"); p.add_argument("spec"); p.add_argument("-o", "--out", required=True); p.add_argument("--name")
     p = sub.add_parser("make"); p.add_argument("spec"); p.add_argument("--out", required=True)
     p.add_argument("--name", default="户型"); p.add_argument("--final")
+    p = sub.add_parser("from-image"); p.add_argument("image"); p.add_argument("-o", "--out", required=True); p.add_argument("--name")
+    p = sub.add_parser("imgcheck"); p.add_argument("image"); p.add_argument("--out", required=True)
+    p.add_argument("--total-width", type=float); p.add_argument("--total-height", type=float)
     p = sub.add_parser("qa"); p.add_argument("html"); p.add_argument("--out", required=True); p.add_argument("--full", action="store_true")
-    a = ap.parse_args()
+    a, extra = ap.parse_known_args()
+    if extra and a.cmd not in ("imgcheck", "from-image"):
+        ap.error("unrecognized arguments: " + " ".join(extra))
     if a.cmd == "doctor":
         print("HPD_DOCTOR " + json.dumps(doctor(), ensure_ascii=False))
     elif a.cmd == "ensure":
@@ -441,6 +750,10 @@ def main():
         print("HPD_DRAFT " + json.dumps(from_cad(a.spec, a.out, a.name), ensure_ascii=False))
     elif a.cmd == "make":
         print("HPD_RESULT " + json.dumps(make(a.spec, a.out, a.name, a.final), ensure_ascii=False))
+    elif a.cmd == "from-image":
+        print("HPD_DRAFT " + json.dumps(from_image(a.image, a.out, a.name, extra), ensure_ascii=False))
+    elif a.cmd == "imgcheck":
+        print("HPD_IMGCHECK " + json.dumps(imgcheck(a.image, a.out, a.total_width, a.total_height, extra), ensure_ascii=False))
     elif a.cmd == "qa":
         sys.exit(qa(a.html, a.out, a.full))
 

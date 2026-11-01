@@ -1142,6 +1142,8 @@ class Chat:
         vm = [a.get("vm_path") for a in attachments if a.get("vm_path")]
         if vm:
             prompt += "\n\n附件（已放到电脑上）：\n" + "\n".join("- " + p for p in vm)
+            if any(a.get("vm_pending") for a in attachments):
+                prompt += "\n（有附件刚才没直接传上，任务开始时已自动补传，以 ATTACHMENTS 一节列出的路径为准）"
         title = (title or "").strip() or _short_title(prompt)
         try:
             res = await self.sessions.submit(prompt, machine_id or None, None, source=source, title=title,
@@ -1196,11 +1198,18 @@ class Chat:
                     from .uploads import push_to_vm   # in 16 MB pieces: videos are bigger than one agent message
                     await push_to_vm(self.sessions.computer(mid), self._allowed(local), f"uploads/{name}")
                     a["vm_path"] = f"~/workspace/uploads/{name}"
-                except Exception as e:  # noqa: BLE001  the task still starts; its prompt names the missing file and why
-                    log.warning("chat attachment upload: %s", e)
-                    a["vm_error"] = str(e)[:200]
+                except Exception as e:  # noqa: BLE001  the task still starts; the run-start sync pushes it again
+                    log.warning("chat attachment upload: %r", e)
+                    a["vm_error"] = (str(e) or type(e).__name__)[:200]
                 if not a.get("vm_path"):
-                    a["vm_path"] = f"（没能放到电脑上：{name}" + (f"，{a['vm_error']}" if a.get("vm_error") else "") + "）"
+                    # v3.9.9: the attachment is linked to the task right after submit and _sync_task_files pushes it when
+                    # the run starts (task-3ddae3f2f2: the photo was on the computer, yet the prompt said 没能放到电脑上 and
+                    # the agent doubted its own file). Name where it will be; say plainly only when no copy exists.
+                    if self._allowed(local):
+                        a["vm_path"] = f"~/workspace/uploads/{name}"
+                        a["vm_pending"] = True
+                    else:
+                        a["vm_path"] = f"（没能放到电脑上：{name}" + (f"，{a['vm_error']}" if a.get("vm_error") else "") + "）"
             out.append(a)
         return out
 

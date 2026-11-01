@@ -61,7 +61,7 @@ import time
 import urllib.request
 from urllib.parse import urlparse
 
-PROBE_VERSION = "8"
+PROBE_VERSION = "9"
 
 # v8: one time budget for the whole probe run (the server's hard cap is 160 s; the probe aims to answer by ~120 s).
 # Each stage takes what it needs out of what is left; the cart / 我的关注 routes run only while time remains, and a

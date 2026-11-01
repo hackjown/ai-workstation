@@ -2582,6 +2582,48 @@ def _read_json_arg(v):
     return json.loads(v)
 
 
+def _trace_hint_labels(a, image):
+    """3.9.9: room names to keep on an auto run, in original image px: --labels (the user / the model) and the
+    names of --from-spec (rooms and free_labels of the earlier round, same image only)."""
+    out = []
+    labs = _read_json_arg(getattr(a, "labels", None)) or []
+    if isinstance(labs, dict):
+        labs = labs.get("labels") or []
+    for lb in labs if isinstance(labs, list) else []:
+        if isinstance(lb, dict) and lb.get("name"):
+            x, y = lb.get("x"), lb.get("y")
+            if x is None and lb.get("at_px"):
+                x, y = lb["at_px"][:2]
+            if x is not None and y is not None:
+                out.append({"name": lb["name"], "x": float(x), "y": float(y), "by": lb.get("by") or "hint"})
+    fs = getattr(a, "from_spec", None)
+    if fs and os.path.exists(fs):
+        try:
+            old = load_spec(fs)
+        except Exception:  # noqa: BLE001
+            old = {}
+        src = old.get("source") or {}
+        if src.get("md5") in (None, file_md5(image)):
+            T = src.get("transform") or {}
+            px = (lambda m: [T["ax"] * m[0] + T["bx"], T["ay"] * m[1] + T["by"]]) if T.get("ax") else None
+            for r in old.get("rooms") or []:
+                nm = r.get("name")
+                if not nm or nm == "房间?":
+                    continue
+                if r.get("label_px"):
+                    out.append({"name": nm, "x": r["label_px"][0], "y": r["label_px"][1], "by": "spec"})
+                elif r.get("label_at") and px:
+                    p = px(r["label_at"]); out.append({"name": nm, "x": p[0], "y": p[1], "by": "spec"})
+            for fl in old.get("free_labels") or []:
+                if not fl.get("text"):
+                    continue
+                if fl.get("at_px"):
+                    out.append({"name": fl["text"], "x": fl["at_px"][0], "y": fl["at_px"][1], "by": "spec"})
+                elif fl.get("at") and px:
+                    p = px(fl["at"]); out.append({"name": fl["text"], "x": p[0], "y": p[1], "by": "spec"})
+    return out
+
+
 def _auto_trace(a):
     """3.9.2: the deterministic tracer (drawtrace.py). Returns the DRAWKIT_AUTO dict, or raises with the reason."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -2590,6 +2632,7 @@ def _auto_trace(a):
     hints = {}
     if getattr(a, "mm_per_px", None):
         hints["mm_per_px"] = float(a.mm_per_px)
+    hints["labels"] = _trace_hint_labels(a, image)
     spec, info, tr = dt.trace(image, task=a.task, image_rel=a.image, hints=hints, debug=a.debug)
     if not spec["walls_traced"]:
         raise ValueError("no walls traced")

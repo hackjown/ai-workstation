@@ -394,6 +394,13 @@ class AgentLoop:
         elif self.cfg.make_plan and _needs_action(self.task.prompt):
             plan_job = asyncio.create_task(self._plan())  # plan in parallel with the first step, not before it
         await _dh.start(self)
+        if self._designer_task:   # 3.9.9 (task-9c4): aiw_hpd.py from-image runs cad-drawing's tracer, so the kit must be there
+            try:
+                err = await self._ensure_drawkit()
+                if err:
+                    __import__("logging").getLogger("aiw.loop").warning("designer task: drawing kit not installed: %s", err)
+            except Exception as e:  # noqa: BLE001  the designer still has its own analyze route
+                __import__("logging").getLogger("aiw.loop").warning("designer task: drawing kit: %s", e)
         if self._cad_mode == "revise":
             await self._cad_revise_start()
         elif self._cad_task and not self._cad_resuming():

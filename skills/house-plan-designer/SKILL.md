@@ -29,7 +29,28 @@ VM 一般没有显卡：截图和验收用 SwiftShader 软件渲染（脚本已�
   ```
   初稿里墙、门窗、房间名、底图都有；家具只是占位（灶台/水槽并进整体橱柜），按下面第 5 步重摆。`_aiw.unplaced_openings`
   是没挂上墙的门窗，要手补。没有 cad/spec.json 时照上游第 0~3 步识别（analyze.py / cadvec.py / cadsplit.py）。
-- 一个户型图任务**只用本技能**，不要再走 cad-drawing 的 drawing_auto / drawing_build（那是出 CAD 平面图的流程）。
+- **图片 / 截图（jpg、png、售楼处 / 贝壳户型图）第一步：from-image**——它调用 cad-drawing 的照图识别（确定性描墙、门窗缺口、
+  尺寸数字定比例、OCR 房间名，十秒左右），再转成 HouseSpec 初稿、补齐墙缺口处的门、检查房间是否围合：
+  ```bash
+  python3 $HPD/scripts/aiw_hpd.py from-image ~/workspace/uploads/<图> -o hpd/<户型名>/spec.json --name <户型名>
+  ```
+  最后一行 `HPD_DRAFT`：
+  - `ok: true`：直接进第 2 步 make。**不要再跑 analyze.py、不要自己按像素峰值手写墙**（task-9c4 这样绕了 35 步以上还把 6 个房间连成一片；
+    同一张图照图识别 8 秒就围出了房间）。按 `open_rooms`（没围合的房间，多半是细线隔墙 / 栏杆没认成墙）和 `shared_rooms`
+    （同一块区域里的几个名字；客餐厅这类开放式就保留）在 spec 里**只补缺的那几面墙**，缺的房间名补到 rooms，`_aiw: "gap"` 的门是按墙缺口补的，开向不对改 hinge / into。
+  - `ok: false`：图上没有可读尺寸时按 `next` 加 `--mm-per-px` 再试**一次**；还不行再跑下面的 imgcheck。
+- **from-image 不行时才用 imgcheck**（它会跑一次 analyze.py，再判断这张图的墙能不能自动认）：
+  ```bash
+  python3 $HPD/scripts/aiw_hpd.py imgcheck ~/workspace/uploads/<图> --total-width <总宽mm> --total-height <总深mm> --out hpd/<户型名>/a0
+  ```
+  总宽、总深读图上最外道尺寸（或分段加起来）。最后一行 `HPD_IMGCHECK`：
+  - `route: "analyze"`：用 `a0/draft.json` 接着做第 3 步。make 后 freeWallEnds 仍 > 8，**最多再换一次参数**重跑 analyze.py，还不行就改走尺寸链。
+  - `route: "dims"`（售楼处小图、效果图、外轮廓认错）：**不要再裁剪、放大、换参数重跑 analyze.py，也不要反复 read_image 让视觉模型报坐标**
+    （task-3ddae3f2f2 这样绕了 126 步也没围出一个房间）。照 `advice` 走尺寸链：上 / 下 / 左 / 右分段数字累加成两套毫米轴网，
+    按 `reference/example-gen.py` 的写法手写墙、门窗、房间名，make 后看 overlay.png 微调。交付时说明哪些位置是按图形估的，并建议用户换一张
+    户型部分 ≥1500 像素宽、没有家具的线稿会更准。
+- 同一张图 read_image 总共不超过 3 次；看细节用 PIL 裁出局部放大后看一次，不要整张反复看。
+- 一个户型图任务不要再调用 cad-drawing 的 drawing_auto / drawing_build 工具出 CAD 图（那是出 DXF 平面图的流程）；照图识别由 from-image 在内部调用，结果直接变成设计器初稿。
 
 ## 2. 生成 + 自查（代替上游第 4 步的两条命令）
 ```bash

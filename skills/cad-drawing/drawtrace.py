@@ -938,6 +938,21 @@ class Trace:
                 continue
             uniq.append(L)
         labels = uniq
+        # 3.9.9 (task-0db): names given by the user / the model / the earlier spec ("加上客厅和厨房") are seeds too.
+        # Before, the tracer used only its own OCR, so a name OCR could not read was wiped on every auto run.
+        hb = sorted(max(L["box"][2] - L["box"][0], L["box"][3] - L["box"][1]) for L in labels) or [40 * self.f]
+        hs = hb[len(hb) // 2]
+        for H in self.hints.get("labels") or []:
+            nm = re.sub(r"\s+", "", str(H.get("name") or ""))
+            if not nm or H.get("x") is None or H.get("y") is None:
+                continue
+            x, y = float(H["x"]) * self.f, float(H["y"]) * self.f
+            if any(L["name"] == nm and math.hypot(L["px"][0] - x, L["px"][1] - y) < 6 * hs for L in labels):
+                continue     # OCR read the same name nearby: keep OCR's position
+            if any(L["name"] == nm for L in labels) and H.get("by") == "spec":
+                continue     # the earlier spec's copy of a name OCR read again elsewhere
+            labels.append({"name": nm, "px": (x, y), "box": (x - hs, y - hs / 2.5, x + hs, y + hs / 2.5),
+                           "by": H.get("by") or "hint"})
         if not labels:
             self.uncertain.append("图上没有读到房间名（OCR）：房间未命名，墙和线条照原图描")
         seeds = []

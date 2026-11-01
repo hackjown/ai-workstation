@@ -115,6 +115,56 @@ async def on_resume(L, note: str) -> str:
             "still reports errors, fix only those in cad/spec.json and drawing_build once more.")
 
 
+# 3.9.9 (task-0db): "继续把客厅和厨房的文字加上去" ended "通过自动核对" without either name on the drawing.
+ROOM_VOCAB = ("主卧室", "次卧室", "老人房", "儿童房", "衣帽间", "储物间", "卫生间", "洗衣房", "多功能间", "可拓展空间", "生活阳台",
+              "客厅", "餐厅", "厨房", "玄关", "阳台", "主卧", "次卧", "卧室", "书房", "主卫", "公卫", "客卫", "过道", "走廊",
+              "门厅", "露台", "空调位", "管井", "设备平台", "保姆房", "影音室", "茶室", "入户花园")
+_ADD_WORDS = re.compile(r"加|添|补|标|写|名字|名称|文字|标注|label", re.I)
+
+
+def requested_names(prompt: str) -> list:
+    """room names the user's follow-up asks to put on the drawing ("把客厅和厨房的文字加上去")."""
+    m = re.search(r"【接着上次继续做】\s*用户补充[:：]\s*(.+)$", prompt or "", re.S)
+    words = (m.group(1) if m else "").strip()
+    if not words or not _ADD_WORDS.search(words):
+        return []
+    out, rest = [], words
+    for nm in ROOM_VOCAB:            # longest names first: 主卧室 before 主卧
+        if nm in rest:
+            out.append(nm)
+            rest = rest.replace(nm, " ")
+    return out
+
+
+async def drawn_names(L, spec: str = "cad/spec.json") -> Optional[set]:
+    cmd = ('cd "${VM_AGENT_FILES_ROOT:-$HOME/workspace}" && python3 -c \'import json,sys;s=json.load(open(sys.argv[1]));'
+           'print(json.dumps([r.get("name") for r in s.get("rooms") or []]+[f.get("text") for f in s.get("free_labels") or []]'
+           '+[e.get("text") for e in s.get("entities") or [] if e.get("type")=="text"]+[x.get("text") for x in s.get("labels") or []]))\' '
+           + spec)
+    try:
+        r = await L.tools.run("shell", {"command": cmd, "timeout": 20}, intent="which room names the drawing has")
+        out = ((r.result or {}).get("stdout") or "").strip().splitlines() if isinstance(r.result, dict) else []
+        return {str(x) for x in json.loads(out[-1]) if x} if out else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def missing_names(L) -> list:
+    want = requested_names(getattr(L.task, "prompt", "") or "")
+    if not want:
+        return []
+    have = await drawn_names(L)
+    if have is None:
+        return []
+    return [n for n in want if not any(n in h for h in have)]
+
+
+MISSING_NOTE = ("NOT DONE: the user asked for {names} on the drawing and the spec still has no such room name or text. "
+                "Add each one now: find the text's pixel position on the source image (drawing_read / the OCR list), then "
+                "add it to cad/spec.json as {{\"text\": \"客厅\", \"at_px\": [x, y]}} in free_labels (or give it as a room's "
+                "name when it is a room of its own; never a room that overlaps another), run drawing_build, and only then done.")
+
+
 async def converge(L, why: str) -> bool:
     """never pause in a loop: run the deterministic pipeline once (if it has not run since the last pause), and if
     the drawing still does not pass, deliver the best draft with what is unconfirmed. True when the task ended."""
@@ -127,6 +177,11 @@ async def converge(L, why: str) -> bool:
         L._converge_note = ("You were looping, so the deterministic pipeline ran instead:\n" + res +
                             "\nDo not re-read the image: send_file the PNG, DXF and PDF and finish with done (list what "
                             "is unconfirmed), or fix only the listed errors once.")
+        miss = await missing_names(L) if not getattr(dp, "names_nagged", False) else []
+        if miss:     # 3.9.9: what the user asked for is not on the drawing: not a delivery yet (asked once)
+            dp.names_nagged = True
+            L._converge_note += "\n" + MISSING_NOTE.format(names="、".join(f"「{n}」" for n in miss))
+            return False
         if dp.last_ok:
             return await deliver_best(L, why)
         return False
@@ -153,11 +208,15 @@ async def deliver_best(L, why: str) -> bool:
             record_delivery(L, r.result)
             sent.append(Path(p).name)
     unc = await _uncertain(L)
-    ok = dp.last_ok is True
+    miss = await missing_names(L)
+    ok = dp.last_ok is True and not miss
     lines = [("图纸已生成并通过自动核对。" if ok else "已交付目前最好的草稿（自动核对还有未通过的项）。") +
              (f" 文件：{', '.join(sent)}。" if sent else " （没能取回文件，图纸在电脑的 cad/ 目录里。）")]
     if not ok and dp.last_errors:
         lines.append("未通过的核对：" + "；".join(_dp._short_err(e) for e in dp.last_errors[:6]))
+    if miss:
+        lines.append("没做到：你要加的" + "、".join(f"「{n}」" for n in miss) + "还没出现在图上（自动识别没读到它们的位置），"
+                     "回复它们大概在哪个房间/哪面墙旁边，我再补上。")
     if unc:
         lines.append("待确认：" + "；".join(unc[:8]))
     lines.append("精度说明：比例来自照片上尺寸链的刻度（逐轴拟合），墙和房间来自像素网格，门窗按墙上的缺口推断；"

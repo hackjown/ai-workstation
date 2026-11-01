@@ -35,6 +35,15 @@ EDIT_RE = re.compile(r"(改一下|改改|改成|改为|修改|再改|调整|换�
 NEW_TASK_RE = re.compile(r"(新任务|另外一个|另一件事|换个任务|新的任务|重新开一个)")
 
 
+
+# 3.9.9 (task-0db): "继续把客厅和厨房的文字加上去" matched the old r"继续[^\n]{0,20}" and the user's words were dropped
+# from the run's prompt. Only a bare "go on" (继续 / 继续做 / 接着做 / continue, with punctuation) carries no new goal.
+_BARE_CONTINUE = re.compile(r"[（(\s]*(继续|继续做|继续吧|接着做|接着来|继续执行|go on|continue|resume)[\s。.!！~～)）吧啊呀]*", re.I)
+
+
+def is_bare_continue(text: str) -> bool:
+    return bool(_BARE_CONTINUE.fullmatch((text or "").strip()))
+
 def is_followup(text: str, has_attachments: bool = False) -> bool:
     t = (text or "").strip()
     if not t:
@@ -190,7 +199,7 @@ def resume_block(store, row: dict, machine_name: Optional[str] = None) -> str:
         parts.append("PLAN SO FAR ([x] = done):\n" + "\n".join(
             f"[{'x' if i in done else ' '}] {i}. {s}" for i, s in enumerate(plan["steps"])))
     new_words = (row.get("prompt") or "").strip()
-    if mode != "edit" and new_words and not re.fullmatch(r"[（(]?继续[^\n]{0,20}", new_words):
+    if mode != "edit" and new_words and not is_bare_continue(new_words):
         parts.append("THIS RUN'S GOAL (aiw-fix-1): " + _short(new_words, 600) + "\nThe ORIGINAL REQUEST was handled by the "
                      "earlier runs: do not clone, install or set up again what STEPS ALREADY DONE / the files in "
                      "~/workspace show is there (check with one ls), and do not tick plan items you did not do in this run.")
@@ -225,6 +234,6 @@ def run_prompt(store, row: dict) -> str:
     new = (row.get("prompt") or "").strip()
     if mode == "edit":
         return instr
-    if not new or re.fullmatch(r"[（(]?继续[^\n]{0,20}", new):
+    if not new or is_bare_continue(new):
         return f"{instr}\n\n【接着上次继续做】"
     return f"{instr}\n\n【接着上次继续做】用户补充：{new}"

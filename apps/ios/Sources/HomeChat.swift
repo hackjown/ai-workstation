@@ -29,6 +29,7 @@ final class HomeChat: ObservableObject {
     @Published var err = ""
     @Published var agent = "小秘"
     @Published var bottomTick = 0              // bumped when the view should scroll to the newest message
+    @Published var handoffThread: String? = nil  // 3.9.10: a message just handed to the computer: open its task page
     // v2 (3.5): with nothing new the home shows 球球 and its briefing (GET /api/greeting) instead of the chat
     @Published var staged = false
     @Published var greet: [JSON] = []
@@ -199,7 +200,9 @@ final class HomeChat: ObservableObject {
                 case "route": if obj.s("route") == "task" { streamNote = obj.b("skill") ? "正在把技能交给电脑…" : "正在交给电脑…" }
                 case "status": if acc.isEmpty { streamNote = obj.s("text") }
                 case "delta": acc += obj.s("text"); stream = acc; bottomTick += 1
-                case "message", "task": stream = nil; upsert(obj, stick: true)
+                case "message", "task":
+                    stream = nil; upsert(obj, stick: true)
+                    if obj.s("kind") == "task" { noteHandoff(obj) }
                 case "done": break
                 default: break
                 }
@@ -220,10 +223,16 @@ final class HomeChat: ObservableObject {
             return r
         } catch { err = error.localizedDescription; await sync(); return nil }
     }
+    /// 3.9.10: the task card a hand-off just made -> its thread opens (HomeChatView watches handoffThread)
+    @MainActor func noteHandoff(_ card: JSON) {
+        let t = card.o("data").s("thread_id")
+        if !t.isEmpty && t != "<null>" { handoffThread = t }
+    }
     @MainActor func toTask(_ id: String) async {
         do {
             let card = try await API.shared.obj("POST", "/api/chat/messages/\(id)/to_task", ["machine_id": API.shared.machine])
             upsert(card, stick: true)
+            if card.s("kind") == "task" { noteHandoff(card) }
             if let i = index(id) {
                 var m = msgs[i]; var d = m.o("data"); d["task_started"] = card.s("id"); m["data"] = d; msgs[i] = m
             }
@@ -410,6 +419,12 @@ struct HomeChatView: View {
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
         .refreshable { await m.load() }
         .onReceive(hub.events) { e in m.onEvent(e) }
+        // 3.9.10: 交给电脑 succeeded (the button, or a send routed to a task): straight to that task's page
+        .onChange(of: m.handoffThread) { t in
+            guard let t = t, !t.isEmpty else { return }
+            m.handoffThread = nil
+            path.append(.task(t, takeover: false))
+        }
         // 3.8 aiw://chat (a push): the chat itself, at the newest message
         .onReceive(NotificationCenter.default.publisher(for: .aiwShowChat)) { _ in
             Task { await m.sync(); m.leaveStage(); pin.toEnd(follow: 2) }

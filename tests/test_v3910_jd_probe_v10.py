@@ -161,3 +161,9 @@ def test_cart_first_after_the_cart_priced_it(monkeypatch):
 def test_longer_waits_still_fit_under_the_cap():
     assert sp.WAIT_MAX_S >= 25 and sp.SKELETON_AFTER_S >= 10
     assert sw.PROBE_BUDGET + 12 < sw.PROBE_TIMEOUT and sp.DEFAULT_BUDGET + 12 < sw.PROBE_TIMEOUT
+
+
+def test_the_shipped_probe_fits_in_one_shell_argument():
+    """3.9.10 hotfix: '/bin/sh -c CMD' takes at most 128 KiB per argument; the base64 of probe v10 alone was 147 KB."""
+    cmd = sw.probe_command("probe", url=DESKTOP, budget="150", progress="/tmp/x.json")
+    assert len(cmd.encode()) < 100_000 and "gzip -dc" in cmd

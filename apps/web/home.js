@@ -477,6 +477,7 @@ async function hSendNow(text, attachments, mode, undo) {
   hUpsert({ id: "tmp-" + Date.now(), role: "user", kind: "text", text: text || "（附件）", data: { attachments }, tmp: true }, { stick: true });
   hStreamShow("", "正在想…");
   let gotReply = false;
+  let openTaskAfterHandoff = null;   // 3.9.10: a phone opens the task the message was handed to
   try {
     const res = await fetch("/api/chat/send", { method: "POST", headers: H(), body: JSON.stringify({ text, attachments, machine_id: MID, mode, stream: true }) });
     if (!res.ok) throw new Error((await res.text()).slice(0, 200) || res.status);
@@ -500,7 +501,8 @@ async function hSendNow(text, attachments, mode, undo) {
         else if (ev === "route") { if (d.route === "task") hStreamShow("", d.skill ? "正在把技能交给电脑…" : "正在交给电脑…"); }
         else if (ev === "status") { if (!acc) hStreamShow("", d.text || "正在想…"); }
         else if (ev === "delta") { acc += d.text || ""; hStreamShow(acc); }
-        else if (ev === "message" || ev === "task") { gotReply = true; HS.stream = null; hUpsert(d, { stick: true }); }
+        else if (ev === "message" || ev === "task") { gotReply = true; HS.stream = null; hUpsert(d, { stick: true });
+          if (d.kind === "task" && d.data && d.data.thread_id) openTaskAfterHandoff = d.id; }
       }
     }
   } catch (err) {
@@ -512,6 +514,7 @@ async function hSendNow(text, attachments, mode, undo) {
   } finally {
     HS.stream = null; HS.sending = false; hSendKey(false);
     hRender(); if (gotReply) hScrollLatest();
+    if (openTaskAfterHandoff) hOpenAfterHandoff(openTaskAfterHandoff);
   }
   return true;
 }
@@ -680,6 +683,13 @@ function hShowChat() {
   hStage(false); hRender("bottom");
   [0, 60, 250, 600, 1200].forEach((t) => setTimeout(() => { if (Date.now() < HS.pinUntil + 50) hScrollLatest(); }, t));
 }
+/* 3.9.10: the 聊天 tab from another page lands on the newest message (it used to restore the old scroll position),
+   after picking up what came in meanwhile; the jump repeats while late content (pictures) lays out. */
+function hJumpLatest() {
+  HS.pinUntil = Date.now() + 1500;
+  [0, 60, 250, 600, 1200].forEach((t) => setTimeout(() => { if (Date.now() < HS.pinUntil + 50) hScrollLatest(); }, t));
+  hSync().then(() => { HS.pinUntil = Date.now() + 600; hScrollLatest(); });
+}
 async function hStageStart() {
   if (!HB.mate && window.AiwMate && AiwMate.create) { HB.mate = AiwMate.create($("hstOrb"), { eyeScale: 1.7 }); HB.mate.set("02"); }
   if (!HB.items.length || Date.now() - HB.at > 60000) {
@@ -828,6 +838,13 @@ toggleDeskPane = function () {
 };
 
 /* ---------------------------------------------------------------- actions */
+/* 3.9.10: on a phone, a message handed to the computer (交给电脑去做, or a send routed to a task) opens that task's
+   page right away, the way tapping its card does; a wide screen keeps the chat and its desktop pane. */
+function hOpenAfterHandoff(cardId) {
+  if (!matchMedia("(max-width: 820px), (pointer: coarse)").matches) return;
+  const m = hFind(cardId); if (!m || !(m.data || {}).thread_id || S.view !== "home") return;
+  hOpenTask(cardId);
+}
 function hOpenTask(mid) {
   const m = hFind(mid); const d = (m && m.data) || {};
   if (!d.thread_id) { toast("这个任务还没有开始"); return Promise.resolve(); }
@@ -858,7 +875,8 @@ async function hForm(mid) {
 async function hToTask(mid, btn) {
   if (btn) { btn.disabled = true; btn.textContent = "交给电脑…"; }
   try { const card = await api("POST", `/api/chat/messages/${mid}/to_task`, { machine_id: MID }); hUpsert(card, { stick: true });
-    const m = hFind(mid); if (m) hUpsert({ ...m, data: { ...m.data, task_started: card.id } }); }
+    const m = hFind(mid); if (m) hUpsert({ ...m, data: { ...m.data, task_started: card.id } });
+    if (card && card.kind === "task") hOpenAfterHandoff(card.id); }
   catch (e) { toast("没能交给电脑：" + e.message); if (btn) { btn.disabled = false; btn.innerHTML = icon("monitor") + "交给电脑去做"; } }
 }
 /* 3.8.8: 继续 / 修改后重新发布 / 补充 straight from the card: the SAME task (its card re-arms and moves down) */
@@ -956,7 +974,9 @@ go = function (view) {
     hTitle();
     if (hStaged()) hStageRun();
     if (!HS.loaded) hLoad();
-    else if (HS.scroll != null) requestAnimationFrame(() => { hBox().scrollTop = HS.scroll; });
+    // 3.9.10: back from a task opened in the chat: where you were; from any other page (the 聊天 tab): the newest message
+    else if (from === "chat" && HS.fromHome && HS.scroll != null) requestAnimationFrame(() => { hBox().scrollTop = HS.scroll; });
+    else if (from !== "home" && !hStaged()) hJumpLatest();
     hMarkRead(); hUnread(false);
   }
   if (view === "tasks") loadTasksPage();

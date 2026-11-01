@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -606,7 +607,9 @@ def ship_command(src: Path, remote: str, sub: str, **kw) -> str:
         data = src.read_bytes()
     except OSError:   # an image without the file: say so as JSON instead of failing the whole check
         return f"echo {_q(json.dumps({'ok': False, 'reason': 'tool_missing', 'error': f'{src.name} is not in this AIW server image'}))}"
-    b64 = base64.b64encode(data).decode()
+    # 3.9.10: gzip first. One argument to /bin/sh -c may be at most 128 KiB (MAX_ARG_STRLEN); probe v10 is 110 KB,
+    # 147 KB in base64, and every check failed with 'OSError: [Errno 7] Argument list too long'
+    b64 = base64.b64encode(gzip.compress(data, 9, mtime=0)).decode()
     digest = hashlib.sha1(data).hexdigest()
     args = " ".join(f"--{k.replace('_', '-')} {_q(str(v))}" for k, v in kw.items()
                     if v not in (None, "", False) and v is not True and not isinstance(v, (list, tuple)))
@@ -617,7 +620,7 @@ def ship_command(src: Path, remote: str, sub: str, **kw) -> str:
     d = remote.rsplit("/", 1)[0]
     return (f'mkdir -p "{d}" && f="{remote}" && '
             f'if [ "$(sha1sum "$f" 2>/dev/null | cut -d" " -f1)" != "{digest}" ]; then '
-            f"echo '{b64}' | base64 -d > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; fi && python3 \"$f\" {sub} {args}")
+            f"echo '{b64}' | base64 -d | gzip -dc > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; fi && python3 \"$f\" {sub} {args}")
 
 
 def probe_command(sub: str, **kw) -> str:

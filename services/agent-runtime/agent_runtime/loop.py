@@ -1139,6 +1139,8 @@ class AgentLoop:
             return await self._read_image(a)
         if t == "image_edit":
             return await self._image_edit(a)
+        if t == "generate_image":
+            return await self._generate_image(a)
         if t == "photopea":
             return await self._photopea(a, decision.thought)
         if t == "remember":
@@ -1925,6 +1927,56 @@ class AgentLoop:
             return None
         return dy
 
+    async def _generate_image(self, a: dict) -> str:
+        """v3.9.15: a picture from words through the image endpoints (default first, the other as fallback), saved
+        on the computer under ~/workspace so the agent can check it, use it, or send_file it."""
+        prompt = str(a.get("prompt") or "").strip()
+        cfg = self.image_cfg
+        err = None
+        if not prompt:
+            err = "generate_image needs `prompt` (what the picture shows, in plain words)"
+        elif not _ie.chain_of(cfg):
+            err = ("no AI image model is set up: the user picks one under 设置 → 模型 → 生图/改图模型 or 生图接口. "
+                   "Tell the user")
+        if err:
+            await self.emit(EventType.ACTION_RESULT, tool="generate_image", success=False, error=err[:200], result={})
+            return f"REFUSED: {err}"
+        n = max(1, min(4, int(a.get("n") or 1)))
+        save = str(a.get("save") or "").strip().lstrip("/")
+        save = _ws_rel(save) if save else f"images/gen-{int(time.time())}.png"
+        if not save.lower().endswith(".png"):
+            save = str(Path(save).with_suffix(".png"))
+        try:
+            outs, used = await _ie.generate_chain(cfg, prompt, _ie.gen_size(a.get("size")), n,
+                                                  float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")))
+        except Exception as e:  # noqa: BLE001
+            await self.emit(EventType.ACTION_RESULT, tool="generate_image", success=False, error=str(e)[:200], result={})
+            return f"FAILED: image generation (tried {', '.join(p['model'] for p in _ie.chain_of(cfg))}): {str(e)[:900]}"
+        saved = []
+        for i, raw in enumerate(outs):
+            png = await asyncio.to_thread(_ie.to_png, raw)
+            path = save if i == 0 else str(Path(save).with_name(f"{Path(save).stem}-{i + 1}.png"))
+            up = None
+            for _i in range(3):
+                up = await self.computer.execute("files.upload", {"path": path, "content_b64": base64.b64encode(png).decode()},
+                                                 observe=False, timeout=120)
+                if up.success or not _transient(up.error):
+                    break
+                await asyncio.sleep(2 * (_i + 1))
+            if not up.success:
+                await self.emit(EventType.ACTION_RESULT, tool="generate_image", success=False, error=up.error, result={})
+                return f"FAILED: could not save {path} on the computer ({up.error})"
+            w, h = Image.open(io.BytesIO(png)).size
+            saved.append(f"{path} ({w}x{h})")
+            self._last_image = path
+            self._images_read.pop(path, None)
+        self._acted = True
+        await self.emit(EventType.ACTION_RESULT, tool="generate_image", success=True, error=None,
+                        result={"saved": saved, "model": used.get("model"), "endpoint": used.get("name")})
+        return (f"generate_image OK with {used.get('model')} ({used.get('name')}): saved " + ", ".join(saved)
+                + ". read_image it to check it matches the request; if not, generate again with a sharper prompt. "
+                  "send_file it to the user when it is what they asked for.")
+
     async def _image_edit(self, a: dict) -> str:
         """AI image edit through the gateway's image model, then size restore + pasting original regions back."""
         def rel(p):
@@ -1942,7 +1994,7 @@ class AgentLoop:
                                                           or len(m.get("to") or []) != 4 for m in moves)):
             err = 'move must be {"box": [l,t,r,b], "to": [l,t,r,b]} (or a list of them) in the image\'s pixels'
         elif prompt and (not cfg.get("model") or not cfg.get("key")):
-            err = ("no AI image model is set up: the user picks one under 设置 → 模型 → 改图模型 "
+            err = ("no AI image model is set up: the user picks one under 设置 → 模型 → 生图/改图模型 or 生图接口 "
                    "(e.g. gpt-image-1 or gemini-2.5-flash-image). Tell the user; Photopea can still do exact edits")
         elif not src:
             err = "image_edit needs `path` (the image, relative to ~/workspace)"
@@ -1977,15 +2029,16 @@ class AgentLoop:
                 src_bytes, minfo = await asyncio.to_thread(_ie.move_regions, src_bytes, moves, int(a.get("feather") or 6))
                 out = src_bytes
             if prompt:
-                out = await _ie.edit(cfg.get("base_url") or "", cfg["key"], cfg["model"], src_bytes, _ie.prompt_for(prompt),
-                                     float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")))
+                out, used = await _ie.edit_chain(cfg, src_bytes, _ie.prompt_for(prompt),
+                                                 float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")))
+                self._image_used = used
                 if moves:  # the AI only blends: keep the exact move, take its redraw along the seams only
                     out = await asyncio.to_thread(_ie.blend_seams, src_bytes, out, minfo["moves"])
             png, info = await asyncio.to_thread(_ie.postprocess, orig_bytes, out, a.get("keep_size", True) is not False,
                                                 boxes, int(a.get("feather") or 6))
         except Exception as e:  # noqa: BLE001
             await self.emit(EventType.ACTION_RESULT, tool="image_edit", success=False, error=str(e)[:200], result={})
-            return f"FAILED: AI image edit with {cfg['model']}: {str(e)[:600]}"
+            return f"FAILED: AI image edit (tried {', '.join(p['model'] for p in _ie.chain_of(cfg))}): {str(e)[:900]}"
         up = None
         for _i in range(3):  # a 2 MB upload through the tunnel can hit a blip; the AI result must not be lost to it
             up = await self.computer.execute("files.upload", {"path": save, "content_b64": base64.b64encode(png).decode()},
@@ -2640,7 +2693,7 @@ def _ws_rel(p: str) -> str:
 
 
 _GUESSED_HOME = re.compile(r"(/home/(?:user|aiw|ubuntu|debian)/)workspace(?=/|\b)")
-_NO_SCREEN_TOOLS = {"read_image", "image_edit", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
+_NO_SCREEN_TOOLS = {"read_image", "image_edit", "generate_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
                     # 3.8.9 (task-3fc): file-only drawing steps; a desktop look + vision description cost 12-15 s each
                     "drawing_auto", "drawing_build", "drawing_note", "drawing_read"}
 _OCR_RE = re.compile(r"\b(tesseract|rapidocr|paddleocr|easyocr)\b", re.I)

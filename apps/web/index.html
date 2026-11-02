@@ -21,6 +21,7 @@
 <link rel="stylesheet" href="approval.css" />
 <link rel="stylesheet" href="home.css" />
 <link rel="stylesheet" href="shop.css" />
+<link rel="stylesheet" href="search.css" />
 </head>
 <body>
 <div id="app">
@@ -55,6 +56,7 @@
       <div class="ttl"><div class="heading" id="viewTitle">对话</div><div class="small" id="viewSub"></div></div>
       <span class="chip" id="pillAgent">Agent …</span>
       <button class="btn sm primary" id="newTaskBtn" onclick="newTaskMode()" title="新建任务"><i data-i="plus"></i><span>新建任务</span></button>
+      <button class="icon" id="searchBtn" onclick="openSearch()" aria-label="搜索" title="搜索对话、任务和文件（/）"><i data-i="search"></i></button>
       <button class="icon" id="bell" onclick="toggleNotes()" aria-label="通知"><i data-i="bell"></i><span class="dot" id="bellDot"></span></button>
       <button class="icon only-wide" id="deskToggle" onclick="toggleDeskPane()" aria-label="桌面" title="显示/隐藏桌面"><i data-i="monitor"></i></button>
     </header>
@@ -271,5 +273,7 @@
 <script src="memory.js"></script>
 <script src="lessons.js"></script>
 <script src="deeplink.js"></script>
+<script src="search.js"></script>
+<script src="paste.js"></script>
 </body>
 </html>

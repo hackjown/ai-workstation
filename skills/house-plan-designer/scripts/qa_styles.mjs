@@ -1,15 +1,13 @@
 // 风格款家具 + 自由模型验收：一行一个风格（默认款 + 9 种风格），一列一类风格家具；最后两行是全部自由模型。分块拍 3D，人工逐件看
 // 用法：node scripts/qa_styles.mjs <设计器.html> <输出目录>
-import puppeteer from 'puppeteer-core';
+import { launch } from './browser.mjs';
 import fs from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
 
 const [, , FILE, OUTARG] = process.argv;
 const OUT = path.resolve(OUTARG); fs.rmSync(OUT, { recursive: true, force: true }); fs.mkdirSync(OUT, { recursive: true });
-// AIW: CHROME_PATH / Linux 浏览器，Linux 无显卡用 SwiftShader
-const exe = [process.env.CHROME_PATH, 'C:/Program Files/Google/Chrome/Application/chrome.exe', 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium'].filter(Boolean).find(p => fs.existsSync(p));
-const b = await puppeteer.launch({ executablePath: exe, headless: 'new', protocolTimeout: 900000, defaultViewport: { width: 1600, height: 1000 }, args: [...(process.platform === 'win32' ? ['--use-angle=d3d11', '--enable-gpu', '--ignore-gpu-blocklist'] : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', ...(process.getuid && process.getuid() === 0 ? ['--no-sandbox'] : [])]), '--disable-background-timer-throttling', '--disable-renderer-backgrounding'] });
+const b = await launch({ gpu: true, headless: 'new', viewport: { width: 1600, height: 1000 }, protocolTimeout: 900000 });
 const page = await b.newPage(); const errs = [];
 page.on('pageerror', e => errs.push(e.message)); page.on('console', m => { if (m.type() === 'error') errs.push(m.text()); });
 await page.evaluateOnNewDocument(() => { try { for (const k of Object.keys(localStorage)) if (k.startsWith('house-designer') || k.startsWith('hd-')) localStorage.removeItem(k); } catch { } });

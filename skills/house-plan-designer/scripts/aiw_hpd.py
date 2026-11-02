@@ -420,10 +420,30 @@ def split_closure(clo: dict) -> dict:
     return {"open": open_fix, "shared": shared_fix, "open_ok": open_ok, "shared_ok": shared_ok}
 
 
+def dark_screenshot(image: str) -> dict | None:
+    """A black-background CAD screenshot (mostly dark, thin coloured lines): route it to upstream cadshot.py (b94183f)."""
+    try:
+        from PIL import Image, ImageStat
+        im = Image.open(image).convert("L")
+        im.thumbnail((400, 400))
+        if ImageStat.Stat(im).mean[0] >= 60:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return {"ok": False, "route": "cadshot", "dark": True,
+            "error": "这是黑底 CAD 截图，照图识别按“深色 = 墙”认不了",
+            "next": (f"python3 {HERE}/cadshot.py {image} --out <工作目录>/shot 看 layers.png 哪个颜色是墙；按轴线尺寸加 "
+                     "--x-dims/--y-dims 再跑一次拿 mmPerPx 和 axis_chain；然后 analyze.py --wall-color cyan --scale <mmPerPx>；"
+                     f"尺寸数字 python3 {HERE}/dimocr.py {image} --color green --scale <mmPerPx> --out <工作目录>/ocr")}
+
+
 def from_image(image: str, out: str, name: str | None = None, extra: list | None = None) -> dict:
     """v3.9.9 (task-9c4): a clean picture goes through cad-drawing's deterministic tracer first (照图画图: walls, door /
     window gaps, scale from the dimension numbers, room names by OCR, in seconds), then from-cad. task-9c4 skipped it,
     hand-measured pixel peaks for 35+ steps and merged six rooms into one; the same picture traced in ~10 s."""
+    dark = dark_screenshot(image)
+    if dark:   # v3.9.16: a black-background CAD screenshot: "dark = wall" tracing sees one big wall
+        return dark
     kit = _kit_dir()
     if not kit:
         return {"ok": False, "route": "analyze", "error": "没有 cad-drawing 技能（~/.claude/skills/cad-drawing），改用 imgcheck / analyze.py"}
@@ -645,6 +665,11 @@ def _summary(rep: dict) -> dict:
                     for r in (rep.get("rooms") or [])][:40]
     out["must_fix"] = [x if isinstance(x, str) else json.dumps(x, ensure_ascii=False)
                        for x, l in zip(iss, levels) if l != "info"][:30]
+    # v3.9.16 (upstream b94183f): dimension-chain reconciliation — spec dims / expectDims against the model
+    dim = [str(x) for x in (rep.get("dimIssues") or [])] + [str(x) for x in (rep.get("dimConflicts") or [])]
+    if dim:
+        out["dimIssues"] = len(dim)
+        out["must_fix"] = (out["must_fix"] + ["尺寸对账：" + x for x in dim])[:40]
     return out
 
 
@@ -715,6 +740,9 @@ def imgcheck(image: str, out: str, total_width: float | None, total_height: floa
     analyze.py was rerun on crops / 2x / 5x upscales about eight times, 126 steps, and no room ever closed. A picture
     that small is read from its dimension chains instead, from the first step."""
     import statistics
+    dark = dark_screenshot(image)
+    if dark:
+        return dark
     cmd = [sys.executable, str(HERE / "analyze.py"), image, "--out", out]
     if total_width:
         cmd += ["--total-width", str(total_width)]
@@ -756,7 +784,7 @@ def imgcheck(image: str, out: str, total_width: float | None, total_height: floa
         res["route"] = "dims" if why else "analyze"
         res["why"] = "；".join(why) or f"户型主体 {bw}×{bh} 像素，240 墙约 {wall_px} 像素，比例一致"
     if res["route"] == "dims":
-        res["advice"] = ("这张图不要再换参数、裁剪、放大重跑 analyze.py（不会变好）。改走尺寸链：读图上上 / 下 / 左 / 右的分段尺寸数字，"
+        res["advice"] = ("这张图不要再换参数、裁剪、放大重跑 analyze.py（不会变好）。改走尺寸链：先用 dimocr.py --scale <mmPerPx> 自动读分段尺寸数字（只信 ok 的段），再读图补上 / 下 / 左 / 右没读出的段，"
                          "累加成 X、Y 两套轴网（毫米），按 reference/example-gen.py 的写法手写墙（外圈先闭合，内墙端点落在别的墙中线上，"
                          "墙厚按常用值 240 / 200 / 120），门窗按原图位置写在墙上，房间名放在原图文字处；underlay 用原图并按总宽换算 mmPerPx，"
                          "然后 make，看 overlay.png 对齐再微调。同一张图 read_image 不超过 3 次。图太小认不清的地方，在交付时说明，"
@@ -765,6 +793,102 @@ def imgcheck(image: str, out: str, total_width: float | None, total_height: floa
         res["advice"] = ("用这次的 draft.json 继续第 3 步。make 之后 freeWallEnds 仍 > 8 或房间围不起来，最多再调一次 analyze.py 参数"
                          "（--outlined / --gray-max / --crop），还不行就改走尺寸链手写，不要反复重跑。")
     return res
+
+
+# ------------------------------------------------------------------------------------------------ 3.9.13 全景漫游
+def _pano_write(doc: dict, src: Path, out_dir: Path, name: str) -> dict:
+    """doc = scenes.json（图片是 src 里的相对文件名）。写两份：
+    <out_dir>/<name>-全景/index.html + 图片（放到网站 / COS 上用），<out_dir>/<name>-全景漫游.html（单文件，图片内嵌，直接发微信）。"""
+    import base64
+    viewer = (HERE.parent / "assets" / "pano-viewer.html").read_text(encoding="utf-8")
+    marker = "window.__PANO__ = window.__PANO__ || null;"
+    assert marker in viewer
+    folder = out_dir / f"{name}-全景"
+    folder.mkdir(parents=True, exist_ok=True)
+    files = [s["image"] for s in doc["scenes"]] + ([doc["plan"]["image"]] if doc.get("plan") else [])
+    for f in files:
+        if (src / f).resolve() != (folder / f).resolve():
+            shutil.copyfile(src / f, folder / f)
+    js = lambda d: json.dumps(d, ensure_ascii=False).replace("</", "<\\/")
+    (folder / "index.html").write_text(viewer.replace(marker, "window.__PANO__ = " + js(doc) + ";"), encoding="utf-8")
+    (folder / "scenes.json").write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+    inl = json.loads(json.dumps(doc))
+    def uri(f):
+        mime = "image/png" if f.lower().endswith(".png") else "image/jpeg"
+        return f"data:{mime};base64," + base64.b64encode((folder / f).read_bytes()).decode()
+    for sc in inl["scenes"]:
+        sc["image"] = uri(sc["image"])
+    if inl.get("plan"):
+        inl["plan"]["image"] = uri(inl["plan"]["image"])
+    single = out_dir / f"{name}-全景漫游.html"
+    single.write_text(viewer.replace(marker, "window.__PANO__ = " + js(inl) + ";"), encoding="utf-8")
+    return {"ok": True, "html": str(single.resolve()), "mb": round(single.stat().st_size / 1e6, 1),
+            "folder": str(folder.resolve()), "scenes": [s["name"] for s in doc["scenes"]],
+            "first": doc.get("first"), "unlinked": [s["name"] for s in doc["scenes"] if not s.get("links")]}
+
+
+def pano(html: str, out: str, name: str | None, size: int, eye: int) -> dict:
+    """生成好的设计器 HTML → 每间房一张 360° 全景 + 门洞跳转热点 + 平面小地图 → 离线漫游网页。"""
+    work = Path(out) / "_pano"
+    work.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["node", str(HERE / "pano.mjs"), html, str(work), "--size", str(size), "--eye", str(eye)],
+                       capture_output=True, text=True, env=_node_env(), timeout=3600)
+    line = [x for x in r.stdout.splitlines() if x.startswith("PANO_SCENES ")]
+    res = json.loads(line[-1][12:]) if line else {"ok": False, "error": (r.stderr or r.stdout)[-400:]}
+    if not res.get("ok"):
+        return res
+    doc = json.loads((work / "scenes.json").read_text(encoding="utf-8"))
+    name = name or doc.get("name") or Path(html).stem.split("-装修设计器")[0]
+    name = re.sub(r"\s*[·-]\s*装修设计器$", "", name).strip() or "户型"
+    doc["name"] = name
+    w = _pano_write(doc, work, Path(out), name)
+    shutil.rmtree(work, ignore_errors=True)
+    w["seconds"] = res.get("seconds")
+    return w
+
+
+def pano_photos(images: list[str], out: str, name: str, names: str | None, links: str | None, first: str | None) -> dict:
+    """用户自己的 360° 全景照片（2:1 等距柱状图：全景相机 / 酷家乐、三维家导出）→ 同一个漫游网页。
+    --names 客厅,主卧,…（按图片顺序，缺省用文件名）
+    --links "客厅>主卧@35,主卧>客厅@-150"：在「客厅」那张图里朝 35° 的地方放一个去「主卧」的箭头
+             （角度：图片正中 = 0°，向右为正，-180..180；可加 ^-20 表示俯仰，默认 -18° 偏地面）。不写 --links 就只有底部房间列表。"""
+    from PIL import Image
+    work = Path(out) / "_pano"
+    work.mkdir(parents=True, exist_ok=True)
+    nm = [x.strip() for x in (names or "").replace("，", ",").split(",") if x.strip()]
+    scenes, bad = [], []
+    for i, f in enumerate(images):
+        im = Image.open(f)
+        im = im.convert("RGB")
+        ratio = im.width / max(1, im.height)
+        if abs(ratio - 2) > 0.15:
+            bad.append(f"{Path(f).name}：{im.width}×{im.height}（不是 2:1 全景图）")
+        if im.width > 6144:
+            im = im.resize((6144, 3072), Image.LANCZOS)
+        elif abs(ratio - 2) <= 0.15 and ratio != 2:
+            im = im.resize((im.width, im.width // 2), Image.LANCZOS)
+        sid = f"s{i}"
+        im.save(work / f"scene-{sid}.jpg", quality=85)
+        scenes.append({"id": sid, "name": nm[i] if i < len(nm) else Path(f).stem, "image": f"scene-{sid}.jpg", "yaw0": 0, "links": []})
+    if bad:
+        shutil.rmtree(work, ignore_errors=True)
+        return {"ok": False, "error": "这些图不是 360° 全景（要 2:1 的等距柱状图，全景相机或装修软件导出的全景图）：" + "；".join(bad)}
+    by = {s["name"]: s for s in scenes}
+    warn = []
+    for item in [x.strip() for x in (links or "").replace("，", ",").split(",") if x.strip()]:
+        m = re.match(r"^(.+?)>(.+?)@(-?\d+(?:\.\d+)?)(?:\^(-?\d+(?:\.\d+)?))?$", item)
+        if not m or m.group(1) not in by or m.group(2) not in by:
+            warn.append(f"看不懂或房间名不对：{item}")
+            continue
+        by[m.group(1)]["links"].append({"to": by[m.group(2)]["id"], "label": m.group(2),
+                                        "yaw": math.radians(float(m.group(3))),
+                                        "pitch": math.radians(float(m.group(4) if m.group(4) else -18))})
+    doc = {"name": name, "first": by[first]["id"] if first in by else scenes[0]["id"], "plan": None, "scenes": scenes}
+    w = _pano_write(doc, work, Path(out), name)
+    shutil.rmtree(work, ignore_errors=True)
+    if warn:
+        w["warnings"] = warn
+    return w
 
 
 def main():
@@ -778,6 +902,10 @@ def main():
     p = sub.add_parser("imgcheck"); p.add_argument("image"); p.add_argument("--out", required=True)
     p.add_argument("--total-width", type=float); p.add_argument("--total-height", type=float)
     p = sub.add_parser("qa"); p.add_argument("html"); p.add_argument("--out", required=True); p.add_argument("--full", action="store_true")
+    p = sub.add_parser("pano"); p.add_argument("html"); p.add_argument("-o", "--out", required=True); p.add_argument("--name")
+    p.add_argument("--size", type=int, default=3072); p.add_argument("--eye", type=int, default=1500)
+    p = sub.add_parser("pano-photos"); p.add_argument("images", nargs="+"); p.add_argument("-o", "--out", required=True)
+    p.add_argument("--name", default="全景漫游"); p.add_argument("--names"); p.add_argument("--links"); p.add_argument("--first")
     a, extra = ap.parse_known_args()
     if extra and a.cmd not in ("imgcheck", "from-image"):
         ap.error("unrecognized arguments: " + " ".join(extra))
@@ -793,6 +921,10 @@ def main():
         print("HPD_DRAFT " + json.dumps(from_image(a.image, a.out, a.name, extra), ensure_ascii=False))
     elif a.cmd == "imgcheck":
         print("HPD_IMGCHECK " + json.dumps(imgcheck(a.image, a.out, a.total_width, a.total_height, extra), ensure_ascii=False))
+    elif a.cmd == "pano":
+        print("HPD_PANO " + json.dumps(pano(a.html, a.out, a.name, a.size, a.eye), ensure_ascii=False))
+    elif a.cmd == "pano-photos":
+        print("HPD_PANO " + json.dumps(pano_photos(a.images, a.out, a.name, a.names, a.links, a.first), ensure_ascii=False))
     elif a.cmd == "qa":
         sys.exit(qa(a.html, a.out, a.full))
 

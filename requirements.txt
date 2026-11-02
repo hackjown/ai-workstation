@@ -11,3 +11,4 @@ tzdata
 # dev / tests
 pytest>=8
 pytest-asyncio>=0.23
+segno>=1.5   # 3.9.13 share-link QR codes

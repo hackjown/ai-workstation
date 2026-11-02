@@ -1,0 +1,21 @@
+/* v3.9.14 in-app search: a sheet over the page (phone: full screen) */
+#aiwSearch{position:fixed;inset:0;z-index:80;display:none;background:rgba(17,25,28,.28);backdrop-filter:blur(2px)}
+#aiwSearch.on{display:block}
+#aiwSearch .sbox{position:absolute;left:50%;top:7vh;transform:translateX(-50%);width:min(680px,94vw);max-height:84vh;display:flex;flex-direction:column;
+  background:var(--card);border-radius:var(--r-card);box-shadow:0 18px 60px rgba(17,25,28,.22);overflow:hidden}
+#aiwSearch .shead{display:flex;align-items:center;gap:10px;padding:14px 16px 10px;border-bottom:1px solid var(--line)}
+#aiwSearch .shead input{flex:1;min-width:0;border:0;outline:0;background:transparent;font-size:17px;padding:6px 0}
+#aiwSearch .shead .icon{flex:none}
+#aiwSearch .skinds{display:flex;gap:6px;padding:8px 16px;border-bottom:1px solid var(--line);overflow-x:auto}
+#aiwSearch .skinds button{border:1px solid var(--line);background:var(--card);border-radius:var(--r-pill);padding:4px 12px;font-size:13px;white-space:nowrap;cursor:pointer}
+#aiwSearch .skinds button.on{background:var(--text);color:#fff;border-color:var(--text)}
+#aiwSearch .slist{overflow-y:auto;padding:6px 8px 14px;-webkit-overflow-scrolling:touch}
+#aiwSearch .sgrp{font-size:12px;color:var(--muted);padding:10px 10px 4px;font-weight:600}
+#aiwSearch .shit{display:block;width:100%;text-align:left;border:0;background:transparent;border-radius:14px;padding:9px 10px;cursor:pointer}
+#aiwSearch .shit:hover,#aiwSearch .shit.sel{background:var(--gray)}
+#aiwSearch .shit .t{font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#aiwSearch .shit .s{font-size:13px;color:var(--muted);line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}
+#aiwSearch .shit mark{background:var(--sand);color:inherit;border-radius:3px;padding:0 1px}
+#aiwSearch .shit .m{font-size:11px;color:var(--muted);margin-top:2px}
+#aiwSearch .sempty{padding:28px 12px;text-align:center;color:var(--muted);font-size:14px}
+@media (max-width:640px){#aiwSearch .sbox{top:0;left:0;transform:none;width:100vw;height:100%;max-height:none;border-radius:0;padding-top:var(--safe-t)}}

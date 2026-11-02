@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>全景漫游</title>
+<!-- 3.9.13 AIW 全景漫游查看器：单文件、无依赖（WebGL 直接采样等距柱状全景），微信 / 手机浏览器 / 电脑都能打开。
+     数据：window.__PANO__ = {name, first, plan:{image,w,h,x0,y0,s}|null, scenes:[{id,name,x,y,image,yaw0,links:[{to,yaw,pitch,label}]}]}
+     yaw 弧度：0 = 图上向右，π/2 = 图上向下；图片可以是相对路径或 data: URI。 -->
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#fff;font:14px/1.4 "PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+#gl{position:fixed;inset:0;width:100%;height:100%;touch-action:none;cursor:grab}
+#gl:active{cursor:grabbing}
+#fade{position:fixed;inset:0;background:#000;opacity:0;pointer-events:none;transition:opacity .35s}
+#spots{position:fixed;inset:0;pointer-events:none}
+.spot{position:absolute;transform:translate(-50%,-50%);pointer-events:auto;display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer}
+.spot i{width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.22);border:2px solid #fff;box-shadow:0 2px 10px rgba(0,0,0,.4);
+  display:flex;align-items:center;justify-content:center;animation:pulse 2s infinite}
+.spot i:after{content:"";width:0;height:0;border-left:8px solid transparent;border-right:8px solid transparent;border-bottom:13px solid #fff;transform:translateY(-1px)}
+.spot b{font-weight:500;font-size:13px;padding:3px 9px;border-radius:12px;background:rgba(0,0,0,.55);white-space:nowrap}
+@keyframes pulse{50%{transform:scale(1.12)}}
+#top{position:fixed;left:0;right:0;top:0;padding:calc(10px + env(safe-area-inset-top)) 14px 24px;background:linear-gradient(rgba(0,0,0,.55),transparent);pointer-events:none}
+#top h1{margin:0;font-size:17px;font-weight:600}#top div{opacity:.8;font-size:13px}
+#bar{position:fixed;left:0;right:0;bottom:0;padding:16px 10px calc(10px + env(safe-area-inset-bottom));background:linear-gradient(transparent,rgba(0,0,0,.6))}
+#list{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;padding-bottom:8px}#list::-webkit-scrollbar{display:none}
+#list button{flex:none;border:0;border-radius:16px;padding:6px 13px;background:rgba(255,255,255,.18);color:#fff;font:inherit}
+#list button.on{background:#fff;color:#111;font-weight:600}
+#tools{display:flex;gap:8px;justify-content:flex-end}
+#tools button{border:0;border-radius:18px;height:34px;min-width:34px;padding:0 12px;background:rgba(255,255,255,.18);color:#fff;font:inherit}
+#tools button.on{background:#fff;color:#111}
+#map{position:fixed;right:10px;top:calc(56px + env(safe-area-inset-top));width:min(42vw,260px);border-radius:10px;overflow:hidden;background:rgba(255,255,255,.92);
+  box-shadow:0 2px 12px rgba(0,0,0,.4);display:none}
+#map.on{display:block}#map img{display:block;width:100%}
+#map svg{position:absolute;inset:0;width:100%;height:100%}
+#hint{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);padding:10px 16px;border-radius:10px;background:rgba(0,0,0,.6);transition:opacity .6s;pointer-events:none}
+#err{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:30px;text-align:center;background:#111}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas><div id="fade"></div><div id="spots"></div>
+<div id="top"><h1 id="title">全景漫游</h1><div id="sub"></div></div>
+<div id="map"><img id="mapimg" alt=""><svg id="mapsvg"></svg></div>
+<div id="bar"><div id="list"></div><div id="tools">
+  <button id="bRot" title="自动旋转">⟳</button><button id="bGyro" title="陀螺仪">陀螺仪</button>
+  <button id="bMap" title="平面图">平面图</button><button id="bFull" title="全屏">⛶</button></div></div>
+<div id="hint">拖动看四周 · 点箭头去其他房间</div>
+<div id="err"></div>
+<script id="__pano">window.__PANO__ = window.__PANO__ || null;</script>
+<script>
+(function () {
+  "use strict";
+  var P = window.__PANO__, $ = function (id) { return document.getElementById(id); };
+  function fail(t) { $("err").style.display = "flex"; $("err").textContent = t; }
+  if (!P || !P.scenes || !P.scenes.length) return fail("没有全景数据");
+  var cv = $("gl"), gl = cv.getContext("webgl", { antialias: false, preserveDrawingBuffer: false }) || cv.getContext("experimental-webgl");
+  if (!gl) return fail("这个浏览器不支持 WebGL，换 Chrome / Safari / 微信最新版打开");
+  var VS = "attribute vec2 p;varying vec2 q;void main(){q=p;gl_Position=vec4(p,0.,1.);}";
+  var FS = "precision highp float;varying vec2 q;uniform sampler2D t;uniform mat3 R;uniform vec2 k;" +
+    "void main(){vec3 d=normalize(R*vec3(q.x*k.x,q.y*k.y,-1.));" +
+    "float yaw=atan(d.z,d.x);float pit=asin(clamp(d.y,-1.,1.));" +
+    "vec2 uv=vec2(yaw/6.2831853+.5,.5-pit/3.1415927);gl_FragColor=texture2D(t,uv);}";
+  function sh(type, src) { var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; }
+  var pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, FS)); gl.linkProgram(pr); gl.useProgram(pr);
+  var vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  var lp = gl.getAttribLocation(pr, "p"); gl.enableVertexAttribArray(lp); gl.vertexAttribPointer(lp, 2, gl.FLOAT, false, 0, 0);
+  var uR = gl.getUniformLocation(pr, "R"), uK = gl.getUniformLocation(pr, "k");
+  var tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T].forEach(function (w) { gl.texParameteri(gl.TEXTURE_2D, w, gl.CLAMP_TO_EDGE); });
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  var maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+
+  // view: yaw / pitch in the scene's own convention (yaw 0 = plan +x), fov vertical in degrees
+  var V = { yaw: 0, pitch: 0, fov: 75, auto: false, gyro: false }, cur = null, byId = {}, cache = {};
+  P.scenes.forEach(function (s) { byId[s.id] = s; });
+  function resize() { var r = Math.min(window.devicePixelRatio || 1, 2); cv.width = innerWidth * r; cv.height = innerHeight * r; gl.viewport(0, 0, cv.width, cv.height); draw(); }
+  function rot() {   // camera basis: forward at (yaw, pitch), y up
+    var cy = Math.cos(V.yaw), sy = Math.sin(V.yaw), cp = Math.cos(V.pitch), sp = Math.sin(V.pitch);
+    var f = [cp * cy, sp, cp * sy], r = [-sy, 0, cy], u = [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]];
+    return { f: f, r: r, u: u };   // world dir = r*x + u*y + f*(-z)… with z = -1 forward
+  }
+  function draw() {
+    if (!cur || !cur.img) return;
+    var b = rot(), t = Math.tan(V.fov * Math.PI / 360), a = cv.width / cv.height;
+    // columns: x -> r, y -> u, z -> -f (so vec3(x,y,-1) looks forward)
+    gl.uniformMatrix3fv(uR, false, new Float32Array([b.r[0], b.r[1], b.r[2], b.u[0], b.u[1], b.u[2], -b.f[0], -b.f[1], -b.f[2]]));
+    gl.uniform2f(uK, t * a, t); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); spots(b, t, a);
+  }
+  function spots(b, t, a) {
+    var box = $("spots"), html = "";
+    (cur.links || []).forEach(function (l, i) {
+      var p = l.pitch != null ? l.pitch : -0.32, d = [Math.cos(p) * Math.cos(l.yaw), Math.sin(p), Math.cos(p) * Math.sin(l.yaw)];
+      var z = d[0] * b.f[0] + d[1] * b.f[1] + d[2] * b.f[2]; if (z <= 0.05) return;
+      var x = (d[0] * b.r[0] + d[1] * b.r[1] + d[2] * b.r[2]) / z / (t * a), y = (d[0] * b.u[0] + d[1] * b.u[1] + d[2] * b.u[2]) / z / t;
+      if (Math.abs(x) > 1.2 || Math.abs(y) > 1.2) return;
+      var sx = (x * 0.5 + 0.5) * innerWidth, sy = (0.5 - y * 0.5) * innerHeight;
+      html += '<div class="spot" data-i="' + i + '" style="left:' + sx.toFixed(1) + 'px;top:' + sy.toFixed(1) + 'px"><i></i><b>' + esc(l.label || (byId[l.to] || {}).name || "") + "</b></div>";
+    });
+    box.innerHTML = html; mapMark();
+  }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+  $("spots").addEventListener("click", function (e) { var el = e.target.closest(".spot"); if (el) go(cur.links[+el.dataset.i].to, true); });
+
+  function load(s, cb) {
+    if (cache[s.id]) return cb(cache[s.id]);
+    var im = new Image();
+    if (/^https?:/i.test(s.image) && s.image.indexOf(location.origin + "/") !== 0) im.crossOrigin = "anonymous";
+    im.onload = function () {
+      var src = im;
+      if (im.width > maxTex) { var c = document.createElement("canvas"); c.width = maxTex; c.height = maxTex / 2; c.getContext("2d").drawImage(im, 0, 0, c.width, c.height); src = c; }
+      cache[s.id] = src; cb(src);
+    };
+    im.onerror = function () { fail("全景图片打不开：" + s.image); };
+    im.src = s.image;
+  }
+  function go(id, fade) {
+    var s = byId[id]; if (!s) return;
+    var from = cur;
+    var show = function (img) {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img); }
+      catch (e) { return fail("浏览器不让本地文件夹里的网页读图片：请打开「全景漫游.html」单文件版，或放到网站上用网址打开"); }
+      cur = s; cur.img = img;
+      // keep facing the way you walked: arriving through a door, look on in the same direction
+      if (from && from.links) { var l = from.links.filter(function (x) { return x.to === id; })[0]; V.yaw = l ? l.yaw : (s.yaw0 || 0); }
+      else V.yaw = s.yaw0 || 0;
+      V.pitch = 0; $("sub").textContent = s.name;
+      [].forEach.call($("list").children, function (b) { b.classList.toggle("on", b.dataset.id === id); });
+      draw(); $("fade").style.opacity = 0;
+      try { history.replaceState(null, "", "#" + id); } catch (e) { /* file:// */ }
+      // the next rooms load in the background
+      (s.links || []).forEach(function (l) { if (byId[l.to]) load(byId[l.to], function () {}); });
+    };
+    if (fade) { $("fade").style.opacity = 1; setTimeout(function () { load(s, show); }, 260); } else load(s, show);
+  }
+
+  // ---- input: drag, pinch, wheel
+  var drag = null, pts = {};
+  cv.addEventListener("pointerdown", function (e) { cv.setPointerCapture(e.pointerId); pts[e.pointerId] = e; drag = { x: e.clientX, y: e.clientY, yaw: V.yaw, pitch: V.pitch }; V.auto = false; $("bRot").classList.remove("on"); hint(); });
+  cv.addEventListener("pointermove", function (e) {
+    if (!pts[e.pointerId]) return; pts[e.pointerId] = e; var ids = Object.keys(pts);
+    if (ids.length === 2) { var a = pts[ids[0]], b = pts[ids[1]], d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      if (drag.d) V.fov = clamp(V.fov * drag.d / d, 30, 100); drag.d = d; draw(); return; }
+    if (!drag) return; var k = V.fov / innerHeight * Math.PI / 180;
+    V.yaw = drag.yaw - (e.clientX - drag.x) * k; V.pitch = clamp(drag.pitch + (e.clientY - drag.y) * k, -1.45, 1.45); draw();
+  });
+  function up(e) { delete pts[e.pointerId]; drag = null; }
+  cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
+  cv.addEventListener("wheel", function (e) { e.preventDefault(); V.fov = clamp(V.fov * (e.deltaY > 0 ? 1.08 : 0.93), 30, 100); draw(); }, { passive: false });
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+  var hinted = false; function hint() { if (!hinted) { hinted = true; $("hint").style.opacity = 0; } }
+  setTimeout(hint, 4000);
+
+  // ---- gyro (iOS asks for permission on a tap)
+  var g0 = null;
+  function onOri(e) {
+    if (!V.gyro || e.alpha == null) return;
+    var yaw = -(e.alpha || 0) * Math.PI / 180, pit = ((e.beta || 0) - 90) * Math.PI / 180;
+    if (!g0) g0 = { yaw: V.yaw - yaw }; V.yaw = g0.yaw + yaw; V.pitch = clamp(pit, -1.45, 1.45); draw();
+  }
+  $("bGyro").onclick = function () {
+    var on = !V.gyro, start = function () { V.gyro = on; g0 = null; $("bGyro").classList.toggle("on", on); if (on) window.addEventListener("deviceorientation", onOri); };
+    if (on && window.DeviceOrientationEvent && DeviceOrientationEvent.requestPermission) DeviceOrientationEvent.requestPermission().then(function (r) { if (r === "granted") start(); }).catch(function () {});
+    else start();
+  };
+  $("bRot").onclick = function () { V.auto = !V.auto; this.classList.toggle("on", V.auto); };
+  $("bFull").onclick = function () { var d = document.documentElement, f = d.requestFullscreen || d.webkitRequestFullscreen; if (document.fullscreenElement) document.exitFullscreen(); else if (f) f.call(d); };
+
+  // ---- minimap: where you stand and where you look
+  var M = P.plan;
+  if (M && M.image) { $("mapimg").src = M.image; $("mapsvg").setAttribute("viewBox", "0 0 " + M.w + " " + M.h); $("map").classList.add("on"); $("bMap").classList.add("on");
+    var fitMap = function () { $("map").style.width = Math.min(innerWidth * 0.42, 260, innerHeight * 0.4 * M.w / M.h) + "px"; };
+    fitMap(); window.addEventListener("resize", fitMap); }
+  else $("bMap").style.display = "none";
+  $("bMap").onclick = function () { var on = !$("map").classList.contains("on"); $("map").classList.toggle("on", on); this.classList.toggle("on", on); };
+  function mapMark() {
+    if (!M || !cur) return;
+    var X = function (x) { return (x - M.x0) * M.s; }, Y = function (y) { return (y - M.y0) * M.s; }, h = "";
+    P.scenes.forEach(function (s) { h += '<circle cx="' + X(s.x) + '" cy="' + Y(s.y) + '" r="' + (s === cur ? 13 : 9) + '" fill="' + (s === cur ? "#2f6fed" : "#fff") + '" stroke="#2f6fed" stroke-width="4" data-id="' + s.id + '" style="cursor:pointer;pointer-events:auto"/>'; });
+    var a = V.fov * Math.PI / 180 * (innerWidth / innerHeight) / 2, R = 120, cx = X(cur.x), cy = Y(cur.y);
+    a = Math.min(a, 1.3);
+    h = '<path d="M' + cx + " " + cy + " L" + (cx + R * Math.cos(V.yaw - a)) + " " + (cy + R * Math.sin(V.yaw - a)) + " A" + R + " " + R + " 0 0 1 " +
+      (cx + R * Math.cos(V.yaw + a)) + " " + (cy + R * Math.sin(V.yaw + a)) + ' Z" fill="rgba(47,111,237,.3)"/>' + h;
+    $("mapsvg").innerHTML = h;
+  }
+  $("mapsvg").addEventListener("click", function (e) { var id = e.target.getAttribute && e.target.getAttribute("data-id"); if (id && id !== cur.id) go(id, true); });
+
+  // ---- scene list, title, start
+  document.title = (P.name || "全景漫游") + " · 全景漫游"; $("title").textContent = P.name || "全景漫游";
+  $("list").innerHTML = P.scenes.map(function (s) { return '<button data-id="' + s.id + '">' + esc(s.name) + "</button>"; }).join("");
+  $("list").onclick = function (e) { var b = e.target.closest("button"); if (b && b.dataset.id !== (cur && cur.id)) go(b.dataset.id, true); };
+  var last = 0;
+  function tick(t) { if (V.auto && cur) { V.yaw += Math.min(50, t - last) * 0.00012; draw(); } last = t; requestAnimationFrame(tick); }
+  requestAnimationFrame(tick);
+  window.addEventListener("resize", resize);
+  var start = (location.hash || "").slice(1);
+  resize(); go(byId[start] ? start : (P.first && byId[P.first] ? P.first : P.scenes[0].id), false);
+})();
+</script>
+</body>
+</html>

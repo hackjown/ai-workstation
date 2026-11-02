@@ -110,6 +110,19 @@ TOOLS: list[ToolSpec] = [
                                       'only cleans seams'},
               "keep_size": {"type": "boolean", "description": "scale the result to the original size (default true)"}},
              ["path"]),
+    ToolSpec("generate_image", None,
+             "AI image generation: a new picture from words (an illustration, a poster, a product shot, a concept "
+             "render, an icon). Uses the image model in settings (default endpoint, the other as fallback). Saved "
+             "as .png on this computer; read_image it to check, then send_file it. To change an existing picture "
+             "use image_edit instead.",
+             {"prompt": {"type": "string", "description": "what the picture shows: subject, style, composition, "
+                                                          "colours, any text that must appear (in quotes)"},
+              "size": {"type": "string", "description": "1024x1024 (square), 1536x1024 (landscape), 1024x1536 "
+                                                        "(portrait) or auto"},
+              "n": {"type": "integer", "description": "how many versions, 1-4 (default 1)"},
+              "save": {"type": "string", "description": "output .png, relative to ~/workspace (default "
+                                                        "images/gen-<time>.png; extra versions get -2, -3…)"}},
+             ["prompt"]),
     ToolSpec("photopea", None,
              "Edit images like in Photoshop: PSD/PNG/JPG/WebP in Photopea (a Photoshop clone) in a browser window on "
              "the desktop; the user watches it. One call = open files -> run `script` -> save. `script` is Photoshop "
@@ -328,7 +341,7 @@ BY_NAME = {t.name: t for t in TOOLS}
 BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit"}
+LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

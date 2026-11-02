@@ -6,7 +6,7 @@ import UserNotifications
 //   aiw://task/<task id>                    the task detail page (its thread: computer on top, steps below)
 //   aiw://takeover/<machine>?task=<task id> that task in takeover (no task: that computer's desktop, takeover)
 //   aiw://monitor/<watch id>                追踪 with that price / page watch highlighted, 立即重试 on top
-//   aiw://chat[?m=<message id>]             the home chat at the newest message
+//   aiw://chat[?m=<message id>]             the home chat at the newest message, or scrolled to that message (v3.9.14)
 // aiw://import… stays the share extension's (Import.swift). A cold launch works the same way: onOpenURL (or the
 // notification tap) stores the target here, and RootView takes it as soon as it is on screen (after sign-in).
 

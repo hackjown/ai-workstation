@@ -19,6 +19,13 @@ DESIGNER_AUTO = (r"house-?plan-?designer|装修设计器|户型设计器|设计�
 def is_designer_task(prompt: str) -> bool:
     return bool(re.search(DESIGNER_AUTO, prompt or "", re.I))
 
+# v3.9.14 auto triggers for the vendored anthropics skills
+SKILL_CREATOR_AUTO = (r"skill-?creator|(做|写|创建|新建|生成|制作|保存|存|沉淀|整理)(成|一个|个|为)?[^。\n]{0,8}(技能|skill)(?!\s*(列表|市场))")
+WEBAPP_TEST_AUTO = (r"webapp-?testing|playwright|(测试|自测|测一下|测一遍|检查|验收)[^。\n]{0,10}(网页|页面|前端|web ?app|网站)|"
+                    r"(网页|页面|前端|网站)[^。\n]{0,10}(测试|自测|有没有\s*bug|报错)")
+FRONTEND_AUTO = (r"frontend-?design|(做|写|设计|生成|搭|改)[^。\n]{0,10}(落地页|着陆页|官网|主页|landing ?page|仪表盘|dashboard|"
+                 r"报告页|展示页|宣传页|个人网站|网页设计|前端页面|ui ?界面)")
+
 MARK = re.compile(r"【技能[:：]\s*([^】]+)】")
 
 SEARCH_DIRS = "~/.claude/skills ~/.workbuddy/skills ~/.codebuddy/skills ~/.agents/skills"
@@ -96,7 +103,9 @@ CATALOG: list[dict] = [
      "desc": "户型图（酷家乐/贝壳/售楼处图、手绘尺寸图、CAD 矢量 PDF/DXF、原始结构图）还原成单文件 HTML 装修设计器：2D + 3D 漫游 + 家具 + 水电/吊顶/铺装/拆改 + 管线自动排布 + 报价 + PDF/DXF 施工图",
      "path": "~/.claude/skills/house-plan-designer",
      "auto": DESIGNER_AUTO,
+     # v3.9.16: the upstream commit in NOTICE.md is part of the check, so a computer with the older copy reinstalls
      "check": ("test -f ~/.claude/skills/house-plan-designer/assets/template.html && "
+               "grep -q b94183f ~/.claude/skills/house-plan-designer/NOTICE.md && "
                "python3 ~/.claude/skills/house-plan-designer/scripts/aiw_hpd.py doctor | grep -q '\"ok\": true'"),
      "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/house-plan-designer-setup.sh "
                "-o /tmp/hpds.sh && bash /tmp/hpds.sh"),
@@ -175,6 +184,33 @@ CATALOG: list[dict] = [
               "template.md, run `remake.py check 复刻_<name>.md --duration <s>` until OK, `remake.py json … --analysis "
               "analysis.json > 复刻_<name>.json`, send_file both, done with the slot table and the check result. "
               "Reference images only when the user asks for them.")},
+    # v3.9.14: three Apache-2.0 skills from anthropics/skills, vendored in skills/<id> (NOTICE.md), set up by aiw-skill-setup.sh
+    {"id": "skill-creator", "title": "技能制作", "icon": "spark",
+     "desc": "把一次做成的流程、或用户描述的做法写成新技能（SKILL.md + 脚本），以后的任务自动用上",
+     "path": "~/.claude/skills/skill-creator", "auto": SKILL_CREATOR_AUTO,
+     "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/aiw-skill-setup.sh "
+               "-o /tmp/aiwss.sh && bash /tmp/aiwss.sh skill-creator"),
+     "note": ("Read the AIW section at the top of SKILL.md. Write the new skill to ~/.claude/skills/<name>/ (AIW scans "
+              "that folder at the start of every task, nothing else to register). Base it on what actually worked: the "
+              "earlier task's successful steps, its errors and the user's corrections (session_search finds an earlier "
+              "task). Scripts over prose; Chinese and English trigger words in the description; never secrets. Skip the "
+              "eval/benchmark loop unless the user asks. Run scripts/quick_validate.py on the folder, send_file SKILL.md.")},
+    {"id": "webapp-testing", "title": "网页自测", "icon": "monitor",
+     "desc": "用 Playwright 打开网页或本地 HTML，点一遍、看控制台、截图，交付前自测",
+     "path": "~/.claude/skills/webapp-testing", "auto": WEBAPP_TEST_AUTO,
+     "check": "test -f ~/.claude/skills/webapp-testing/SKILL.md && python3 -c 'import playwright' 2>/dev/null",
+     "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/aiw-skill-setup.sh "
+               "-o /tmp/aiwss.sh && bash /tmp/aiwss.sh webapp-testing"),
+     "note": ("Headless Playwright scripts (scripts/with_server.py for a dev server, file:// for a single HTML; WebGL pages "
+              "need --use-gl=swiftshader --enable-unsafe-swiftshader). Collect console + pageerror, click the key controls, "
+              "screenshot to ~/workspace/qa/<name>/ and read_image it; fix before delivering.")},
+    {"id": "frontend-design", "title": "前端设计", "icon": "image",
+     "desc": "做落地页、官网、仪表盘、报告页等网页时给出有设计感、不像模板的界面",
+     "path": "~/.claude/skills/frontend-design", "auto": FRONTEND_AUTO,
+     "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/aiw-skill-setup.sh "
+               "-o /tmp/aiwss.sh && bash /tmp/aiwss.sh frontend-design"),
+     "note": ("Commit to one clear aesthetic direction before coding; full Chinese font stack; single offline HTML that "
+              "also works on a phone; self-test it the webapp-testing way before send_file.")},
     {"id": "photopea", "title": "Photopea 修图", "icon": "image",
      "desc": "AI 改图后用 Photopea 精修文字、图层，导出 PSD / PNG",
      "path": "", "setup": "", "note": "Use the image_edit tool for the AI edit and the photopea tool for exact finishing."},
@@ -240,7 +276,7 @@ def auto(prompt: str) -> list[str]:
     text = strip(prompt or "")
     out = [s["id"] for s in CATALOG if s.get("auto") and re.search(s["auto"], text, re.I)]
     if "house-plan-designer" in out:      # the designer reads the plan itself; the CAD redraw phases would fight it
-        out = [n for n in out if n not in ("cad-drawing", "librecad")]
+        out = [n for n in out if n not in ("cad-drawing", "librecad", "frontend-design")]
     return out
 
 

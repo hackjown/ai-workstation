@@ -268,6 +268,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     xhs.mount(app, store, sessions, notifier, auth)
     from . import remote_input   # 3.8.4: takeover input straight to the VM (/ws/input/{mid}, /api/machines/{mid}/input)
     remote_input.mount(app, store, sessions, auth, lambda ws: _ok(ws_token(ws)))
+    from . import share as _share   # 3.9.13: read-only share links /s/<code> for designer and pano pages
+    _share.mount(app, settings, auth)
     from . import browseros   # BrowserOS neo per computer (/api/browseros*)
     browseros.mount(app, store, sessions, auth)
     from . import chat as _chat   # the persistent 小秘 chat (/api/chat*): routing, task cards, escalations in the chat
@@ -287,6 +289,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     app.state.lessons = lessons
     _lessons.mount(app, lessons, auth)
     _uploads.ensure_table(store)
+    from . import search as _search   # v3.9.14: in-app search (/api/search) + session_search for the chat and tasks
+    srch = _search.Search(store)
+    chat.search = srch
+    sessions.search = srch
+    app.state.search = srch
+    _search.mount(app, srch, auth)
     from . import greeting as _greeting   # 球球播报 on the home screen (/api/greeting)
     _greeting.mount(app, store, chat, mem, auth)
 
@@ -794,18 +802,53 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     async def get_models():
         m = store.kv_get("models", {}) or {}
         return {**m, "env_model": os.environ.get("OPENAI_MODEL"), "env_base_url": os.environ.get("OPENAI_BASE_URL"),
-                "has_key": bool(secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY"))}
+                "has_key": bool(secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")),
+                "has_image2_key": bool(secrets.get("image2_api_key") or os.environ.get("AIW_IMAGE2_API_KEY"))}
 
     @app.put("/api/settings/models", dependencies=[Depends(auth)])
     async def put_models(body: dict):
-        m = {k: (str(body.get(k) or "").strip() or None)
-             for k in ("model", "vision_model", "vision_fallback", "fallback", "subagent_model", "image_model", "video_model", "base_url", "thinking",
-                       "chat_model", "small_model", "embed_model")}
+        """The web form. v3.9.15: keys the form does not send keep their value (it used to blank chat_model,
+        small_model and embed_model, which only the API sets)."""
+        m = dict(store.kv_get("models", {}) or {})
+        for k in MODEL_KEYS:
+            if k in body:
+                m[k] = str(body.get(k) or "").strip() or None
+        if m.get("image_default") not in (None, "gateway", "custom"):
+            raise HTTPException(400, "image_default must be gateway or custom")
+        if m.get("image2_base_url"):
+            m["image2_base_url"] = m["image2_base_url"].rstrip("/")
         store.kv_set("models", m)
         return m
 
+    # v3.9.15: image2_* = the second image endpoint (its key is the secret image2_api_key); image_default picks which
+    # of the two is tried first (gateway | custom), the other is the fallback
     MODEL_KEYS = ("model", "vision_model", "vision_fallback", "fallback", "subagent_model", "image_model", "video_model",
-                  "base_url", "thinking", "chat_model", "small_model", "embed_model")
+                  "base_url", "thinking", "chat_model", "small_model", "embed_model",
+                  "image2_base_url", "image2_model", "image_default")
+
+    @app.post("/api/image/test", dependencies=[Depends(auth)])
+    async def image_test(body: dict | None = None):
+        """v3.9.15 设置 → 生图接口 → 测试: one small picture from each endpoint (or only body.which), in chain order."""
+        import time as _t
+        from agent_runtime import image_edit as _ie
+        from .sessions import image_cfg_from
+        cfg = image_cfg_from(store.kv_get("models", {}) or {}, secrets)
+        if not cfg:
+            return {"ok": False, "error": "没有配置生图模型", "results": []}
+        which = (body or {}).get("which")
+        out = []
+        for p in cfg["chain"]:
+            if which and p["id"] != which:
+                continue
+            t0 = _t.time()
+            try:
+                imgs = await _ie.generate(p["base_url"], p["key"], p["model"], "一个红色的圆，白色背景，极简", "1024x1024", 1, 180)
+                out.append({"id": p["id"], "name": p["name"], "model": p["model"], "ok": True, "bytes": len(imgs[0]),
+                            "ms": int((_t.time() - t0) * 1000)})
+            except Exception as e:  # noqa: BLE001
+                out.append({"id": p["id"], "name": p["name"], "model": p["model"], "ok": False, "error": str(e)[:300],
+                            "ms": int((_t.time() - t0) * 1000)})
+        return {"ok": any(r["ok"] for r in out), "default": cfg["default"], "results": out}
 
     @app.patch("/api/settings/models", dependencies=[Depends(auth)])
     async def patch_models(body: dict):

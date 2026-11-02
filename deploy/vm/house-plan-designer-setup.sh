@@ -5,7 +5,7 @@
 set -euo pipefail
 D="$HOME/.claude/skills/house-plan-designer"
 if [ "${1:-}" = "check" ]; then
-  test -f "$D/assets/template.html" && test -d "$D/scripts/node_modules/puppeteer-core" && \
+  test -f "$D/assets/template.html" && grep -q b94183f "$D/NOTICE.md" && test -d "$D/scripts/node_modules/puppeteer-core" && \
     python3 "$D/scripts/aiw_hpd.py" doctor | grep -q '"ok": true' && exit 0 || exit 1
 fi
 BASE="${AIW_RAW:-https://raw.githubusercontent.com/hackjown/ai-workstation/main}/skills/house-plan-designer"

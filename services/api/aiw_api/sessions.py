@@ -188,16 +188,14 @@ class SessionManager:
         return LLMRouter.from_settings(name, None, key, m.get("base_url") or None, None, "off")
 
     def _image_cfg(self) -> Optional[dict]:
-        """The AI image-editing model (image_edit tool), through the same gateway and key as the other models."""
+        """The AI image models (image_edit / generate_image), v3.9.15 two endpoints:
+          网关  = the main gateway (base_url + openai_api_key) with image_model (改图/生图模型),
+          自定义 = its own base URL, key (secret image2_api_key) and model (设置 → 模型 → 生图接口).
+        image_default (gateway | custom) picks the one tried first; the other is the fallback. Unset = the custom
+        endpoint first when it is filled in. Top-level model/key/base_url = the default, for older callers."""
         if self._custom_llm:
             return None
-        m = self.model_settings()
-        model = m.get("image_model") or os.environ.get("AIW_IMAGE_MODEL")
-        key = (self.secrets.get("openai_api_key") if self.secrets else None) or os.environ.get("OPENAI_API_KEY")
-        if not model or not key:
-            return None
-        base = m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        return {"model": model, "key": key, "base_url": base}
+        return image_cfg_from(self.model_settings(), self.secrets)
 
     # ------------------------------------------------------------------ context
     def build_context(self, thread_id: Optional[str], exclude_task: Optional[str] = None,
@@ -717,6 +715,12 @@ class SessionManager:
                         extra["deploy_server"] = (sch, fn)
                 except Exception as e:  # noqa: BLE001
                     log.warning("deploy tool unavailable: %s", e)
+                try:  # v3.9.14: earlier chats, tasks and files (search.py), full text, the real words
+                    srch = getattr(self, "search", None)
+                    if srch is not None:
+                        extra["session_search"] = srch.tool(exclude_task=task.id)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("session_search unavailable: %s", e)
                 try:  # hosts the user authorised for ops work (设置 › 电脑 › 运维主机)
                     from . import remote_hosts
                     if self.secrets and remote_hosts.hosts(self.store):
@@ -1446,3 +1450,25 @@ def _budget_raw(prompt: str, max_steps: int, timeout_s: float, context: Optional
         # old 900 s because the API passes its own LoopConfig, so the loop's own image budget never applied)
         return max_steps, max(timeout_s, float(os.environ.get("AIW_IMAGE_TIMEOUT", "2400")))
     return max_steps, timeout_s
+
+
+def image_cfg_from(m: dict, secrets=None) -> Optional[dict]:
+    """See SessionManager._image_cfg. Also used by the chat and by /api/image/test."""
+    m = m or {}
+    gw_model = m.get("image_model") or os.environ.get("AIW_IMAGE_MODEL")
+    gw_key = (secrets.get("openai_api_key") if secrets else None) or os.environ.get("OPENAI_API_KEY")
+    gw_base = m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+    c_model = m.get("image2_model") or os.environ.get("AIW_IMAGE2_MODEL")
+    c_key = (secrets.get("image2_api_key") if secrets else None) or os.environ.get("AIW_IMAGE2_API_KEY")
+    c_base = m.get("image2_base_url") or os.environ.get("AIW_IMAGE2_BASE_URL")
+    gw = {"id": "gateway", "name": "主网关", "base_url": gw_base, "key": gw_key, "model": gw_model} \
+        if gw_model and gw_key else None
+    cu = {"id": "custom", "name": "自定义生图接口", "base_url": c_base.rstrip("/"), "key": c_key, "model": c_model} \
+        if c_model and c_key and c_base else None
+    default = (m.get("image_default") or "").strip() or ("custom" if cu else "gateway")
+    chain = [p for p in ((cu, gw) if default == "custom" else (gw, cu)) if p]
+    if not chain:
+        return None
+    first = chain[0]
+    return {"model": first["model"], "key": first["key"], "base_url": first["base_url"], "chain": chain,
+            "default": default}

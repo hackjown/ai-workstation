@@ -14,6 +14,8 @@ The model is called through the same OpenAI-compatible gateway as the agent's ot
   - /chat/completions with the image attached for chat models that answer with an image (Gemini image models on
     OpenRouter/one-api/new-api style gateways put it in message.images, in content parts, or as a data URI).
 Each is tried, the likelier one first.
+v3.9.15: generate() makes a picture from words (/images/generations), and edit_chain/generate_chain try the
+default image endpoint, then the other one (设置 → 模型 → 生图接口), so one broken endpoint never stops the job.
 """
 from __future__ import annotations
 
@@ -63,14 +65,22 @@ async def _fetch(c: httpx.AsyncClient, url: str) -> bytes:
 
 
 async def _from_images_api(c, base, key, model, png: bytes, prompt: str) -> bytes:
-    files = [("image[]", ("image.png", png, "image/png"))]
+    field = "image[]"
     data = {"model": model, "prompt": prompt, "n": "1"}
     if re.search(r"gpt-image", model, re.I):
         data["input_fidelity"] = "high"  # keeps faces, logos and details of the input closer
-    r = await c.post(f"{base}/images/edits", headers={"Authorization": f"Bearer {key}"}, data=data, files=files)
-    if r.status_code == 400 and "input_fidelity" in r.text:
+
+    async def post():
+        return await c.post(f"{base}/images/edits", headers={"Authorization": f"Bearer {key}"}, data=data,
+                            files=[(field, ("image.png", png, "image/png"))])
+    r = await post()
+    if r.status_code in (400, 422) and "input_fidelity" in r.text:
         data.pop("input_fidelity", None)
-        r = await c.post(f"{base}/images/edits", headers={"Authorization": f"Bearer {key}"}, data=data, files=files)
+        r = await post()
+    if r.status_code in (400, 422) and re.search(r"image", r.text, re.I):
+        # v3.9.15: some OpenAI-compatible servers (chatgpt2api, one-api forks) only read the field `image`
+        field = "image"
+        r = await post()
     if r.status_code >= 400:
         raise ImageEditError(f"/images/edits {r.status_code}: {r.text[:300]}")
     d = (r.json().get("data") or [{}])[0]
@@ -152,6 +162,127 @@ async def edit(base_url: str, key: str, model: str, img_bytes: bytes, prompt: st
             except (ImageEditError, httpx.HTTPError, ValueError, OSError) as e:
                 errs.append(str(e)[:300])
     raise ImageEditError(" | ".join(errs))
+
+
+# ---------------------------------------------------------------- v3.9.15: text -> image
+
+SIZES = ("1024x1024", "1536x1024", "1024x1536", "auto")
+
+
+def gen_size(size: str) -> Optional[str]:
+    """Normalise a size ('横版', '1536x1024', '16:9') to one gpt-image accepts; None = let the server choose."""
+    s = str(size or "").strip().lower().replace("*", "x").replace("×", "x")
+    if not s or s == "auto":
+        return None
+    if re.fullmatch(r"\d{3,4}x\d{3,4}", s):
+        return s
+    if re.search(r"横|landscape|wide|16:9|3:2|4:3", s):
+        return "1536x1024"
+    if re.search(r"竖|portrait|tall|9:16|2:3|3:4", s):
+        return "1024x1536"
+    if re.search(r"方|square|1:1", s):
+        return "1024x1024"
+    return None
+
+
+async def _gen_images_api(c, base, key, model, prompt: str, size: Optional[str], n: int) -> list[bytes]:
+    body = {"model": model, "prompt": prompt, "n": n}
+    if size:
+        body["size"] = size
+    r = await c.post(f"{base}/images/generations", headers={"Authorization": f"Bearer {key}"}, json=body)
+    if r.status_code in (400, 422) and size and "size" in r.text:
+        body.pop("size")
+        r = await c.post(f"{base}/images/generations", headers={"Authorization": f"Bearer {key}"}, json=body)
+    if r.status_code >= 400:
+        raise ImageEditError(f"/images/generations {r.status_code}: {r.text[:300]}")
+    out = []
+    for d in (r.json().get("data") or []):
+        if d.get("b64_json"):
+            out.append(base64.b64decode(d["b64_json"]))
+        elif d.get("url"):
+            out.append(await _decode(c, d["url"]))
+    if not out:
+        raise ImageEditError("/images/generations returned no image")
+    return out
+
+
+async def _gen_chat(c, base, key, model, prompt: str, size: Optional[str], n: int) -> list[bytes]:
+    text = prompt + (f"\n画幅：{size}" if size else "") + "\nReturn the picture itself as an image."
+    body = {"model": model, "modalities": ["image", "text"], "messages": [{"role": "user", "content": text}]}
+    r = await c.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=body)
+    if r.status_code == 400 and "modalities" in r.text:
+        body.pop("modalities")
+        r = await c.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"}, json=body)
+    if r.status_code >= 400:
+        raise ImageEditError(f"/chat/completions {r.status_code}: {r.text[:300]}")
+    msg = ((r.json().get("choices") or [{}])[0]).get("message") or {}
+    found = _images_in(msg)
+    if not found:
+        txt = msg.get("content") if isinstance(msg.get("content"), str) else ""
+        raise ImageEditError(f"{model} answered without an image{': ' + txt[:200] if txt else ''}")
+    return [await _decode(c, f) for f in found[:max(1, n)]]
+
+
+async def generate(base_url: str, key: str, model: str, prompt: str, size: Optional[str] = None, n: int = 1,
+                   timeout: float = 300) -> list[bytes]:
+    """Text to image: /images/generations for gpt-image/dall-e style models, else a chat model that answers with one."""
+    base = (base_url or "https://api.openai.com/v1").rstrip("/")
+    n = max(1, min(4, int(n or 1)))
+    order = [_gen_images_api, _gen_chat] if IMAGES_API_HINT.search(model) else [_gen_chat, _gen_images_api]
+    errs = []
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
+        for fn in order:
+            try:
+                outs = await fn(c, base, key, model, prompt, size, n)
+                for o in outs:
+                    Image.open(io.BytesIO(o)).verify()
+                return outs
+            except (ImageEditError, httpx.HTTPError, ValueError, OSError) as e:
+                errs.append(str(e)[:300])
+    raise ImageEditError(" | ".join(errs))
+
+
+# ---------------------------------------------------------------- v3.9.15: two endpoints, default + fallback
+
+def chain_of(cfg: Optional[dict]) -> list[dict]:
+    """The image endpoints to try, in order: cfg["chain"] (sessions._image_cfg), else the single legacy entry."""
+    cfg = cfg or {}
+    ch = [p for p in (cfg.get("chain") or []) if p.get("model") and p.get("key")]
+    if ch:
+        return ch
+    if cfg.get("model") and cfg.get("key"):
+        return [{"name": "网关", "base_url": cfg.get("base_url") or "", "key": cfg["key"], "model": cfg["model"]}]
+    return []
+
+
+async def edit_chain(cfg, img_bytes: bytes, prompt: str, timeout: float = 300) -> tuple[bytes, dict]:
+    """edit() on the default endpoint; on any failure the next one. Returns (image, the endpoint that made it)."""
+    errs = []
+    for p in chain_of(cfg):
+        try:
+            return await edit(p.get("base_url") or "", p["key"], p["model"], img_bytes, prompt, timeout), p
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{p.get('name') or p['model']}（{p['model']}）: {str(e)[:300]}")
+    raise ImageEditError(" || ".join(errs) or "no image model is set up")
+
+
+async def generate_chain(cfg, prompt: str, size: Optional[str] = None, n: int = 1,
+                         timeout: float = 300) -> tuple[list[bytes], dict]:
+    errs = []
+    for p in chain_of(cfg):
+        try:
+            return await generate(p.get("base_url") or "", p["key"], p["model"], prompt, size, n, timeout), p
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{p.get('name') or p['model']}（{p['model']}）: {str(e)[:300]}")
+    raise ImageEditError(" || ".join(errs) or "no image model is set up")
+
+
+def to_png(raw: bytes) -> bytes:
+    im = Image.open(io.BytesIO(raw))
+    im = im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB")
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------- alignment and restore

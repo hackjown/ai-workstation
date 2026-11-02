@@ -92,6 +92,8 @@ Rules:
   like "A 的顶边和 B 的顶边分别在图片高度的百分之几处") so the prompt says which way and how much (加高/降低,
   拉宽/缩窄). If the direction is still unclear, ask_user. Before done, the compare=true read must show the
   change is really there; never deliver an image the check says is unchanged or wrong.
+- A NEW picture from words (illustration, poster, concept image, icon): `generate_image`, then read_image it and
+  send_file it. Do not draw it by hand in a paint program or Photopea.
 - Image editing (PSD, layers, replacing or adding text on a poster/banner, compositing, retouching, resizing for
   print): use the `photopea` tool, Photopea being a Photoshop clone that runs in a browser window the user watches
   (Photoshop itself does not run on this Linux computer). Workflow: 1) photopea open=[file] info=true (layer names,

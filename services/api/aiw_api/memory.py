@@ -36,6 +36,9 @@ KINDS = ("profile", "fact", "decision")
 KIND_CN = {"profile": "画像", "fact": "事实", "decision": "决定"}
 TOP_K = 8
 MAX_TEXT = 300
+PROFILE_CAP = 16        # v3.9.14: profile lines in the frozen snapshot (consolidation merges past this)
+PROFILE_CHARS = 1500
+FACT_CAP = 300          # facts + decisions before a daily consolidation pass
 OPEN, CLOSE = "[MEMORY]", "[/MEMORY]"
 
 SECRET_RE = re.compile(
@@ -57,6 +60,14 @@ LEARN_PROMPT = """你是长期记忆整理员（MEMORY）。读用户和助理�
 - {{"op": "replace", "id": "被新信息推翻的旧记忆 id", "kind": "...", "text": "新的说法"}}（用户改了主意、搬家、换了偏好时用）
 - {{"op": "same", "id": "..."}}（新信息和已有记忆说的是同一件事）
 没有值得记的就输出 {{"ops": []}}。"""
+
+CONSOLIDATE_PROMPT = """你是长期记忆整理员。下面是用户的一批长期记忆（带 id），有些重复、互相重叠或已经过时。
+把说的是同一件事的合并成一条（保留最新、最具体的说法，数字、名字照原样），明显是一次性小事、已经没用的标记删除。
+画像（profile）最后最多留 {cap} 条。拿不准的不要动。不要改写没问题的条目。
+输出一行 JSON：{{"ops": [...]}}，op 只能是：
+- {{"op": "merge", "ids": ["要合并的 id", "..."], "kind": "profile|fact|decision", "text": "合并后的一句话，第三人称"}}
+- {{"op": "drop", "ids": ["..."]}}
+没有要整理的就输出 {{"ops": []}}。"""
 
 
 def looks_secret(text: str) -> bool:
@@ -337,14 +348,39 @@ class Memory:
         return [self._out(r) for _, _, r in scored[:k]]
 
     def profile_lines(self) -> list[str]:
+        """v3.9.14 frozen snapshot: oldest first and capped, so the profile text only changes when a profile memory is
+        added, edited or replaced (a 'same' that bumps updated_at no longer reorders it). The chat puts it in the
+        stable head of the system prompt, where the provider's prefix cache keeps hitting."""
         prof = self.store.kv_get("profile", {}) or {}
         out = []
         if prof.get("name"):
             out.append(f"称呼：{prof['name']}")
         if prof.get("about"):
             out.append(f"关于用户：{prof['about']}")
-        out += [m["text"] for m in self.items(kind="profile")[:12]]
+        rows = sorted(self.items(kind="profile"), key=lambda m: (m.get("created_at") or 0, m["id"]))
+        rows = rows[-PROFILE_CAP:]
+        total = sum(len(x) for x in out)
+        for m in rows:
+            if total + len(m["text"]) > PROFILE_CHARS:
+                break
+            out.append(m["text"])
+            total += len(m["text"])
         return out
+
+    def profile_block(self) -> str:
+        prof = self.profile_lines()
+        if not prof:
+            return ""
+        return "关于用户（长期画像；与用户最新的话冲突时以最新的话为准）：" + "；".join(prof)
+
+    def facts_block(self, query: str = "", k: int = TOP_K) -> str:
+        mems = self.search(query, k)
+        if not mems:
+            return ""
+        lines = [OPEN, "和这句话相关的长期记忆（用户说过或确认过的；与用户最新的话冲突时以最新的话为准）："]
+        lines += [f"- [{KIND_CN.get(m['kind'], '事实')}] {m['text']}" for m in mems]
+        lines.append(CLOSE)
+        return "\n".join(lines)
 
     def prompt_block(self, query: str = "", k: int = TOP_K) -> str:
         prof = self.profile_lines()
@@ -358,6 +394,56 @@ class Memory:
             lines.append(f"- [{KIND_CN.get(m['kind'], '事实')}] {m['text']}")
         lines.append(CLOSE)
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------ consolidation (v3.9.14)
+    def needs_consolidation(self) -> bool:
+        if (time.time() - float(self.store.kv_get("memory_consolidated_at", 0) or 0)) < 20 * 3600:
+            return False
+        rows = self.active_rows()
+        prof = [r for r in rows if r.get("kind") == "profile"]
+        return len(prof) > PROFILE_CAP or len(rows) - len(prof) > FACT_CAP
+
+    async def consolidate(self, force: bool = False) -> list[dict]:
+        """Merge overlapping memories so the store stays small and clean: at most once a day, only when the profile is
+        over PROFILE_CAP or facts + decisions over FACT_CAP. Merged rows are superseded (kept, never shown)."""
+        if not self.llm or (not force and not self.needs_consolidation()):
+            return []
+        self.store.kv_set("memory_consolidated_at", time.time())
+        rows = self.active_rows()
+        prof = [r for r in rows if r.get("kind") == "profile"]
+        rest = [r for r in rows if r.get("kind") != "profile"]
+        pick = prof if len(prof) > PROFILE_CAP else []
+        pick += sorted(rest, key=lambda r: (r.get("hits") or 0, r.get("updated_at") or 0))[:80] if len(rest) > FACT_CAP else []
+        if not pick:
+            return []
+        listing = "\n".join(f"{r['id']}: [{r.get('kind') or 'fact'}] {r['text']}" for r in pick)
+        try:
+            out = await asyncio.wait_for(self.llm("small").complete(CONSOLIDATE_PROMPT.format(cap=PROFILE_CAP), listing, 1200), 120)
+        except Exception as e:  # noqa: BLE001
+            log.warning("memory consolidate: %s", e)
+            return []
+        known = {r["id"] for r in pick}
+        done = []
+        for o in parse_ops(out)[:40]:
+            op = str(o.get("op") or "").lower()
+            ids = [str(i) for i in (o.get("ids") or []) if str(i) in known]
+            if op == "merge" and len(ids) >= 2 and str(o.get("text") or "").strip():
+                kinds = {self.get(i)["kind"] for i in ids if self.get(i)}
+                kind = o.get("kind") if o.get("kind") in KINDS else (kinds.pop() if len(kinds) == 1 else "fact")
+                row = self.add(str(o["text"]), kind, "consolidate", supersedes=ids[0])
+                if row:
+                    now = time.time()
+                    for i in ids[1:]:
+                        self.store._x("UPDATE memories SET superseded=?, updated_at=? WHERE id=? AND id<>?", (row["id"], now, i, row["id"]))
+                    known -= set(ids)
+                    done.append({"op": "merge", "id": row["id"], "old": ids})
+            elif op == "drop" and ids:
+                now = time.time()
+                for i in ids:
+                    self.store._x("UPDATE memories SET superseded='dropped', updated_at=? WHERE id=?", (now, i))
+                known -= set(ids)
+                done.append({"op": "drop", "old": ids})
+        return done
 
     # ------------------------------------------------------------------ chat hooks
     async def command(self, text: str, msg_id: Optional[str] = None) -> Optional[str]:
@@ -428,7 +514,13 @@ class Memory:
             except Exception as e:  # noqa: BLE001
                 log.warning("memory learn: %s", e)
                 return []
-            return self.apply(parse_ops(out), source=(user or {}).get("id") or "chat", known={m["id"] for m in related})
+            done = self.apply(parse_ops(out), source=(user or {}).get("id") or "chat", known={m["id"] for m in related})
+        if self.needs_consolidation():   # v3.9.14: keep the store small (at most once a day, only past the caps)
+            try:
+                await self.consolidate()
+            except Exception as e:  # noqa: BLE001
+                log.warning("memory consolidate: %s", e)
+        return done
 
     def apply(self, ops: list[dict], source: str = "chat", known: Optional[set] = None) -> list[dict]:
         done = []

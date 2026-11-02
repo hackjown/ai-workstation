@@ -71,6 +71,34 @@ def attachments_want_task(text: str, attachments: list) -> bool:
     return bool(ATT_TASK_RE.search(t))
 
 
+# v3.9.15: a plain "画一张/生成一张…图" is made right here with the image model (no computer); CAD, plans, decks,
+# software and file jobs still go to the computer
+IMG_GEN_RE = re.compile(r"(画|生成|做|来|出|设计|创作|绘制)(一|几|两|三|四|个|张|幅|副|组|下)*.{0,30}?"
+                        r"(图|图片|照片|插画|插图|海报|头像|壁纸|logo|LOGO|图标|封面|表情包|效果图|概念图|手绘|漫画|水彩|油画)"
+                        r"|text.?to.?image|generate (an? )?(image|picture)", re.I)
+IMG_EDIT_RE = re.compile(r"改|换|去掉|删掉|去除|抹掉|加上|加个|添加|变成|调成|P一下|p一下|修图|修一下|美化|风格|背景|上色|"
+                         r"高清|扩图|编辑|edit|remove|replace", re.I)
+NOT_IMG_RE = re.compile(r"CAD|cad|dwg|dxf|平面图|户型|施工图|立面|剖面|装修设计|PPT|ppt|幻灯|表格|Excel|excel|Word|文档|PDF|pdf|"
+                        r"流程图|思维导图|架构图|图表|柱状图|折线图|饼图|psd|PSD|图层|Photopea|photopea|批量|压缩|格式|转成|转为|导出|"
+                        r"截图|截屏|网站|网页|下单|登录|视频|剪辑|动画|描图|描成|矢量|svg|SVG", re.I)
+_IMG_EXT = re.compile(r"\.(png|jpe?g|webp|bmp|gif|heic)$", re.I)
+
+
+def wants_image_gen(text: str, attachments: Optional[list] = None) -> bool:
+    t = (text or "").strip()
+    return bool(t) and not attachments and bool(IMG_GEN_RE.search(t)) and not NOT_IMG_RE.search(t)
+
+
+def wants_image_edit(text: str, attachments: Optional[list] = None) -> bool:
+    """Only pictures attached + a change to what they show (not a format/PSD/batch job)."""
+    t = (text or "").strip()
+    if not t or not attachments or len(attachments) > 3:
+        return False
+    if not all(_IMG_EXT.search(str(a.get("name") or a.get("vm_path") or a.get("path") or "")) for a in attachments):
+        return False
+    return bool(IMG_EDIT_RE.search(t)) and not NOT_IMG_RE.search(t)
+
+
 OFFER_RE = re.compile(r"\[\[\s*交给电脑\s*[:：]\s*(.+?)\s*\]\]", re.S)
 
 ROUTE_PROMPT = """你是消息分流器（ROUTE）。用户在和私人助理聊天；助理背后有一台能操作的电脑（浏览器、文件、软件、下单、注册、画图、做视频、批量处理等）。
@@ -82,7 +110,7 @@ ROUTE_PROMPT = """你是消息分流器（ROUTE）。用户在和私人助理聊
 只输出一行 JSON：{"route": "chat" 或 "task", "title": "≤16 个字的任务标题（chat 时留空）"}"""
 
 SYSTEM = """你是「{name}」，用户的私人助理，形象是一只叫球球的小球。你在一个永不清空的聊天里陪用户说话、回答问题。
-现在是 {now}（北京时间）。
+现在的北京时间写在用户最新那条消息开头的［背景］里（用户看不到这段）。
 说话方式：简体中文，口语、简洁、直接给答案；不要客套，不要长篇大论；需要列点时用短列表。
 你在聊天里能用的工具：{tools}。不知道的事先查，查不到就直说，绝不编造。
 你自己不能操作电脑。用户要的事需要在电脑上动手（打开网站办事、登录、填表、下单、下载、做或改文件、画图、剪视频、长时间执行）时，
@@ -241,6 +269,8 @@ class Chat:
         self.jobs: set = set()
         self._reply_job: Optional[asyncio.Task] = None   # the chat reply being written (POST /api/chat/cancel stops it)
         self._stop_next = False      # 停止 pressed while the message was still being routed: the reply never starts
+        self._made_files: list = []   # v3.9.15: pictures made in the reply being written
+        self._image_on = False
         sessions.listeners.append(self.on_task_event)
         from . import shopwatch
         shopwatch.bind(chat=self)        # price-watch questions with one-tap 立即重试 land in this chat
@@ -573,18 +603,28 @@ class Chat:
         gap = self.store._x("SELECT * FROM chat_messages WHERE conv=? AND seq>? AND seq<? ORDER BY seq DESC LIMIT 40",
                             (CONV, upto, start))
         tools = ["读网页（read_url）", "读文件（read_file）", "查任务和例程的状态（task_status）"]
+        if getattr(self, "search", None) is not None:
+            tools.append("搜以前的聊天、任务和文件（session_search，用户说「上次/之前/那个…」时先搜）")
         if getattr(self, "_search_names", None):
             tools.insert(0, "联网搜索")
+        if getattr(self, "_image_on", False):
+            tools.append("AI 生成图片（generate_image）、AI 改用户发来的图片（edit_image）——用户只是要一张图或改图时直接用它们，"
+                         "不要交给电脑；生成后用一句话说明，图片会自动显示")
         system = SYSTEM.format(name=self.agent_name(), now=time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600)),
                                tools="、".join(tools))
         prof = self.store.kv_get("profile", {}) or {}
         if prof.get("tone"):
             system += f"\n回复语气：{prof['tone']}。"
+        # v3.9.14 prefix cache: the system prompt holds only what stays the same from turn to turn (instructions, the
+        # frozen profile, the summary). The time and the memories picked for THIS question ride on the last user turn.
+        facts = ""
         if self.memory:
             try:
-                block = self.memory.prompt_block(query)
-                if block:
-                    system += "\n\n" + block
+                prof_block = self.memory.profile_block() if hasattr(self.memory, "profile_block") else ""
+                if prof_block:
+                    system += "\n\n" + prof_block
+                facts = self.memory.facts_block(query) if hasattr(self.memory, "facts_block") \
+                    else self.memory.prompt_block(query)
             except Exception as e:  # noqa: BLE001
                 log.warning("memory block: %s", e)
         if summ.get("text"):
@@ -609,6 +649,10 @@ class Chat:
                 msgs.append({"role": role, "content": t})
         if msgs[-1]["role"] != "user" and query:
             msgs.append({"role": "user", "content": query})
+        if msgs[-1]["role"] == "user":
+            now = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+            bg = f"［背景，用户看不到：现在是 {now}（北京时间）。" + (f"\n{facts}" if facts else "") + "］"
+            msgs[-1] = {**msgs[-1], "content": bg + "\n\n" + msgs[-1]["content"]}
         return msgs
 
     def recent_text(self, turns: int = 6) -> str:
@@ -705,6 +749,8 @@ class Chat:
                 route = {"route": mode, "title": ""}
             elif SKILL_RE.match(text):   # a skill picked with "/" (or the + menu) runs on the computer, like the old skills menu
                 route = {"route": "task", "title": "", "skill": True}
+            elif (wants_image_gen(text, attachments) or wants_image_edit(text, attachments)) and self._image_cfg():
+                route = {"route": "chat", "title": "", "image": True}   # v3.9.15: the image model, right in the chat
             elif attachments_want_task(text, attachments):   # v3.9.3: shared files + "帮我转成…" go straight to the computer
                 route = {"route": "task", "title": ""}
             else:
@@ -792,6 +838,7 @@ class Chat:
                 log.warning("memory learn: %s", e)
 
     async def reply(self, text: str, on_delta=None, on_status=None, attachments: Optional[list] = None) -> dict:
+        self._made_files = []   # v3.9.15: pictures generate_image / edit_image made in this reply
         tools = await self.tools()
         if self.memory and hasattr(self.memory, "prepare"):   # embeds the question when an embedding model is set
             try:
@@ -833,11 +880,17 @@ class Chat:
                     res = await self.run_tool(tools, c["name"], c.get("args") or {})
                     messages.append({"role": "tool", "tool_call_id": c["id"], "content": res[:6000]})
             body = "\n\n".join(p for p in parts if p).strip()
+            if self._made_files:   # the picture is made: no 交给电脑去做 under it
+                offer = None
             if not body and offer:
                 body = "这件事需要在电脑上动手，我可以交给电脑去做。"
             if not body:
                 body = "嗯，我在。"
             data = {"offer_task": offer} if offer else {}
+            if self._made_files:
+                data["files"] = files_of(self._made_files)
+                if not body or body == "嗯，我在。":
+                    body = "好了。"
             if offer and attachments:   # v3.9.3: 交给电脑去做 carries the files the user sent with the request
                 data["offer_attachments"] = attachments[:10]
             return self.add("assistant", "text", body, data)
@@ -862,6 +915,24 @@ class Chat:
                                  "task_id": {"type": "string"}}}},
                             self._task_status),
         }
+        self._image_on = bool(self._image_cfg())
+        if self._image_on:   # v3.9.15: pictures made right in the chat (default endpoint, the other as fallback)
+            out["generate_image"] = ({"name": "generate_image", "description": "用 AI 生图模型按文字生成新图片（插画、海报、头像、"
+                                      "壁纸、产品图、概念图）。生成的图片会直接显示给用户",
+                                      "parameters": {"type": "object", "properties": {
+                                          "prompt": {"type": "string", "description": "画面内容、风格、构图、颜色，图里要出现的文字放引号里"},
+                                          "size": {"type": "string", "description": "1024x1024（方）、1536x1024（横）、1024x1536（竖）或 auto"},
+                                          "n": {"type": "integer", "description": "张数 1-4，默认 1"}},
+                                          "required": ["prompt"]}}, self._gen_image)
+            out["edit_image"] = ({"name": "edit_image", "description": "用 AI 改图模型修改用户发来的图片（换背景、去掉/加上东西、"
+                                  "换颜色材质、换风格）。改好的图片会直接显示给用户",
+                                  "parameters": {"type": "object", "properties": {
+                                      "path": {"type": "string", "description": "要改的图片：附件的文件名或路径"},
+                                      "prompt": {"type": "string", "description": "只写要改什么，其余保持不变"}},
+                                      "required": ["path", "prompt"]}}, self._edit_image)
+        srch = getattr(self, "search", None)
+        if srch is not None:   # v3.9.14: earlier chats, tasks and files
+            out["session_search"] = srch.tool()
         self._search_names = []
         try:
             loader = self.tool_loader
@@ -884,16 +955,74 @@ class Chat:
         """The short line under 球球 while it thinks (正在查…)."""
         if name in (getattr(self, "_search_names", None) or []):
             return "正在搜索…"
-        return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…"}.get(name, "正在查…")
+        return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…",
+                "session_search": "正在翻以前的记录…", "generate_image": "正在画图…",
+                "edit_image": "正在改图…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:
             return f"没有这个工具：{name}"
         try:
-            res = await asyncio.wait_for(tools[name][1](args), 40)
+            res = await asyncio.wait_for(tools[name][1](args),
+                                         float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")) * 2 + 30
+                                         if name in ("generate_image", "edit_image") else 40)
         except Exception as e:  # noqa: BLE001
             return f"工具出错：{type(e).__name__}: {str(e)[:200]}"
         return res if isinstance(res, str) else json.dumps(res, ensure_ascii=False, default=str)
+
+    def _image_cfg(self) -> Optional[dict]:
+        fn = getattr(self.sessions, "_image_cfg", None)
+        try:
+            return fn() if fn else None
+        except Exception as e:  # noqa: BLE001
+            log.warning("image cfg: %s", e)
+            return None
+
+    def _save_image(self, png: bytes, stem: str) -> str:
+        root = (self.settings.artifacts_dir if self.settings else None) or "workspace/artifacts"
+        d = os.path.join(root, "chat-images")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-{stem}.png")
+        with open(path, "wb") as f:
+            f.write(png)
+        self._made_files.append(path)
+        return path
+
+    async def _gen_image(self, a: dict) -> str:
+        from agent_runtime import image_edit as _ie
+        cfg = self._image_cfg()
+        prompt = str(a.get("prompt") or "").strip()
+        if not cfg or not prompt:
+            return "没有配置生图模型（设置 → 模型 → 生图接口）" if not cfg else "缺少 prompt"
+        try:
+            outs, used = await _ie.generate_chain(cfg, prompt, _ie.gen_size(a.get("size")), int(a.get("n") or 1),
+                                                  float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")))
+        except Exception as e:  # noqa: BLE001
+            return f"生图失败（两个接口都试过）：{str(e)[:500]}"
+        names = [os.path.basename(self._save_image(await asyncio.to_thread(_ie.to_png, o), "gen")) for o in outs]
+        return f"已生成 {len(names)} 张（{used.get('model')} · {used.get('name')}），会自动显示给用户：{'、'.join(names)}"
+
+    async def _edit_image(self, a: dict) -> str:
+        from agent_runtime import image_edit as _ie
+        cfg = self._image_cfg()
+        if not cfg:
+            return "没有配置改图模型（设置 → 模型 → 生图接口）"
+        real = self._allowed(a.get("path"))
+        prompt = str(a.get("prompt") or "").strip()
+        if not real or not _IMG_EXT.search(real):
+            return "找不到这张图片（给附件的文件名）"
+        if not prompt:
+            return "缺少 prompt（要改什么）"
+        src = open(real, "rb").read()
+        try:
+            out, used = await _ie.edit_chain(cfg, src, _ie.prompt_for(prompt),
+                                             float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")))
+            png, info = await asyncio.to_thread(_ie.postprocess, src, out, True, None)
+        except Exception as e:  # noqa: BLE001
+            return f"改图失败（两个接口都试过）：{str(e)[:500]}"
+        name = os.path.basename(self._save_image(png, "edit"))
+        warn = "；几乎没变化，可能没改成功" if (info.get("changed") is not None and info["changed"] < 0.5) else ""
+        return f"已改好（{used.get('model')} · {used.get('name')}），会自动显示给用户：{name}{warn}"
 
     async def _read_url(self, a: dict) -> str:
         import httpx

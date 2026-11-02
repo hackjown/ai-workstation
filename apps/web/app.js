@@ -57,6 +57,7 @@ const IC = {
   activity: "M3 12h4l3-8 4 16 3-8h4", target: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 12h.01",
   clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2", monitor: "M3 4h18v12H3zM8 20h8M12 16v4",
   settings: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z",
+  search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3",
   bell: "M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0", menu: "M4 6h16M4 12h16M4 18h16",
   clip: "M21.4 11.1l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5",
   mic: "M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3",
@@ -987,7 +988,7 @@ const MODEL_ROLES = [
   { key: "fallback", label: "备用模型", hint: "主模型出错时用", need: "tools" },
   { key: "subagent_model", label: "子 Agent 模型", hint: "纯文本命令行任务", need: "tools" },
   { key: "video_model", label: "视频模型", hint: "可选，制作/修改视频的任务用它（如 claude-opus），失败回到主模型", need: "tools" },
-  { key: "image_model", label: "改图模型", hint: "AI 改图，如 gpt-image-1、gemini-2.5-flash-image", need: "image" },
+  { key: "image_model", label: "生图/改图模型", hint: "主网关上的 AI 生图和改图模型，如 gpt-image-1、gemini-2.5-flash-image", need: "image" },
 ];
 S.modelIds = []; S.probes = {};
 async function fetchModels(manual) {
@@ -999,7 +1000,7 @@ async function fetchModels(manual) {
     const cur = sel.value || sel.dataset.cur || "";
     const ids = [...new Set([...(cur ? [cur] : []), ...S.modelIds])];
     const role = MODEL_ROLES.find((x) => x.key === sel.name);
-    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" || role.key === "vision_fallback" ? "不用" : role.key === "image_model" ? "不用（不能 AI 改图）" : "同主模型"}</option>`
+    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" || role.key === "vision_fallback" ? "不用" : role.key === "image_model" ? "不用（只用生图接口）" : "同主模型"}</option>`
       + ids.map((m) => `<option value="${esc(m)}" ${m === cur ? "selected" : ""}>${esc(m)}${probeTag(m)}</option>`).join("")
       + `<option value="__custom">手动输入…</option>`;
     paintProbe(sel);
@@ -1041,9 +1042,23 @@ async function probeModel(btn) {
 async function saveModels(e) {
   e.preventDefault(); const f = e.target;
   if (f.key.value) await api("PUT", "/api/secrets/openai_api_key", { value: f.key.value });
+  if (f.image2_key && f.image2_key.value) await api("PUT", "/api/secrets/image2_api_key", { value: f.image2_key.value });
   const v = (n) => (f[n].value === "__custom" ? "" : f[n].value);
-  await api("PUT", "/api/settings/models", { model: v("model"), vision_model: v("vision_model"), vision_fallback: v("vision_fallback"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value });
+  const body = { model: v("model"), vision_model: v("vision_model"), vision_fallback: v("vision_fallback"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value };
+  if (f.image2_base_url) { body.image2_base_url = f.image2_base_url.value.trim(); body.image2_model = f.image2_model.value.trim(); body.image_default = (f.image_default && f.image_default.value) || ""; }
+  await api("PUT", "/api/settings/models", body);
   toast("已保存，下个任务生效"); loadSettings();
+}
+/* v3.9.15 设置 → 生图接口 → 测试: saves first (so the test uses what is on screen), then one small picture per endpoint */
+async function testImage(btn) {
+  const out = $("imageTestOut"); const f = btn.closest("form");
+  btn.disabled = true; out.innerHTML = `<span class="spin"></span> 先保存，再各生成一张小图（可能要一分钟）…`;
+  try {
+    if (f.image2_key && f.image2_key.value) await api("PUT", "/api/secrets/image2_api_key", { value: f.image2_key.value });
+    await api("PATCH", "/api/settings/models", { image2_base_url: f.image2_base_url.value.trim(), image2_model: f.image2_model.value.trim(), image_default: f.image_default.value || "" });
+    const r = await api("POST", "/api/image/test", {});
+    out.innerHTML = r.results && r.results.length ? r.results.map((x, i) => `<span class="chip ${x.ok ? "ok" : "bad"}">${i === 0 ? "默认" : "备选"} · ${esc(x.name)} · ${esc(x.model)} ${x.ok ? "✓ " + (x.ms / 1000).toFixed(1) + "s" : "✕"}</span>${x.ok ? "" : ` <span class="small" style="color:var(--bad)">${esc((x.error || "").slice(0, 160))}</span>`}`).join("<br>") : esc(r.error || "没有可测的接口");
+  } catch (e) { out.textContent = "测试失败：" + e.message; } finally { btn.disabled = false; }
 }
 async function saveVmNet(e) {
   e.preventDefault(); const f = e.target;

@@ -102,7 +102,7 @@
     close();
     const view = href.replace(/([?&])download=1&?/, "$1").replace(/[?&]$/, "");
     document.body.insertAdjacentHTML("beforeend", `<div class="mdm mdm-html" id="mdModal" role="dialog" aria-modal="true">
-      <div class="mdm-box"><div class="mdm-h"><b></b><span class="mdm-k">HTML</span><button type="button" class="mdm-fs">全屏</button><a class="mdm-dl">下载</a><button type="button" class="mdm-x" aria-label="关闭">×</button></div>
+      <div class="mdm-box"><div class="mdm-h"><b></b><span class="mdm-k">HTML</span><button type="button" class="mdm-share" title="生成别人不用登录也能打开的链接和二维码">分享</button><button type="button" class="mdm-fs">全屏</button><a class="mdm-dl">下载</a><button type="button" class="mdm-x" aria-label="关闭">×</button></div>
       <div class="mdm-b"><div class="mdm-load">加载中…</div></div></div></div>`);
     const m = document.getElementById("mdModal");
     m.querySelector(".mdm-h b").textContent = name;
@@ -132,8 +132,55 @@
     };
     window.addEventListener("message", onStore);
     fr.srcdoc = injectShim(html, key);
+    m.querySelector(".mdm-share").onclick = () => shareDialog(href, name);
     m.querySelector(".mdm-fs").onclick = () => { const b = m.querySelector(".mdm-box"); (b.requestFullscreen || b.webkitRequestFullscreen || (() => {})).call(b); };
   }
+
+  // 3.9.13: a read-only link (/s/<code>) + QR code for an .html deliverable; the designer opens in 只看模式
+  async function shareDialog(href, name) {
+    const path = decodeURIComponent((href.match(/[?&]path=([^&]+)/) || [])[1] || "");
+    document.getElementById("shareModal")?.remove();
+    document.body.insertAdjacentHTML("beforeend", `<div class="mdm" id="shareModal" role="dialog" aria-modal="true" style="z-index:10050">
+      <div class="mdm-box" style="max-width:420px;height:auto"><div class="mdm-h"><b>分享</b><span class="grow"></span><button type="button" class="mdm-x" aria-label="关闭">×</button></div>
+      <div style="padding:14px 16px;display:flex;flex-direction:column;gap:10px">
+        <div class="small" style="word-break:break-all"></div>
+        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" class="sh-vo" checked> 只看模式（不能改方案）</label>
+        <label style="display:flex;gap:8px;align-items:center">有效期 <select class="sh-days"><option value="7">7 天</option><option value="30" selected>30 天</option><option value="365">1 年</option><option value="0">永久</option></select></label>
+        <button type="button" class="btn primary sh-go">生成链接</button>
+        <div class="sh-out" style="display:none;flex-direction:column;gap:8px;align-items:center">
+          <div class="sh-qr" style="width:200px"></div>
+          <input class="sh-url" readonly style="width:100%">
+          <div style="display:flex;gap:8px"><button type="button" class="btn sh-copy">复制链接</button><a class="btn sh-open" target="_blank" rel="noopener">打开</a><button type="button" class="btn sh-rev">作废</button></div>
+          <div class="small muted">对方不用登录；微信里长按二维码或点链接就能看。链接经过你的 AIW 服务器，服务器要能从外网访问。</div>
+        </div></div></div></div>`);
+    const m = document.getElementById("shareModal");
+    m.querySelector(".small").textContent = name;
+    m.addEventListener("click", (e) => { if (e.target === m || e.target.closest(".mdm-x")) m.remove(); });
+    const out = m.querySelector(".sh-out");
+    let code = "";
+    m.querySelector(".sh-go").onclick = async (e) => {
+      e.target.disabled = true;
+      try {
+        const r = await api("POST", "/api/shares", { path, days: +m.querySelector(".sh-days").value, view_only: m.querySelector(".sh-vo").checked, title: name.replace(/\.html?$/i, "") });
+        code = r.code;
+        m.querySelector(".sh-qr").innerHTML = r.qr_svg || "";
+        const qs = m.querySelector(".sh-qr svg"); if (qs) { qs.style.width = "100%"; qs.style.height = "auto"; }
+        m.querySelector(".sh-url").value = r.url; m.querySelector(".sh-open").href = r.url;
+        out.style.display = "flex"; e.target.textContent = "重新生成";
+      } catch (err) { alert("生成失败：" + (err.message || err)); }
+      e.target.disabled = false;
+    };
+    m.querySelector(".sh-copy").onclick = async () => {
+      const u = m.querySelector(".sh-url"); u.select();
+      try { await navigator.clipboard.writeText(u.value); } catch (err) { document.execCommand("copy"); }
+      m.querySelector(".sh-copy").textContent = "已复制";
+    };
+    m.querySelector(".sh-rev").onclick = async () => {
+      if (!code || !confirm("作废后这个链接立刻打不开，确定？")) return;
+      try { await api("DELETE", "/api/shares/" + code); m.querySelector(".sh-rev").textContent = "已作废"; m.querySelector(".sh-qr").innerHTML = ""; } catch (err) { alert(err.message || err); }
+    };
+  }
+  window.AiwShare = { open: shareDialog };
 
   async function open(href, name, kind) {
     if (kind === "office") return openOffice(href, name);

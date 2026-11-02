@@ -182,6 +182,17 @@ loadSettings = async function () {
     <div class="rows">
       ${roles.map(mrow).join("")}
       <details class="more"><summary>${icon("chev")}更多角色<span class="cnt">${extra.map((r) => r.label).join("、")}</span></summary>${extra.map(mrow).join("")}</details>
+    </div>
+    <div class="rows">
+      <div class="rw head"><div class="k">生图接口<small>第二个 OpenAI 兼容生图端点：生图 /images/generations，改图 /images/edits</small></div><div>${models.image2_model && models.has_image2_key && models.image2_base_url ? '<span class="chip ok">已配置</span>' : '<span class="chip">未配置</span>'}</div></div>
+      ${row("地址", "Base URL，带 /v1", `<input name="image2_base_url" value="${esc(models.image2_base_url || "")}" placeholder="http://192.168.50.188:3500/v1" />`)}
+      ${row("API Key", "加密保存在服务器", `<input name="image2_key" type="password" placeholder="${models.has_image2_key ? "已设置，留空不修改" : "Bearer 后面那段"}" autocomplete="off" />`, models.has_image2_key ? '<span class="chip ok">已设置</span>' : '<span class="chip">未设置</span>')}
+      ${row("模型", "生图和改图都用它", `<input name="image2_model" value="${esc(models.image2_model || "")}" placeholder="gpt-image-2.5" />`)}
+      ${row("默认用", "默认的出错或不可用时自动换另一个", `<div class="segsw"><label><input type="radio" name="image_default" value="custom" ${(models.image_default || (models.image2_model ? "custom" : "gateway")) === "custom" ? "checked" : ""}>生图接口</label><label><input type="radio" name="image_default" value="gateway" ${(models.image_default || (models.image2_model ? "custom" : "gateway")) === "gateway" ? "checked" : ""}>主网关（生图/改图模型）</label></div>`,
+        `<button type="button" class="btn sm" onclick="testImage(this)">测试</button>`)}
+      <div class="rw"><div class="k"></div><div class="v"><span class="small" id="imageTestOut"></span></div><div class="t"></div></div>
+    </div>
+    <div class="rows">
       ${row("深度思考", "关掉可快很多", `<div class="segsw"><label><input type="radio" name="thinking" value="off" ${(models.thinking || "off") === "off" ? "checked" : ""}>关闭</label><label><input type="radio" name="thinking" value="on" ${models.thinking === "on" ? "checked" : ""}>模型默认</label></div>`)}
     </div>
   </form>

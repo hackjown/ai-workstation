@@ -214,8 +214,10 @@ async def test_chat_uses_memory_and_tasks_get_it(stack):  # noqa: F811
     assert not fake.chats   # no model reply for a memory command
     fake.replies.append("好的，我按免费取消来找。")
     await client.post("/api/chat/send", json={"text": "帮我看看北京的酒店", "mode": "chat", "stream": False})
-    system = fake.chats[-1]["messages"][0]["content"]
-    assert "[MEMORY]" in system and "免费取消" in system
+    msgs = fake.chats[-1]["messages"]
+    system, last = msgs[0]["content"], msgs[-1]["content"]
+    # v3.9.14: the per-question memories ride on the last user turn, the system prompt stays cacheable
+    assert "[MEMORY]" in last and "免费取消" in last and "免费取消" not in system
     ctx = app.state.chat.sessions.build_context(None, query="订酒店")
     assert "USER MEMORY" in ctx and "免费取消" in ctx
     # 忘掉 in the chat

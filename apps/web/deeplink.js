@@ -3,7 +3,7 @@
      task/<id>                     the task's own view (its thread)
      takeover/<machine>?task=<id>  that task's view, then the desktop takeover
      monitor/<watch id>            追踪, the watch highlighted (立即检查 on its row)
-     chat[?m=<message id>]         the chat home at the newest message
+     chat[?m=<message id>]         the chat home, scrolled to that message when m is given (v3.9.14)
    window.aiwOpen(path) is the same router for anything else in the page. */
 "use strict";
 (function () {
@@ -38,9 +38,10 @@
         }
         return;
       }
-      // chat (and anything unknown): the chat home at the newest message
+      // chat (and anything unknown): the chat home at the newest message, or at ?m=<message id> (v3.9.14 search)
       go("home");
       if (typeof hShowChat === "function") hShowChat();
+      if (q.get("m") && typeof hJumpTo === "function") setTimeout(() => hJumpTo(q.get("m")), 250);
     } catch (e) { if (typeof toast === "function") toast("没能打开通知里的内容：" + e.message); }
   }
   window.aiwOpen = aiwOpen;

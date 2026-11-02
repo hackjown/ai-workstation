@@ -1,11 +1,11 @@
 import SwiftUI
 import AVFoundation
 
-/// iOS 3.4 home: the persistent chat (HomeChat.swift). The gear opens 设置, the pencil starts a 新建任务, the "+" opens a
+/// iOS 3.4 home: the persistent chat (HomeChat.swift). The gear opens 设置, the magnifier 搜索 (v3.9.14, was the pencil 新建任务), the "+" opens a
 /// native menu; 任务 (every task, was 历史对话) and the rest open as large sheets with × and a centred title. A task opens
 /// as a pushed page (ChatView: the computer on top, the steps below); back returns to the chat where it was.
 enum HomeSheet: String, Identifiable {
-    case history, archive, tracking, routine, computer
+    case history, archive, tracking, routine, computer, search
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -14,6 +14,7 @@ enum HomeSheet: String, Identifiable {
         case .tracking: return "追踪"
         case .routine: return "例程"
         case .computer: return "电脑"
+        case .search: return "搜索"
         }
     }
 }
@@ -58,6 +59,7 @@ struct RootView: View {
         case .tracking: TrackingSheet(close: close)
         case .routine: RoutineSheet(open: openThread, close: close)
         case .computer: ComputerSheet(close: close)
+        case .search: SearchSheet(close: close)
         }
     }
 
@@ -66,9 +68,11 @@ struct RootView: View {
         guard let t = links.take() else { return }
         showSettings = false
         switch t {
-        case .chat:
+        case .chat(let msg):
             sheet = nil; path = []
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NotificationCenter.default.post(name: .aiwShowChat, object: nil) }
+            // v3.9.14: aiw://chat?m=<id> (a search hit) scrolls the chat to that message
+            let info: [String: String]? = msg.map { ["m": $0] }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { NotificationCenter.default.post(name: .aiwShowChat, object: nil, userInfo: info) }
         case .monitor(let id):
             path = []; links.focusWatch = id
             sheet = .tracking

@@ -334,8 +334,9 @@ struct ChatView: View {
         }
         .onChange(of: m.threadId) { id in if let id = id { onThread(id) } }
         .sheet(item: $preview) { p in
-            // .md / .json / text: rendered in-app (MarkdownPreview.swift); everything else in QuickLook
-            if !textPreviewKind(p.url).isEmpty, textPreviewPage() != nil { FilePreviewView(url: p.url, kind: textPreviewKind(p.url)) }
+            // .md / .json / text: rendered in-app (MarkdownPreview.swift); .html in a WKWebView (HtmlPreview.swift); else QuickLook
+            if isHtmlFile(p.url) { HtmlPreviewView(url: p.url, serverPath: p.path) }
+            else if !textPreviewKind(p.url).isEmpty, textPreviewPage() != nil { FilePreviewView(url: p.url, kind: textPreviewKind(p.url)) }
             else { QuickLookView(url: p.url).ignoresSafeArea() }
         }
     }
@@ -513,7 +514,7 @@ struct HomeEmpty: View {
     }
 }
 
-struct Preview: Identifiable { let url: URL; var id: String { url.absoluteString } }
+struct Preview: Identifiable { let url: URL; var path: String = ""; var id: String { url.absoluteString } }
 
 struct TaskBlock: View {
     let t: JSON
@@ -821,7 +822,7 @@ struct TaskBlock: View {
         let dest = FileManager.default.temporaryDirectory.appendingPathComponent(previewFileName(name, path: path))
         try? FileManager.default.removeItem(at: dest)
         try? FileManager.default.moveItem(at: tmp, to: dest)
-        preview = Preview(url: dest)
+        preview = Preview(url: dest, path: path)
     }
 }
 

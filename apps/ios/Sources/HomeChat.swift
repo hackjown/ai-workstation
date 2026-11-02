@@ -9,7 +9,8 @@ import UniformTypeIdentifiers
 ///   tapping it pushes the existing task view (ChatView: the computer on top, the steps below); back keeps the scroll
 /// * questions / confirmations come in as messages with buttons; 我来接管桌面 opens the task view in takeover
 /// * a reply that needs the computer has 交给电脑去做 (POST /api/chat/messages/{id}/to_task)
-/// * 新建任务 (top right) sends the next message straight to the computer (mode "task")
+/// * 搜索 (top right, v3.9.14) searches the chat, tasks and files; 新建任务 (in the "+" menu) sends the next message
+///   straight to the computer (mode "task")
 /// * 3.5 (v2 mockup, HomeV2.swift): with nothing new, 球球 and its briefing (GET /api/greeting) instead of the chat;
 ///   amber / dark bubbles with a small 球球, thinking 球球 + 停止, "/" skill picker, "+" sheet with camera / video / library
 ///   (videos too) / files / 新建任务 / 链接 / 技能, uploads through POST /api/uploads/raw
@@ -38,6 +39,18 @@ final class HomeChat: ObservableObject {
     var stageOff = false
 
     @MainActor func index(_ id: String) -> Int? { msgs.firstIndex { $0.s("id") == id } }
+    /// v3.9.14: the message a search hit asked for (HomeChatView.main scrolls to it, then clears it)
+    @Published var jumpTo: String? = nil
+    @Published var flash: String? = nil
+    @MainActor func loadUntil(_ id: String) async -> Bool {
+        if !loaded { await load() }
+        for _ in 0..<40 {
+            if index(id) != nil { return true }
+            guard hasMore else { return false }
+            if await older() == nil { return index(id) != nil }
+        }
+        return index(id) != nil
+    }
 
     @MainActor func load() async {
         do {
@@ -370,6 +383,14 @@ struct HomeChatView: View {
             // 3.6: new messages / streaming keep the chat at the newest message unless you scrolled up (then ↓ 最新消息)
             .onChange(of: m.bottomTick) { _ in pin.newContent() }
             .onChange(of: m.loaded) { ok in if ok { pin.toEnd(follow: 2.5) } }
+            .onChange(of: m.jumpTo) { id in
+                guard let id = id else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .center) }
+                    m.flash = id; m.jumpTo = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { if m.flash == id { m.flash = nil } }
+                }
+            }
             .onAppear {
                 pin.jumpAction = { animated in
                     if animated { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("end", anchor: .bottom) } }
@@ -401,8 +422,9 @@ struct HomeChatView: View {
             }
             ToolbarItem(placement: .principal) { MateTitle(title: m.agent, status: liveStatus, threadId: nil, showMate: !m.staged) }
             ToolbarItemGroup(placement: .navigationBarTrailing) {
-                Button { mode = "task"; focused = true } label: { Image(systemName: "square.and.pencil").font(.system(size: 17)) }
-                    .accessibilityLabel("新建任务")
+                // v3.9.14: 搜索 replaces the pencil (新建任务 is still the first item of the "+" menu)
+                Button { openSheet(.search) } label: { Image(systemName: "magnifyingglass").font(.system(size: 17)) }
+                    .accessibilityLabel("搜索")
                 Menu {
                     Button { mode = "task"; focused = true } label: { Label("新建任务", systemImage: "square.and.pencil") }
                     Button { openSheet(.history) } label: { Label("任务", systemImage: "list.bullet.rectangle") }
@@ -426,8 +448,14 @@ struct HomeChatView: View {
             path.append(.task(t, takeover: false))
         }
         // 3.8 aiw://chat (a push): the chat itself, at the newest message
-        .onReceive(NotificationCenter.default.publisher(for: .aiwShowChat)) { _ in
-            Task { await m.sync(); m.leaveStage(); pin.toEnd(follow: 2) }
+        .onReceive(NotificationCenter.default.publisher(for: .aiwShowChat)) { n in
+            let target = (n.userInfo?["m"] as? String) ?? ""
+            Task {
+                await m.sync(); m.leaveStage()
+                if target.isEmpty { pin.toEnd(follow: 2); return }
+                // v3.9.14 a search hit: older pages until the message is loaded, then scroll to it (main's onChange)
+                if await m.loadUntil(target) { m.jumpTo = target } else { pin.toEnd(follow: 2) }
+            }
         }
         .onChange(of: phase) { p in   // back in the foreground: what came in meanwhile, then the newest message
             if p != .active { voice.stop() }
@@ -463,7 +491,8 @@ struct HomeChatView: View {
             TaskTextSheet(ask: a.ask) { text in await m.cardText(a, text) }
         }
         .sheet(item: $preview) { p in
-            if !textPreviewKind(p.url).isEmpty, textPreviewPage() != nil { FilePreviewView(url: p.url, kind: textPreviewKind(p.url)) }
+            if isHtmlFile(p.url) { HtmlPreviewView(url: p.url, serverPath: p.path) }
+            else if !textPreviewKind(p.url).isEmpty, textPreviewPage() != nil { FilePreviewView(url: p.url, kind: textPreviewKind(p.url)) }
             else { QuickLookView(url: p.url).ignoresSafeArea() }
         }
     }
@@ -481,6 +510,8 @@ struct HomeChatView: View {
     }
     func msgRow(_ msg: JSON, id: String) -> some View {
         row(msg).id(id).environment(\.aiwDeleteMessage, delAction(msg))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(amber, lineWidth: m.flash == id ? 2 : 0)
+                        .animation(.easeOut(duration: 0.3), value: m.flash))
     }
     func outRow(_ q: JSON, id: String) -> some View {
         let drop: () -> Void = { Task { @MainActor in m.dropQueued(id) } }
@@ -531,6 +562,19 @@ struct HomeChatView: View {
         withAvatar(meta: true) {
             VStack(alignment: .leading, spacing: 6) {
                 AiwBubble(text: msg.s("text"), error: d.b("error"))
+                // v3.9.15: pictures the chat made itself (generate_image / edit_image)
+                ForEach(d.a("files").indices, id: \.self) { i in
+                    let f = d.a("files")[i]
+                    Button { Task { await openFile(f.s("path"), f.s("name")) } } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: f.s("kind") == "image" ? "photo" : "doc").foregroundColor(amber)
+                                .frame(width: 32, height: 32).background(amber.opacity(0.12)).clipShape(RoundedRectangle(cornerRadius: 8))
+                            Text(f.s("name")).font(.callout.weight(.medium)).lineLimit(1).foregroundColor(.primary)
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                        }.padding(8).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 12))
+                    }.buttonStyle(.plain)
+                }
                 if !d.s("offer_task").isEmpty {
                     if d.s("task_started").isEmpty {
                         Button { Task { await m.toTask(msg.s("id")) } } label: { Label("交给电脑去做", systemImage: "desktopcomputer") }
@@ -775,7 +819,7 @@ struct HomeChatView: View {
         let dest = FileManager.default.temporaryDirectory.appendingPathComponent(previewFileName(name, path: path))
         try? FileManager.default.removeItem(at: dest)
         try? FileManager.default.moveItem(at: tmp, to: dest)
-        preview = Preview(url: dest)
+        preview = Preview(url: dest, path: path)
     }
 
     // MARK: uploads (POST /api/uploads/raw: the file itself, so videos work; chat attachments stay on the API host)

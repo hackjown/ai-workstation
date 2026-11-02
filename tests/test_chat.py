@@ -262,7 +262,7 @@ async def test_window_is_last_20_turns_and_summary_covers_the_rest(stack):
     chat.add("user", "text", "现在")
     msgs = chat.build_messages("现在")
     users = [m for m in msgs if m["role"] == "user"]
-    assert len(users) == 20 and users[0]["content"] == "问题11" and users[-1]["content"] == "现在"
+    assert len(users) == 20 and users[0]["content"] == "问题11" and users[-1]["content"].endswith("\n\n现在") and users[-1]["content"].startswith("［背景")
     assert "问题9" in msgs[0]["content"]          # outside the window, not yet summarised: still in the prompt
     assert await chat.compact()
     summ = chat.summary()

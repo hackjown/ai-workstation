@@ -233,7 +233,7 @@ function hMsg(m) {
   if (d.offer_task) offer = d.task_started
     ? `<div class="opts"><button class="btn sm" disabled>${icon("check")}已交给电脑</button></div>`
     : `<div class="opts"><button class="btn sm primary" onclick="hToTask('${m.id}', this)">${icon("monitor")}交给电脑去做</button></div>`;
-  return hA(m, `<div class="hbody"><div class="bubble hmd ${d.error ? "err" : ""}">${hMd(m.text)}</div>${offer}<div class="meta">${m.stream ? "" : hTime(m.created_at)}</div></div>`);
+  return hA(m, `<div class="hbody"><div class="bubble hmd ${d.error ? "err" : ""}">${hMd(m.text)}</div>${hFiles(d.files)}${offer}<div class="meta">${m.stream ? "" : hTime(m.created_at)}</div></div>`);
 }
 function hEmpty() {
   return `<div class="welcome hwelcome"><div class="avatar" style="background:${AVATAR_BG[(S.profile || {}).avatar] || AVATAR_BG.amber}">${avatarSVG()}</div>
@@ -354,6 +354,24 @@ async function hOlder() {
   hRender();
   box.scrollTop = box.scrollHeight - h0 + t0;   // keep what you were reading where it was
 }
+async function hJumpTo(id) {   // v3.9.14: a search hit in the chat: load older pages until it is there, then show it
+  for (let i = 0; i < 40; i++) {
+    if (!HS.loaded) { await new Promise((r) => setTimeout(r, 150)); continue; }
+    const el = hBox().querySelector(`[data-id="${CSS.escape(id)}"]`);
+    if (el) {
+      HS.pinUntil = 0;
+      el.scrollIntoView({ block: "center", behavior: "smooth" });
+      el.classList.add("deep-hit"); setTimeout(() => el.classList.remove("deep-hit"), 3500);
+      return true;
+    }
+    if (!HS.hasMore) break;
+    HS.pinUntil = 0;
+    await hOlder();
+  }
+  toast("这条消息太早了，没能在聊天里定位到");
+  return false;
+}
+window.hJumpTo = hJumpTo;
 async function hSync() {   // after a reconnect: pick up what came in while the socket was down
   if (!HS.loaded) return;
   try {

@@ -324,7 +324,7 @@ struct RoutineSheet: View {
                 IconTile(symbol: icon(r), color: r.b("enabled") ? amber : .secondary)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(r.s("name")).font(.subheadline.weight(.semibold)).foregroundColor(.primary).lineLimit(1)
-                    Text(cleanTitle(r.s("prompt"))).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    Text(oneLine(cleanTitle(r.s("prompt")))).font(.caption).foregroundColor(.secondary).lineLimit(1)
                     HStack(spacing: 6) {
                         Chip(text: scheduleText(r.s("schedule")), color: amber)
                         Chip(text: r.b("enabled") ? (r.d("next_run") > 0 ? "下次 " + dayTime(r.d("next_run")) : "待排期") : "已暂停", color: .secondary)

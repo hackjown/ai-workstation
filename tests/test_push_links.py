@@ -28,8 +28,8 @@ def test_bark_request_app_and_web(monkeypatch):
     monkeypatch.delenv("AIW_PUBLIC_URL", raising=False)
     monkeypatch.delenv("AIW_PUSH_LINK", raising=False)
     u, p = N.bark_request("https://api.day.app/KEY/", "任务完成", "好了", "done", "task/t1", {})
-    assert u == "https://api.day.app/KEY/%E4%BB%BB%E5%8A%A1%E5%AE%8C%E6%88%90/%E5%A5%BD%E4%BA%86"
-    assert p == {"url": "aiw://task/t1", "group": "任务", "sound": "aiw-wancheng"}   # no public url: no icon, app link; 3.9.0 voice
+    assert u == "https://api.day.app/KEY"   # 3.9.17: title / body are query parameters, never path segments
+    assert p == {"title": "任务完成", "body": "好了", "url": "aiw://task/t1", "group": "任务", "sound": "glass"}   # builtin
     _, p = N.bark_request("https://api.day.app/KEY", "t", "b", "confirm", "task/t1", {"public_url": "https://aiw.example.com/"})
     assert p["url"] == "aiw://task/t1" and p["icon"] == "https://aiw.example.com/icon-180.png"
     assert p["group"] == "需要你" and p["level"] == "timeSensitive"
@@ -78,14 +78,14 @@ async def test_every_push_carries_the_link(tmp_path, mock_http, monkeypatch):
     await n.notify("done", "任务完成", "ok", task_id="task-7", thread_id="thr-7")
     await n.notify("input", "需要你接管桌面", "验证码", task_id="task-8", deep="takeover/ai-linux-001?task=task-8")
     await asyncio.sleep(0.2)
-    bark = [c for c in mock_http.calls if c.url.host == "api.day.app"]
-    assert [c.url.params["url"] for c in bark] == ["aiw://monitor/w-jd", "aiw://task/task-7", "aiw://takeover/ai-linux-001?task=task-8"]
-    assert all(c.url.params["group"] for c in bark)
-    ntfy = [c for c in mock_http.calls if c.url.host == "ntfy.sh"]
-    assert ntfy[0].headers["Click"] == "aiw://monitor/w-jd"
-    hooks = [c for c in mock_http.calls if c.url.host == "hook.example.com"]
     import json
-    h = json.loads(hooks[1].content)
+    bark = [json.loads(c.content) for c in mock_http.calls if c.url.host == "api.day.app"]   # 3.9.17: POST JSON
+    assert sorted(b["url"] for b in bark) == sorted(["aiw://monitor/w-jd", "aiw://task/task-7", "aiw://takeover/ai-linux-001?task=task-8"])
+    assert all(b["group"] for b in bark)
+    ntfy = [c for c in mock_http.calls if c.url.host == "ntfy.sh"]
+    assert "aiw://monitor/w-jd" in [x.headers["Click"] for x in ntfy]
+    hooks = [c for c in mock_http.calls if c.url.host == "hook.example.com"]
+    h = next(json.loads(x.content) for x in hooks if json.loads(x.content)["deep"] == "task/task-7")
     assert h["deep"] == "task/task-7" and h["app_url"] == "aiw://task/task-7" and h["web_url"] is None
 
 

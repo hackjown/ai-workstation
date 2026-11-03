@@ -54,8 +54,12 @@ struct UserBubbleV2: View {
     let text: String
     let attachments: [JSON]
     let skillTitle: (String) -> String
+    /// 3.9.17: a pasted plan of thousands of characters froze the task view; the bubble shows 600 and 展开全文
+    @State var expanded = false
     var body: some View {
         let p = PromptParts(text)
+        let fold = expanded ? (p.text, false) : foldedText(p.text, limit: 600)
+        let shownText = fold.0, folded = fold.1
         VStack(alignment: .trailing, spacing: 6) {
             VStack(alignment: .leading, spacing: 6) {
                 if !p.skills.isEmpty {
@@ -68,8 +72,13 @@ struct UserBubbleV2: View {
                     }
                 }
                 if !p.text.isEmpty {   // 3.8: partial selection + 复制 (SelectableText.swift)
-                    SelectableText(text: uiAttributed(inlineMD(p.text), style: .callout, weight: .medium, color: UIColor(hInk), lineSpacing: 2),
+                    SelectableText(text: uiAttributed(inlineMD(shownText), style: .callout, weight: .medium, color: UIColor(hInk), lineSpacing: 2),
                                    whole: p.text, link: UIColor(hInk))
+                    if folded || expanded {
+                        Button { expanded.toggle() } label: {
+                            Text(expanded ? "收起" : "展开全文（共 \(p.text.count) 字）").font(.caption.weight(.bold)).underline()
+                        }.buttonStyle(.plain)
+                    }
                 }
             }
             .foregroundColor(hInk)
@@ -609,13 +618,14 @@ final class BottomPin: ObservableObject {
     private var followUntil = Date.distantPast
     private var holdUntil = Date.distantPast   // a jump is under way: the frames in between do not unpin
     private var lastFix = Date.distantPast
+    private var fixes = 0   // 3.9.17: at most a few empty-space fixes per jump (a mis-measured end looped forever)
     /// scrolls the ScrollViewReader to the "end" anchor (set by the view; animated or not)
     var jumpAction: ((Bool) -> Void)?
 
     /// Go to the newest message and stay there while the content settles (`follow` seconds of growth are followed).
     func toEnd(animated: Bool = false, follow: TimeInterval = 1.5) {
         opened = true
-        pinned = true; unseen = false
+        pinned = true; unseen = false; fixes = 0
         followUntil = max(followUntil, Date().addingTimeInterval(follow))
         holdUntil = Date().addingTimeInterval(animated ? 0.6 : 0.25)
         publish()
@@ -638,8 +648,8 @@ final class BottomPin: ObservableObject {
         // scrolled up. When the content's end is well above the visible bottom while the content is taller than the
         // screen, we are scrolled into empty space: go back to the real end.
         if pinned, bottom > 0, mm.contentH > bottom * 0.8, mm.endY < bottom - BottomPin.near,
-           Date().timeIntervalSince(lastFix) > 0.4 {
-            lastFix = Date()
+           Date().timeIntervalSince(lastFix) > 0.4, fixes < 3 {
+            lastFix = Date(); fixes += 1
             holdUntil = max(holdUntil, Date().addingTimeInterval(0.2))
             DispatchQueue.main.async { self.jumpAction?(false) }
             return

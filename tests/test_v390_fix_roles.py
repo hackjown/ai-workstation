@@ -217,7 +217,7 @@ def test_bark_sound_per_push_kind(monkeypatch):
     assert N.sound_for("done") == "aiw-wancheng" and N.sound_for("failed") == "aiw-shibai"
     assert N.sound_for("watch") == "aiw-jiangjia" and N.sound_for("xhs_login") == "aiw-xiaohongshu"
     assert N.sound_for("test") == "aiw-tixing"
-    _, p = N.bark_request("https://api.day.app/KEY", "需要你确认", "b", "confirm", "task/t1", {})
+    _, p = N.bark_request("https://api.day.app/KEY", "需要你确认", "b", "confirm", "task/t1", {"bark_sound": "voice"})
     assert p["sound"] == "aiw-shouquan"
     _, p = N.bark_request("https://api.day.app/KEY", "t", "b", "done", "task/t1", {"bark_sound": "off"})
     assert "sound" not in p

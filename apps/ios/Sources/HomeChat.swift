@@ -295,7 +295,7 @@ struct HomeChatView: View {
     @State private var preview: Preview?
     @StateObject private var pin = BottomPin()
     @Environment(\.colorScheme) private var cs
-    @FocusState private var focused: Bool
+    @State private var focused = false   // v3.9.17: IMEField (UITextView) takes a plain Bool binding
     @Environment(\.scenePhase) private var phase
     @AppStorage("hdraft") private var draft = ""
     @StateObject private var voice = SpeechInput()
@@ -685,8 +685,7 @@ struct HomeChatView: View {
                 }.accessibilityLabel("添加：拍照、视频、文件、技能")
                 HStack(spacing: 6) {
                     ForEach(picked, id: \.self) { id in SkillToken(title: skillTitle(id)) { picked.removeAll { $0 == id } } }
-                    TextField(placeholder, text: $text, axis: .vertical)
-                        .lineLimit(1...6).focused($focused).padding(.vertical, 8)
+                    IMEField(placeholder: placeholder, text: $text, focused: $focused, maxLines: 6)   // v3.9.17 pinyin
                 }
                 // 3.8: listening -> stop the mic; text -> send (queued while 球球 answers); a reply with nothing typed
                 // -> 停止; otherwise the mic (voice input, Speech.swift)

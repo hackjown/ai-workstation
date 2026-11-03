@@ -1103,8 +1103,16 @@ class SessionManager:
 
     async def _notify(self, kind: str, title: str, body: str, task: Task, deep: Optional[str] = None):
         if self.notifier:
+            level = None
+            if getattr(task, "source", "") == "routine" and kind in ("done", "failed"):
+                # 3.9.17: a scheduled routine (e.g. the 9:00 news digest) says what it is and is timeSensitive, so iOS
+                # 定时推送摘要 / 专注模式 delivers it at once instead of holding it
+                name = ((self.store.thread(task.thread_id) or {}).get("title") if task.thread_id else "") or "定时任务"
+                title = f"{name} 已生成" if kind == "done" else f"{name} 失败"
+                level = "timeSensitive"
             try:
-                await self.notifier.notify(kind, title, body, task_id=task.id, thread_id=task.thread_id, deep=deep)
+                await self.notifier.notify(kind, title, body, task_id=task.id, thread_id=task.thread_id, deep=deep,
+                                           level=level)
             except Exception as e:  # noqa: BLE001
                 log.warning("notify failed: %s", e)
 

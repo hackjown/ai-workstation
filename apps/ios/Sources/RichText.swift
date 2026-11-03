@@ -91,6 +91,9 @@ struct RichText: View {
     var style: UIFont.TextStyle = .callout
     /// the text colour (UIKit draws it, so a .foregroundColor around RichText does not reach it); nil = the bubble text
     var color: Color? = nil
+    /// 3.9.17: fold text longer than this (0 = never); 展开全文 shows it all
+    var limit: Int = 4000
+    @State var expanded = false
     @Environment(\.colorScheme) private var cs
     func md(_ s: String, leadBold: Bool = false) -> AttributedString {
         var a = inlineMD(s, leadBold: leadBold)
@@ -108,8 +111,18 @@ struct RichText: View {
                        whole: text, link: strong.map { UIColor($0) } ?? UIColor(amber))
     }
     var body: some View {
+        let fold = expanded ? (text, false) : foldedText(text, limit: limit)
+        let shown = fold.0, folded = fold.1
         VStack(alignment: .leading, spacing: 9) {
-            ForEach(Array(richBlocks(text).enumerated()), id: \.offset) { _, b in block(b) }
+            ForEach(Array(richBlocks(shown).enumerated()), id: \.offset) { _, b in block(b) }
+            if folded {
+                Button { expanded = true } label: {
+                    Text("展开全文（共 \(text.count) 字）").font(.caption.weight(.semibold))
+                }.buttonStyle(.plain).foregroundColor(strong ?? amber)
+            } else if expanded && limit > 0 && text.count > limit {
+                Button { expanded = false } label: { Text("收起").font(.caption.weight(.semibold)) }
+                    .buttonStyle(.plain).foregroundColor(strong ?? amber)
+            }
         }
         .font(font)
         .lineSpacing(3)

@@ -225,6 +225,9 @@ struct ChatView: View {
     @Environment(\.colorScheme) private var cs
     @StateObject private var pin = BottomPin()
     @Environment(\.scenePhase) private var phase
+    /// 3.9.17 iOS freeze: a long-running task with many 继续 runs drew every run (plain VStack, all text measured) at
+    /// once; the view now draws the latest few and 显示更早的 N 次 on demand.
+    @State private var shownRuns = 4
 
     init(threadId: String?, fromParent: Bool = false, onThread: @escaping (String) -> Void = { _ in }) {
         _m = StateObject(wrappedValue: ChatModel(threadId)); self.onThread = onThread; self.fromParent = fromParent
@@ -254,8 +257,15 @@ struct ChatView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     if let p = m.parentThread { parentBanner(p) }
                     if m.tasks.isEmpty { HomeEmpty(threadId: m.threadId) }
-                    ForEach(m.tasks.indices, id: \.self) { i in
-                        TaskBlock(t: m.tasks[i], live: m.live(m.tasks[i]), preview: $preview, reload: { await m.load() })
+                    let first = max(0, m.tasks.count - shownRuns)
+                    if first > 0 {
+                        Button { shownRuns += 6 } label: {
+                            Label("显示更早的 \(first) 次", systemImage: "chevron.up").font(.caption.weight(.semibold))
+                        }.buttonStyle(.bordered).tint(hAmber).controlSize(.small).frame(maxWidth: .infinity)
+                    }
+                    ForEach(Array(first..<m.tasks.count), id: \.self) { i in
+                        TaskBlock(t: m.tasks[i], live: m.live(m.tasks[i]), preview: $preview, reload: { await m.load() },
+                                  latest: i == m.tasks.count - 1)
                     }
                     if !m.err.isEmpty { Text(m.err).font(.footnote).foregroundColor(.red) }
                     Color.clear.frame(height: 1).id("end")
@@ -521,6 +531,7 @@ struct TaskBlock: View {
     @ObservedObject var live: TaskLive
     @Binding var preview: Preview?
     let reload: () async -> Void
+    var latest: Bool = true
     @State private var showSteps = false
     @State private var answer = ""
     @State private var downloading = ""
@@ -702,7 +713,7 @@ struct TaskBlock: View {
                 if !live.approvals.isEmpty && (running || showSteps) { ApprovalLog(items: live.approvals) }
 
                 if !live.result.isEmpty && !running {
-                    RichText(text: live.result, strong: hStrong(cs)).foregroundColor(hBubbleText(cs))
+                    RichText(text: live.result, strong: hStrong(cs), limit: latest ? 4000 : 800).foregroundColor(hBubbleText(cs))
                 }
                 ForEach(uniqueFiles.indices, id: \.self) { i in fileRow(uniqueFiles[i]) }
 
@@ -959,7 +970,7 @@ struct TaskComposerInput: View {
     let queued: Bool
     let onPlus: () -> Void
     let onSend: () async -> Bool
-    @FocusState private var focused: Bool
+    @State private var focused = false   // v3.9.17: IMEField (UITextView) takes a plain Bool binding
 
     var body: some View {
         VStack(spacing: 6) {
@@ -968,8 +979,7 @@ struct TaskComposerInput: View {
                     Group { if uploading { ProgressView().tint(hAmber) } else { Image(systemName: "plus").font(.system(size: 22, weight: .light)).foregroundColor(hAmber) } }
                         .frame(width: 36, height: 36)
                 }.accessibilityLabel("添加：拍照、视频、文件、技能")
-                TextField("和电脑说点什么，点 + 加文件或技能", text: $draft.text, axis: .vertical)
-                    .lineLimit(1...6).focused($focused).padding(.vertical, 8)
+                IMEField(placeholder: "和电脑说点什么，点 + 加文件或技能", text: $draft.text, focused: $focused, maxLines: 6)   // v3.9.17 pinyin
                 // 3.8: empty -> the mic (voice input, Speech.swift); listening -> stop; text -> send
                 if voice.active {
                     MicButton(voice: voice) { voice.stop() }

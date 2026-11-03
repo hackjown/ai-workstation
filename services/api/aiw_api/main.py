@@ -1055,7 +1055,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.put("/api/settings/notify", dependencies=[Depends(auth)])
     async def put_notify(body: dict):
-        cfg = {k: (str(body.get(k) or "").strip() or None) for k in ("bark_url", "ntfy_url", "webhook_url", "public_url", "link_mode", "bark_sound")}
+        cfg = {k: (str(body.get(k) or "").strip() or None) for k in ("bark_url", "ntfy_url", "webhook_url", "public_url", "link_mode", "bark_sound",
+                                                             "bark_critical", "bark_volume")}
         if cfg["link_mode"] not in (None, "app", "web"):
             raise HTTPException(400, "link_mode is app or web")
         if cfg["public_url"] and not cfg["public_url"].startswith(("http://", "https://")):
@@ -1075,6 +1076,11 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.post("/api/settings/notify/test", dependencies=[Depends(auth)])
     async def test_notify():
         return await notifier.notify("test", "Aiw", "通知测试成功：点这条会打开 Aiw 的聊天")
+
+    @app.get("/api/settings/notify/log", dependencies=[Depends(auth)])
+    async def notify_log():
+        """3.9.17: the last 50 Bark attempts (ok, via post/get, sound, level, or the error)."""
+        return {"log": list(reversed(store.kv_get("push_log", []) or []))}
 
     @app.post("/api/settings/notify/test_sounds", dependencies=[Depends(auth)])
     async def test_sounds():

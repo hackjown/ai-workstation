@@ -28,6 +28,12 @@ func durText(_ s: Double) -> String {
     return "\(n / 3600) 小时 \((n % 3600) / 60) 分"
 }
 
+/// 3.9.17: the first 120 characters on one line (a Text with lineLimit(1) still typesets the whole string)
+func oneLine(_ s: String) -> String {
+    String(s.prefix(240)).split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }.joined(separator: " ").prefix(120).description
+}
+
 /// a plain string field, never "<null>" (a JSON null reads as NSNull)
 func jstr(_ d: JSON, _ k: String) -> String { (d[k] as? String) ?? "" }
 
@@ -115,7 +121,7 @@ struct TaskCardHead: View {
                 Text(cleanTitle(d.s("title").isEmpty ? msg.s("text") : d.s("title"))).font(.callout.weight(.semibold)).lineLimit(2)
                     .foregroundColor(cardTitle(cs))
                 if !jstr(d, "prompt").isEmpty && jstr(d, "prompt") != d.s("title") {
-                    Text(jstr(d, "prompt")).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    Text(oneLine(jstr(d, "prompt"))).font(.caption).foregroundColor(.secondary).lineLimit(1)
                 }
                 CardSubLine(msg: msg).foregroundColor(cardAccent(tone, cs))
                 if !d.s("machine_name").isEmpty {   // aiw-roles-1: the computer (and its role) this task runs on

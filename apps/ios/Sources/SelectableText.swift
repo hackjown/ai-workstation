@@ -41,12 +41,29 @@ func uiAttributed(_ a: AttributedString, style: UIFont.TextStyle, weight: UIFont
 }
 
 /// Measures a string the way SelectableText lays it out (TextKit 1, zero insets): the size it needs at `width`.
+/// 3.9.17 iOS freeze: a long thread re-measured every text block on every layout pass (scroll pins, live ticks), each a
+/// full TextKit layout on the main thread. Sizes are cached per (text, attributes, width, Dynamic Type size).
+private let selectableSizeCache: NSCache<NSString, NSValue> = { let c = NSCache<NSString, NSValue>(); c.countLimit = 3000; return c }()
 func selectableSize(_ s: NSAttributedString, width: CGFloat) -> CGSize {
     guard s.length > 0 else { return .zero }
     let w = max(1, width)
+    let key = "\(s.string.hashValue)|\(s.hash)|\(s.length)|\(Int((w * 2).rounded()))|\(UIFont.preferredFont(forTextStyle: .body).pointSize)" as NSString
+    if let v = selectableSizeCache.object(forKey: key) { return v.cgSizeValue }
     let r = s.boundingRect(with: CGSize(width: w, height: .greatestFiniteMagnitude),
                            options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
-    return CGSize(width: min(w, ceil(r.width) + 1), height: ceil(r.height) + 1)
+    let out = CGSize(width: min(w, ceil(r.width) + 1), height: ceil(r.height) + 1)
+    selectableSizeCache.setObject(NSValue(cgSize: out), forKey: key)
+    return out
+}
+
+/// 3.9.17: very long text (a pasted plan of thousands of characters, a long report) is shown folded; 展开全文 shows it all.
+func foldedText(_ s: String, limit: Int) -> (String, Bool) {
+    guard limit > 0, s.count > limit else { return (s, false) }
+    var cut = String(s.prefix(limit))
+    if let nl = cut.lastIndex(of: "\n"), cut.distance(from: cut.startIndex, to: nl) > limit / 2 { cut = String(cut[..<nl]) }
+    // collapse runs of blank lines in the folded part (pasted documents carry dozens of empty lines)
+    while cut.contains("\n\n\n") { cut = cut.replacingOccurrences(of: "\n\n\n", with: "\n\n") }
+    return (cut + " …", true)
 }
 
 final class AiwTextView: UITextView, UITextViewDelegate {

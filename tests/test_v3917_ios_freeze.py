@@ -34,5 +34,5 @@ def test_scroll_fix_loop_is_capped():
 
 
 def test_card_prompt_is_one_short_line():
-    assert "Text(oneLine(jstr(d, \"prompt\")))" in read("TaskCardV2.swift")
-    assert "func oneLine(" in read("TaskCardV2.swift")
+    assert "Text(promptLine(jstr(d, \"prompt\")))" in read("TaskCardV2.swift")
+    assert "func promptLine(" in read("TaskCardV2.swift")

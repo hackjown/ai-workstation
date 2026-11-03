@@ -29,7 +29,7 @@ func durText(_ s: Double) -> String {
 }
 
 /// 3.9.17: the first 120 characters on one line (a Text with lineLimit(1) still typesets the whole string)
-func oneLine(_ s: String) -> String {
+func promptLine(_ s: String) -> String {
     String(s.prefix(240)).split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
         .filter { !$0.isEmpty }.joined(separator: " ").prefix(120).description
 }
@@ -121,7 +121,7 @@ struct TaskCardHead: View {
                 Text(cleanTitle(d.s("title").isEmpty ? msg.s("text") : d.s("title"))).font(.callout.weight(.semibold)).lineLimit(2)
                     .foregroundColor(cardTitle(cs))
                 if !jstr(d, "prompt").isEmpty && jstr(d, "prompt") != d.s("title") {
-                    Text(oneLine(jstr(d, "prompt"))).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    Text(promptLine(jstr(d, "prompt"))).font(.caption).foregroundColor(.secondary).lineLimit(1)
                 }
                 CardSubLine(msg: msg).foregroundColor(cardAccent(tone, cs))
                 if !d.s("machine_name").isEmpty {   // aiw-roles-1: the computer (and its role) this task runs on

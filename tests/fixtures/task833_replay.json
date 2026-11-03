@@ -1,0 +1,266 @@
+{
+ "source": "aiw-task-task-833 export (passwords removed)",
+ "prompt": "用本地vm去ssh服务器，192.168.50.188 用户名root 密码***，这是docker服务器，现在cpu和内存都占用很高，去看看是哪些容器占用高，全面分析",
+ "original": {
+  "steps": 14,
+  "minutes": 23.0,
+  "confirms": 9,
+  "stopped_by_user": true
+ },
+ "steps": [
+  {
+   "step": 1,
+   "thought": "我先用 shell 通过 sshpass 连接 192.168.50.188，查看 CPU 和内存占用高的容器。",
+   "tool": "shell",
+   "args": {
+    "command": "which sshpass || echo NO_SSHPASS; sshpass -p '***' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@192.168.50.188 'hostname; uptime; nproc; free -h' 2>&1 | tail -20"
+   },
+   "at": 3.7,
+   "llm_ms": 3453,
+   "result": {
+    "exit_code": 0,
+    "stdout": "NO_SSHPASS\n/bin/sh: 1: sshpass: not found\n",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 155.3
+  },
+  {
+   "step": 2,
+   "thought": "没有 sshpass，改用 Python 的 paramiko 或直接装 sshpass 来连。先试 paramiko。",
+   "tool": "shell",
+   "args": {
+    "command": "python3 -c \"import paramiko; print(paramiko.__version__)\" 2>&1 | head -3; ls ~/workspace | head"
+   },
+   "at": 161.7,
+   "llm_ms": 6124,
+   "result": {
+    "exit_code": 0,
+    "stdout": "5.1.0\n2024-2025学年第一学期期中联考历史科试卷_A4四版面_去空白页.docx\n2026年月度销售报告.docx\n安盛盛利II至尊_5年缴计划_讲解视频.mp4\n本周新增星数.png\n车辆号码提取.txt\n枫木服务区_调平.png\n视频复刻提示词_逐秒版.md\n销售.xlsx\n兴丹路消防救援站荣誉室施工图.dxf\n兴丹路消防救援站荣誉室施工图.pdf\n",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 174.7
+  },
+  {
+   "step": 3,
+   "thought": "用 paramiko 通过 SSH 连上 192.168.50.188，先采集 CPU/内存/容器占用数据。",
+   "tool": "files_write",
+   "args": {
+    "path": "ssh_docker_check.py",
+    "content": "import paramiko, sys\n\nHOST = \"192.168.50.188\"\nUSER = \"root\"\nPWD = \"***\"\n\ncmds = {\n    \"uptime\": \"uptime; echo; free -m; echo; nproc; echo; cat /proc/loadavg\",\n    \"top_cpu\": \"top -b -n1 | head -25\",\n    \"docker_ps\": \"docker ps --format 'table {{.Names}}\\\\t{{.Image}}\\\\t{{.Status}}' 2>&1 | head -60\",\n    \"docker_stats\": \"docker stats --no-stream --format 'table {{.Name}}\\\\t{{.CPUPerc}}\\\\t{{.MemUsage}}\\\\t{{.MemPerc}}\\\\t{{.PIDs}}' 2>&1 | sort -t$'\\\\t' -k1 | head -80\",\n    \"disk\": \"df -h / /var/lib/docker 2>&1\",\n}\n\nc = paramiko.SSHClient()\nc.set_missing_host_key_policy(paramiko.AutoAddPolicy())\nc.connect(HOST, username=USER, password=***, timeout=20, look_for_keys=False, allow_agent=False)\nfor k, v in cmds.items():\n    stdin, stdout, stderr = c.exec_command(v, timeout=90)\n    out = stdout.read().decode(\"utf-8\", \"ignore\")\n    err = stderr.read().decode(\"utf-8\", \"ignore\")\n    print(\"=\" * 20, k, \"=\" * 20)\n    print(out.strip())\n    if err.strip():\n        print(\"[stderr]\", err.strip()[:500])\n    print()\nc.close()\n"
+   },
+   "at": 181.9,
+   "llm_ms": 6954,
+   "result": {
+    "path": "/home/aiw/workspace/ssh_docker_check.py",
+    "size": 1026
+   },
+   "success": true,
+   "done_at": 182.6
+  },
+  {
+   "step": 4,
+   "thought": "已写好脚本，先运行它连上去做一次整体检查（CPU、内存、容器）。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && python3 ssh_docker_check.py 2>&1 | head -80"
+   },
+   "at": 187.0,
+   "llm_ms": 4133,
+   "result": {
+    "exit_code": 0,
+    "stdout": "==================== uptime ====================\n15:55:25 up 3 days,  1:07,  2 users,  load average: 19.19, 19.20, 21.67\n\n               total        used        free      shared  buff/cache   available\nMem:            4096        1715         560           0        1820        2380\nSwap:           4096        1853        2242\n\n4\n\n19.19 19.20 21.67 14/7266 918322\n\n==================== top_cpu ====================\ntop - 15:55:30 up 3 days,  1:07,  2 users,  load average: 19.33, 19.23, 21.66\nTasks...",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 210.5
+  },
+  {
+   "step": 5,
+   "thought": "已经连上服务器拿到概览：负载 19+、CPU 满、内存 1.7G/4G、Swap 用掉 1.85G，还有 5731 个僵尸进程这个异常点。下一步要看完整的 docker stats（按 CPU/内存排序）以及僵尸进程来源，才能定位到具体容器。",
+   "tool": "files_write",
+   "args": {
+    "path": "ssh_docker_deep.py",
+    "content": "import paramiko\n\nHOST = \"192.168.50.188\"\nUSER = \"root\"\nPWD = \"***\"\n\ncmds = [\n    (\"docker_stats_full\", \"docker stats --no-stream --format '{{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\\t{{.MemPerc}}\\t{{.PIDs}}' | sort -t$'\\\\t' -k2 -hr | head -40\"),\n    (\"top_by_container_cpu\", \"for c in $(docker ps -q); do n=$(docker inspect --format '{{.Name}}' $c); echo -n \\\"$c $n \\\"; cat /sys/fs/cgroup/system.slice/docker-$c.scope/cpu.stat 2>/dev/null | head -1; done | head -50\"),\n    (\"ps_cpu_top20\", \"ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd --sort=-%cpu | head -25\"),\n    (\"zombie_parents\", \"ps -eo stat,ppid,comm | awk '$1 ~ /Z/ {print $2\\\" \\\"$3}' | sort | uniq -c | sort -rn | head -20\"),\n    (\"free_detail\", \"free -m; echo ---; cat /proc/loadavg\"),\n    (\"io_top\", \"which iotop || (cat /proc/pressure/io 2>/dev/null; uptime)\"),\n]\n\nc = paramiko.SSHClient()\nc.set_missing_host_key_policy(paramiko.AutoAddPolicy())\nc.connect(HOST, username=USER, password=***, timeout=20)\nfor name, cmd in cmds:\n    print(\"=\" * 20, name, \"=\" * 20)\n    stdin, stdout, stderr = c.exec_command(cmd, timeout=90)\n    print(stdout.read().decode(\"utf-8\", \"replace\"))\n    err = stderr.read().decode(\"utf-8\", \"replace\")\n    if err.strip():\n        print(\"[stderr]\", err[:500])\nc.close()\n"
+   },
+   "at": 215.9,
+   "llm_ms": 5031,
+   "result": {
+    "path": "/home/aiw/workspace/ssh_docker_deep.py",
+    "size": 1256
+   },
+   "success": true,
+   "done_at": 216.4
+  },
+  {
+   "step": 6,
+   "thought": "继续跑深度分析脚本，抓取完整的容器资源排行、僵尸进程等细节。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && timeout 180 python3 ssh_docker_deep.py 2>&1 | head -150",
+    "timeout": 200
+   },
+   "at": 219.1,
+   "llm_ms": 2434,
+   "result": {
+    "exit_code": 0,
+    "stdout": "==================== docker_stats_full ====================\nclouddrive2\t50.68%\t87.07MiB / 4GiB\t2.13%\t36\naiw-api\t10.19%\t107.9MiB / 4GiB\t2.64%\t73\nwatchtower\t9.27%\t16.51MiB / 4GiB\t0.40%\t10\ndockerCopilot\t1.39%\t24.04MiB / 4GiB\t0.59%\t12\nchatgpt2api\t1.18%\t646.4MiB / 4GiB\t15.78%\t8\nvoice-core\t0.91%\t17.64MiB / 4GiB\t0.43%\t6\nclipboard-online\t0.86%\t110.4MiB / 4GiB\t2.69%\t5679\nworkbuddy-manager\t0.81%\t57.65MiB / 4GiB\t1.41%\t19\ncanvas\t0.60%\t100.1MiB / 4GiB\t2.44%\t22\ngrok2api\t0.36%\t53.89MiB / 4GiB\t1.32%\t13\nfrpc\t0.3...",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 255.9
+  },
+  {
+   "step": 7,
+   "thought": "已经拿到整体数据了，但有几个关键点还没查清：`ps_cpu_top20` 的 %CPU 全是 0（因为 ps 的 %CPU 是进程生命周期平均值，看不出瞬时占用），真正的高占用进程要从 top 里看（clouddrive、chatgpt2api 里的 uvicorn 堆了 640MB、 clipboard-online 有 5679 个进程/5731 个僵尸进程）。下一步再做一轮针对性采集：容器数、各容器实时 CPU、高 CPU 进程的真实瞬时占用、僵尸进程来源、容器内存排行，然后把结果汇总成报告发给伟少。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && cat > ssh_docker_deep2.py <<'PYEOF'\nimport paramiko\n\nHOST=\"192.168.50.188\"; USER=\"root\"; PWD=\"***\"\ncli=paramiko.SSHClient(); cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())\ncli.connect(HOST, username=USER, password=***, timeout=20)\n\ncmds = {\n \"top_batch\": \"top -b -n 2 -d 2 -o %CPU | awk '/^top -/{n++} n==2' | head -45\",\n \"docker_stats_2\": \"docker stats --no-stream --format '{{.Name}}\\\\t{{.CPUPerc}}\\\\t{{.MemUsage}}\\\\t{{.PIDs}}' 2>/dev/null | sort -t$'\\\\t' -k2 -r | head -20\",\n \"mem_by_container\": \"for c in $(docker ps -q); do n=$(docker inspect -f '{{.Name}}' $c | sed 's#/##'); m=$(cat /sys/fs/cgroup/system.slice/docker-$c*.scope/memory.current 2>/dev/null || cat /sys/fs/cgroup/docker/$c*/memory.current 2>/dev/null); echo -e \\\"$n\\\\t${m}\\\"; done | sort -k2 -nr | head -20\",\n \"zombies\": \"ps -eo stat,ppid,comm | awk '$1 ~ /Z/ {print $2, $3}' | sort | uniq -c | sort -nr | head -20; echo ---; ps -eo ppid,comm | grep -c Z\",\n \"clipboard_pids\": \"docker top clipboard-online 2>/dev/null | head -8; echo ---; docker top clipboard-online 2>/dev/null | wc -l\",\n \"load_procs\": \"ps -eo pid,ppid,pcpu,pmem,rss,etime,comm --sort=-pcpu | head -20\",\n \"cpu_count\": \"nproc; lscpu | egrep 'Model name|^CPU\\\\(s\\\\)'\",\n \"up_time\": \"uptime; echo ---; docker ps -q | wc -l; docker ps -a -q | wc -l\"\n}\n\nfor k,c in cmds.items():\n    print(\"=\"*20, k, \"=\"*20)\n    _,o,e = cli.exec_command(c, timeout=90)\n    print(o.read().decode(errors=\"replace\")[:4000])\n    err = e.read().decode(errors=\"replace\").strip()\n    if err: print(\"[stderr]\", err[:400])\ncli.close()\nPYEOF\ntimeout 200 python3 ssh_docker_deep2.py 2>&1 | head -200",
+    "timeout": 240
+   },
+   "at": 263.6,
+   "llm_ms": 7514,
+   "result": {
+    "exit_code": 0,
+    "stdout": "==================== top_batch ====================\ntop - 15:57:00 up 3 days,  1:08,  2 users,  load average: 17.28, 18.38, 21.12\nTasks: 5916 total,   8 running, 174 sleeping,   0 stopped, 5734 zombie\n%Cpu(s): 50.1 us, 47.8 sy,  0.0 ni,  0.0 id,  0.0 wa,  0.0 hi,  1.3 si,  0.0 st \nMiB Mem :   4096.0 total,    544.8 free,   1726.9 used,   1824.9 buff/cache     \nMiB Swap:   4096.0 total,   2242.4 free,   1853.6 used.   2369.1 avail Mem \n\n    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM...",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 343.3
+  },
+  {
+   "step": 8,
+   "thought": "已经查到关键线索：负载 19~21（CPU 只有 4 核）、**5731 个僵尸进程**、`clipboard-online` 一个容器就有 5619 个 PID、clouddrive2 常年 50~78% CPU。再补一次数据：僵尸进程的来源进程、clouddrive2/clipboard-online 的详细进程树和容器重启/日志，用来确定根因。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && cat > ssh_docker_deep3.py <<'PYEOF'\nimport paramiko\n\nHOST=\"192.168.50.188\"; USER=\"root\"; PWD=\"***\"\ncli=paramiko.SSHClient(); cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())\ncli.connect(HOST, username=USER, password=***, timeout=20)\ndef run(c, t=60):\n    si,so,se=cli.exec_command(c, timeout=t)\n    return so.read().decode('utf-8','ignore')+se.read().decode('utf-8','ignore')\n\ncmds = {\n\"zombie_tree\": \"ps -eo stat,ppid,pid,comm | awk '$1 ~ /Z/ {print $2}' | sort | uniq -c | sort -rn | head -15\",\n\"zombie_detail\": \"ps -eo pid,ppid,user,stat,etime,cmd | awk '$4 ~ /Z/' | head -10\",\n\"ppid_names\": \"for p in $(ps -eo stat,ppid | awk '$1 ~ /Z/ {print $2}' | sort | uniq -c | sort -rn | head -8 | awk '{print $2}'); do echo \\\"--- parent $p: $(ps -p $p -o pid,ppid,user,etime,args --no-headers 2>/dev/null | cut -c1-180)\\\"; done\",\n\"clipboard_tree\": \"docker top clipboard-online 2>/dev/null | head -20; echo '--- count:'; docker top clipboard-online 2>/dev/null | wc -l\",\n\"clipboard_procs\": \"docker top clipboard-online 2>/dev/null | awk '{print $7,$8,$9,$10}' | sort | uniq -c | sort -rn | head -15\",\n\"clouddrive_ps\": \"docker top clouddrive2 2>/dev/null | head -15\",\n\"docker_inspect\": \"for n in clouddrive2 clipboard-online chatgpt2api aiw-api; do echo \\\"=== $n\\\"; docker inspect -f 'RestartCount={{.RestartCount}} Started={{.State.StartedAt}} Pid={{.State.Pid}} MemLimit={{.HostConfig.Memory}}' $n 2>/dev/null; done\",\n\"docker_stats_nostream\": \"docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' 2>/dev/null | sort -k2 -hr | head -12\",\n\"disk\": \"df -h / /var/lib/docker 2>/dev/null | head -5; docker system df 2>/dev/null\",\n\"dmesg_oom\": \"dmesg -T 2>/dev/null | grep -iE 'oom|killed process' | tail -10\",\n\"log_clipboard\": \"docker logs --tail 15 clipboard-online 2>&1 | tail -15\",\n\"log_clouddrive\": \"docker logs --tail 15 clouddrive2 2>&1 | tail -15\",\n\"load_now\": \"uptime; echo ---; cat /proc/loadavg; echo ---; nproc; echo '--- zombie count:'; ps -eo stat | awk '$1 ~ /Z/' | wc -l\",\n}\nfor k,c in cmds.items():\n    print(\"=\"*20, k, \"=\"*20)\n    try:\n        print(run(c, 90)[:2500])\n    except Exception as e:\n        print(\"ERR\", e)\ncli.close()\nPYEOF\ntimeout 300 python3 ssh_docker_deep3.py 2>&1 | head -200",
+    "timeout": 320
+   },
+   "at": 351.5,
+   "llm_ms": 7945,
+   "result": {
+    "exit_code": 0,
+    "stdout": "==================== zombie_tree ====================\n   5676 2850\n     60 2178707\n      2 2660\n\n==================== zombie_detail ====================\n   9319    2850 10001    Z    441077230-02:02:40 [python] <defunct>\n  10009    2660 root     Z    441077230-02:02:08 [wget] <defunct>\n  10320    2850 10001    Z    441077230-02:01:36 [python] <defunct>\n  10805    2850 10001    Z    441077230-02:01:04 [python] <defunct>\n  11445    2850 10001    Z    441077230-02:00:32 [python] <defunct>\n  13448  ...",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 531.7
+  },
+  {
+   "step": 9,
+   "thought": "我已拿到大量诊断数据，关键疑点已浮现：负载 19–21（4 核机器），5745 个僵尸进程，主要父进程是 clipboard-online 的 uvicorn（5676 个 defunct）、uniapi(y) 的 granian 和 aiw-api 的 uvicorn；clouddrive2 持续占 50–70% CPU。还需要补两块证据：僵尸进程的完整分布统计（按父容器汇总）、各容器 cgroup 的 CPU 累计用量与 pthread 数，以及高 CPU 时段的进程级 CPU 排行（用 /proc 采样避免 top 自身开销）。再跑一次脚本收集这些，然后出报告。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && cat > ssh_docker_deep4.py <<'PYEOF'\nimport paramiko\n\nHOST=\"192.168.50.188\"; USER=\"root\"; PWD=\"***\"\nc = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())\nc.connect(HOST, username=USER, password=***, timeout=20)\n\ndef run(cmd, t=120):\n    si,so,se = c.exec_command(cmd, timeout=t)\n    out = so.read().decode(errors=\"replace\"); err = se.read().decode(errors=\"replace\")\n    return out + ((\"\\nERR \" + err) if err.strip() else \"\")\n\ndef sec(t, cmd, tm=120):\n    print(\"=\"*20, t, \"=\"*20)\n    print(run(cmd, tm).strip()[:6000])\n\nsec(\"zombie_state_count\", \"grep -c '^State:\\\\s*Z' /proc/[0-9]*/status 2>/dev/null | tail -1; ps -eo stat= | grep -c '^Z'\")\nsec(\"zombie_by_ppid\", \"ps -eo stat=,ppid= | awk '$1 ~ /^Z/ {c[$2]++} END {for (p in c) print c[p], p}' | sort -rn | head -15\")\nsec(\"zombie_ppid_names\", \"for p in $(ps -eo stat=,ppid= | awk '$1 ~ /^Z/ {c[$2]++} END {for (p in c) print c[p], p}' | sort -rn | head -8 | awk '{print $2}'); do echo \\\"-- ppid $p: $(tr '\\\\0' ' ' < /proc/$p/cmdline | cut -c1-160)\\\"; done\")\nsec(\"cgroup_of_ppids\", \"for p in 2850 2178707 2660; do echo \\\"$p -> $(cat /proc/$p/cgroup 2>/dev/null | head -1)\\\"; done\")\nsec(\"threads_top\", \"ps -eLo pid,comm --no-headers | awk '{c[$1]++} END {for (p in c) print c[p], p}' | sort -rn | head -8 | while read n p; do echo \\\"$n threads  pid=$p  $(tr '\\\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-110)\\\"; done\")\nsec(\"mem_top\", \"ps -eo rss=,pid=,args= --sort=-rss | head -12 | awk '{printf \\\"%8.1f MB  pid=%s  \\\", $1/1024, $2; for(i=3;i<=NF && i<=14;i++) printf \\\"%s \\\", $i; print \\\"\\\"}'\")\nsec(\"cgroup_cpu_secs\", \"for d in /sys/fs/cgroup/system.slice/docker-*.scope; do n=$(basename $d); u=$(cat $d/cpu.stat 2>/dev/null | awk '/usage_usec/{print int($2/1000000)}'); echo \\\"$u s  ${n:0:40}\\\"; done | sort -rn | head -10\")\nsec(\"docker_names_map\", \"docker ps --format '{{.ID}} {{.Names}}' | head -40\")\nsec(\"uniapi_log\", \"docker logs --tail 40 uniapi 2>&1 | tail -40\")\nsec(\"aiwapi_log\", \"docker logs --tail 25 aiw-api 2>&1 | tail -25\")\nsec(\"load_trend\", \"for i in 1 2 3; do cat /proc/loadavg; sleep 2; done; echo '--- cpu by /proc/stat sample'; a=$(awk '/^cpu /{print $2+$3+$4, $5}' /proc/stat); sleep 3; b=$(awk '/^cpu /{print $2+$3+$4, $5}' /proc/stat); echo \\\"$a | $b\\\"\")\nsec(\"swap_ps\", \"for f in /proc/[0-9]*/status; do awk '/^Name:/{n=$2}/^VmSwap:/{if($2>10000) print $2\\\" kB \\\"n}' $f 2>/dev/null; done | sort -rn | head -10\")\nc.close()\nPYEOF\ntimeout 280 python3 ssh_docker_deep4.py 2>&1 | head -160",
+    "timeout": 320
+   },
+   "at": 543.0,
+   "llm_ms": 10879,
+   "result": {
+    "exit_code": 0,
+    "stdout": "==================== zombie_state_count ====================\n/proc/999801/status:1\n5745\n==================== zombie_by_ppid ====================\n5681 2850\n62 2178707\n2 2660\n==================== zombie_ppid_names ====================\n-- ppid 2850: /usr/local/bin/python3.12 /usr/local/bin/uvicorn app.main:app --host 0.0.0.0 --port 8099 --proxy-headers --forwarded-allow-ips=* \n-- ppid 2178707: /usr/local/bin/python3.11 /usr/local/bin/uvicorn aiw_api.main:app --host 0.0.0.0 --port 8000 \n-- ppid 2660...",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 718.7
+  },
+  {
+   "step": 10,
+   "thought": "已经查到关键线索：clipboard-online 容器内 uvicorn（pid 2850）产生了 5681 个僵尸进程，另有 aiw-api（62个）、grok-register（2个），系统共 5745 个僵尸进程、7300+ 任务，load average 常年 19~21，这就是 CPU（尤其 sy 系统态）和内存被拖高的主因。再补一轮数据：僵尸进程是否仍在持续增长（每秒新增数）、各容器内存上限与整体内存分布，然后出报告。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && cat > ssh_docker_final.py <<'PYEOF'\nimport paramiko, time\nHOST=\"192.168.50.188\"; USER=\"root\"; PWD=\"***\"\nc=paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())\nc.connect(HOST, username=USER, password=***, timeout=20)\ndef run(cmd, t=60):\n    ch=c.get_transport().open_session(); ch.settimeout(t); ch.exec_command(cmd)\n    out=b\"\"\n    while True:\n        if ch.recv_ready():\n            out+=ch.recv(65536)\n        elif ch.exit_status_ready():\n            try:\n                while ch.recv_ready(): out+=ch.recv(65536)\n            except: pass\n            break\n        else:\n            time.sleep(0.05)\n    return out.decode(\"utf-8\",\"replace\")\n\nprint(\"== 僵尸进程增长观察（每 5 秒一次，共 3 次）==\")\nfor i in range(3):\n    n=run(\"ps -eo stat | grep -c '^Z'\")\n    l=run(\"cat /proc/loadavg\")\n    print(f\"第{i+1}次: 僵尸={n.strip()}  load={l.strip()}\")\n    if i<2: time.sleep(5)\n\nprint(\"\\n== 内存 TOP 容器（docker stats 内存倒序，含上限）==\")\nprint(run(\"docker stats --no-stream --format '{{.Name}}\\\\t{{.CPUPerc}}\\\\t{{.MemUsage}}\\\\t{{.MemPerc}}\\\\t{{.PIDs}}' | sort -t$'\\\\t' -k3 -hr | head -15\"))\n\nprint(\"\\n== 各容器内存总量与主机内存 ==\")\nprint(run(\"free -m; echo ---; cat /proc/meminfo | egrep 'MemTotal|MemAvailable|SwapTotal|SwapFree'; echo ---; echo 'cgroup 内存占用前 8:'; \"\n          \"for d in /sys/fs/cgroup/system.slice/docker-*.scope; do m=$(cat $d/memory.current 2>/dev/null); echo \\\"$m $d\\\"; done | sort -nr | head -8\"))\n\nprint(\"\\n== 是否 OOM / 内核报错 ==\")\nprint(run(\"journalctl -k --since '1 day ago' 2>/dev/null | egrep -i 'oom|out of memory|fork' | tail -10; echo ---; cat /proc/meminfo | grep -i commit\"))\n\nprint(\"\\n== 僵尸进程占用情况（内存是否真的被占）==\")\nprint(run(\"ps -eo stat,rss | awk '$1 ~ /^Z/ {s+=$2; n++} END {print \\\"僵尸数=\\\" n, \\\"僵尸RSS合计(KB)=\\\" s}'\"))\nprint(\"\\n== 各容器僵尸数排名 ==\")\nprint(run(\"for p in $(ps -eo pid=,stat= | awk '$2 ~ /^Z/ {print $1}'); do pp=$(awk '/^PPid:/{print $2}' /proc/$p/status 2>/dev/null); echo $pp; done | sort | uniq -c | sort -nr | head -6\"))\nprint(\"\\n== dmesg 尾部 ==\")\nprint(run(\"dmesg 2>/dev/null | tail -15\"))\nprint(\"\\n== 磁盘 ==\")\nprint(run(\"df -h / /var/lib/docker 2>&1 | head -5; echo ---; docker system df\"))\nc.close()\nPYEOF\ntimeout 200 python3 ssh_docker_final.py 2>&1 | tail -90",
+    "timeout": 240
+   },
+   "at": 727.1,
+   "llm_ms": 8196,
+   "result": {
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 938.0
+  },
+  {
+   "step": 11,
+   "thought": "已经查到关键数据了。最后一步没有输出，可能是超时。我改用一条命令获取最终确认：zombie 明细、clouddrive2 与 uniapi 的 CPU 采样，然后直接出报告。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && cat > ssh_docker_final2.py <<'PYEOF'\nimport paramiko\nHOST=\"192.168.50.188\"; USER=\"root\"; PWD=\"***\"\nc=paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())\nc.connect(HOST, username=USER, password=***, timeout=15)\ndef run(cmd, t=40):\n    ch=c.get_transport().open_session(); ch.settimeout(t)\n    ch.exec_command(cmd)\n    out=b\"\"\n    try:\n        while True:\n            d=ch.recv(65536)\n            if not d: break\n            out+=d\n    except Exception as e:\n        out+=(\"\\n[TIMEOUT]\"+str(e)).encode()\n    return out.decode(errors=\"replace\")\n\nprint(\"=== 1) docker stats one-shot (sorted) ===\")\nprint(run(\"timeout 25 docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}} {{.MemPerc}}' | sort -k2 -hr | head -12\"))\n\nprint(\"=== 2) zombie count & parents ===\")\nprint(run(\"ps -eo stat,ppid,comm | awk '$1 ~ /Z/ {print $2}' | sort | uniq -c | sort -rn | head -6\"))\n\nprint(\"=== 3) 进程总数/线程 ===\")\nprint(run(\"ps -eo stat= | wc -l; ps -eLf | wc -l\"))\n\nprint(\"=== 4) 每容器内存 top ===\")\nprint(run(\"timeout 20 docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' | sort -k2 -hr | head -8\"))\n\nprint(\"=== 5) 磁盘 & inode ===\")\nprint(run(\"df -h / /var/lib/docker 2>&1 | tail -4; free -m | head -3\"))\n\nprint(\"=== 6) 各容器 1 秒采样 CPU（相对） ===\")\nprint(run(\"timeout 30 sh -c 'docker stats --no-stream --format \\\"{{.Name}} {{.CPUPerc}}\\\" > /tmp/s1; sleep 3; docker stats --no-stream --format \\\"{{.Name}} {{.CPUPerc}}\\\" > /tmp/s2; paste /tmp/s1 /tmp/s2 | awk \\\"{print \\\\$1, \\\\$2, \\\\$4}\\\" | sort -k2 -hr | head -10'\"))\n\nprint(\"=== 7) systemd 顶层可疑进程 ===\")\nprint(run(\"ps -eo pid,ppid,pcpu,pmem,etime,comm --sort=-pcpu | head -15\"))\nc.close()\nPYEOF\ntimeout 300 python3 ssh_docker_final2.py 2>&1 | tail -90",
+    "timeout": 320
+   },
+   "at": 944.3,
+   "llm_ms": 6070,
+   "result": {
+    "exit_code": 0,
+    "stdout": "=== 1) docker stats one-shot (sorted) ===\nclouddrive2 53.06% 136.3MiB / 4GiB 3.33%\nworkbuddy-manager 19.38% 58.04MiB / 4GiB 1.42%\nuniapi 9.24% 94.65MiB / 4GiB 2.31%\ndockerCopilot 1.45% 24.6MiB / 4GiB 0.60%\nchatgpt2api 1.05% 634.7MiB / 4GiB 15.49%\nvoice-core 0.84% 17.64MiB / 4GiB 0.43%\nclipboard-online 0.81% 110.6MiB / 4GiB 2.70%\naiw-api 0.68% 104.8MiB / 4GiB 2.56%\nfrpc 0.53% 8.809MiB / 4GiB 0.22%\ncanvas 0.51% 99.97MiB / 4GiB 2.44%\nmy-alist-monitor 0.32% 31.93MiB / 4GiB 0.78%\ngrok2api 0.30% 50.95...",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 1061.9
+  },
+  {
+   "step": 12,
+   "thought": "我已经掌握了大部分关键数据（CPU 负载 20、5734 个僵尸进程、clouddrive2 和 uniapi 高 CPU），还差最后一块：465 个僵尸进程被回收的 root 原因确认、以及 uniapi/clouddrive2 的即时线程热点。不过信息已足够形成全面分析报告。我先补一次最关键的采集（uniapi 为何高 CPU、僵尸进程产生速率），然后写报告。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && cat > ssh_docker_final3.py <<'PYEOF'\nimport paramiko, time\nHOST=\"192.168.50.188\"; USER=\"root\"; PWD=\"***\"\nc=paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())\nc.connect(HOST,username=USER,password=***,timeout=20)\ndef run(cmd, t=120):\n    i,o,e=c.exec_command(cmd, timeout=t)\n    return o.read().decode('utf-8','ignore')+e.read().decode('utf-8','ignore')\n\nprint(\"=== A) 僵尸增长速率（10s） ===\")\nn1=run(\"ps -eo stat | grep -c '^Z'\"); time.sleep(10); n2=run(\"ps -eo stat | grep -c '^Z'\")\nprint(\"zombie t0=%s t10=%s\"%(n1.strip(),n2.strip()))\n\nprint(\"=== B) clipboard-online 进程树(容器内) ===\")\nprint(run(\"docker exec clipboard-online ps -eo pid,ppid,stat,etime,cmd --no-headers 2>/dev/null | head -25\"))\n\nprint(\"=== C) uniapi 容器内 CPU 热点 ===\")\nprint(run(\"docker exec uniapi ps -eo pid,ppid,%cpu,%mem,etime,cmd --sort=-%cpu --no-headers 2>/dev/null | head -10\"))\n\nprint(\"=== D) clouddrive2 线程/状态 ===\")\nprint(run(\"cat /proc/1904/status 2>/dev/null | egrep 'Threads|State|VmRSS|voluntary'\"))\nprint(run(\"cat /proc/1904/wchan 2>/dev/null; echo; ls -l /proc/1904/fd 2>/dev/null | wc -l\"))\n\nprint(\"=== E) aiw-api / workbuddy-manager 实时 ===\")\nprint(run(\"docker exec aiw-api sh -c 'ps -eo pid,%cpu,%mem,etime,cmd --sort=-%cpu --no-headers | head -6' 2>/dev/null\"))\nprint(run(\"docker exec aiw-api sh -c 'ps -eo stat --no-headers | grep -c ^Z' 2>/dev/null\"))\n\nprint(\"=== F) 容器重启/健康 ===\")\nprint(run(\"docker ps --format '{{.Names}}\\\\t{{.Status}}' | egrep -i 'unhealthy|restart'\"))\n\nprint(\"=== G) 最近 dmesg 关键 ===\")\nprint(run(\"dmesg -T 2>/dev/null | tail -12\"))\n\nprint(\"=== H) 磁盘/loop 与 docker 目录占用 ===\")\nprint(run(\"df -h / /var/lib/docker 2>/dev/null; docker system df 2>/dev/null | head -6\"))\n\nprint(\"=== I) 内存压力 ===\")\nprint(run(\"cat /proc/pressure/memory 2>/dev/null; cat /proc/pressure/cpu 2>/dev/null\"))\n\nprint(\"=== J) top 3 快照（3 秒间隔累计差异） ===\")\nprint(run(\"for i in 1 2 3; do cat /proc/loadavg; sleep 3; done\"))\nc.close()\nPYEOF\ntimeout 200 python3 ssh_docker_final3.py 2>&1 | tail -80",
+    "timeout": 240
+   },
+   "at": 1067.9,
+   "llm_ms": 5898,
+   "result": {
+    "exit_code": 0,
+    "stdout": "=== A) 僵尸增长速率（10s） ===\nzombie t0=5765 t10=5765\n=== B) clipboard-online 进程树(容器内) ===\nOCI runtime exec failed: exec failed: unable to start container process: exec: \"ps\": executable file not found in $PATH: unknown\r\n\n=== C) uniapi 容器内 CPU 热点 ===\nOCI runtime exec failed: exec failed: unable to start container process: exec: \"ps\": executable file not found in $PATH: unknown\r\n\n=== D) clouddrive2 线程/状态 ===\nState:\tS (sleeping)\nVmRSS:\t   73216 kB\nThreads:\t31\nvoluntary_ctxt_switches:\t526190\nnonvoluntary_...",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 1170.2
+  },
+  {
+   "step": 13,
+   "thought": "关键线索已经查清：5440+ 个僵尸进程，CPU 被这些高负载容器拖住。我再补一组数据定位僵尸和云盘容器的具体成因，然后生成分析报告。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && cat > ssh_docker_final4.py <<'PYEOF'\nimport paramiko, time\nHOST=\"192.168.50.188\"; USER=\"root\"; PWD=\"***\"\nc=paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())\nc.connect(HOST, username=USER, password=***, timeout=20, banner_timeout=30)\n\ndef run(cmd, t=60):\n    tr=c.get_transport(); ch=tr.open_session(); ch.settimeout(t); ch.exec_command(cmd)\n    out=b\"\"\n    try:\n        while True:\n            d=ch.recv(65536)\n            if not d: break\n            out+=d\n    except Exception as e:\n        out+=(\"\\n[TIMEOUT]\").encode()\n    return out.decode(\"utf-8\",\"replace\")\n\nprint(\"=== 1) clouddrive2 线程 CPU 分布 (top -H) ===\")\nprint(run(\"top -H -b -n1 -p 1904 | tail -15\", 40))\n\nprint(\"=== 2) clipboard-online 主进程 CPU 与子进程 ===\")\nprint(run(\"cat /proc/2850/stat | awk '{print \\\"utime=\\\"$14\\\" stime=\\\"$15}' ; ls /proc/2850/task | wc -l; cat /proc/2850/status | egrep 'Threads|VmRSS'\", 30))\n\nprint(\"=== 3) 僵尸大户 2850 的子孙与 /proc 是否可回收 ===\")\nprint(run(\"ps -eo stat,ppid | awk '$1 ~ /Z/ {print $2}' | sort | uniq -c | sort -rn | head\", 60))\n\nprint(\"=== 4) aiw-api 2178707 内部 62 个僵尸来源 ===\")\nprint(run(\"ps -o pid,ppid,stat,cmd --ppid 2178707 | head -20\", 30))\n\nprint(\"=== 5) 内存占用前 8 全进程（含子进程） ===\")\nprint(run(\"ps -eo pid,user,rss,pcpu,comm --sort=-rss | head -12\", 30))\n\nprint(\"=== 6) swap 使用大户 ===\")\nprint(run(\"for f in /proc/[0-9]*/status; do a=$(awk '/VmSwap/{print $2}' $f 2>/dev/null); [ -n \\\"$a\\\" ] && [ $a -gt 20000 ] && echo \\\"$a $(awk '/^Name/{print $2}' $f) $(basename $(dirname $f))\\\"; done | sort -rn | head -10\", 90))\n\nprint(\"=== 7) 负载构成：running/runnable 线程 ===\")\nprint(run(\"ps -eLo stat= | sort | uniq -c | sort -rn | head -8\", 60))\n\nprint(\"=== 8) 网络/磁盘 io 大户 ===\")\nprint(run(\"cat /proc/diskstats | awk '$13>0 {print $3, $13}' | sort -k2 -rn | head -5\", 20))\n\nprint(\"=== 9) 容器健康 & 重启次数 ===\")\nprint(run(\"docker ps --format '{{.Names}} {{.Status}}' | egrep -i 'unhealthy|restart' \", 40))\n\nprint(\"=== 10) uniapi 最近日志尾部 ===\")\nprint(run(\"docker logs --tail 25 uniapi 2>&1 | cut -c1-160\", 40))\nc.close()\nPYEOF\ntimeout 400 python3 ssh_docker_final4.py 2>&1 | head -140",
+    "timeout": 450
+   },
+   "at": 1178.1,
+   "llm_ms": 7713,
+   "result": {
+    "exit_code": 0,
+    "stdout": "=== 1) clouddrive2 线程 CPU 分布 (top -H) ===\n   2664 root      20   0  169912  75468   8248 S   0.0   1.8   0:00.00 tokio-r+\n   2665 root      20   0  169912  75468   8248 S   0.0   1.8   0:00.00 tokio-r+\n   2666 root      20   0  169912  75468   8248 S   0.0   1.8   0:00.00 tokio-r+\n   2667 root      20   0  169912  75468   8248 S   0.0   1.8   0:00.00 tokio-r+\n   2668 root      20   0  169912  75468   8248 S   0.0   1.8   3:06.97 tokio-r+\n   2670 root      20   0  169912  75468   8248 S   0.0   1...",
+    "stderr": "",
+    "timed_out": false
+   },
+   "success": true,
+   "done_at": 1326.0
+  },
+  {
+   "step": 14,
+   "thought": "现状已基本查清：机器是 4 核 i3-N305（top 显示 8 线程）共 4GB 内存，却跑了 28 个容器、近 6000 个进程，其中约 **5771 个是僵尸进程**，主要来自 clipboard-online（约 5700 个，父进程 PID 2850）和 aiw-api（约 65 个）。负载 17–20 主要由这些僵尸进程与 PID 耗尽、以及 clouddrive2（50%+ CPU）、uniapi（qwen 浏览器 CDP 超时/风控）拉动。\n\n再补一条最后的关键信息：占用 swap/常驻最大的是 chatgpt2api（约 630MB），并确认线程/PID 上限与僵尸是否导致 fork 压力。我直接做一次汇总采样，然后写报告交付。",
+   "tool": "shell",
+   "args": {
+    "command": "cd ~/workspace && cat > ssh_docker_final5.py <<'PYEOF'\nimport paramiko\nHOST=\"192.168.50.188\"; USER=\"root\"; PWD=\"***\"\ncli=paramiko.SSHClient(); cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())\ncli.connect(HOST, username=USER, password=***, timeout=20, banner_timeout=30)\ndef run(cmd, t=60):\n    try:\n        si,so,se=cli.exec_command(cmd, timeout=t)\n        return so.read().decode('utf-8','ignore')+se.read().decode('utf-8','ignore')\n    except Exception as e:\n        return f\"ERR {e}\"\n\nprint(\"=== 1) 内核线程/PID 上限与实际 ===\")\nprint(run(\"cat /proc/sys/kernel/pid_max; cat /proc/sys/kernel/threads-max; echo ---; ps -eLf 2>/dev/null | wc -l; echo ---; ps -eo stat 2>/dev/null | sort | uniq -c | sort -rn | head -8\"))\n\nprint(\"=== 2) clipboard-online 容器：僵尸来源进程详情 ===\")\nprint(run(\"ps -o pid,ppid,stat,rss,etime,cmd -p 2850 2>/dev/null; echo ---; ls /proc/2850/task | wc -l; echo --- ; docker inspect clipboard-online --format '{{.RestartCount}} {{.State.Health.Status}}'; docker logs --tail 5 clipboard-online 2>&1 | tail -5\"))\n\nprint(\"=== 3) aiw-api 62 僵尸的父 ===\")\nprint(run(\"ps -o pid,ppid,stat,rss,etime,cmd -p 2178707 2>/dev/null | cut -c1-160; echo ---; docker logs --tail 6 aiw-api 2>&1 | cut -c1-200\"))\n\nprint(\"=== 4) chatgpt2api 内存/子进程 ===\")\nprint(run(\"ps -o pid,ppid,stat,rss,etime,cmd --ppid 2934 2>/dev/null | head -20 | cut -c1-150; echo ---; docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' chatgpt2api chatgpt2api-browser-otp chatgpt2api-flaresolverr\"))\n\nprint(\"=== 5) 各容器 CPU 秒数排行(自启动累计) + 名称 ===\")\nprint(run(\"for f in /sys/fs/cgroup/system.slice/docker-*.scope; do id=$(basename $f .scope | sed 's/docker-//;s/\\\\.scope//'); n=$(grep -m1 -o 'io.etcd\\\\|' /dev/null); echo -n \\\"$id \\\"; head -1 $f/cpu.stat 2>/dev/null | awk '{print $2}'; done | sort -k2 -rn | head -10\"))\n\nprint(\"=== 6) docker 全部容器 CPU/内存一次快照(排序) ===\")\nprint(run(\"docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.PIDs}}' | sort -t'|' -k2 -rn | head -15\"))\n\nprint(\"=== 7) 磁盘 io 与 inode ===\")\nprint(run(\"df -i / | tail -2; echo ---; docker system df\"))\n\nprint(\"=== 8) 建议: zombie 回收可行性(容器内 PID1 是否 tini) ===\")\nprint(run(\"docker inspect clipboard-online --format '{{.Config.Entrypoint}} | Path={{.Path}} Args={{.Args}}'\"))\ncli.close()\nPYEOF\ntimeout 300 python3 ssh_docker_final5.py 2>&1 | head -120",
+    "timeout": 330
+   },
+   "at": 1333.2,
+   "llm_ms": 7039,
+   "result": {},
+   "success": false,
+   "done_at": 1378.3
+  }
+ ]
+}

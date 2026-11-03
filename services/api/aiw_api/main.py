@@ -45,6 +45,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from websockets.asyncio.client import connect as ws_connect
 
+from agent_runtime import redact as _rd
 from . import cron
 from . import desktop_view
 from . import uploads as _uploads
@@ -232,6 +233,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @asynccontextmanager
     async def lifespan(_app):
+        try:   # v3.9.17: plaintext passwords already in the database -> vault + ***
+            n = sessions.redact_stored()
+            if n:
+                log.info("redacted passwords in %d stored task(s)", n)
+        except Exception as e:  # noqa: BLE001
+            log.warning("redact stored prompts: %s", e)
         try:
             await sessions.recover_interrupted(requeue=settings.resume_interrupted)
         except Exception as e:  # noqa: BLE001
@@ -448,8 +455,13 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             d = {k: v for k, v in d.items() if k not in ("screenshot", "screenshot_b64", "image", "content_b64")}
             steps.append({"type": e.get("type"), "step": e.get("step"), "at": e.get("ts"), **d})
         settings = store.kv_get("models", {}) or {}
-        return _redact({"exported_at": time.time(), "server_version": os.environ.get("AIW_VERSION", "dev")[:7], "task": base["task"], "models": {k: v for k, v in settings.items() if "key" not in k.lower()},
-                        "events": steps, "receipts": base["actions"], "files": [f.get("path") for f in base["files"]]})
+        # v3.9.17: the task's vault values, and any password still written in its prompt (task-833: task.prompt and the
+        # task.started event kept "密码<明文>" because the old patterns only knew password=)
+        known = sessions.task_secret_values(task_id)
+        for r in [base["task"]] + list(store.continuations(base["task"].get("continues") or task_id) or []):
+            known += [c["value"] for c in _rd.extract((r or {}).get("prompt") or "")[1]]
+        return _rd.mask_obj(_redact({"exported_at": time.time(), "server_version": os.environ.get("AIW_VERSION", "dev")[:7], "task": base["task"], "models": {k: v for k, v in settings.items() if "key" not in k.lower()},
+                        "events": steps, "receipts": base["actions"], "files": [f.get("path") for f in base["files"]]}), known)
 
     # ------------------------------------------------------------- threads
     def _thread_full(tid: str) -> dict:

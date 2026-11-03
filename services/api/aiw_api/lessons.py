@@ -31,6 +31,7 @@ import json
 import logging
 import math
 import re
+import os
 import time
 import uuid
 from typing import Any, Callable, Iterable, Optional
@@ -409,7 +410,13 @@ class Lessons:
         if not (error or "").strip():
             return "", []
         rows = self.relevant(machine=machine, domains=domains, skills=skills, tools=[tool] if tool else [],
-                             text=error, k=3, exclude=exclude, min_score=2.2)
+                             text=error, k=8, exclude=exclude, min_score=2.2)
+        # v3.9.17 经验匹配收紧: only a lesson about the SAME tool and the SAME kind of error is injected
+        if os.environ.get("AIW_LESSON_STRICT", "1") != "0":
+            ec = error_class(error)
+            rows = [r for r in rows if lesson_tool_ok(r, tool) and error_class(f"{r['problem']} {r['fix']}") == ec
+                    and (ec != "other" or (r.get("scope") == "tool" and tool_family(r.get("key") or "") == tool_family(tool)))]
+        rows = rows[:3]
         if not rows:
             return "", []
         self.mark_used(r["id"] for r in rows)
@@ -551,3 +558,66 @@ def mount(app, lessons: Lessons, auth) -> None:
     @app.delete("/api/lessons", dependencies=dep)
     async def clear_lessons():
         return {"deleted": lessons.clear()}
+
+
+
+# ---------------------------------------------------------------- v3.9.17 经验匹配收紧
+ERROR_CLASSES = [   # first match wins; the same order for the error and for the lesson text
+    ("captcha", r"验证码|滑块|captcha|风控|baxia|punish|RGV587|x5sec|FAIL_SYS_USER_VALIDATE|人机"),
+    ("auth", r"401|403|unauthori[sz]ed|forbidden|permission denied|权限|denied|authenticat|登录|login|password|密码|token (expired|invalid)|sudo"),
+    ("not_found", r"no such file|not found|找不到|不存在|404|ENOENT|cannot find|未找到|missing|路径(不对|不是|错)|工作区路径|家目录|/home/\w+/workspace"),
+    ("timeout", r"timed? ?out|timeout|超时|deadline"),
+    ("network", r"connection (refused|reset|closed)|unreachable|name resolution|dns|ECONNREFUSED|EOF|proxy|网络|连不上|无法连接|ssl|certificate"),
+    ("server", r"\b5\d\d\b|bad gateway|internal server error|service unavailable|网关"),
+    ("syntax", r"syntax ?error|unexpected (token|eof)|invalid syntax|parse error|unterminated|quote|引号|traceback|exception|typeerror|valueerror|keyerror"),
+    ("resource", r"out of memory|oom|no space left|disk full|killed|内存不足|磁盘"),
+    ("module", r"modulenotfound|no module named|import error|command not found|未安装|not installed"),
+    ("busy", r"locked|in use|busy|already running|占用|address already in use"),
+]
+_EC = [(n, re.compile(rx, re.I)) for n, rx in ERROR_CLASSES]
+TOOL_FAMILY = {
+    "shell": "shell", "files_read": "files", "files_write": "files", "files_list": "files", "files_download": "files",
+    "send_file": "files", "ssh_exec": "remote", "remote_exec": "remote", "browser_open": "browser",
+    "browser_navigate": "browser", "browser_click": "browser", "browser_fill": "browser", "browser_network": "browser",
+    "click": "screen", "type": "screen", "click_element": "screen", "screenshot": "screen", "read_image": "vision",
+    "image_edit": "image", "generate_image": "image", "photopea": "image", "cad_command": "cad", "drawing_build": "cad",
+}
+_FAMILY_WORDS = {
+    "shell": r"\bshell\b|命令|终端|\bpip\b|\bapt\b|\bnpm\b|python|bash|路径|workspace|脚本",
+    "remote": r"ssh|sshpass|paramiko|远程|服务器|docker exec|运维主机|remote_exec|ssh_exec",
+    "browser": r"browser_|bos_|页面|网页|浏览器|chrome|点击|登录页|url|cookie|请求",
+    "files": r"files_|文件|send_file|上传|下载",
+    "screen": r"截图|坐标|点击|桌面|screenshot|click",
+    "vision": r"read_image|读图|视觉|vision",
+    "image": r"image_edit|生图|修图|photopea|generate_image",
+    "cad": r"cad|librecad|dxf|dwg|图纸|drawing_",
+}
+
+
+def error_class(text: str) -> str:
+    t = text or ""
+    for n, rx in _EC:
+        if rx.search(t):
+            return n
+    return "other"
+
+
+def tool_family(tool: str) -> str:
+    t = str(tool or "")
+    if t.startswith("bos_"):
+        return "browser"
+    return TOOL_FAMILY.get(t, t)
+
+
+def lesson_tool_ok(r: dict, tool: str) -> bool:
+    """A lesson belongs to this tool: scoped to it, or (any other scope) its own words name the tool or its family."""
+    if not tool:
+        return True
+    if (r.get("scope") or "") == "tool":
+        return tool_family(r.get("key") or "") == tool_family(tool)
+    text = f"{r.get('problem') or ''} {r.get('fix') or ''}"
+    if tool.lower() in text.lower():
+        return True
+    fam = tool_family(tool)
+    rx = _FAMILY_WORDS.get(fam)
+    return bool(rx and re.search(rx, text, re.I))

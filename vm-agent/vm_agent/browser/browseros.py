@@ -100,7 +100,9 @@ class BrowserOS:
         return f"http://127.0.0.1:{ports()[0]}/mcp"
 
     # ------------------------------------------------------------------ process
-    async def ensure_running(self, wait_s: float = 30) -> bool:
+    async def ensure_running(self, wait_s: Optional[float] = None) -> bool:
+        # v3.9.17: a first start (profile, extensions, the MCP server process) can take longer than 30 s
+        wait_s = float(wait_s or os.environ.get("BROWSEROS_START_WAIT", "60"))
         if _up():
             return True
         b = binary()
@@ -110,13 +112,18 @@ class BrowserOS:
             if _up():
                 return True
             env = dict(self.env)
-            env.setdefault("DISPLAY", os.environ.get("DISPLAY", ":0"))
+            # v3.9.17: the minimal/cloud images run Xvnc on :1; ":0" there means the window dies at once and 9210
+            # never comes up. Same order as browseros-setup.sh: $DISPLAY, then the X socket that exists.
+            env["DISPLAY"] = env.get("DISPLAY") or os.environ.get("DISPLAY") or guess_display()
             if not _running():
                 # an MCP server left over from a browser that went away holds 9210: clear it so the new one binds
                 kill = await asyncio.create_subprocess_shell("pkill -f browseros-claw-server >/dev/null 2>&1; sleep 1")
                 await kill.wait()
+                clear_stale_locks()   # a crashed window leaves Singleton* behind: the next start hands off to it and exits
+                log = os.path.expanduser(os.environ.get("BROWSEROS_LOG", "~/.cache/aiw/browseros.log"))
+                os.makedirs(os.path.dirname(log), exist_ok=True)
                 proc = await asyncio.create_subprocess_shell(
-                    f"nohup {b} --no-first-run --no-default-browser-check >/dev/null 2>&1 &", env=env)
+                    f"nohup {b} --no-first-run --no-default-browser-check >>{log} 2>&1 &", env=env)
                 await proc.wait()
             t0 = time.monotonic()
             while time.monotonic() - t0 < wait_s:
@@ -124,7 +131,8 @@ class BrowserOS:
                 if _up():
                     await asyncio.sleep(1.0)   # the MCP server answers a moment before its first tool call works
                     return True
-        raise RuntimeError(f"BrowserOS started but its MCP server did not come up on port {ports()[0]} within {wait_s:.0f}s")
+        raise RuntimeError(f"BrowserOS started but its MCP server did not come up on port {ports()[0]} within {wait_s:.0f}s"
+                           f" ({diagnose()}). 诊断：bash ~/ai-workstation/deploy/vm/browseros-setup.sh diag")
 
     # ------------------------------------------------------------------ MCP plumbing
     async def _post(self, body: dict, sid: Optional[str]) -> tuple[Optional[str], Optional[dict], int]:
@@ -356,21 +364,70 @@ class BrowserOS:
         return {"ok": True, "closed": bool(c)}
 
 
-def _running() -> bool:
+def _is_main(argv: list[str]) -> bool:
+    """The browser process itself. v3.9.17: Chromium's zygote/renderer/gpu/utility children run the SAME binary
+    (argv[0] ends in /browserclaw) with --type=...; one left over after the window died made _running() say yes,
+    so ensure_running never relaunched and waited for a 9210 that could not come."""
+    if not argv:
+        return False
+    exe = argv[0]
+    if not exe.endswith(("/browserclaw", "/browseros", "browserclaw", "browseros")) or "crashpad" in exe:
+        return False
+    return not any(a.startswith("--type=") for a in argv[1:])
+
+
+def _running(root: str = "/proc") -> bool:
     try:
-        for pid in os.listdir("/proc"):
+        for pid in os.listdir(root):
             if not pid.isdigit():
                 continue
             try:
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmd = f.read().split(b"\0")[0].decode(errors="ignore")
+                with open(f"{root}/{pid}/cmdline", "rb") as f:
+                    argv = [x.decode(errors="ignore") for x in f.read().split(b"\0") if x]
             except OSError:
                 continue
-            if cmd.endswith(("/browserclaw", "/browseros")) and "crashpad" not in cmd:
+            if _is_main(argv):
                 return True
     except OSError:
         pass
     return False
+
+
+def guess_display(xdir: str = "/tmp/.X11-unix") -> str:
+    for d in ("1", "0"):
+        if os.path.exists(f"{xdir}/X{d}"):
+            return f":{d}"
+    return ":0"
+
+
+PROFILE_DIRS = ("~/.config/browser-claw", "~/.config/browserclaw", "~/.config/BrowserOS")
+
+
+def clear_stale_locks(dirs=PROFILE_DIRS) -> list[str]:
+    """Remove Singleton{Lock,Socket,Cookie} that point to a process that is gone (only called when no main browser
+    process is running)."""
+    removed = []
+    for d in dirs:
+        d = os.path.expanduser(d)
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            p = os.path.join(d, name)
+            if os.path.islink(p) or os.path.exists(p):
+                try:
+                    os.remove(p)
+                    removed.append(p)
+                except OSError:
+                    pass
+    return removed
+
+
+def diagnose() -> str:
+    """One line on why 9210 is not there (for the error text)."""
+    mcp, cdp = ports()
+    bits = [f"mcp {mcp} {'open' if _port_open(mcp) else 'closed'}", f"cdp {cdp} {'open' if _port_open(cdp) else 'closed'}",
+            f"browser {'running' if _running() else 'not running'}", f"DISPLAY={os.environ.get('DISPLAY') or '(unset)->' + guess_display()}"]
+    if not os.path.exists("/tmp/.X11-unix") or not os.listdir("/tmp/.X11-unix"):
+        bits.append("no X server")
+    return ", ".join(bits)
 
 
 def front_page(tool: str, args: dict, out: dict) -> Optional[int]:

@@ -7,6 +7,8 @@
 #   bash browseros-setup.sh check       exit 0 when installed and its MCP port answers
 #   bash browseros-setup.sh status      one JSON line: installed / running / version / arch (what 重新检测 reads)
 #   bash browseros-setup.sh start       start it on the desktop if it is not running
+#   bash browseros-setup.sh diag        v3.9.17: why the MCP port (9210) does not come up (display, processes, ports,
+#                                       config ports, stale Singleton locks, the last lines of the browser's log)
 # On a computer whose sudo asks for a password, run it yourself in a terminal (接管 › 终端 or ssh):
 #   curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/browseros-setup.sh | bash
 # (sudo asks for the password on the terminal; `| sudo bash` works too.)
@@ -51,11 +53,18 @@ need_sudo() {  # sudo -n first (vm-agent, cloud boxes); a terminal falls back to
   fail sudo "NEED_SUDO_PASSWORD" 10
 }
 
-mcp_up() { (exec 3<>/dev/tcp/127.0.0.1/9210) 2>/dev/null; }
-cdp_up() { (exec 3<>/dev/tcp/127.0.0.1/9110) 2>/dev/null; }
+# v3.9.17: the ports BrowserOS really uses come from its config (it moves off 9210 when that port is taken); the
+# script used to probe a hard-coded 9210 and report "did not come up" while the server listened elsewhere
+CONF="${BROWSEROS_CONFIG:-$HOME/.config/browser-claw/.browseros/config.json}"
+conf_port() { [ -f "$CONF" ] && python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('ports',{}).get(sys.argv[2],''))" "$CONF" "$1" 2>/dev/null; }
+MCP_PORT="${BROWSEROS_MCP_PORT:-$(conf_port server)}"; MCP_PORT="${MCP_PORT:-9210}"
+CDP_PORT="${BROWSEROS_CDP_PORT:-$(conf_port cdp)}"; CDP_PORT="${CDP_PORT:-9110}"
+BLOG="${BROWSEROS_LOG:-$HOME/.cache/aiw/browseros.log}"
+mcp_up() { (exec 3<>/dev/tcp/127.0.0.1/$MCP_PORT) 2>/dev/null; }
+cdp_up() { (exec 3<>/dev/tcp/127.0.0.1/$CDP_PORT) 2>/dev/null; }
 # running = both ports: its MCP server (browseros-claw-server) can outlive a closed/crashed window and keep 9210 open
 up() { mcp_up && cdp_up; }
-browser_running() { pgrep -af "browserclaw/browserclaw" 2>/dev/null | grep -v -e "--type=" -e crashpad | grep -q .; }
+browser_running() { pgrep -af "browserclaw" 2>/dev/null | grep -E '^[0-9]+ [^ ]*browserclaw( |$)' | grep -v -e "--type=" -e crashpad | grep -q .; }
 installed() { [ -x "$BIN" ] && dpkg -s browserclaw >/dev/null 2>&1; }
 
 display() {  # the desktop the agent drives: Xvnc :1 on the minimal/cloud images, :0 on setup-vm.sh's lightdm
@@ -76,11 +85,29 @@ start() {
   fi
   if ! browser_running; then
     pkill -f browseros-claw-server 2>/dev/null && sleep 1   # an orphaned MCP server would hold 9210
-    # detached: the caller (vm-agent shell) must not wait on the browser
-    ( as_user env DISPLAY="$(display)" setsid nohup "$BIN" $ARGS >/dev/null 2>&1 </dev/null & )
+    # a crashed window leaves Singleton* in the profile: a new start hands off to the dead one and exits at once
+    for d in "$HOME/.config/browser-claw" "$HOME/.config/browserclaw"; do rm -f "$d"/Singleton{Lock,Socket,Cookie} 2>/dev/null; done
+    mkdir -p "$(dirname "$BLOG")"
+    # detached: the caller (vm-agent shell) must not wait on the browser; its output goes to $BLOG for `diag`
+    ( as_user env DISPLAY="$(display)" setsid nohup "$BIN" $ARGS >>"$BLOG" 2>&1 </dev/null & )
   fi
   for _ in $(seq 1 "${BROWSEROS_START_WAIT:-60}"); do up && { echo "BrowserOS MCP is up on 127.0.0.1:9210"; return 0; }; sleep 1; done
-  echo "BrowserOS started but MCP port 9210 did not answer within ${BROWSEROS_START_WAIT:-60} s (is the desktop $(display) up?)"; return 1
+  echo "BrowserOS started but MCP port $MCP_PORT did not answer within ${BROWSEROS_START_WAIT:-60} s (is the desktop $(display) up?). Run: bash $0 diag"; return 1
+}
+
+diag() {  # v3.9.17: everything that decides whether 9210 comes up, read-only
+  echo "== display: DISPLAY=${DISPLAY:-(unset)} -> $(display); X sockets: $(ls /tmp/.X11-unix 2>/dev/null | tr '\n' ' ')"
+  DISPLAY="$(display)" xdpyinfo >/dev/null 2>&1 && echo "   X server $(display) answers" || echo "   X server $(display) NOT reachable (BrowserOS window cannot open)"
+  echo "== installed: $(installed && dpkg-query -W -f='${Version}' browserclaw || echo no)  arch: $(dpkg --print-architecture 2>/dev/null || uname -m)"
+  echo "== config $CONF: mcp=$MCP_PORT cdp=$CDP_PORT"
+  echo "== listening:"; (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep -E ":(${MCP_PORT}|${CDP_PORT}|9210|9110)\b" || echo "   nothing on $MCP_PORT/$CDP_PORT"
+  echo "== processes (main = no --type=):"
+  pgrep -af "browserclaw|browseros-claw-server" 2>/dev/null | grep -E '^[0-9]+ [^ ]*(browserclaw|browseros-claw-server)' | sed 's/^/   /' | cut -c1-200 | grep . || echo "   none"
+  browser_running && echo "   main browser process: yes" || echo "   main browser process: NO (only helpers/server left, or nothing)"
+  echo "== stale locks:"; ls -l "$HOME"/.config/browser-claw/Singleton* 2>/dev/null || echo "   none"
+  echo "== who runs this: $(id -un) (desktop owner: $(stat -c %U /tmp/.X11-unix/X1 2>/dev/null || stat -c %U /tmp/.X11-unix/X0 2>/dev/null || echo ?))"
+  echo "== last browser log lines ($BLOG):"; tail -n 20 "$BLOG" 2>/dev/null | sed 's/^/   /' || echo "   (no log yet)"
+  echo "== vm-agent env DISPLAY: $(grep '^DISPLAY=' "$HOME/.config/aiw/vm-agent.env" 2>/dev/null || echo '(not set: vm-agent falls back to the X socket it finds)')"
 }
 
 status_json() {
@@ -88,8 +115,8 @@ status_json() {
   installed && inst=true
   up && run=true
   $inst && ver=$(dpkg-query -W -f='${Version}' browserclaw 2>/dev/null)
-  printf '{"installed": %s, "running": %s, "version": "%s", "arch": "%s", "mcp_port": 9210, "cdp_port": 9110}\n' \
-    "$inst" "$run" "$ver" "$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  printf '{"installed": %s, "running": %s, "version": "%s", "arch": "%s", "mcp_port": %s, "cdp_port": %s}\n' \
+    "$inst" "$run" "$ver" "$(dpkg --print-architecture 2>/dev/null || uname -m)" "$MCP_PORT" "$CDP_PORT"
 }
 
 autostart() {
@@ -113,8 +140,9 @@ case "$CMD" in
   check) installed && up && { echo "ok"; exit 0; }; echo "not ready"; exit 1;;
   status) status_json; exit 0;;
   start) start; exit $?;;
+  diag) diag; exit 0;;
   install|upgrade) ;;
-  *) echo "usage: $0 [install|upgrade|check|status|start]"; exit 2;;
+  *) echo "usage: $0 [install|upgrade|check|status|start|diag]"; exit 2;;
 esac
 
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"

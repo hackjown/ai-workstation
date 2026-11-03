@@ -31,6 +31,10 @@ from . import image_brief as _ib
 from . import photopea as _pp
 from . import escalate as _es
 from . import vision_guard as _vg
+from . import redact as _rd
+from .breaker import Breaker
+from .findings import FindingsBoard
+from .progress_guard import ProgressGuard
 from llm_router import vision as _vis
 
 # Only an explicit "go on with the earlier drawing" resumes. The bare words matched far too much: run 3ac's prompt said
@@ -155,6 +159,14 @@ class AgentLoop:
         self.home: Optional[str] = None       # $HOME on this computer (set by the session manager): fixes guessed paths
         self.lesson_hint: Optional[Callable[..., Awaitable[Optional[str]]]] = None   # (error, tool, domain) -> note
         self._user_notes: list[str] = []      # 补充要求 the user sent while the task runs
+        # v3.9.17
+        self.findings = FindingsBoard()       # 已确认事实板, in the task text every turn (never compressed)
+        self.guard = ProgressGuard(task.prompt or "", self.findings, question=_is_question(task.prompt or ""))
+        if self._cad_task or self._designer_task or self._image_task or self._video_task:
+            self.guard.off = True   # drawing / image / video jobs have their own loop guards (drawing_hooks, hpd_guard)
+        self.breaker = Breaker()              # same tool + same error twice -> off for this task
+        self._guard_note: Optional[str] = None
+        self._ssh_scripts = 0                 # shell steps that opened their own SSH connection
 
     def inject(self, text: str) -> None:
         """An instruction the user added while the task runs (修改任务 / 补充要求): read at the next step."""
@@ -618,6 +630,9 @@ class AgentLoop:
                 note = ((note + "\n") if note else "") + (
                     "THE USER JUST ADDED TO THIS TASK (follow it from now on; it changes or extends the request, it is "
                     "not a new task):\n" + adds)
+            if self._guard_note:   # v3.9.17: deliver now / last collection / tool switched off
+                note = ((note + "\n") if note else "") + self._guard_note
+                self._guard_note = None
             self.step += 1
             blind = self._last_tool in _NO_SCREEN_TOOLS and self.step > 1
             # shell/file work (analyse a video, convert a file, write a script) needs no first look at the desktop:
@@ -816,6 +831,13 @@ class AgentLoop:
             await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args, llm_ms=llm_ms,
                             out_tokens=u.get("out_tokens") or u.get("completion_tokens"), attempts=u.get("attempts"),
                             reasoning=(getattr(decision, "reasoning", "") or "")[-4000:] or None)
+            gate = await self._progress_gate(decision)   # v3.9.17 速度与效率 / 卡住检测 / 工具熔断
+            if gate == "ended":
+                return
+            if gate == "skip":
+                note, failures = self._guard_note, 0
+                self._guard_note = None
+                continue
             sig = (decision.tool, repr(sorted(decision.args.items())))
             if decision.tool not in ("screenshot", "wait", "done", "fail"):
                 self._rep = self._rep + 1 if sig == self._prev_sig else 0
@@ -881,6 +903,13 @@ class AgentLoop:
             handled = await self._loop_tool(decision)
             if handled is not None:
                 self.history.append(f"{self.step}. {decision.tool}({_args_short(decision.args)}) -> {handled}")
+                if getattr(self, "_gate_pending", None):   # v3.9.17 人工关卡 in a remote/network tool's output
+                    self._gate_pending = None
+                    n = await self._escalate("blocked", decision.thought or "")
+                    if n is None:
+                        return
+                    note, failures = n, 0
+                    continue
                 _dh.post_tool(self, decision, not str(handled).startswith(("FAILED", "REFUSED", "CONFLICT")), str(handled))
                 await _dh.save_facts(self)
                 note = None
@@ -895,6 +924,7 @@ class AgentLoop:
             if fixed:
                 self.history.append(f"{self.step}. (path fixed: /home/user/workspace → {self.home}/workspace; "
                                     "write ~/workspace next time)")
+            t_tool, w_tool = time.monotonic(), self._waited
             for attempt in range(self.cfg.action_retries + 1):
                 outcome = await self.tools.run(decision.tool, self._fill_secrets(decision.tool, run_args), intent=decision.thought)
                 await self.emit(EventType.POLICY, level=int(outcome.decision.level), reason=outcome.decision.reason)
@@ -940,8 +970,18 @@ class AgentLoop:
                         "with a short Chinese summary.")
             if outcome.success and decision.tool not in ("screenshot", "done", "fail"):
                 self._acted = True
+            if self._secrets:   # v3.9.17: an output that echoes a vault value shows ***
+                outcome.result = _rd.mask_obj(outcome.result, self._secrets.values())
+                outcome.error = _rd.mask(outcome.error, self._secrets.values())
+            wait_ms = int((self._waited - w_tool) * 1000)
             await self.emit(EventType.ACTION_RESULT, tool=outcome.tool, success=outcome.success,
-                            error=outcome.error, result=_short(outcome.result))
+                            error=outcome.error, result=_short(outcome.result),
+                            tool_ms=max(0, int((time.monotonic() - t_tool) * 1000) - wait_ms), wait_ms=wait_ms,
+                            confirmed=bool(outcome.decision.needs_confirm))
+            bn = self.breaker.feed(decision.tool, run_args, outcome.success, str(outcome.error or ""))
+            if bn:
+                self._guard_note = ((self._guard_note + "\n") if self._guard_note else "") + bn
+                await self.emit(EventType.MESSAGE, text=f"工具熔断：{bn[:200]}", breaker=True)
             seen = ""
             if isinstance(outcome.result, dict):
                 seen = str(outcome.result.get("text") or outcome.result.get("stdout") or "")[:20000]
@@ -956,7 +996,10 @@ class AgentLoop:
             stall_note = _es.NUDGE if st == "nudge" else None
 
             if outcome.control == "done":
-                self._finish(TaskStatus.SUCCEEDED, decision.args.get("summary", "done"))
+                summ = str(decision.args.get("summary", "done"))
+                if self.guard.mode == "deliver" and self.guard.reason in ("budget", "soft_cap") and "深挖" not in summ:
+                    summ += self.guard.tail()
+                self._finish(TaskStatus.SUCCEEDED, summ)
                 return
             if outcome.control == "fail":   # the model may not give up on its own: the user decides
                 n = await self._escalate("fail", str(decision.args.get("reason") or decision.thought or ""))
@@ -1068,7 +1111,7 @@ class AgentLoop:
         return desc
 
     def _task_with_plan(self) -> str:
-        base = self.task_text + _dh.task_block(self)
+        base = self.task_text + _dh.task_block(self) + self.findings.block()
         if self._images_read:
             base += ("\n\nIMAGES ALREADY READ (do not read again; their content is in cad/plan.md or above): "
                      + ", ".join(self._images_read))
@@ -1082,6 +1125,8 @@ class AgentLoop:
         """update_plan / ask_user / remember / delegate / external tools. Returns a history
         note when handled here, None when the Tool Router should run it."""
         t, a = decision.tool, decision.args or {}
+        if t == "note_finding":   # v3.9.17 已确认事实板
+            return await self._note_finding(a)
         if t == "update_plan":
             for i in a.get("done") or []:
                 if isinstance(i, int) and 0 <= i < len(self.plan_steps):
@@ -1164,9 +1209,13 @@ class AgentLoop:
             _schema, fn = self.extra_tools[t]
             await self.emit(EventType.TOOL_CALL, tool=t, args=a)
             _need = getattr(fn, "needs_confirm", None)   # a tool may judge its own calls (remote_exec: by host + command)
-            if (_need(a) if callable(_need) else _RISKY_EXT.search(t)) and self.tools.confirm:
+            t_tool, w_tool = time.monotonic(), self._waited
+            need = _need(a) if callable(_need) else _RISKY_EXT.search(t)
+            if need and self.tools.confirm:
                 from tool_router import Decision, RiskLevel
-                ok = await self.tools.confirm(t, a, Decision(RiskLevel.L3, getattr(fn, "confirm_reason", None) or "external tool can act outside the VM"))
+                _sc = getattr(fn, "confirm_scope", None)   # v3.9.17: "once" = asked once per host per task
+                scope = _sc(a) if (need == "once" and callable(_sc)) else ""
+                ok = await self.tools.confirm(t, a, Decision(RiskLevel.L3, getattr(fn, "confirm_reason", None) or "external tool can act outside the VM", scope=scope))
                 if not ok:
                     await self.emit(EventType.ACTION_RESULT, tool=t, success=False, error="user declined", result={})
                     return "user declined this external action; choose another approach or ask_user"
@@ -1176,10 +1225,130 @@ class AgentLoop:
             except Exception as e:  # noqa: BLE001
                 res, ok, err = {}, False, f"{type(e).__name__}: {e}"
             self._acted = self._acted or ok
-            await self.emit(EventType.ACTION_RESULT, tool=t, success=ok, error=err, result=_short(res if isinstance(res, dict) else {"result": res}))
-            text = str(res)[:int(getattr(fn, "max_result", 600))] if ok else f"FAILED ({err})"
+            if self._secrets:
+                res, err = _rd.mask_obj(res, self._secrets.values()), _rd.mask(err, self._secrets.values())
+            wait_ms = int((self._waited - w_tool) * 1000)
+            await self.emit(EventType.ACTION_RESULT, tool=t, success=ok, error=err, result=_short(res if isinstance(res, dict) else {"result": res}),
+                            tool_ms=max(0, int((time.monotonic() - t_tool) * 1000) - wait_ms), wait_ms=wait_ms, confirmed=bool(need))
+            text = _ext_text(res)[:int(getattr(fn, "max_result", 600))] if ok else f"FAILED ({err})"
+            bn = self.breaker.feed(t, a, ok, str(err or ""))
+            if bn:
+                self._guard_note = ((self._guard_note + "\n") if self._guard_note else "") + bn
+            word, _k = _es.human_gate(text)
+            if word and getattr(self, "_stall", None) is not None and word.lower() not in self._stall.handled:
+                self._stall.blocked, self._stall.blocked_looks = word, _es.BLOCKED_LOOKS
+                self._gate_pending = word
             return text
         return None
+
+    # ------------------------------------------------- v3.9.17 速度与效率
+    async def _progress_gate(self, decision) -> str:
+        """'ok' (go on, maybe with the decision rewritten to done), 'skip' (not run; self._guard_note says why) or
+        'ended' (the task finished while asking the user)."""
+        from tool_router import remote as _rm
+        t, a = decision.tool, decision.args or {}
+        if t == "shell":
+            cmd = str(a.get("command") or "")
+            if _rm.is_remote(cmd):
+                self._ssh_scripts += 1
+                if "ssh_exec" in self.extra_tools and os.environ.get("AIW_FORCE_SSH_EXEC", "1") != "0":
+                    self.history.append(f"{self.step}. shell REFUSED: it opens its own SSH connection; use ssh_exec")
+                    await self.emit(EventType.VALIDATION, success=False, change=0.0, message="改用 ssh_exec：不再每步重写连接脚本")
+                    self._guard_note = (
+                        "REFUSED: do not ssh / sshpass / write a paramiko script from the shell. Call ssh_exec with host "
+                        "and ALL the commands you need as `commands` (one call, one reused connection; the password comes "
+                        "from the vault; `container` runs them via docker exec; default 60 s per command).")
+                    return "skip"
+                if self._ssh_scripts >= 2:
+                    self._guard_note = ("You are opening a new SSH connection again. Batch every remaining remote command "
+                                        "into this ONE run; do not write another connect script after it.")
+        msg = self.breaker.blocked(t, a)
+        if msg:
+            self.history.append(f"{self.step}. {t} {msg}")
+            await self.emit(EventType.VALIDATION, success=False, change=0.0, message="工具已熔断：" + msg[:160])
+            self._guard_note = msg
+            return "skip"
+        t0 = getattr(self, "_t0", None)
+        elapsed = max(0.0, time.monotonic() - t0 - self._waited) if t0 else 0.0
+        n0 = len(self.findings.items)
+        verdict, gnote = self.guard.decide(self.step, decision.thought or "", t, a, elapsed, self._progress_at)
+        await self._emit_findings(n0)
+        if verdict == "deliver_now":
+            self._guard_note = gnote
+            await self.emit(EventType.VALIDATION, success=True, change=0.0,
+                            message={"sufficient": "已查清：下一步直接交付报告", "budget": "诊断已到时间/步数预算：先交一版结论",
+                                     "soft_cap": "诊断步数到上限：先交一版结论"}.get(self.guard.reason, "先交付"))
+        elif verdict == "extra":
+            self._guard_note = gnote
+            await self.emit(EventType.VALIDATION, success=True, change=0.0, message="允许最后补一次数据（已说明缺什么）")
+        elif verdict == "force_done":
+            report = await self._write_report()
+            await self.emit(EventType.VALIDATION, success=True, change=0.0, message="不再补数据：按已确认事实直接交付报告")
+            self.history.append(f"{self.step}. {t} NOT RUN: the answer was already known; delivered the report instead")
+            decision.tool, decision.args = "done", {"summary": report}
+        elif verdict == "ask":
+            n = await self._escalate("stuck_fact", self.guard.ask_text(gnote))
+            if n is None:
+                return "ended"
+            self.guard.reset_after_ask(self.step)
+            self._guard_note = n
+            return "skip"
+        return "ok"
+
+    async def _emit_findings(self, n0: int) -> None:
+        for f in self.findings.items[n0:]:
+            self._mark_progress()
+            await self.emit(EventType.FINDING, finding=dict(f), board=self.findings.to_list()[-40:])
+
+    async def _note_finding(self, a: dict) -> str:
+        facts = a.get("facts") if isinstance(a.get("facts"), list) else []
+        if a.get("fact"):
+            facts = [a.get("fact")] + facts
+        if not facts:
+            await self.emit(EventType.ACTION_RESULT, tool="note_finding", success=False, error="missing fact", result={})
+            return "FAILED: give fact (or facts)"
+        n0, out = len(self.findings.items), []
+        for i, f in enumerate(facts[:12]):
+            st, e = self.findings.add(str(f), self.step, "model", a.get("replaces") if i == 0 else None,
+                                      str(a.get("evidence") or ""))
+            if st == "added" or st == "replaced":
+                self.guard.on_fact(self.step)
+            if st == "refused":
+                out.append(f"REFUSED: overturning {a.get('replaces')} needs `evidence` (the data that disproves it); "
+                           "the old finding stays")
+            else:
+                out.append(f"{st} {e['id'] if e else ''}".strip())
+        await self._emit_findings(n0)
+        await self.emit(EventType.ACTION_RESULT, tool="note_finding", success=not any(o.startswith("REFUSED") for o in out),
+                        error=None, result={"status": out})
+        return "; ".join(out)
+
+    async def _write_report(self) -> str:
+        """The report a model that would not stop collecting did not write: from the findings board (one short model
+        call without tools, AIW_REPORT_TIMEOUT s; the board itself when that fails)."""
+        base = self.guard.synth_report()
+        if not self.findings.live():
+            steps = _es.recent_done(self.history, 8)
+            if steps:
+                base = base.replace("（事实板为空）", "最近的步骤：\n" + "\n".join("· " + x for x in steps))
+        if os.environ.get("AIW_REPORT_LLM", "1") == "0":
+            return base
+        try:
+            facts = self.findings.report() or "（无）"
+            facts += "\n\n最近的步骤和输出（节选）：\n" + "\n".join(_clip(h, 1500) for h in self.history[-8:])
+            txt = await asyncio.wait_for(self.llm.complete(
+                "你是运维诊断助手。只根据给出的已确认事实写一份简短的中文诊断报告：结论（主因按影响排序）、关键数据、"
+                "建议怎么处理（可直接执行的命令）、还可以深挖的方向。不要编造事实里没有的数据。",
+                f"用户的问题：{(self.task.prompt or '')[:600]}\n\n已确认事实：\n{facts}\n\n模型最后的判断：{self.guard.last_thought[:800]}",
+                1200), float(os.environ.get("AIW_REPORT_TIMEOUT", "60")))
+            txt = str(txt or "").strip()
+            if len(txt) > 40:
+                return txt + self.guard.tail()
+        except (StopRequested, asyncio.CancelledError):
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+        return base
 
     async def _lesson_for(self, tool: str, outcome) -> Optional[str]:
         """3.8.5: a lesson from earlier tasks that matches this error (by error text, tool, site, computer)."""
@@ -1307,6 +1476,11 @@ class AgentLoop:
             if hit:
                 out["secret"] = True
             return out
+        if tool == "shell" and self._secrets and "{{" in str(args.get("command") or ""):   # v3.9.17: vault values
+            cmd = str(args["command"])
+            for k, v in self._secrets.items():
+                cmd = cmd.replace("{{" + k + "}}", v)
+            return {**args, "command": cmd}
         if tool != "type" or not self._secrets or "{{" not in str(args.get("text") or ""):
             return args
         text = str(args["text"])
@@ -1359,7 +1533,7 @@ class AgentLoop:
         if blocked:
             act = "slider" if re.search(r"滑块|拖动|slide", blocked, re.I) else "captcha"
             r = await self._request_takeover({"action": act, "url": page.get("url") or "",
-                                              "what_to_do": f"在页面上完成「{blocked}」（滑块/图形验证码等），完成后点「完成，交还给 Aiw」",
+                                              "what_to_do": f"页面/接口返回了「{blocked}」：" + _es.gate_todo(blocked),
                                               "reason": f"页面出现「{blocked}」，需要真人完成验证"},
                                              f"页面出现「{blocked}」验证，Aiw 过不去，需要你来完成")
             self.history.append(f"{self.step}. request_takeover(auto: {blocked}) -> {r}")
@@ -2415,6 +2589,8 @@ class AgentLoop:
             hide.append("dispatch")
         if not self.bos_enabled:
             hide.extend(BOS_TOOLS)
+        if getattr(self, "breaker", None) is not None:
+            hide.extend(self.breaker.hidden())   # v3.9.17 工具熔断
         return tuple(hide)
 
     async def _dispatch(self, a: dict) -> str:
@@ -2506,6 +2682,25 @@ import re as _re
 _RISKY_EXT = _re.compile(r"(send|delete|remove|pay|purchase|order|post|publish|transfer|create|update|write|cancel|deploy)", _re.I)
 
 
+def _ext_text(res) -> str:
+    """An external tool's result as the model reads it (ssh_exec: one section per command)."""
+    if isinstance(res, str):
+        return res
+    if isinstance(res, dict) and ("results" in res or "stdout" in res):
+        items = res.get("results") or [res]
+        parts = []
+        if res.get("host"):
+            parts.append(f"[{res.get('user') or ''}@{res['host']}{'，复用连接' if res.get('reused') else ''}]")
+        for i, r in enumerate(items, 1):
+            head = f"=== [{i}] {r.get('command') or ''} (exit {r.get('exit_code')}{'，超时：以下是已有输出' if r.get('timed_out') else ''}) ==="
+            body = (r.get("stdout") or "").rstrip()
+            if r.get("stderr"):
+                body += ("\n" if body else "") + "[stderr] " + str(r["stderr"]).rstrip()
+            parts.append(head + "\n" + (body or "（无输出）"))
+        return "\n".join(parts)
+    return str(res)
+
+
 def _args_short(a: dict) -> dict:
     return {k: (v[:80] if isinstance(v, str) else v) for k, v in (a or {}).items()}
 
@@ -2542,6 +2737,8 @@ def _hist_line(step, decision, outcome, vmsg) -> str:
     elif outcome.action == "files.list" and outcome.success and isinstance(outcome.result, dict):
         ents = outcome.result.get("entries") or []
         res = " entries=" + ", ".join((e.get("name", "") + ("/" if e.get("dir") else "")) for e in ents[:60])
+    elif outcome.action == "browser.network" and isinstance(outcome.result, dict):   # v3.9.17
+        res = " result:\n" + _clip(outcome.result.get("text") or "", int(os.environ.get("AIW_NET_HIST_CHARS", "9000")))
     elif outcome.action == "browseros.call" and isinstance(outcome.result, dict):
         el = outcome.result.get("element")
         res = (f" on [{el}]" if el else "") + (
@@ -2623,7 +2820,8 @@ def _gui_text(prompt: str) -> str:
     return _GIT_URL.sub(" ", p)
 
 
-_NON_GUI_TOOLS = {"ask_user", "update_plan", "remember", "done", "fail", "wait", "request_takeover"}
+_NON_GUI_TOOLS = {"ask_user", "update_plan", "remember", "done", "fail", "wait", "request_takeover",
+                  "note_finding", "ssh_exec", "remote_exec", "session_search", "deploy_server", "browser_network"}
 
 
 _VIDEO_TASK = re.compile(r"视频|讲解片|宣传片|发布片|动画片|动效|huashu-motion|\bvideo\b|\.mp4\b|explainer", re.I)
@@ -2695,7 +2893,9 @@ def _ws_rel(p: str) -> str:
 _GUESSED_HOME = re.compile(r"(/home/(?:user|aiw|ubuntu|debian)/)workspace(?=/|\b)")
 _NO_SCREEN_TOOLS = {"read_image", "image_edit", "generate_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
                     # 3.8.9 (task-3fc): file-only drawing steps; a desktop look + vision description cost 12-15 s each
-                    "drawing_auto", "drawing_build", "drawing_note", "drawing_read"}
+                    "drawing_auto", "drawing_build", "drawing_note", "drawing_read",
+                    # v3.9.17: facts, remote commands and the request log never change the screen
+                    "note_finding", "ssh_exec", "remote_exec", "browser_network", "session_search"}
 _OCR_RE = re.compile(r"\b(tesseract|rapidocr|paddleocr|easyocr)\b", re.I)
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "dispatch", "open_app"}
 

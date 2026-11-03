@@ -52,6 +52,7 @@ class Router:
             A.BROWSER_FORWARD: lambda p: self.browser.forward(),
             A.BROWSER_CLICK: lambda p: self.browser.click(p["text"]),
             A.BROWSER_FILL: lambda p: self.browser.fill(p["field"], p["text"], bool(p.get("submit"))),
+            A.BROWSER_NETWORK: self._network,
             A.BROWSEROS_CALL: self._bos_call,
             A.BROWSEROS_STATUS: self._bos_status,
             A.FILES_LIST: lambda p: _sync(fread.list_dir, p["path"]),
@@ -69,6 +70,12 @@ class Router:
         kw = {"front": bool(p["front"])} if p.get("front") is not None else {}   # False: a lookup, keep the screen
         return await self.bos.call(p.get("key") or "default", p["tool"], p.get("args") or {}, p.get("title"), p.get("category"),
                                    **kw)
+
+    async def _network(self, p):   # v3.9.17 browser_network
+        from ..browser import network
+        return await network.capture(p.get("url") or "", p.get("page_match") or "", bool(p.get("reload")),
+                                     float(p.get("seconds") or 6), p.get("match") or "", int(p.get("limit") or 60),
+                                     p.get("port"))
 
     async def _bos_status(self, p):
         st = bos_status()
@@ -94,7 +101,7 @@ class Router:
         if err:
             return CommandResult(id=cmd.id, success=False, error=err)
         handler = self.handlers[cmd.type]
-        gui = cmd.type.startswith("computer.") or cmd.type.startswith("browser.")
+        gui = (cmd.type.startswith("computer.") or cmd.type.startswith("browser.")) and cmd.type != A.BROWSER_NETWORK.value
         try:
             if gui and cmd.type not in (A.SCREENSHOT.value, A.CURSOR.value, A.SCREEN_SIZE.value):
                 async with self._input_lock:

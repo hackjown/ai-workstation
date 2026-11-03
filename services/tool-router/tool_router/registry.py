@@ -226,6 +226,23 @@ TOOLS: list[ToolSpec] = [
               "code": {"type": "string"},
               "scale": {"type": "integer", "description": "1:scale, default 50 (details 1:10 or 1:20)"},
               "open": {"type": "boolean"}, "deliver": {"type": "boolean"}}, ["name", "code"]),
+    ToolSpec("note_finding", None,
+             "已确认事实板: record a conclusion this step established (one short sentence with its key number), e.g. "
+             "'clipboard-online 容器内 uvicorn(PID 2850) 留下约 5700 个僵尸进程'. Recorded facts are shown to you every "
+             "turn and are never lost when the history is trimmed, so do not collect them again. To overturn an earlier "
+             "fact pass replaces=<its id, e.g. F2> AND evidence (the data that disproves it). When the facts answer the "
+             "user's question, deliver (done with the report) instead of collecting more.",
+             {"fact": {"type": "string"}, "facts": {"type": "array", "items": {"type": "string"}},
+              "replaces": {"type": "string"}, "evidence": {"type": "string"}}),
+    ToolSpec("browser_network", "browser.network",
+             "Read the requests a browser page makes (Chrome DevTools Network): method, URL, status, type, request "
+             "headers, cookie NAMES (never values; secret headers masked), set-cookie names, timing. Use this to compare "
+             "two sites / see which API a page calls / why a request fails, instead of screenshots. Picks the tab whose "
+             "URL contains `page_match` (default: the visible tab); reload=true reloads it first, or url= opens that URL "
+             "in it; listens `seconds` (default 6); `match` filters URLs (substring or /regex/).",
+             {"url": {"type": "string"}, "page_match": {"type": "string"}, "reload": {"type": "boolean"},
+              "seconds": {"type": "number"}, "match": {"type": "string"}, "limit": {"type": "integer"},
+              "port": {"type": "integer", "description": "DevTools port, default 9222 (AIW Chrome) then 9110 (BrowserOS)"}}),
     ToolSpec("update_plan", None, "Mark plan steps finished (0-based indexes) and optionally add a short progress note.",
              {"done": {"type": "array", "items": {"type": "integer"}}, "note": {"type": "string"}}, ["done"]),
     ToolSpec("ask_user", None, "Ask the user a question when required information is missing (login choice, which file, "
@@ -341,7 +358,7 @@ BY_NAME = {t.name: t for t in TOOLS}
 BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
-LOOP_TOOLS = {"done", "fail", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
+LOOP_TOOLS = {"done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

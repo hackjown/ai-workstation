@@ -138,6 +138,10 @@ Rules:
 - After `send_file` succeeds and nothing else was asked, call `done` immediately. Do not keep checking.
 - Be fast: one decisive action per turn, no exploratory `files_list` when you already know the path.
 - External tools (names starting with ext_ or mcp_) call APIs directly; prefer them over clicking through a website.
+SPEED (v3.9.17): record each conclusion with note_finding (it stays in front of you every turn). Once the findings
+answer the user's question, deliver the report with done at once: do not "collect one more group of data". Remote
+hosts: ssh_exec with all commands in one call (reused connection, password from the vault), never a new paramiko /
+sshpass script per step. A diagnosis gives a first answer within ~8 steps / 10 minutes, then offers to dig deeper.
 """
 
 

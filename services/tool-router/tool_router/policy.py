@@ -13,6 +13,7 @@ from typing import Callable, Optional
 from urllib.parse import urlparse
 
 from . import explain as _ex
+from . import remote as _rm
 
 
 class RiskLevel(IntEnum):
@@ -27,6 +28,7 @@ class RiskLevel(IntEnum):
 class Decision:
     level: RiskLevel
     reason: str
+    scope: str = ""   # v3.9.17: same scope approved once in a task = approved for the rest of it (remote_diag:<host>)
 
     @property
     def allowed(self) -> bool:
@@ -69,6 +71,12 @@ SHELL_L2 = [
 # explain.py, like deletes outside the workspace, uploads, git push. AIW_AUTO_INSTALL=1 keeps pip/npm installs (not
 # apt/sudo) automatic for setups that relied on that.
 SENSITIVE_PATH = re.compile(r"(\.ssh/|id_rsa|\.env\b|\.aws/|credentials|\.pem$|\.key$|/etc/shadow|password)", re.I)
+# v3.9.17: in a shell command only a real file path counts. `password=PWD` in a paramiko script, `{{task_cred_1}}`
+# or the word "password" in a heredoc is not a sensitive file (task-833: 8 cards for read-only checks).
+SENSITIVE_FILE = re.compile(
+    r"(?:^|[\s'\"=:(<>])(?:~|\$HOME|/|\.{1,2}/)?[\w./-]*(?:\.ssh/[\w.-]*|id_(?:rsa|ed25519|ecdsa)\b|\.aws/[\w.-]*|/etc/shadow\b|"
+    r"(?<![\w])\.env\b(?![\w(])|[\w-]*credentials(?:\.json|\.ya?ml|\.txt)?(?=$|[\s'\";|])|[\w-]+\.pem\b|[\w-]+\.key\b|"
+    r"[\w-]*passwords?\.(?:txt|json|csv|ya?ml|kdbx|db)\b)", re.I)
 PAY_WORDS = re.compile(r"(checkout|payment|pay now|place order|立即支付|确认付款|下单|支付)", re.I)
 
 
@@ -144,11 +152,21 @@ class PolicyEngine:
                 return Decision(RiskLevel.L4, f"shell: {why}")
         if scratch_delete(cmd) or self._own_delete(cmd):  # strip the scratch deletes, judge the rest as usual
             cmd = _RMRF.sub("true", cmd)
+        remote = _rm.is_remote(cmd) and os.environ.get("AIW_REMOTE_DEDUPE", "1") != "0"
         for pat, why in SHELL_L3:
+            if remote and why == "remote login":
+                continue
             if re.search(pat, cmd):
                 return Decision(RiskLevel.L3, f"shell: {why}")
-        if SENSITIVE_PATH.search(cmd):
+        if SENSITIVE_FILE.search(cmd):
             return Decision(RiskLevel.L3, "shell touches sensitive file")
+        if remote:   # v3.9.17: judged by what it runs on the other host
+            j = _rm.judge(cmd)
+            if j == "read":
+                return Decision(RiskLevel.L2, "shell: remote read-only diagnosis")
+            if j == "write":
+                return Decision(RiskLevel.L3, "shell: remote change")
+            return Decision(RiskLevel.L3, "shell: remote login", scope=_rm.scope_for(cmd))
         try:
             e = _ex.explain_shell(full, self.created)
         except Exception:  # noqa: BLE001
@@ -196,9 +214,11 @@ class PolicyEngine:
         return Decision(RiskLevel.L0 if action in ("files.list", "files.read") else RiskLevel.L1, "workspace file op")
 
     def _net(self, action, p):
-        if action not in ("browser.open", "browser.navigate", "files.download"):
+        if action not in ("browser.open", "browser.navigate", "files.download", "browser.network"):
             return None
         url = p.get("url")
+        if action == "browser.network" and not url:
+            return Decision(RiskLevel.L0, "read page requests")
         if not url:
             return Decision(RiskLevel.L0, "open browser")
         host = (urlparse(url if "://" in url else f"https://{url}").hostname or "").lower()

@@ -94,7 +94,7 @@ class ToolExecutor:
 
         if spec.action in SETTLE:
             payload.setdefault("settle", SETTLE[spec.action] * float(os.environ.get("AIW_SETTLE_SCALE", "1")))
-        observe = spec.action not in ("computer.screenshot", "shell.exec") and not spec.action.startswith("files.")
+        observe = spec.action not in ("computer.screenshot", "shell.exec", "browser.network") and not spec.action.startswith("files.")
         t_out = float(args.get("timeout") or _default_timeout(spec.action, payload))
         if spec.action == "shell.exec":
             # the VM kills the command at payload["timeout"] (60 s when absent): pip got 300 s here but died at 60 s,
@@ -197,6 +197,8 @@ def _default_timeout(action: str, args: dict) -> float:
         # not arrive within 30 s (task-a0e), three tries failed and the jammed socket timed out the next shell too.
         import os
         return float(os.environ.get("AIW_SEND_FILE_TIMEOUT", "300"))
+    if action == "browser.network":   # v3.9.17: it listens `seconds` (max 60) before answering
+        return min(60.0, float(args.get("seconds") or 6)) + 20
     if action != "shell.exec":
         return 30
     cmd = str(args.get("command", ""))

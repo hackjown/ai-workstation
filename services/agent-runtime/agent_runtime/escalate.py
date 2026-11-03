@@ -49,7 +49,47 @@ def checkin_steps() -> int:
 BLOCKED = re.compile(
     r"刷新验证码|验证码|人机|滑块|拖动.{0,6}(滑块|完成|拼图)|安全验证|身份验证|风控|风险提示|操作频繁|访问频繁|请求频繁|账号异常|"
     r"扫码登录|短信验证|captcha|recaptcha|hcaptcha|turnstile|cloudflare|verify (you are|that you are) human|"
-    r"human check|are you a robot|rate.?limit|too many requests|risk control|slide to verify|security check", re.I)
+    r"human check|are you a robot|rate.?limit|too many requests|risk control|slide to verify|security check|"
+    r"重新登录|请先登录|登录已过期|登录失效|会话已过期|punish|baxia|RGV587|FAIL_SYS_USER_VALIDATE|x5sec|_____tmd_____", re.I)
+
+# v3.9.17 人工关卡: tokens only a risk-control / login wall sends (Alibaba baxia/punish, x5sec, mtop error codes). Seen
+# anywhere - a page, a shell/curl/ssh output, browser_network - they stop the task at once (no 2 looks first) and the
+# user is told exactly what to do. A line that looks like source code (const/import/def/#, a grep hit "file:line:")
+# is not a wall: the uniapi qwen-bx.ts work had "baxia" all over its files.
+STRONG = re.compile(r"RGV587(_ERROR)?|FAIL_SYS_USER_VALIDATE|FAIL_SYS_SESSION_EXPIRED|FAIL_SYS_TOKEN_EX\w*|_____tmd_____|"
+                    r"x5secdata|x5sec=|/punish\?|punish\.(htm|html)|baxia-?punish|nocaptcha|\bbx-?(punish|captcha)\b|"
+                    r"滑块验证|拖动滑块|请拖动|重新登录|登录已过期|登录失效|请先登录|session expired|please log ?in again", re.I)
+_CODE_LINE = re.compile(r"^\s*(const|let|var|import|from|def|class|function|export|#|//|\*|/\*)|^[\w./-]+:\d+:|"
+                        r"\bre\.compile\(|new RegExp|=>|\breturn\b|\bif\s*\(")
+GATE_TODO = {
+    "slider": "在电脑桌面的浏览器里拖动滑块（或完成图形验证），页面恢复正常后点「完成，交还给 Aiw」",
+    "login": "在电脑桌面的浏览器里重新登录这个网站（扫码或输入账号密码），登录好后点「完成，交还给 Aiw」",
+    "risk": "这个网站的风控（baxia/x5sec/RGV587）拦住了自动访问：请在桌面浏览器里打开该页面，按提示完成验证（滑块/验证码/重新登录），完成后点「完成，交还给 Aiw」；若一直弹，可能是 IP 被风控，需要换网络或稍后再试",
+    "captcha": "在页面上完成验证码，完成后点「完成，交还给 Aiw」",
+}
+
+
+def human_gate(text: str) -> tuple[str, str]:
+    """('', '') or (the wall's word, kind) for a strong risk-control / re-login token outside source code."""
+    for line in str(text or "").splitlines()[:4000]:
+        m = STRONG.search(line)
+        if not m or _CODE_LINE.search(line):
+            continue
+        w = m.group(0)
+        if re.search(r"滑块|拖动|nocaptcha", w, re.I):
+            return w, "slider"
+        if re.search(r"登录|log ?in|SESSION_EXPIRED|TOKEN_EX", w, re.I):
+            return w, "login"
+        return w, "risk"
+    return "", ""
+
+
+def gate_todo(word: str) -> str:
+    w = word or ""
+    kind = "slider" if re.search(r"滑块|拖动|slide|nocaptcha", w, re.I) else \
+        "login" if re.search(r"登录|log ?in|SESSION_EXPIRED|TOKEN", w, re.I) else \
+        "risk" if STRONG.search(w) or re.search(r"punish|baxia|风控", w, re.I) else "captcha"
+    return GATE_TODO[kind]
 
 # a step that only looks: it cannot get a stuck page any further
 LOOK_TOOLS = {"screenshot", "bos_snapshot", "bos_read", "bos_grep", "bos_diff", "bos_wait", "wait", "files_list",
@@ -73,6 +113,7 @@ KIND_TEXT = {
     "vision_down": "读图服务（视觉模型）不可用",
     "drawing_loop": "模型反复分析同一件事，没有动手写 spec、生成图纸",
     "drawing_verify": "图纸 spec 已生成，但核对没通过、模型在原地打转",
+    "stuck_fact": "同一个结论反复出现 / 很久没有新事实，先给你汇报",
 }
 
 OPT_RETRY, OPT_TAKEOVER, OPT_STOP = "继续，换个方法再试", "我来接管桌面", "停止任务"
@@ -140,6 +181,12 @@ class Stall:
             self.handled = set()
         on_page = page_tool(tool)
         hint = blocked_hint(result_text) if (result_text and on_page) else ""
+        strong, _kind = human_gate(result_text) if result_text else ("", "")
+        if strong and on_page and _kind == "slider":
+            strong = ""   # on a page a slider wording keeps the two-look rule below (a page can name one in passing)
+        if strong and strong.lower() not in self.handled:   # v3.9.17: a risk-control token stops at once
+            self.blocked, self.blocked_looks = strong, BLOCKED_LOOKS
+            return "blocked"
         if hint and hint.lower() in self.handled:
             hint = ""
         if hint:

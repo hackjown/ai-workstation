@@ -250,7 +250,7 @@ function renderTask(t) {
     if (e.type === "agent.plan") plan = { steps: d.plan || [], done: d.done || [] };
     if (e.type === "agent.plan_update" && plan) plan = { ...plan, done: d.done || [] };
     if (e.type === "agent.decision") cur = { tool: d.tool, args: d.args, thought: d.thought, why: d.reasoning, ok: null, ms: d.llm_ms, tok: d.out_tokens, tries: d.attempts };
-    if (e.type === "agent.action_result" && cur && cur.tool === d.tool) { cur.ok = d.success; cur.err = d.error; if (cur.tool !== "screenshot") steps.push(cur); cur = null; }
+    if (e.type === "agent.action_result" && cur && cur.tool === d.tool) { cur.ok = d.success; cur.err = d.error; cur.tms = d.tool_ms; cur.wms = d.wait_ms; if (cur.tool !== "screenshot") steps.push(cur); cur = null; }
     if (e.type === "agent.subagent" && d.phase === "step") steps.push({ tool: d.tool, args: d.args, sub: true, ok: true });
     if (e.type === "agent.file") files.push(d);
     if (e.type === "agent.message") steps.push({ tool: "message", thought: d.text, ok: true });
@@ -282,7 +282,7 @@ function renderTask(t) {
   html += renderKids(t, evs);
   if (steps.length) {
     html += `<details class="steps" ${liveNow ? "open" : ""}><summary>${icon("chev", "chev")}${steps.length} 个操作</summary><div class="steplist">${steps.slice(-40).map((s) =>
-      `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${s.ms ? `<em class="ms">${(s.ms / 1000).toFixed(1)}s${s.tok ? ` · ${s.tok} tok` : ""}${s.tries > 1 ? ` · 重试${s.tries - 1}` : ""}</em>` : ""}</span></div>`
+      `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${(s.ms || s.tms || s.wms) ? `<em class="ms" title="思考 = 模型耗时，工具 = 执行耗时，等确认 = 等你点允许">${stepTimes(s)}${s.tok ? ` · ${s.tok} tok` : ""}${s.tries > 1 ? ` · 重试${s.tries - 1}` : ""}</em>` : ""}</span></div>`
       // the step's thought shows inline; only the long reasoning stays folded
       + (s.thought && s.tool !== "message" && s.tool !== "vision" ? `<p class="thinl">${esc(s.thought)}</p>` : "")
       + (s.why ? `<details class="why"><summary>${icon("chev", "chev")}思考过程</summary><pre>${esc(s.why)}</pre></details>` : "")).join("")}</div></details>`;
@@ -1130,3 +1130,13 @@ go("chat"); loadThreads(); refreshThread(true); loadDraft(); loadMachines().then
 setInterval(refreshMachine, 10000);
 setInterval(() => { if (busyTask && S.view === "chat") renderChat(); }, 5000);
 if (NATIVE) { document.body.classList.add("native"); NATIVE.postMessage({ op: "ready" }); }
+
+/* v3.9.17: per-step time split, so a slow task shows where the time went (model / tool / waiting for a confirm) */
+function fmtDur(ms) { ms = +ms || 0; return ms >= 60000 ? `${Math.floor(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s` : `${(ms / 1000).toFixed(1)}s`; }
+function stepTimes(s) {
+  const p = [];
+  if (s.ms) p.push(`思考 ${fmtDur(s.ms)}`);
+  if (s.tms != null && s.tms > 0) p.push(`工具 ${fmtDur(s.tms)}`);
+  if (s.wms) p.push(`等确认 ${fmtDur(s.wms)}`);
+  return p.join(" · ");
+}

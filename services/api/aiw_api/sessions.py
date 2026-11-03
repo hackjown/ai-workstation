@@ -27,6 +27,7 @@ from typing import Optional
 
 from agent_runtime import AgentControl, AgentLoop, LoopConfig
 from agent_runtime import escalate as _es
+from agent_runtime import redact as _rd
 from aiw_protocols import AgentEvent, EventType, Task, TaskStatus
 from computer_runtime import Computer, LinuxComputerProvider
 from llm_router import LLMRouter
@@ -59,6 +60,8 @@ class LiveSession:
     allow_task: bool = False            # the user said 本任务内都允许 (never covers payments or posts)
     last_thought: str = ""              # the agent's stated reason for the step being confirmed (为什么)
     pending_notes: list = field(default_factory=list)   # 补充要求 sent before the loop existed (3.8.5)
+    allowed_scopes: set = field(default_factory=set)    # v3.9.17: "remote_diag:<host>" the user allowed once
+    secret_values: list = field(default_factory=list)   # v3.9.17: this task's vault values, masked in every event
 
 
 class SessionManager:
@@ -259,6 +262,7 @@ class SessionManager:
         max_steps, timeout_s = _budget(prompt, max_steps, timeout_s)
         task = Task(prompt=prompt, machine_id=machine_id, max_steps=max_steps, timeout_s=timeout_s,
                     thread_id=thread_id, source=source)
+        task.prompt = self.protect(task.id, task.prompt)   # v3.9.17: passwords to the vault, *** in the prompt
         row = task.model_dump()
         row["status"] = "queued"
         if continues and self.store.task(continues):
@@ -493,6 +497,15 @@ class SessionManager:
             raise ValueError("empty instruction")
         if not (live and live.runner and not live.runner.done()):
             return await self.continue_task(task_id, text)
+        text = self.protect(task_id, text)
+        if live:
+            live.secret_values = self.task_secret_values(task_id)
+            lp = getattr(live, "loop", None)
+            if lp is not None and hasattr(lp, "_secrets"):
+                for c in self.task_creds(task_id):
+                    v = self.secrets.get(c["key"]) if self.secrets else None
+                    if v:
+                        lp._secrets.setdefault(c["key"], v)
         if live.question and not live.question.done():
             live.question.set_result(text)
             return {"answered": True, "task_id": task_id}
@@ -505,6 +518,78 @@ class SessionManager:
         self.store.add_event(ev.model_dump(mode="json"))
         await self._broadcast(live, {"kind": "event", "task_id": task_id, "thread_id": live.task.thread_id, **ev.model_dump(mode="json")})
         return {"instructed": True, "task_id": task_id}
+
+    # ------------------------------------------------------------------ v3.9.17 密码保护
+    def protect(self, task_id: str, text: str) -> str:
+        """Passwords the user wrote go to the vault (secret task_cred_<task>_<n>), the text keeps ***."""
+        clean, creds = _rd.extract(text or "")
+        if not creds or not self.secrets:
+            return clean if creds else (text or "")
+        meta = list(self.store.kv_get(f"task_creds:{task_id}") or [])
+        for c in creds:
+            key = f"task_cred_{task_id}_{len(meta) + 1}"
+            try:
+                self.secrets.put(key, c["value"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("vault: %s", e)
+                continue
+            meta.append({"key": key, "host": c.get("host") or "", "user": c.get("user") or "", "kind": c.get("kind")})
+        self.store.kv_set(f"task_creds:{task_id}", meta)
+        return clean
+
+    def redact_stored(self, force: bool = False) -> int:
+        """v3.9.17: passwords already sitting in the database (task prompts, their events and actions, chat messages)
+        move to the vault and become ***. Runs once (kv redact_v3917); returns how many tasks it cleaned."""
+        if not force and self.store.kv_get("redact_v3917"):
+            return 0
+        n = 0
+        for t in self.store._x("SELECT id, prompt FROM tasks"):
+            clean, creds = _rd.extract(t.get("prompt") or "")
+            if not creds:
+                continue
+            self.protect(t["id"], t.get("prompt") or "")
+            self.store._x("UPDATE tasks SET prompt=? WHERE id=?", (clean, t["id"]))
+            sids = [r["id"] for r in self.store._x("SELECT id FROM sessions WHERE task_id=?", (t["id"],))]
+            for c in creds:
+                v = c["value"]
+                for sid in sids:
+                    self.store._x("UPDATE agent_events SET data=REPLACE(data, ?, '***') WHERE session_id=? AND instr(data, ?) > 0",
+                                  (v, sid, v))
+                    self.store._x("UPDATE machine_actions SET payload=REPLACE(payload, ?, '***') WHERE session_id=? AND instr(payload, ?) > 0",
+                                  (v, sid, v))
+                self.store._x("UPDATE tasks SET result=REPLACE(result, ?, '***') WHERE instr(result, ?) > 0", (v, v))
+                with contextlib.suppress(Exception):
+                    self.store._x("UPDATE chat_messages SET text=REPLACE(text, ?, '***') WHERE instr(text, ?) > 0", (v, v))
+            n += 1
+        self.store.kv_set("redact_v3917", {"at": time.time(), "tasks": n})
+        return n
+
+    def task_creds(self, task_id: str) -> list[dict]:
+        """This task's credentials (and its root's, for a continuation): [{key, host, user}] without values."""
+        row = self.store.task(task_id) or {}
+        ids = [task_id] + ([row["continues"]] if row.get("continues") else [])
+        out, seen = [], set()
+        for tid in ids:
+            for c in self.store.kv_get(f"task_creds:{tid}") or []:
+                if c.get("key") not in seen:
+                    seen.add(c.get("key"))
+                    out.append(dict(c))
+        return out
+
+    def task_secret_values(self, task_id: str) -> list[str]:
+        vals = []
+        for c in self.task_creds(task_id):
+            with contextlib.suppress(Exception):
+                v = self.secrets.get(c["key"]) if self.secrets else None
+                if v:
+                    vals.append(v)
+        with contextlib.suppress(Exception):   # the hosts the user authorised (运维主机) too
+            from . import remote_hosts as _rh
+            for h in _rh.hosts(self.store):
+                v = self.secrets.get(f"remote_host_{h['id']}") if self.secrets else None
+                if v:
+                    vals.append(v)
+        return vals
 
     async def edit_task(self, task_id: str, prompt: str) -> dict:
         """修改任务 (3.8.5): new instructions for the same task; a running run stops and the task re-runs with them,
@@ -545,10 +630,15 @@ class SessionManager:
         self.store.update_task(task.id, TaskStatus.RUNNING.value)
         live = LiveSession(sid, task, AgentControl())
         self.live[sid] = live
+        with contextlib.suppress(Exception):   # v3.9.17: this task's vault values, masked in every event
+            live.secret_values = self.task_secret_values(task.id)
+        ssh_pool = None
         plan_state: dict = {"steps": [], "done": []}
 
         async def emit(ev: AgentEvent):
             d = ev.model_dump(mode="json")
+            if isinstance(d.get("data"), dict):   # v3.9.17: no password / *_KEY value in any stored or sent event
+                d["data"] = _rd.mask_obj(d["data"], live.secret_values)
             if ev.type == EventType.DECISION:
                 live.last_thought = str(ev.data.get("thought") or "")[:600]
             if ev.type == EventType.THINKING and ev.data.get("live"):
@@ -567,6 +657,10 @@ class SessionManager:
             if ev.type == EventType.PLAN_UPDATE and plan_state.get("steps"):   # ticks without a plan keep nothing
                 plan_state["done"] = ev.data.get("done") or []
                 self.store.set_task_plan(task.id, plan_state)
+            if ev.type == EventType.FINDING and ev.data.get("board") is not None:   # v3.9.17: kept for continuations
+                with contextlib.suppress(Exception):
+                    root = (self.store.task(task.id) or {}).get("continues") or task.id
+                    self.store.kv_set(f"task_findings:{root}", d["data"]["board"])
             if ev.type == EventType.MEMORY and ev.data.get("text"):
                 pass  # saved by remember()
             if ev.type == EventType.ERROR and ev.data.get("vision_down"):   # 3.8.8: once per task, names the service
@@ -581,11 +675,20 @@ class SessionManager:
                 await self._event_all(msg)
 
         async def audit(rec: dict):
-            self.store.add_action(sid, rec)
+            self.store.add_action(sid, _rd.mask_obj(rec, live.secret_values))
 
         async def confirm(tool, payload, decision) -> bool:
+            payload = _rd.mask_obj(payload, live.secret_values) if isinstance(payload, dict) else payload
+            scope = getattr(decision, "scope", "") or ""
             summary = await self._confirm_summary(tool, payload, decision, live)
+            if scope.startswith("remote_diag:"):
+                summary["scope_note"] = f"本任务内允许对该主机（{scope.split(':', 1)[1]}）执行只读诊断：同意一次，后面同类操作不再询问"
             brief = {"title": summary["title"], "risk": summary["risk"], "what": summary["what"]}
+            if scope and scope in live.allowed_scopes:
+                # v3.9.17: same host, same kind of read-only diagnosis, already allowed in this task
+                await emit(AgentEvent(session_id=sid, type=EventType.CONFIRM_ANSWERED,
+                                      data={"tool": tool, "approve": True, "by": "scope", "scope": scope, **brief}))
+                return True
             if live.allow_task and tool not in TASK_ALLOW_NEVER and summary.get("category") not in ("pay", "message"):
                 # 本任务内都允许: approved without a card, still on the timeline
                 await emit(AgentEvent(session_id=sid, type=EventType.CONFIRM_ANSWERED,
@@ -606,6 +709,8 @@ class SessionManager:
                 ok = bool(await asyncio.wait_for(live.confirm, wait))
                 if ok and live.allow_task:
                     by = "user_task"     # this card's 本任务内都允许
+                if ok and scope:
+                    live.allowed_scopes.add(scope)
                 return ok
             except asyncio.TimeoutError:
                 by = "timeout"
@@ -698,7 +803,7 @@ class SessionManager:
         live.cleanup = cleanup
 
         async def runner():
-            nonlocal computer
+            nonlocal computer, ssh_pool
             self.store.update_task(task.id, TaskStatus.RUNNING.value)
             try:
                 # integrations (MCP servers) are loaded here, off the request path: POST /api/tasks returns at once
@@ -727,6 +832,17 @@ class SessionManager:
                         extra["remote_exec"] = remote_hosts.tool(self.store, self.secrets)
                 except Exception as e:  # noqa: BLE001
                     log.warning("remote_exec unavailable: %s", e)
+                creds = []
+                try:  # v3.9.17 ssh_exec: one reused paramiko connection, password from the vault
+                    from . import remote_hosts, ssh_exec as _sx
+                    creds = self.task_creds(task.id)
+                    hcreds = [{"key": f"remote_host_{h['id']}", "host": h.get("host") or "", "user": h.get("user") or "root"}
+                              for h in remote_hosts.hosts(self.store)]
+                    if self.secrets and (creds or hcreds) and os.environ.get("AIW_SSH_EXEC", "1") != "0":
+                        ssh_pool = _sx.SSHPool()
+                        extra["ssh_exec"] = _sx.tool(self.store, self.secrets, ssh_pool, creds + hcreds)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("ssh_exec unavailable: %s", e)
                 hold = contextlib.nullcontext()
                 cloud = getattr(self, "cloud", None)
                 if cloud and cloud.is_cloud(task.machine_id) and not cleanup:
@@ -786,6 +902,21 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    try:   # v3.9.17 密码保护: {{task_cred_…}} fills in type / bos_act / shell; outputs mask the values
+                        for c in creds:
+                            v = self.secrets.get(c["key"]) if self.secrets else None
+                            if v:
+                                loop._secrets[c["key"]] = v
+                        if creds:
+                            note = _rd.note_for(creds, [c["key"] for c in creds])
+                            task.context = (task.context + "\n\n" if task.context else "") + note
+                        root = (self.store.task(task.id) or {}).get("continues")
+                        board = self.store.kv_get(f"task_findings:{root}") if root else None
+                        if board:   # a continuation keeps the facts board
+                            from agent_runtime.findings import FindingsBoard
+                            loop.findings.items = FindingsBoard(board).items
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("task secrets/findings: %s", e)
                     loop.vision_missing = self.vision_missing()
                     loop.home = home
                     seed = self.store.kv_get(f"task_seed_plan:{task.id}")
@@ -832,6 +963,11 @@ class SessionManager:
                 status, result = t.status.value, t.result
             except Exception as e:  # noqa: BLE001
                 status, result = "failed", f"{type(e).__name__}: {e}"
+            finally:
+                if ssh_pool is not None:
+                    with contextlib.suppress(Exception):
+                        ssh_pool.close()
+            result = _rd.mask(result, live.secret_values) if isinstance(result, str) else result
             self.store.update_task(task.id, status, result)
             self.store.end_session(sid, status)
             await self._tell(task, sid, {"type": "task.end", "status": status, "result": result,

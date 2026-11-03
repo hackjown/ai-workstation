@@ -36,6 +36,7 @@ class EventType(str, Enum):
     SUBAGENT = "agent.subagent"
     MEMORY = "agent.memory"
     TOOL_CALL = "agent.tool_call"
+    FINDING = "agent.finding"          # v3.9.17 已确认事实板: {finding, board}
     DISPATCH = "agent.dispatch"        # child tasks on other computers: {phase, children:[{task_id, machine, status...}]}
 
 

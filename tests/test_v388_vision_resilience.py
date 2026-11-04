@@ -181,7 +181,7 @@ def test_sessions_build_the_chain(tmp_path):
 # ------------------------------------------------------------------ escalate
 def test_vision_down_options_and_card():
     assert es.options("vision_down") == [es.OPT_FIXED, es.OPT_TAKEOVER, es.OPT_STOP]
-    assert es.options("fail") == es.OPTIONS
+    assert es.options("fail") == [es.OPT_RETRY, es.OPT_TAKEOVER, es.OPT_STOP] and es.options("stall") == es.OPTIONS
     assert es.choice(es.OPT_FIXED) == "retry"
     card = es.stuck_card("vision_down", "读图服务不可用：HTTP 500 @ hackjown.3322.org（模型 deveco-qwen3-vl），连续 2 次失败。")
     assert "hackjown.3322.org" in card["reason"] and card["actions"][0] == es.OPT_FIXED

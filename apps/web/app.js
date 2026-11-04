@@ -212,9 +212,17 @@ function onLiveEvent(t, e) {
 
 /* ---------------------------------------------------------------- chat render */
 const SUGS = ["打开 Chrome 搜索今天的科技新闻，挑 3 条总结给我", "用 Python 在 ~/workspace 新建 周报.docx，写三条要点，然后发给我", "查一下磁盘空间和内存占用", "打开 Hacker News，把前 5 条标题整理成表格发给我"];
+/* v3.9.18: the task view follows new output only while you are at the bottom. Scrolling up (wheel, touch, keys,
+   scrollbar) stops the follow until you come back down; a re-render keeps where you were reading and which
+   folds (操作 / 确认记录 / 思考过程) you opened or closed. */
+S.stick = true; S.det = S.det || {};
+let progScrollAt = 0;
+function chatDist(b) { return b.scrollHeight - b.scrollTop - b.clientHeight; }
 function renderChat(scroll) {
   const box = $("msgs");
-  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
+  if (scroll) S.stick = true;
+  const t0 = box.scrollTop;
+  box.querySelectorAll("details[data-k]").forEach((d) => { S.det[d.dataset.k] = d.open; });
   if (!S.thread || !S.thread.tasks.length) {
     box.innerHTML = `<div class="welcome"><div class="avatar" style="background:${AVATAR_BG[S.profile.avatar] || AVATAR_BG.amber}">${avatarSVG()}</div>
       <div class="title">${esc(S.profile.name ? "你好，" + S.profile.name : "想让我做什么？")}</div>
@@ -232,7 +240,9 @@ function renderChat(scroll) {
   const live = S.thread.tasks.find((t) => LIVE.includes(t.status) || t.live);
   setComposerBusy(live || null);
   if (live && live.status === "takeover" && !S.take) setTake(true, true);
-  if (scroll || nearBottom) scrollLatest();
+  box.querySelectorAll("details[data-k]").forEach((d) => { const k = d.dataset.k; if (k in S.det) d.open = S.det[k]; });
+  const keep = () => { if (S.stick) scrollLatest(); else { progScrollAt = Date.now(); box.scrollTop = t0; } };
+  keep(); requestAnimationFrame(keep);   // again after ui.js / mate.js have patched the cards
 }
 function renderTask(t) {
   const evs = S.evs[t.id] || [];
@@ -277,15 +287,16 @@ function renderTask(t) {
   if (barPct) html += `<div class="hc-bar tc-bar"><i style="width:${Math.max(3, Math.min(100, Math.round(barPct)))}%"></i></div>`;
   if (plan) {
     const done = new Set(plan.done || []); const firstOpen = plan.steps.findIndex((_, i) => !done.has(i));
-    html += `<div class="plan">${plan.steps.map((s, i) => `<div class="st ${done.has(i) ? "done" : i === firstOpen && liveNow ? "cur" : ""}"><span class="ck">${done.has(i) ? icon("check") : ""}</span><span class="tx">${esc(s)}</span></div>`).join("")}</div>`;
+    // v3.9.19: same as iOS — n/m count, ticks land live (agent.plan_update), the current step carries an arrow
+    html += `<div class="plan"><div class="plan-n">${done.size}/${plan.steps.length} 项</div>${plan.steps.map((s, i) => `<div class="st ${done.has(i) ? "done" : i === firstOpen && liveNow ? "cur" : ""}"><span class="ck">${done.has(i) ? icon("check") : i === firstOpen && liveNow ? "→" : ""}</span><span class="tx">${esc(s)}</span></div>`).join("")}</div>`;
   }
   html += renderKids(t, evs);
   if (steps.length) {
-    html += `<details class="steps" ${liveNow ? "open" : ""}><summary>${icon("chev", "chev")}${steps.length} 个操作</summary><div class="steplist">${steps.slice(-40).map((s) =>
+    html += `<details class="steps" data-k="steps:${esc(t.id)}" ${liveNow ? "open" : ""}><summary>${icon("chev", "chev")}${steps.length} 个操作</summary><div class="steplist">${steps.slice(-40).map((s, i) =>
       `<div class="s ${s.ok === false ? "err" : ""} ${s.sub ? "sub" : ""}"><b>${esc(s.tool === "message" ? "说明" : s.tool === "vision" ? "看屏幕" : toolName(s.tool))}</b><span>${esc(stepText(s))}${(s.ms || s.tms || s.wms) ? `<em class="ms" title="思考 = 模型耗时，工具 = 执行耗时，等确认 = 等你点允许">${stepTimes(s)}${s.tok ? ` · ${s.tok} tok` : ""}${s.tries > 1 ? ` · 重试${s.tries - 1}` : ""}</em>` : ""}</span></div>`
       // the step's thought shows inline; only the long reasoning stays folded
       + (s.thought && s.tool !== "message" && s.tool !== "vision" ? `<p class="thinl">${esc(s.thought)}</p>` : "")
-      + (s.why ? `<details class="why"><summary>${icon("chev", "chev")}思考过程</summary><pre>${esc(s.why)}</pre></details>` : "")).join("")}</div></details>`;
+      + (s.why ? `<details class="why" data-k="why:${esc(t.id)}:${i}"><summary>${icon("chev", "chev")}思考过程</summary><pre>${esc(s.why)}</pre></details>` : "")).join("")}</div></details>`;
   }
   const fq = t.pending_question && liveNow && t.pending_question.form;
   if (fq && fq.kind === "form") {
@@ -301,7 +312,7 @@ function renderTask(t) {
       <form onsubmit="answerQForm(event,'${t.session_id}')"><input name="a" placeholder="回答…" /><button class="btn sm primary">回复</button></form></div>`;
   }
   if (t.pending_confirm && liveNow) html += apvCard(t.pending_confirm, t.session_id);   // approval.js: plain summary
-  html += apvLog(evs);   // past confirmations / takeovers with the user's decision
+  html += apvLog(evs, t.id);   // past confirmations / takeovers with the user's decision (older ones folded)
   const allFiles = files.length ? files : (t.files || []).map((f) => ({ name: f.path.split("/").pop(), artifact: f.path }));
   // pictures show as pictures (a grid when there are several); everything else is a download card
   const pics = allFiles.filter((f) => /\.(png|jpe?g|webp|gif)$/i.test(f.name));
@@ -342,8 +353,21 @@ function stepText(s) {
   if (s.ok === false && s.err) t += " — " + s.err;
   return String(t).slice(0, 200);
 }
-function scrollLatest(smooth) { const b = $("msgs"); b.scrollTo({ top: b.scrollHeight, behavior: smooth ? "smooth" : "auto" }); }
-$("msgs").addEventListener("scroll", () => { const b = $("msgs"); $("toLatest").classList.toggle("on", b.scrollHeight - b.scrollTop - b.clientHeight > 300); });
+function scrollLatest(smooth) { const b = $("msgs"); S.stick = true; progScrollAt = Date.now(); b.scrollTo({ top: b.scrollHeight, behavior: smooth ? "smooth" : "auto" }); }
+(() => {
+  const b = $("msgs");
+  const up = () => { if (chatDist(b) > 4) S.stick = false; };
+  b.addEventListener("wheel", (e) => { if (e.deltaY < 0) S.stick = false; }, { passive: true });
+  b.addEventListener("touchmove", up, { passive: true });
+  b.addEventListener("keydown", (e) => { if (["ArrowUp", "PageUp", "Home"].includes(e.key)) S.stick = false; });
+  b.addEventListener("pointerdown", (e) => { if (e.target === b) up(); });   // grabbing the scrollbar
+  b.addEventListener("scroll", () => {
+    const dist = chatDist(b);
+    // only the user's own scroll changes the follow: back near the bottom follows again, anywhere else stops it
+    if (Date.now() - progScrollAt > 150) S.stick = dist < 60;
+    $("toLatest").classList.toggle("on", dist > 300);
+  });
+})();
 
 function renderQueue() {
   const q = S.thread ? S.thread.tasks.filter((t) => t.status === "queued") : [];

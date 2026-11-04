@@ -46,7 +46,7 @@ async def test_fail_becomes_a_question_and_stop_ends_with_a_report(env):  # noqa
         asked.append((q, opts)); return es.OPT_STOP
     loop.ask = ask
     t = await loop.run()
-    assert asked and "按钮点不动" in asked[0][0] and asked[0][1] == es.OPTIONS
+    assert asked and "按钮点不动" in asked[0][0] and asked[0][1] == es.options("fail")
     assert t.status == TaskStatus.STOPPED and "按你的选择已停止" in t.result
     assert any(e.type == EventType.INPUT_REQUIRED for e in events)
 

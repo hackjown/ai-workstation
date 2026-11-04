@@ -322,8 +322,19 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                     mid = mid or body.machine_id
                 except Exception as e:  # noqa: BLE001
                     logging.getLogger("aiw").warning("roles: %s", e)
+            else:   # v3.9.19: 继续 on a cooling cloud computer goes to the backup instead of failing
+                try:
+                    from . import roles as _roles
+                    prev = [t for t in store.thread_tasks(body.thread_id) if not t.get("parent_id")]
+                    own = (prev[-1].get("machine_id") if prev else None) or mid
+                    mid2, notice = await _roles.continue_live(sessions, own)
+                    if notice:
+                        mid = mid2
+                except Exception as e:  # noqa: BLE001
+                    logging.getLogger("aiw").warning("roles continue: %s", e)
             res = await sessions.submit(body.prompt.strip(), mid, body.thread_id, max_steps=body.max_steps,
-                                        timeout_s=body.timeout_s, isolated=body.isolated, link_thread=not body.new_task)
+                                        timeout_s=body.timeout_s, isolated=body.isolated, link_thread=not body.new_task,
+                                        context_extra=(_roles.CONTINUE_ON_BACKUP if notice and notice.get("continue") else None))
             if notice:
                 res = {**res, "backup_vm": notice, "notice": _roles.notice_text(notice)}
             return res

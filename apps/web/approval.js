@@ -67,7 +67,7 @@
   };
 
   /** Past approvals and takeovers of a task, from its events: plain title, risk, and what the user decided. */
-  window.apvLog = function (evs) {
+  window.apvLog = function (evs, tid) {
     const rows = [];
     let lastTk = null;
     for (const e of evs || []) {
@@ -88,7 +88,15 @@
         lastTk = null;
       }
     }
-    return rows.length ? `<div class="apv-log"><div class="apv-l">确认记录</div>${rows.join("")}</div>` : "";
+    if (!rows.length) return "";
+    // v3.9.18: many approvals used to push the task's status off screen; only the latest 2 stay open, the rest fold
+    const SHOW = 2;
+    const ok = rows.filter((r) => r.includes('apv-row ok') || r.includes('apv-row tk ok')).length;
+    const head = `确认记录 · ${rows.length} 条（允许 ${ok}${rows.length - ok ? `，未允许 ${rows.length - ok}` : ""}）`;
+    if (rows.length <= SHOW + 1) return `<div class="apv-log"><div class="apv-l">${E(head)}</div>${rows.join("")}</div>`;
+    const old = rows.slice(0, -SHOW), recent = rows.slice(-SHOW);
+    return `<div class="apv-log"><div class="apv-l">${E(head)}</div>
+      <details class="apv-fold" data-k="apv:${E(tid || "")}"><summary>更早的 ${old.length} 条</summary>${old.join("")}</details>${recent.join("")}</div>`;
   };
 
   window.openTakeover = async function (sid, mid) {

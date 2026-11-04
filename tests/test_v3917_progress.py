@@ -47,15 +47,22 @@ def test_budget_8_steps_or_10_minutes(monkeypatch):
 
 
 def test_same_conclusion_three_times_asks(monkeypatch):
+    # v3.9.20: an action task restating a fact is not stuck; a question task asks after AIW_STUCK_MIN_STEPS steps
+    # and AIW_SAME_FACT_LIMIT (5) repeats
     monkeypatch.setenv("AIW_DIAG_STEPS", "0")
     g = ProgressGuard("帮我把这个网页的价格抓下来写成表格", question=False)
     t = "发现 价格接口 api/price 返回 403"
-    assert g.decide(1, t, "shell", {})[0] == "ok"
-    assert g.decide(2, t, "shell", {})[0] == "ok"
-    v, why = g.decide(3, t, "shell", {})
-    assert v == "ask" and "3" in why
-    g.reset_after_ask(3)
-    assert g.decide(4, "换个方法", "shell", {})[0] == "ok"
+    for i in range(1, 8):
+        assert g.decide(i, t, "shell", {})[0] == "ok"
+    monkeypatch.setenv("AIW_STUCK_MIN_STEPS", "3")
+    q = ProgressGuard("帮我看看价格接口为什么 403", question=True)
+    q.min_steps = 99
+    for i in range(1, 5):
+        assert q.decide(i, t, "shell", {})[0] == "ok"
+    v, why = q.decide(5, t, "shell", {})
+    assert v == "ask" and "5" in why
+    q.reset_after_ask(5)
+    assert q.decide(6, "换个方法", "shell", {})[0] == "ok"
 
 
 def test_twenty_steps_without_a_new_fact_asks(monkeypatch):

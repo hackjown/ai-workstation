@@ -117,12 +117,27 @@ KIND_TEXT = {
 }
 
 OPT_RETRY, OPT_TAKEOVER, OPT_STOP = "继续，换个方法再试", "我来接管桌面", "停止任务"
-OPTIONS = [OPT_RETRY, OPT_TAKEOVER, OPT_STOP]
+# v3.9.20: the guard can be wrong (the user sees it is working): go on with the SAME plan, and the same kind of
+# check stays quiet for a while (AIW_STUCK_SNOOZE steps, default 30)
+OPT_GO = "继续执行（没卡住）"
+OPTIONS = [OPT_GO, OPT_RETRY, OPT_TAKEOVER, OPT_STOP]
+NO_SNOOZE = {"blocked", "vision_down", "fail", "max_steps", "time"}
+
+
+def snooze_steps() -> int:
+    try:
+        return max(0, int(os.environ.get("AIW_STUCK_SNOOZE", "30") or 0))
+    except ValueError:
+        return 30
 OPT_FIXED = "修好后继续"   # 3.8.8 vision_down: the user fixed the vision service; resets the breaker
 
 
 def options(kind: str) -> list:
-    return [OPT_FIXED, OPT_TAKEOVER, OPT_STOP] if kind == "vision_down" else list(OPTIONS)
+    if kind == "vision_down":
+        return [OPT_FIXED, OPT_TAKEOVER, OPT_STOP]
+    if kind in ("blocked", "fail"):   # a wall / the model gave up: going on unchanged makes no sense
+        return [OPT_RETRY, OPT_TAKEOVER, OPT_STOP]
+    return list(OPTIONS)
 
 
 def is_look(tool: str, args: Optional[dict] = None) -> bool:
@@ -250,7 +265,7 @@ def question(kind: str, detail: str, page: Optional[dict] = None, blocked: str =
     if kind == "vision_down":
         lines.append("这是服务故障，不是图片问题。任务已暂停：检查/修好视觉模型服务后点「修好后继续」/ 接管桌面 / 停止任务。")
     else:
-        lines.append("任务已暂停，不会自己结束。你可以：继续（换个方法再试）/ 接管桌面自己处理 / 停止任务。")
+        lines.append("任务已暂停，不会自己结束。你可以：继续执行（没卡住，照原计划做）/ 换个方法再试 / 接管桌面自己处理 / 停止任务。")
     return "\n".join(lines)
 
 
@@ -264,7 +279,8 @@ def stuck_card(kind: str, detail: str = "", blocked: str = "") -> dict:
         return {"kind": kind, "reason": why, "detail": str(detail or "").strip()[:200],
                 "actions": [OPT_FIXED, "接管", "停止"], "line": f"卡住了：{why} · 等你选 修好后继续 / 接管 / 停止"}
     return {"kind": kind, "reason": why, "detail": str(detail or "").strip()[:200],
-            "actions": ["继续", "接管", "停止"], "line": f"卡住了：{why} · 等你选 继续 / 接管 / 停止"}
+            "actions": ["继续执行", "换个方法", "接管", "停止"],
+            "line": f"卡住了：{why} · 等你选 继续执行 / 换个方法 / 接管 / 停止"}
 
 
 def report(kind: str, detail: str, history: list[str], page: Optional[dict] = None, blocked: str = "",
@@ -299,4 +315,6 @@ def choice(reply: Optional[str]) -> str:
         return "stop"
     if r == OPT_TAKEOVER or "接管" in r:
         return "takeover"
+    if r == OPT_GO or re.fullmatch(r"(继续执行|继续|接着做|没卡住|没有卡住|继续执行（没卡住）)[。.!！]?", r):
+        return "go"
     return "retry"

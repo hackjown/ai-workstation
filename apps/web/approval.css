@@ -51,3 +51,9 @@
 .apv-row details p{margin:0;color:var(--mute)}
 .apv-tt{color:var(--text);word-break:break-word}
 @media (max-width:760px){.apv-sec{grid-template-columns:1fr;gap:4px}.apv-btns .btn{flex:1}}
+
+/* v3.9.18: older approvals fold */
+.apv-fold>summary{cursor:pointer;color:var(--muted);font-size:13px;padding:2px 0;list-style:none}
+.apv-fold>summary::before{content:"▸ ";}
+.apv-fold[open]>summary::before{content:"▾ ";}
+.apv-fold[open]{display:flex;flex-direction:column;gap:6px}

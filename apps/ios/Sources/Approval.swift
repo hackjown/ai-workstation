@@ -223,10 +223,30 @@ struct TakeoverCard: View {
 /// Past confirmations / takeovers of a task with the user's decision (the timeline).
 struct ApprovalLog: View {
     let items: [JSON]
+    @State private var showOlder = false   // v3.9.19: same as the web: over 3 records, only the newest 2 stay open
+    private var okCount: Int { items.filter { $0.s("kind") != "takeover" && $0.b("approve") }.count }
+    private var noCount: Int { items.filter { $0.s("kind") != "takeover" && !$0.b("approve") }.count }
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("确认记录").font(.caption.bold()).foregroundColor(.secondary)
-            ForEach(items.indices, id: \.self) { i in row(items[i]) }
+            HStack(spacing: 6) {
+                Text("确认记录").font(.caption.bold()).foregroundColor(.secondary)
+                if items.count > 3 {
+                    Text("允许 \(okCount) · 未允许 \(noCount)").font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            if items.count > 3 {
+                let older = items.count - 2
+                DisclosureGroup(isExpanded: $showOlder) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(0..<older, id: \.self) { i in row(items[i]) }
+                    }
+                } label: {
+                    Text("更早的 \(older) 条").font(.caption).foregroundColor(.secondary)
+                }
+                ForEach(older..<items.count, id: \.self) { i in row(items[i]) }
+            } else {
+                ForEach(items.indices, id: \.self) { i in row(items[i]) }
+            }
         }
     }
     @ViewBuilder func row(_ d: JSON) -> some View {

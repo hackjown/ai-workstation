@@ -56,6 +56,11 @@ RememberFn = Callable[[str], Awaitable[None]]
 ExtTool = tuple[dict, Callable[[dict], Awaitable[dict]]]  # (schema, call)
 
 
+def _dev_task(prompt: str) -> bool:
+    """v3.9.19: a task the user tagged 【技能：dev】 (or that names the dev skill)."""
+    return bool(re.search(r"【技能[:：][^】]*\bdev\b", prompt or "", re.I))
+
+
 @dataclass
 class LoopConfig:
     max_steps: int = 0      # 0 = no step budget (3.8.2); >0 pauses and asks when reached, never ends the task
@@ -558,6 +563,8 @@ class AgentLoop:
         shots = 0
         self._acted = False
         self._done_rejects = 0
+        self._plan_rejects, self._since_plan, self._known_rejects = 0, 0, 0   # v3.9.19 live ticks / known issues
+        self._undone_rejects, self._asked_user, self._undone_ok = 0, False, False   # v3.9.20 not done -> choices
         self._nocall = 0  # consecutive replies without a tool call
         self._sent_file, self._after_send = None, 0
         self._last_sent_thumb = None
@@ -818,6 +825,71 @@ class AgentLoop:
                         "(open/search/type/click...). Do the first action now, e.g. browser_open with the URL. "
                         "Do not invent results.")
                 continue
+            # v3.9.19: the checklist is ticked as the work goes, not all at the end
+            if self.plan_steps and decision.tool == "done" and len(self.plan_done) < len(self.plan_steps) \
+                    and self._plan_rejects < 1 and os.environ.get("AIW_PLAN_GATE", "1") != "0":
+                self._plan_rejects += 1
+                await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="拒绝 done：清单还有未勾选的步骤")
+                self.history.append(f"{self.step}. done REJECTED: plan steps not ticked")
+                open_ = [f"{i}. {st}" for i, st in enumerate(self.plan_steps) if i not in self.plan_done]
+                note = ("REJECTED: the PLAN checklist still has open steps:\n" + "\n".join(open_) +
+                        "\nCall update_plan with the indexes of the steps that are REALLY finished. Then call done; in its "
+                        "summary list every step you did not finish under 未完成, with the reason. Do not tick unfinished steps.")
+                continue
+            if decision.tool == "done" and _dev_task(self.task.prompt) and self._known_rejects < 1 \
+                    and not re.search(r"已知(未解决)?问题|未解决|未完成|遗留|known issue", str((decision.args or {}).get("summary") or ""), re.I):
+                self._known_rejects += 1
+                await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="拒绝 done：开发任务缺少「已知问题」")
+                self.history.append(f"{self.step}. done REJECTED: no known-issues section")
+                note = ("REJECTED: a development task's done summary must end with a section 已知问题 listing what is still "
+                        "broken, untested, simplified or only checked against fakes, and for each acceptance item the evidence "
+                        "(test name, screenshot, report numbers). Self-made fixtures do not prove accuracy. If nothing is "
+                        "open, write 已知问题：无 and say how it was verified. Call done again with that summary.")
+                continue
+            # v3.9.20 (task-62c): "没达到/没打通/做不到" is not a result. First push on with the next approach the model
+            # itself named; the second time the user gets a card with choices instead of a give-up report.
+            if decision.tool == "done" and not self._asked_user and not self._undone_ok \
+                    and os.environ.get("AIW_UNDONE_GATE", "1") != "0" and not self.guard.answer_task \
+                    and _undone(str((decision.args or {}).get("summary") or "")):
+                self._undone_rejects += 1
+                await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                if self._undone_rejects == 1:
+                    await self.emit(EventType.VALIDATION, success=False, change=0.0, message="拒绝 done：任务还没完成，先按下一步方向继续做")
+                    self.history.append(f"{self.step}. done REJECTED: the goal is not reached yet")
+                    note = ("REJECTED: your summary says the goal is NOT reached. Do not report yet. Take the most promising "
+                            "next approach you listed yourself and actually try it now (real commands / requests). If a "
+                            "decision only the user can make blocks you (which approach, an account, money, a risk), call "
+                            "ask_user with a short question and 2-4 short options (one per approach, plus 停止并出报告); the "
+                            "user picks on a card. Never end with a report that only lists what could be done next.")
+                    continue
+                summary = str((decision.args or {}).get("summary") or "")
+                q, opts = _undone_card(summary)
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="还没完成：请你选下一步")
+                await self.emit(EventType.INPUT_REQUIRED, question=q, options=opts)
+                t0q = time.monotonic()
+                reply = await self._ask(q, opts)
+                self.add_wait(time.monotonic() - t0q)
+                await self.emit(EventType.INPUT_ANSWERED, answer=reply)
+                self._asked_user = True
+                if reply is None or re.search(r"停止|出报告|就这样|结束", str(reply)):
+                    self._undone_ok = True   # the user chose to stop: this done goes through
+                else:
+                    self._mark_progress()
+                    self.history.append(f"{self.step}. done held back: the user chose {reply!r}")
+                    note = (f"The user chose: {reply!r}. Do exactly that now and keep working until it is really done; "
+                            "report only when it works or when you need another decision (ask_user with options).")
+                    continue
+            if self.plan_steps and decision.tool not in ("update_plan", "screenshot", "done", "fail") \
+                    and len(self.plan_done) < len(self.plan_steps):
+                self._since_plan += 1
+                if self._since_plan >= int(os.environ.get("AIW_PLAN_NUDGE", "6")):
+                    self._since_plan = 0
+                    cur = next((i for i in range(len(self.plan_steps)) if i not in self.plan_done), None)
+                    self._guard_note = ((self._guard_note + "\n") if self._guard_note else "") + (
+                        f"PLAN CHECK: is step {cur} ({self.plan_steps[cur]}) finished? If it is, or any later step is, "
+                        "call update_plan with those indexes right now: the user watches the checklist tick live.")
             llm_ms = int((time.time() - t_llm) * 1000)
             if (self._sent_file and decision.tool not in ("done", "fail", "send_file")
                     and not (self._cad_task and (not self._cad_pdf_ok or self._sheet_audit.get("thin")))):
@@ -1128,6 +1200,7 @@ class AgentLoop:
         if t == "note_finding":   # v3.9.17 已确认事实板
             return await self._note_finding(a)
         if t == "update_plan":
+            self._since_plan = 0
             for i in a.get("done") or []:
                 if isinstance(i, int) and 0 <= i < len(self.plan_steps):
                     if i not in self.plan_done:
@@ -1151,6 +1224,7 @@ class AgentLoop:
             await self.emit(EventType.ACTION_RESULT, tool=t, success=reply is not None, error=None if reply else "no answer",
                             result={"answer": reply})
             if reply:
+                self._asked_user = True
                 return f"user answered: {reply!r}"
             # 3.8.5: never "我按最实用的默认方案" — an unanswered question is asked again or the task waits
             return ("NO ANSWER from the user yet. Do NOT decide yourself and do NOT pick a default option: call ask_user "
@@ -1519,6 +1593,14 @@ class AgentLoop:
         stall = getattr(self, "_stall", None) or _es.Stall()
         self._stall = stall
         blocked = stall.blocked or ("验证" if kind == "blocked" else "")
+        # v3.9.20: the user chose 继续执行（没卡住） for this kind a moment ago: do not ask again yet
+        snooze = getattr(self, "_snooze", {})
+        if not blocked and kind not in _es.NO_SNOOZE and self.step < snooze.get(kind, -1):
+            self._mark_progress()
+            self._rep, self._prev_sig = 0, None
+            stall.reset()
+            self.history.append(f"{self.step}. (stuck check {kind} skipped: the user said it is not stuck)")
+            return "Keep going with your current plan (the user confirmed you are not stuck)."
         await self.emit(EventType.VALIDATION, success=False, change=0.0, message="需要你：" + _es.KIND_TEXT.get(kind, kind))
         if not self.ask:
             self._finish(TaskStatus.FAILED, _es.report(kind, detail, self.history, page, blocked))
@@ -1569,6 +1651,23 @@ class AgentLoop:
                     q = "接管没有完成，任务还停在这里。\n" + _es.question(kind, detail, page, blocked)
                     continue
             break
+        if c == "go":   # v3.9.20 继续执行（没卡住）: same plan, same approach, and this check stays quiet for a while
+            if self.cfg.max_steps > 0:
+                self.cfg.max_steps = max(self.cfg.max_steps, self.step + max(25, _es.step_cap()))
+            if kind == "time":
+                self.cfg.timeout_s += max(900.0, _es.time_cap())
+                self._time_asked = False
+                self._time_up = False
+            self._mark_progress()
+            self._rep, self._prev_sig = 0, None
+            stall.reset()
+            if not hasattr(self, "_snooze"):
+                self._snooze = {}
+            self._snooze[kind] = self.step + _es.snooze_steps()
+            self.history.append(f"{self.step}. (asked the user: {_es.KIND_TEXT.get(kind, kind)}; they said it is not stuck)")
+            return ("The user looked at your progress and says you are NOT stuck. Continue exactly with your current plan "
+                    "and approach; do not stop to report and do not ask again about this. Work until the task is really "
+                    "done.")
         if c == "retry":
             if self.cfg.max_steps > 0:
                 self.cfg.max_steps = max(self.cfg.max_steps, self.step + max(25, _es.step_cap()))
@@ -2760,6 +2859,41 @@ _QUESTION = re.compile(r"^(为什么|为啥|怎么回事|怎么没|是什么|什
 def _is_question(prompt: str) -> bool:
     p = (prompt or "").strip()
     return bool(_QUESTION.search(p)) and len(p) < 60 and not re.search(r"帮我|请你|给我|发给|please", p, re.I)
+
+
+_UNDONE = re.compile(r"没(有)?(达到|达成|做到|打通|跑通|做成|完成|成功|拿到|实现)|未(达到|达成|完成|打通|跑通|实现|成功)|"
+                     r"做不到|无法(实现|完成|播放|获取|打通|绕过)|不能(实现|完成)|失败了|卡在|没能|尚未(完成|实现|打通)|"
+                     r"验收标准.{0,6}没|not (reached|achieved|done|working)|could not|unable to", re.I)
+_UNDONE_NOT = re.compile(r"已(全部)?(完成|实现|打通|跑通)|全部通过|验收通过", re.I)
+
+
+def _undone(summary: str) -> bool:
+    """v3.9.20: a done summary that says the goal was not reached (its first part: the verdict)."""
+    head = (summary or "")[:500]
+    return bool(_UNDONE.search(head)) and not _UNDONE_NOT.search(head[:120])
+
+
+def _undone_card(summary: str) -> tuple[str, list]:
+    """The question + choices the user gets instead of a give-up report: the model's own next steps as options."""
+    opts: list[str] = []
+    for b in re.findall(r"(?m)^\s*\*\*((?:路线|方案|选项|办法|方向)\s*[\dA-Ca-c一二三][^*\n]{0,80})\*\*", summary):
+        name = re.split(r"[（(]", b)[0].strip(" ：:")
+        rest = re.split(r"[：:]", b, 1)[1] if re.search(r"[：:]", b) else ""
+        rest = re.split(r"[，,。；;（(]", rest.strip())[0][:24]
+        if len(opts) < 3:
+            opts.append(f"{name}：{rest}" if rest else name)
+    m = None if opts else re.search(r"(下一步|接下来|可执行方向|怎么打|可以(继续)?(深挖|尝试)的方向|建议)[^\n]*\n((?:\s*(?:[-*•]|\d+[.、)]).*\n?){1,6})", summary)
+    if m:
+        for ln in m.group(4).splitlines():
+            t = re.sub(r"^\s*(?:[-*•]|\d+[.、)])\s*", "", ln).strip()
+            t = re.sub(r"[*`#]", "", t).split("：")[0].split("。")[0].strip()
+            if 2 <= len(t) and len(opts) < 3:
+                opts.append(t[:40])
+    if not opts:
+        opts = ["继续：按你说的下一步方向做"]
+    opts += ["换个方向（我补充说明）", "停止并出报告"]
+    verdict = re.sub(r"[*#`]", "", summary).strip().split("\n")[0][:200]
+    return ("任务还没完成：" + verdict + "\n要怎么继续？", opts)
 
 
 def _needs_action(prompt: str) -> bool:

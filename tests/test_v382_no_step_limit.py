@@ -80,6 +80,6 @@ async def test_unanswered_question_keeps_waiting_until_stop(env, monkeypatch):  
 
 def test_stuck_card_says_what_and_what_to_do():
     c = es.stuck_card("max_steps", "已经执行了 40 步")
-    assert c["actions"] == ["继续", "接管", "停止"] and "步数" in c["reason"] and "继续 / 接管 / 停止" in c["line"]
+    assert c["actions"] == ["继续执行", "换个方法", "接管", "停止"] and "步数" in c["reason"] and "继续执行 / 换个方法 / 接管 / 停止" in c["line"]
     c = es.stuck_card("blocked", "", "滑块")
     assert "滑块" in c["reason"]

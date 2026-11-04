@@ -77,6 +77,17 @@ SENSITIVE_FILE = re.compile(
     r"(?:^|[\s'\"=:(<>])(?:~|\$HOME|/|\.{1,2}/)?[\w./-]*(?:\.ssh/[\w.-]*|id_(?:rsa|ed25519|ecdsa)\b|\.aws/[\w.-]*|/etc/shadow\b|"
     r"(?<![\w])\.env\b(?![\w(])|[\w-]*credentials(?:\.json|\.ya?ml|\.txt)?(?=$|[\s'\";|])|[\w-]+\.pem\b|[\w-]+\.key\b|"
     r"[\w-]*passwords?\.(?:txt|json|csv|ya?ml|kdbx|db)\b)", re.I)
+# v3.9.19: a path named only to be LEFT OUT (rsync/tar --exclude, zip -x, find ! -name, grep -v, != ".env") is not
+# a read of that file (task-d31: packaging without .env asked for confirmation 3 times).
+_EXCLUDED = re.compile(r"""--exclude(?:=|\s+)(?:'[^']*'|"[^"]*"|\S+)|(?:!|-not)\s+-(?:i?name|path)\s+(?:'[^']*'|"[^"]*"|\S+)|"""
+                       r"""\bgrep\s+-v\w*\s+(?:'[^']*'|"[^"]*"|\S+)|!=\s*(?:'[^']*'|"[^"]*")|"""
+                       r"""\bzip\b[^;&|\n]*?\s-x((?:\s+(?:'[^']*'|"[^"]*"|[^\s;&|-]\S*))+)""")
+
+
+def _drop_excluded(cmd: str) -> str:
+    return _EXCLUDED.sub(" ", cmd)
+
+
 PAY_WORDS = re.compile(r"(checkout|payment|pay now|place order|立即支付|确认付款|下单|支付)", re.I)
 
 
@@ -93,7 +104,9 @@ def scratch_delete(cmd: str) -> bool:
     if not hits or re.search(r"\$\(|`|\.\.", cmd):
         return False
     cds = re.findall(r"\bcd\s+([^;&|\s]+)", cmd)
-    rel_ok = bool(cds) and all(re.fullmatch(r"(~|\$HOME|\$\{HOME\}|/data/home|/home/[\w.-]+|/root)/workspace", c.rstrip("/")) for c in cds)
+    # v3.9.19: a project folder under ~/workspace counts too (cd ~/workspace/tasks/task-x && rm -rf pkg_out)
+    rel_ok = bool(cds) and all(re.fullmatch(r"(~|\$HOME|\$\{HOME\}|/data/home|/home/[\w.-]+|/root)/workspace(/[\w.@%+-]+)*", c.rstrip("/"))
+                               and ".." not in c for c in cds)
     for m in hits:
         for t in m.group(2).split():
             t = t.strip("'\"")
@@ -158,7 +171,7 @@ class PolicyEngine:
                 continue
             if re.search(pat, cmd):
                 return Decision(RiskLevel.L3, f"shell: {why}")
-        if SENSITIVE_FILE.search(cmd):
+        if SENSITIVE_FILE.search(_drop_excluded(cmd)):
             return Decision(RiskLevel.L3, "shell touches sensitive file")
         if remote:   # v3.9.17: judged by what it runs on the other host
             j = _rm.judge(cmd)

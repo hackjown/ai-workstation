@@ -661,13 +661,18 @@ struct TaskBlock: View {
                 } else if live.status == "succeeded" {
                     CardProgress(frac: 1, tone: .done)
                 }
-                if !live.plan.isEmpty && running {
+                if !live.plan.isEmpty {   // v3.9.19: like the web — ticks land live, the current step is marked, kept after the end
+                    let cur = running ? live.plan.indices.first(where: { !live.planDone.contains($0) }) : nil
                     VStack(alignment: .leading, spacing: 3) {
+                        Text("\(live.planDone.count)/\(live.plan.count) 项").font(.caption2).foregroundColor(.secondary)
                         ForEach(live.plan.indices, id: \.self) { i in
+                            let done = live.planDone.contains(i)
                             HStack(alignment: .top, spacing: 6) {
-                                Image(systemName: live.planDone.contains(i) ? "checkmark.circle.fill" : "circle")
-                                    .foregroundColor(live.planDone.contains(i) ? amber : .secondary).font(.caption)
-                                Text(live.plan[i]).font(.caption).foregroundColor(live.planDone.contains(i) ? .secondary : .primary)
+                                Image(systemName: done ? "checkmark.circle.fill" : i == cur ? "arrow.right.circle.fill" : "circle")
+                                    .foregroundColor(done || i == cur ? amber : .secondary).font(.caption)
+                                Text(live.plan[i]).font(i == cur ? .caption.bold() : .caption)
+                                    .foregroundColor(done ? .secondary : .primary)
+                                    .strikethrough(false)
                             }
                         }
                     }

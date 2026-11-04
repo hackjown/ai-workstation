@@ -4,6 +4,10 @@ description: Guidance for distinctive, intentional visual design when building n
 license: Complete terms in LICENSE.txt
 ---
 
+## 先给方案再动手（AIW v3.9.19）
+用户还没选定外观的新界面或改版：先在 mockups/ 做 2–3 个差异明显的静态方案（可参考用户给的参考图），每个截一张图 send_file，再 ask_user 让用户选一个或说怎么组合。用户选定前不写正式界面代码。验收时把成品截图和选定方案并排对比。
+
+
 # AIW 内置版说明（先读这一节）
 
 本技能来自 anthropics/skills（Apache-2.0，见 LICENSE 与 NOTICE.md），正文原样保留。在 AIW 里这样用：

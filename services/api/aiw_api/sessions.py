@@ -915,6 +915,8 @@ class SessionManager:
                         if board:   # a continuation keeps the facts board
                             from agent_runtime.findings import FindingsBoard
                             loop.findings.items = FindingsBoard(board).items
+                            with contextlib.suppress(Exception):
+                                loop.guard.inherit()   # v3.9.20
                     except Exception as e:  # noqa: BLE001
                         log.warning("task secrets/findings: %s", e)
                     loop.vision_missing = self.vision_missing()

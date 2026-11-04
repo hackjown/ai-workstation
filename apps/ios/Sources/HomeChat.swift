@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import PhotosUI
 import UniformTypeIdentifiers
 
@@ -196,6 +197,16 @@ final class HomeChat: ObservableObject {
         r.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         let body: JSON = ["text": text, "attachments": attachments, "machine_id": API.shared.machine, "mode": mode, "stream": true]
         r.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        // v3.9.20: leaving the app right after 发送 used to cut the stream and show 发送失败 although the server
+        // already had the message (it finishes the reply on its own). Ask iOS for background time, and on a
+        // dropped stream check the server before calling it a failure.
+        var bg = UIBackgroundTaskIdentifier.invalid
+        bg = UIApplication.shared.beginBackgroundTask(withName: "aiw-chat-send") {
+            UIApplication.shared.endBackgroundTask(bg); bg = .invalid
+        }
+        defer { if bg != .invalid { UIApplication.shared.endBackgroundTask(bg) } }
+        var accepted = false
+        let sentAt = Date()
         do {
             let (bytes, resp) = try await URLSession.shared.bytes(for: r)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -209,7 +220,7 @@ final class HomeChat: ObservableObject {
                 let raw = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
                 guard let d = raw.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d) as? JSON else { continue }
                 switch event {
-                case "user": upsert(obj, stick: true)
+                case "user": accepted = true; upsert(obj, stick: true)
                 case "route": if obj.s("route") == "task" { streamNote = obj.b("skill") ? "正在把技能交给电脑…" : "正在交给电脑…" }
                 case "status": if acc.isEmpty { streamNote = obj.s("text") }
                 case "delta": acc += obj.s("text"); stream = acc; bottomTick += 1
@@ -223,10 +234,32 @@ final class HomeChat: ObservableObject {
             }
             return true
         } catch {
+            if accepted || (error as? APIError) == nil, await recoverAfterDrop(text, since: sentAt, known: accepted) {
+                return true
+            }
             msgs.removeAll { $0.b("tmp") }
             err = "发送失败：\(error.localizedDescription)"
             return false
         }
+    }
+    /// v3.9.20: the stream broke (app sent to the background, network switch). If the server has the message,
+    /// pull history instead of 发送失败; the reply is stored server-side and shows up by sync / the socket.
+    @MainActor func recoverAfterDrop(_ text: String, since: Date, known: Bool) async -> Bool {
+        let want = text.isEmpty ? "（附件）" : text
+        for attempt in 0..<4 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 1_500_000_000) }
+            guard let r = try? await API.shared.obj("GET", "/api/chat?limit=20") else { continue }
+            let rows = r.a("messages")
+            let mine = rows.last { $0.s("role") == "user" && $0.s("text") == want
+                && (Date(timeIntervalSince1970: $0.d("created_at")) >= since.addingTimeInterval(-600) || $0.d("created_at") == 0) }
+            if known || mine != nil {
+                msgs.removeAll { $0.b("tmp") }
+                for m in rows { if let i = index(m.s("id")) { msgs[i] = m } else { msgs.append(m) } }
+                sortMsgs(); bottomTick += 1; err = ""
+                return true
+            }
+        }
+        return false
     }
 
     @MainActor func answer(_ id: String, _ body: JSON) async -> JSON? {

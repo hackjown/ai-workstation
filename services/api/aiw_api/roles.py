@@ -101,6 +101,8 @@ def skill_role(prompt: str) -> Optional[str]:
         names = [n.lower() for n in _sk.picked(prompt) + _sk.mentioned(prompt)]
     except Exception:  # noqa: BLE001
         return None
+    if "dev" in names:   # v3.9.19: a coding task stays on the office computer even when it also names frontend-design
+        return "office"
     votes: dict = {}
     for n in names:
         r = SKILL_ROLE.get(n)
@@ -247,9 +249,36 @@ async def pick_live(sessions, prompt: str, current: Optional[str]) -> tuple:
                 "minutes": int(left // 60) + 1, "until": f"{until:%H:%M}", "ahead": ahead}
 
 
+CONTINUE_ON_BACKUP = ("BACKUP COMPUTER: this run continues a task whose cloud computer is in its cooldown, so its files are "
+                      "NOT on this computer. First locate the project: if it is a git repo the earlier run pushed, clone or "
+                      "pull it into ~/workspace (git log must show the last commit the earlier run reported). If it was never "
+                      "pushed, do not rebuild it from memory: ask_user whether to wait for the cloud computer or start over.")
+
+
+async def continue_live(sessions, mid: Optional[str]) -> tuple:
+    """v3.9.19: a 继续 / 修改 run stays on its task's computer, except when that cloud computer is in its forced
+    cooldown: then it goes to the local backup computer and the notice says the files are still on the cooling one."""
+    if not mid or not cfg(sessions.store)["enabled"]:
+        return mid, None
+    left = await cooldown_left(sessions, mid)
+    if left <= 0:
+        return mid, None
+    bk = backup_of(sessions)
+    if not bk or bk == mid:
+        return mid, None
+    from datetime import datetime, timedelta, timezone
+    until = (datetime.now(timezone.utc) + timedelta(seconds=left)).astimezone(timezone(timedelta(hours=8)))
+    m, b = sessions.store.machine(mid) or {}, sessions.store.machine(bk) or {}
+    return bk, {"cooling": mid, "cooling_name": m.get("name") or mid, "backup": bk, "backup_name": b.get("name") or bk,
+                "minutes": int(left // 60) + 1, "until": f"{until:%H:%M}", "ahead": 0, "continue": True}
+
+
 def notice_text(n: dict) -> str:
     t = (f"云电脑「{n['cooling_name']}」在 8 小时后的冷却期，约 {n['minutes']} 分钟后（北京时间 {n['until']}）才能再开，"
          f"这次改用备用电脑「{n['backup_name']}」执行。")
+    if n.get("continue"):
+        t += ("续做需要的文件还在原电脑上：备用机会先从 git 拉取最新提交；没有推送过的改动看不到，"
+              "这种情况它会停下来告诉你，等冷却结束再续做原电脑。")
     if n.get("ahead"):
         t += f"它前面还有 {n['ahead']} 个任务，会按顺序排队执行。"
     return t

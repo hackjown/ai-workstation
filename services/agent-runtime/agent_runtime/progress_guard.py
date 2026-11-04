@@ -30,7 +30,13 @@ DIAG_TASK = re.compile(
     r"调查|对比|对照|比较|审计|评估|报告|\b(diagnos|investigat|analy[sz]|troubleshoot|why|audit|inspect|check)\w*", re.I)
 MAKE_TASK = re.compile(r"画|绘制|生成|制作|做一个|做个|写一个|写个|开发|实现|部署|安装|下单|购买|注册|发布|发帖|修图|剪辑|渲染|"
                        r"转成|转换|改成|装修|设计|订(票|机票|酒店|餐)|预订|预约|发送|发给|回复|填写|提交|上传|删除|修复|修好|修改|"
-                       r"重启|迁移|备份|配置|登录|签到|领取|抢|draw|build|deploy|install|create|generate|render|book|send|fix", re.I)
+                       r"重启|迁移|备份|配置|登录|签到|领取|抢|draw|build|deploy|install|create|generate|render|book|send|fix|"
+                       # v3.9.20 task-62c: 「看看这个网址，能不能复刻」 is building, not a diagnosis
+                       r"复刻|仿站|仿一个|仿做|克隆|还原|逆向|破解|抓包|爬取|跑通|打通|搭建|搭一个|做出来|"
+                       r"clone|replicate|reverse|scrape|【技能[:：][^】]*(dev|reverse|engineer)", re.I)
+# v3.9.20: the user asks for depth or to keep going: never cut it short with "已查清→交付"
+DEEP_TASK = re.compile(r"深挖|继续挖|继续深入|往下挖|挖到底|别停|不要停|做完再|做到.{0,6}(为止|才)|必须.{0,12}(才|再)汇报|"
+                       r"直到|不达.{0,4}不|【接着上次继续做】", re.I)
 # delivering, not collecting
 DELIVER_TOOLS = {"done", "send_file", "ask_user", "note_finding", "update_plan", "remember", "request_takeover", "fail"}
 _REPORT_FILE = re.compile(r"\.(md|txt|html?|docx?|pdf|csv|xlsx?)$", re.I)
@@ -66,7 +72,8 @@ class ProgressGuard:
         self.step_budget = _env_int("AIW_DIAG_STEPS", 8)
         self.time_budget = _env_int("AIW_DIAG_SECONDS", 600)
         self.soft_cap = _env_int("AIW_DIAG_SOFT_CAP", 60)
-        self.same_limit = _env_int("AIW_SAME_FACT_LIMIT", 3)
+        self.same_limit = _env_int("AIW_SAME_FACT_LIMIT", 5)   # v3.9.20: was 3 (asked at step 3)
+        self.ask_min_steps = _env_int("AIW_STUCK_MIN_STEPS", 12)
         self.no_fact_steps = _env_int("AIW_NO_FACT_STEPS", 20)
         self.mode = "work"            # work | deliver
         self.reason = ""              # sufficient | budget | soft_cap
@@ -77,6 +84,18 @@ class ProgressGuard:
         self.forced = 0
         self.last_thought = ""
         self.off = os.environ.get("AIW_PROGRESS_GUARD", "1") == "0"
+        # v3.9.20 (task-62c 「继续深挖」 delivered at step 1 from the facts the LAST run found): only facts found in this
+        # run can say "known", never before AIW_DELIVER_MIN_STEPS steps, and not at all when the user asked for depth
+        self.deep = bool(DEEP_TASK.search(prompt or ""))
+        self.min_steps = _env_int("AIW_DELIVER_MIN_STEPS", 4)
+        self.inherited = 0            # facts carried over from the run this one continues
+        self.new_here = 0             # facts found in this run
+
+    def inherit(self) -> None:
+        """The board was seeded from the previous run: those facts do not count as this run's progress."""
+        self.inherited = len(self.board.items)
+        for i in self.board.items:
+            i["repeats"] = 0
 
     # --------------------------------------------------------------- feed
     def on_fact(self, step: int) -> None:
@@ -99,6 +118,7 @@ class ProgressGuard:
         new, _rep = self.board.capture(thought or "", step)
         if new:
             self.last_new = step
+            self.new_here += 1
         delivering = is_delivery(tool, args)
         if self.mode == "deliver":
             if delivering:
@@ -111,12 +131,13 @@ class ProgressGuard:
             return "force_done", ""
         # switching to deliver
         why = ""
-        if self.answer_task and says_sufficient(thought) and self.board.live():
+        if self.answer_task and not self.deep and says_sufficient(thought) and self.board.live() \
+                and step >= self.min_steps and (self.new_here > 0 or not self.inherited):
             why = "sufficient"
-        elif self.diagnostic and not self.budget_done and (
+        elif self.diagnostic and not self.deep and not self.budget_done and (
                 (self.step_budget > 0 and step >= self.step_budget) or (self.time_budget > 0 and elapsed_s >= self.time_budget)):
             why = "budget"
-        elif self.diagnostic and self.soft_cap > 0 and step >= self.soft_cap and not self.budget_done:
+        elif self.diagnostic and not self.deep and self.soft_cap > 0 and step >= self.soft_cap and not self.budget_done:
             why = "soft_cap"
         if why:
             self.mode, self.reason, self.armed_at = "deliver", why, step
@@ -126,7 +147,9 @@ class ProgressGuard:
                 self.extra_used = True   # this step's collection is the one extra
             return "deliver_now", self.deliver_note(why, elapsed_s, step)
         # stuck
-        if self.board.max_repeats() >= self.same_limit - 1:
+        # v3.9.20: a thought that restates a known fact while working is normal; only a question / diagnosis task
+        # that has run a while and keeps landing on the same conclusion asks
+        if self.answer_task and step >= self.ask_min_steps and self.board.max_repeats() >= self.same_limit - 1:
             return "ask", "同一个结论已经重复了 {} 次，没有新进展".format(self.board.max_repeats() + 1)
         # 20 steps without a new fact: only for a task whose job is an answer (diagnosis / question). A long action
         # task (a 45-step price comparison) keeps running: its valve is the 150-step check-in (3.8.2)

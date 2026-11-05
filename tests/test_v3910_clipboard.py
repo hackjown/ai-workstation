@@ -22,7 +22,7 @@ def test_paste_script_carries_the_text_base64_and_presses_the_key():
     b64 = re.search(r"printf %s (\S+) \|", cmd).group(1)
     assert base64.b64decode(b64).decode() == text
     assert "xclip -selection clipboard" in cmd and ">/dev/null 2>&1" in cmd     # a forked xclip never holds the output
-    assert cmd.rstrip().endswith("xdotool key --clearmodifiers -- ctrl+shift+v")
+    assert "k=ctrl+shift+v;" in cmd and cmd.rstrip().endswith('xdotool key --clearmodifiers -- "$k"; }')
     assert "xdotool key" not in paste_script(clean({"t": "paste", "text": "x", "key": ""}))
 
 

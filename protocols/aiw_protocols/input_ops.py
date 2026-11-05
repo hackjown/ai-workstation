@@ -174,19 +174,49 @@ def xdotool_script(ops: list[dict]) -> str:
     return DISPLAY_GUARD + " && ".join(cmds) if cmds else ""
 
 
+TERM_CLASSES = ("terminal", "xterm", "konsole", "alacritty", "kitty", "tilix", "terminator", "wezterm", "urxvt",
+                "rxvt", "st-256color", "foot", "terminology", "guake", "tilda", "yakuake", "sakura", "cool-retro-term")
+TYPE_IN_TERMINAL = 1500   # v3.9.22: a single line this short is typed into a terminal instead of pasted
+
+
 def paste_script(op: dict) -> str:
     """3.9.10: one shell command that puts op["text"] on the VM's CLIPBOARD (and PRIMARY) selection with xclip
     (xsel when there is no xclip), then presses op["key"] in the focused window. The text travels base64-encoded, so
-    quotes, newlines and Chinese arrive unchanged. Without either tool it is typed instead (short text only)."""
+    quotes, newlines and Chinese arrive unchanged. Without either tool it is typed instead (short text only).
+
+    v3.9.22 (粘贴到终端前面多一串字符、结尾多一个 ~): a terminal wraps a paste in the bracketed-paste markers
+    ESC[200~ … ESC[201~, and whatever reads the line without understanding them shows them as text. When the focused
+    window is a terminal: a single line up to TYPE_IN_TERMINAL characters is TYPED (xdotool type --file: no paste, no
+    markers, a trailing newline dropped so nothing runs by itself); longer or multi-line text is pasted with
+    Ctrl+Shift+V (Ctrl+V in a terminal is quoted-insert), and new shells get `set enable-bracketed-paste off` in
+    ~/.inputrc so bash stops asking the terminal for the markers."""
     import base64
     import shlex
-    b64 = base64.b64encode(op["text"].encode("utf-8")).decode()
+    text = op["text"]
+    b64 = base64.b64encode(text.encode("utf-8")).decode()
     put = (f"printf %s {b64} | base64 -d > \"$f\" && "
            "if command -v xclip >/dev/null 2>&1; then xclip -selection clipboard -i \"$f\" >/dev/null 2>&1 && xclip -selection primary -i \"$f\" >/dev/null 2>&1; "
            "elif command -v xsel >/dev/null 2>&1; then xsel -bi < \"$f\" >/dev/null 2>&1 && xsel -pi < \"$f\" >/dev/null 2>&1; "
-           f"else xdotool type --delay 30 -- {shlex.quote(op['text'][:MAX_TEXT])}; exit $?; fi")
-    key = f" && sleep 0.15 && xdotool key --clearmodifiers -- {shlex.quote(xkey(op['key']))}" if op.get("key") else ""
-    return DISPLAY_GUARD + 'f=$(mktemp) && trap \'rm -f "$f"\' EXIT && ' + put + key
+           f"else xdotool type --delay 30 -- {shlex.quote(text[:MAX_TEXT])}; exit $?; fi")
+    if not op.get("key"):
+        return DISPLAY_GUARD + 'f=$(mktemp) && trap \'rm -f "$f"\' EXIT && ' + put
+    pats = "|".join(f"*{c}*" for c in TERM_CLASSES)
+    line = text.rstrip("\r\n")
+    one_line = bool(line) and "\n" not in line and "\r" not in line and len(line) <= TYPE_IN_TERMINAL
+    wide = any(ord(ch) > 127 for ch in line)
+    typed = ""
+    if one_line:
+        lb = base64.b64encode(line.encode("utf-8")).decode()
+        typed = (f"printf %s {lb} | base64 -d > \"$f.t\" && xdotool type --clearmodifiers --delay {60 if wide else 15} "
+                 "--file \"$f.t\"; r=$?; rm -f \"$f.t\"; exit $r; ")
+    detect = ("cls=$(xdotool getactivewindow getwindowclassname 2>/dev/null | tr 'A-Z' 'a-z'); term=0; "
+              f"case \"$cls\" in {pats}) term=1;; esac; ")
+    in_term = ("if [ \"$term\" = 1 ]; then "
+               "grep -qs 'enable-bracketed-paste' ~/.inputrc || printf '%s\\n' 'set enable-bracketed-paste off' >> ~/.inputrc; "
+               + typed + "k=ctrl+shift+v; fi; ")
+    key = (f" && sleep 0.15 && {{ k={shlex.quote(xkey(op['key']))}; {detect}{in_term}"
+           "xdotool key --clearmodifiers -- \"$k\"; }")
+    return DISPLAY_GUARD + 'f=$(mktemp) && trap \'rm -f "$f" "$f.t"\' EXIT && ' + put + key
 
 
 def budget(ops: list[dict]) -> float:

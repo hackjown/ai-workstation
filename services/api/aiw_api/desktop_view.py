@@ -129,8 +129,13 @@ function connect() {
   rfb.scaleViewport = true; rfb.resizeSession = false; rfb.clipViewport = false;
   rfb.viewOnly = viewOnly; rfb.background = "#000";
   try { rfb.focusOnClick = !viewOnly; rfb.qualityLevel = 6; rfb.compressionLevel = 2; } catch (e) { /* older noVNC */ }
+  // v3.9.22 (接管时有时看不到鼠标): the VNC server sometimes sends an empty / transparent cursor (x11vnc and
+  // TigerVNC do it over some windows and right after xdotool moved the pointer); noVNC then draws nothing. The dot
+  // cursor shows in its place, and the viewer takes the keyboard focus on connect.
+  try { rfb.showDotCursor = !viewOnly; } catch (e) { /* older noVNC */ }
   rfb.addEventListener("connect", () => {
     ok = true; tries = 0; needPw = false; clearTimeout(watchdog); hide();
+    if (!viewOnly) { try { rfb.focus(); } catch (e) { /* older noVNC */ } }
     if (sentPw && pw) { try { localStorage.setItem(KEY, pw); } catch (e) { /* private mode */ } }
   });
   rfb.addEventListener("credentialsrequired", (e) => {

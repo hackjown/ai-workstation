@@ -49,3 +49,20 @@ def test_ios_answer_and_supplement_boxes_use_ime_field():
         assert "IMEInput(" in s, f
     s = (ROOT / "apps/ios/Sources/ChatView.swift").read_text()
     assert 'TextField(ask.kind == .edit' not in s
+
+
+def test_paste_into_terminal_types_a_line_and_turns_bracketed_paste_off():
+    import base64, re
+    from aiw_protocols.input_ops import clean, paste_script
+    cmd = paste_script(clean({"t": "paste", "text": "echo 你好\n", "key": "ctrl+v"}))
+    assert "getwindowclassname" in cmd and "*terminal*" in cmd
+    assert "enable-bracketed-paste off" in cmd and "xdotool type --clearmodifiers" in cmd
+    typed = re.findall(r"printf %s (\S+) \| base64 -d > \"\$f\.t\"", cmd)[0]
+    assert base64.b64decode(typed).decode() == "echo 你好"          # the trailing newline never runs it
+    multi = paste_script(clean({"t": "paste", "text": "a\nb", "key": "ctrl+v"}))
+    assert "$f.t" not in multi.split("EXIT")[1] and "k=ctrl+shift+v" in multi
+
+
+def test_viewer_shows_a_dot_cursor_when_taking_over():
+    s = (ROOT / "services/api/aiw_api/desktop_view.py").read_text()
+    assert "rfb.showDotCursor = !viewOnly" in s

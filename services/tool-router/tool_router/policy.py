@@ -101,12 +101,17 @@ def scratch_delete(cmd: str) -> bool:
     still asks. Scratch: /tmp/<name>..., ~/workspace/<name>..., or a bare relative <name>/... when the command cd's into ~/workspace
     (the shell starts in ~, so without that cd a bare name is not known to be scratch)."""
     hits = list(_RMRF.finditer(cmd))
-    if not hits or re.search(r"\$\(|`|\.\.", cmd):
+    # v3.9.22 task-ca7: `SDK=$(ls -d /tmp/x)` later in the command is not part of the delete; only the rm's own
+    # targets must be plain (no $(...), backticks or ..)
+    if not hits or any(re.search(r"\$\(|`|\.\.", m.group(2)) for m in hits):
         return False
     cds = re.findall(r"\bcd\s+([^;&|\s]+)", cmd)
     # v3.9.19: a project folder under ~/workspace counts too (cd ~/workspace/tasks/task-x && rm -rf pkg_out)
-    rel_ok = bool(cds) and all(re.fullmatch(r"(~|\$HOME|\$\{HOME\}|/data/home|/home/[\w.-]+|/root)/workspace(/[\w.@%+-]+)*", c.rstrip("/"))
-                               and ".." not in c for c in cds)
+    # v3.9.22: a relative cd after that (cd src) stays inside it
+    ws = r"(~|\$HOME|\$\{HOME\}|/data/home|/home/[\w.-]+|/root)/workspace(/[\w.@%+-]+)*"
+    rel_ok = bool(cds) and bool(re.fullmatch(ws, cds[0].rstrip("/"))) and ".." not in cds[0] and all(
+        (re.fullmatch(ws, c.rstrip("/")) or re.fullmatch(r"[\w@%+-][\w.@%+-]*(/[\w.@%+-]+)*", c.rstrip("/")))
+        and ".." not in c for c in cds)
     for m in hits:
         for t in m.group(2).split():
             t = t.strip("'\"")

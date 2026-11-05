@@ -98,3 +98,20 @@ final class IMETextView: UITextView {
     func refreshPlaceholder() { placeholder.isHidden = !(text ?? "").isEmpty || markedTextRange != nil }
     override var text: String! { didSet { refreshPlaceholder() } }
 }
+
+/// v3.9.21: IMEField with its own focus and a rounded border, for the answer / 补充 boxes that sit inside views
+/// a running task keeps re-rendering. SwiftUI's TextField drops the pinyin being composed on such a re-render,
+/// which is what cut the first letter off (the same bug v3.9.17 fixed in the composer).
+struct IMEInput: View {
+    let placeholder: String
+    @Binding var text: String
+    var maxLines: Int = 4
+    var autofocus = false
+    @State private var focused = false
+    var body: some View {
+        IMEField(placeholder: placeholder, text: $text, focused: $focused, maxLines: maxLines)
+            .padding(.horizontal, 8)
+            .background(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.35)))
+            .onAppear { if autofocus { focused = true } }
+    }
+}

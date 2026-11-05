@@ -251,8 +251,7 @@ struct CardActionView: View {
         let opts = (action["options"] as? [Any])?.map { "\($0)" } ?? []
         if !opts.isEmpty { FlowButtons(options: opts) { o in go(["choice": o]) }.disabled(busy) }
         HStack {
-            TextField(opts.isEmpty ? "回答…" : "或者直接告诉它…", text: $reply).textFieldStyle(.roundedBorder).submitLabel(.send)
-                .onSubmit { send() }
+            IMEInput(placeholder: opts.isEmpty ? "回答…" : "或者直接告诉它…", text: $reply)   // v3.9.21 pinyin
             Button("回复") { send() }.buttonStyle(.borderedProminent).tint(amber).controlSize(.small)
                 .disabled(reply.trimmingCharacters(in: .whitespaces).isEmpty || busy)
         }

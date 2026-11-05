@@ -122,6 +122,8 @@ class AgentLoop:
                 self.cfg.timeout_s = max(self.cfg.timeout_s, float(os.environ.get("AIW_VIDEO_TIMEOUT", "3600")))
         self._checkin = _es.checkin_steps()   # soft valve: pause and ask after this many steps without progress
         self._progress_at = 0                 # the step of the last visible progress
+        self._plan_tick_at = 0                # v3.9.22: the step a plan item was last ticked (or the user answered)
+        self._rabbit_nudged = -1
         self._pages_seen: set = set()
         _dh.init(self)   # 3.8.8: per-task work folder, delivered-file index, drawing phases
         self._waited = 0.0  # seconds spent waiting on the user (ask_user, confirmations): not counted toward timeout
@@ -611,6 +613,22 @@ class AgentLoop:
                 if n is None:
                     return
                 note, failures, shots = n, 0, 0
+            # v3.9.22 task-ca7: 200 steps (30 min) on one plan item, debugging a headless browser's WebGL instead of the
+            # product. Plan items stop moving -> first a note (step back: environment problem? record it, work around,
+            # or ask), then the user is asked with 继续执行 among the choices.
+            rab = _es.rabbit_steps()
+            if rab and self.plan_steps and len(self.plan_done) < len(self.plan_steps):
+                since = self.step - max(self._plan_tick_at, getattr(self, "_answered_at", 0))
+                cur = next((i for i in range(len(self.plan_steps)) if i not in self.plan_done), 0)
+                if since >= 2 * rab:
+                    n = await self._escalate("rabbit", f"计划第 {cur + 1} 项「{self.plan_steps[cur][:60]}」已经做了 {since} 步还没完成")
+                    if n is None:
+                        return
+                    self._plan_tick_at = self.step
+                    note, failures, shots = n, 0, 0
+                elif since >= rab and self._rabbit_nudged < self._plan_tick_at:
+                    self._rabbit_nudged = self.step
+                    note = ((note + "\n") if note else "") + _es.rabbit_note(cur, self.plan_steps[cur], since)
             t0 = getattr(self, "_t0", None)
             if t0 and self.cfg.timeout_s > 0 and not self._time_asked and self.ask and (getattr(self, "_time_up", False) or (
                     self.cfg.timeout_s + self._waited - (time.monotonic() - t0)) < min(90.0, 0.15 * self.cfg.timeout_s)):
@@ -1205,6 +1223,7 @@ class AgentLoop:
                 if isinstance(i, int) and 0 <= i < len(self.plan_steps):
                     if i not in self.plan_done:
                         self._mark_progress()
+                        self._plan_tick_at = self.step   # v3.9.22
                     self.plan_done.add(i)
             await self.emit(EventType.PLAN_UPDATE, done=sorted(self.plan_done), note=a.get("note"))
             await self.emit(EventType.ACTION_RESULT, tool=t, success=True, error=None, result={})
@@ -1458,6 +1477,7 @@ class AgentLoop:
             return None
         self._asking_since = time.monotonic()
         self._mark_progress()          # the user was in the loop: the no-progress count starts again
+        self._answered_at = self.step
         try:
             if getattr(self, "_stall", None) is not None:
                 self._stall.reset()

@@ -253,6 +253,9 @@ class Ctx:
         self.cds: list[str] = []
         self.created = set(created or ())     # dirs this task made (normalized), across commands
         self.made_here: set[str] = set()
+        self.vars: dict[str, str] = {}        # v3.9.22: P=http://127.0.0.1:8799 earlier in the line
+        self.heredocs: dict[str, str] = {}    # v3.9.22: NAME_BODY -> the heredoc text
+        self.stdin_code = ""
 
 
 def _is_scratch_dir(p: str, ctx: Ctx) -> bool:
@@ -333,13 +336,34 @@ def _write_target(op: Op, p: str, verb: str = "写入", append: bool = False):
         op.risk(f"如果已有 {name} 会被覆盖", LOW)
 
 
+def _expand(t: str, ctx: Ctx) -> str:
+    if "$" not in t or not ctx.vars:
+        return t
+    return re.sub(r"\$\{?([A-Za-z_]\w*)\}?", lambda m: ctx.vars.get(m.group(1), m.group(0)), t)
+
+
 def _shell_op(words: list[str], ctx: Ctx) -> Optional[Op]:
     if not words:
         return None
+    while words and words[0] in _SH_KEYWORDS:   # v3.9.22: `do tail x`, `then rm y`: the command after the keyword
+        words = words[1:]
+    if not words:
+        return None
+    if words[0] in ("for", "case", "select"):   # `for f in a b` / `case $x in`: the loop header itself does nothing
+        return Op(trivial=True, category="read")
+    if all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w) for w in words):   # P=http://... on its own
+        for w in words:
+            k, _, v = w.partition("=")
+            ctx.vars[k] = v
+        return Op(trivial=True, category="read")
+    words = [_expand(w, ctx) for w in words]
     words, sudo = _strip_prefix(words)
     if not words:
         return None
     args, reds = _redirects(words)
+    ctx.stdin_code = next((ctx.heredocs.get(t, "") for r, t in reds if r == "<<"), "")
+    if args and args[0] in ("[", "[[", "test", "true", "false", ":"):
+        return Op(trivial=True, category="read")
     if not args:
         op = Op(trivial=True, category="read")
     else:
@@ -622,7 +646,8 @@ def _command_op(args: list[str], ctx: Ctx) -> Op:
         op.phrase, op.sentence = f"运行 {c} {sub}", f"运行 {c} {sub}"
         return op
     if c in ("curl", "wget", "aria2c", "http", "httpie"):
-        urls = [a for a in rest if re.match(r"^(https?|ftp)://", a) or re.match(r"^[\w.-]+\.[a-z]{2,}(/|$)", a)]
+        urls = [a for a in rest if re.match(r"^(https?|ftp)://", a) or re.match(r"^[\w.-]+\.[a-z]{2,}(:\d+)?(/|$)", a)
+                or re.match(r"^(localhost|\d{1,3}(\.\d{1,3}){3})(:\d+)?(/|$)", a)]   # v3.9.22 localhost:8000/api
         name, host = site_of(urls[0]) if urls else ("", "")
         up = any(a in ("-T", "--upload-file", "-F", "--form", "-d", "--data", "--data-binary", "--data-raw",
                        "--data-urlencode", "--json", "--post-file", "--post-data", "--body-file") or a.startswith(("-d", "-F", "--data"))
@@ -796,6 +821,11 @@ def _command_op(args: list[str], ctx: Ctx) -> Op:
         op.category = "app"
         return op
     if c in INTERPRETERS:
+        if c.startswith("python") and ctx.stdin_code and (not rest or rest[:1] == ["-"]):   # python3 - <<'EOF'
+            _python_code_op(ctx.stdin_code, ctx, op)
+            if not op.phrase:
+                op.phrase, op.sentence = "运行一段 Python 代码", "运行一段 Python 代码"
+            return op
         if "-c" in rest and c.startswith("python"):
             code = rest[rest.index("-c") + 1] if rest.index("-c") + 1 < len(rest) else ""
             _python_code_op(code, ctx, op)
@@ -864,9 +894,26 @@ def cjoin(parts: list[str], word: str) -> str:
     return out
 
 
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][\w]*)\1[^\n]*\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+_SH_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "done", "fi", "esac"}
+
+
+def _prep(cmd: str, ctx: Optional["Ctx"] = None) -> str:
+    """v3.9.22 (task-ca7 cards: 「运行 \\necho 并运行 \\ncurl」「运行 for 并运行 do」「运行 python3 并运行 p」):
+    join backslash-newline continuations and drop heredoc bodies (the text fed to cat / python is data, not commands;
+    the redirect that writes it stays)."""
+    cmd = re.sub(r"\\\r?\n", " ", cmd or "")
+    def sub(m):
+        if ctx is not None:
+            ctx.heredocs[m.group(2) + "_BODY"] = m.group(3)
+        return "<< " + m.group(2) + "_BODY\n"
+    return _HEREDOC.sub(sub, cmd)
+
+
 def explain_shell(cmd: str, created: Optional[set] = None) -> dict:
     """{phrase, what, impact, risks, sev, ask, category, ops} for a shell line."""
     ctx = Ctx(set(created or ()) | created_dirs(cmd or ""))   # a folder this line (re)creates is scratch
+    cmd = _prep(cmd, ctx)
     parts = split_shell(cmd or "")
     if parts is None:
         return {"phrase": "运行一段命令", "what": "运行一段命令（格式复杂，看技术细节）", "impact": [], "risks": ["命令格式复杂，自动解读不了"],

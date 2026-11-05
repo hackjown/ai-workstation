@@ -800,7 +800,7 @@ struct TaskBlock: View {
                 FlowButtons(options: opts) { o in Task { await reply(o) } }
             }
             HStack {
-                TextField("回答…", text: $answer).textFieldStyle(.roundedBorder)
+                IMEInput(placeholder: "回答…", text: $answer)   // v3.9.21 pinyin
                 Button("发送") { Task { await reply(answer) } }.disabled(answer.isEmpty)
             }
         }.padding(10).askCardStyle(cs, settled: false)
@@ -932,7 +932,7 @@ struct TaskTextSheet: View {
         NavigationStack {
             Form {
                 Section(footer: Text(hint)) {
-                    TextField(ask.kind == .edit ? "新的要求" : "例如：顺便把 PDF 也转成 Word", text: $text, axis: .vertical).lineLimit(3...10)
+                    IMEInput(placeholder: ask.kind == .edit ? "新的要求" : "例如：顺便把 PDF 也转成 Word", text: $text, maxLines: 10, autofocus: true)   // v3.9.21 pinyin
                 }
                 if !err.isEmpty { Section { Text(err).foregroundColor(.red).font(.footnote) } }
             }

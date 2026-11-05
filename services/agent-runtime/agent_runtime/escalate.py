@@ -114,6 +114,7 @@ KIND_TEXT = {
     "drawing_loop": "模型反复分析同一件事，没有动手写 spec、生成图纸",
     "drawing_verify": "图纸 spec 已生成，但核对没通过、模型在原地打转",
     "stuck_fact": "同一个结论反复出现 / 很久没有新事实，先给你汇报",
+    "rabbit": "同一个计划步骤做了很久还没完成，可能在环境问题上打转",
 }
 
 OPT_RETRY, OPT_TAKEOVER, OPT_STOP = "继续，换个方法再试", "我来接管桌面", "停止任务"
@@ -122,6 +123,24 @@ OPT_RETRY, OPT_TAKEOVER, OPT_STOP = "继续，换个方法再试", "我来接管
 OPT_GO = "继续执行（没卡住）"
 OPTIONS = [OPT_GO, OPT_RETRY, OPT_TAKEOVER, OPT_STOP]
 NO_SNOOZE = {"blocked", "vision_down", "fail", "max_steps", "time"}
+
+
+def rabbit_steps() -> int:
+    """v3.9.22: steps on one plan item before a step-back note (2x: the user is asked). AIW_RABBIT_STEPS, 40, 0 = off."""
+    try:
+        return max(0, int(os.environ.get("AIW_RABBIT_STEPS", "40") or 0))
+    except ValueError:
+        return 40
+
+
+def rabbit_note(idx: int, item: str, since: int) -> str:
+    return (f"STEP BACK: plan item {idx} ({item}) has taken {since} steps and is not done. Look at what the last steps were: "
+            "if you are debugging the ENVIRONMENT (headless browser / no GPU / sandbox / a vendor library's internals) "
+            "rather than the user's product, stop digging. Record it with note_finding as 已知问题 with the evidence, then "
+            "either use a workaround that verifies the same thing another way (e.g. a headed browser under Xvfb, a "
+            "different renderer, a unit test) or move on to the next plan item and list it in 已知问题 at the end. If the "
+            "choice changes what the user gets, ask_user with 2-4 concrete options. Do NOT write another probe script "
+            "for the same error.")
 
 
 def snooze_steps() -> int:

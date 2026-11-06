@@ -286,6 +286,26 @@ class Chat:
         self._push("new", m)
         return m
 
+    async def push_reply(self, m: dict) -> bool:
+        """v3.9.20: a chat reply the user did not see (the app was closed / in the background) goes out as a push,
+        once per message. A task card is not pushed here: its task pushes when it ends or asks. AIW_CHAT_PUSH=0 off."""
+        if not (self.notifier and m) or os.environ.get("AIW_CHAT_PUSH", "1") == "0":
+            return False
+        if m.get("role") != "assistant" or m.get("kind") == "task":
+            return False
+        cfg = self.store.kv_get("notify", {}) or {}
+        if cfg.get("chat_push") is False:
+            return False
+        done = self.store.kv_get("chat_pushed", []) or []
+        if m.get("id") in done:
+            return False
+        self.store.kv_set("chat_pushed", (done + [m.get("id")])[-200:])
+        text = re.sub(r"[*`#>|]", "", str(m.get("text") or "")).strip()
+        text = re.sub(r"\s+", " ", text)
+        await self.notifier.notify("reply", "小秘回复了", text[:300] or "（新回复）", deep=f"chat?m={m.get('id')}",
+                                   message_id=m.get("id"))
+        return True
+
     def get(self, mid: str) -> Optional[dict]:
         r = self.store._x("SELECT * FROM chat_messages WHERE id=?", (mid,))
         return _row(r[0]) if r else None
@@ -544,7 +564,30 @@ class Chat:
             name = m.get("small_model") or m.get("subagent_model") or m.get("chat_model") or main
         back = main if name != main else m.get("fallback")
         key = s.secrets.get("openai_api_key") if s.secrets else None
-        return LLMRouter.from_settings(name, back, key, m.get("base_url") or None, None, "off")
+        return LLMRouter.from_settings(name, back, key, m.get("base_url") or None, None, "off",
+                                       role="chat" if role == "chat" else "small")
+
+    async def _chat_llm(self, text: str):
+        """v3.9.24 (2): the chat model for this turn; with 模型路由 on for chat, the tier's model / effort."""
+        try:
+            from . import autoroute
+            if self.llm_factory or getattr(self.sessions, "_custom_llm", None) or not autoroute.on(self.store):
+                return self.llm("chat")
+            route = await autoroute.decide(self.store, text, self.llm("small"), for_chat=True)
+            if not route or (not route.get("model") and (route.get("effort") or "off") == "off"):
+                return self.llm("chat")
+            from llm_router import LLMRouter
+            m = self.sessions.model_settings()
+            main = m.get("chat_model") or m.get("model")
+            name = route.get("model") or main
+            key = self.sessions.secrets.get("openai_api_key") if self.sessions.secrets else None
+            self.last_route = route
+            eff = route.get("effort") if route.get("effort") != "off" else None
+            return LLMRouter.from_settings(name, main if name != main else m.get("fallback"), key,
+                                           m.get("base_url") or None, None, "on" if eff else "off", effort=eff, role="chat")
+        except Exception as e:  # noqa: BLE001
+            log.warning("chat route: %s", e)
+            return self.llm("chat")
 
     # ------------------------------------------------------------------ context
     def _recent_rows(self, n: int = 400) -> list[dict]:
@@ -610,7 +653,8 @@ class Chat:
         if getattr(self, "_image_on", False):
             tools.append("AI 生成图片（generate_image）、AI 改用户发来的图片（edit_image）——用户只是要一张图或改图时直接用它们，"
                          "不要交给电脑；生成后用一句话说明，图片会自动显示")
-        system = SYSTEM.format(name=self.agent_name(), now=time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600)),
+        from agent_runtime import prompts as _prompts   # v3.9.24: the user's edited chat prompt, if any
+        system = _prompts.fmt("chat", SYSTEM, name=self.agent_name(), now=time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600)),
                                tools="、".join(tools))
         prof = self.store.kv_get("profile", {}) or {}
         if prof.get("tone"):
@@ -680,7 +724,7 @@ class Chat:
         try:
             convo = "\n".join(f"{'用户' if r['role'] == 'user' else '助理'}：{(self.render(r) or '')[:600]}" for r in gap)
             new = await asyncio.wait_for(self.llm("small").complete(
-                SUMMARY_PROMPT, f"已有摘要：\n{summ.get('text') or '（无）'}\n\n新的对话：\n{convo}", 1200), 120)
+                __import__("agent_runtime.prompts", fromlist=["get"]).get("chat_summary", SUMMARY_PROMPT), f"已有摘要：\n{summ.get('text') or '（无）'}\n\n新的对话：\n{convo}", 1200), 120)
             new = re.sub(r"<think>.*?</think>", "", new or "", flags=re.S).strip()
             if not new:
                 return False
@@ -699,7 +743,8 @@ class Chat:
         user = (f"最近的聊天：\n{recent}\n\n" if recent else "") + f"最新消息：{text[:1500]}"
         if attachments:
             user += "\n（这条消息带附件：" + "、".join(str(a.get("name") or "") for a in attachments[:10]) + "）"
-        system = ROUTE_PROMPT
+        from agent_runtime import prompts as _prompts
+        system = _prompts.get("chat_route", ROUTE_PROMPT)
         if cands:   # 3.8.5: the classifier may also say "this continues task n"
             system += ROUTE_TASKS.format(tasks="\n".join(
                 f"{i + 1}: {STATUS_CN.get(c['run']['status'], c['run']['status'])} · {c['title']}" for i, c in enumerate(cands[:5])))
@@ -849,7 +894,7 @@ class Chat:
         schemas = [t[0] for t in tools.values()]
         parts, offer = [], None
         try:
-            llm = self.llm("chat")
+            llm = await self._chat_llm(text)
             for rnd in range(TOOL_ROUNDS + 1):
                 flt = OfferFilter()
 
@@ -1639,8 +1684,11 @@ def mount(app, chat: Chat, auth) -> None:
         if body.machine_id and not chat.store.machine(body.machine_id):
             raise HTTPException(404, "machine not found")
         q: asyncio.Queue = asyncio.Queue()
+        state = {"gone": False, "replies": []}   # v3.9.20: the app left before the reply was written
 
         async def on_event(kind, data):
+            if kind == "message" and isinstance(data, dict) and data.get("role") == "assistant":
+                state["replies"].append(data)
             await q.put((kind, data))
 
         async def run():
@@ -1649,9 +1697,14 @@ def mount(app, chat: Chat, auth) -> None:
             except Exception as e:  # noqa: BLE001  never silent
                 log.exception("chat send")
                 m = chat.add("assistant", "text", f"出错了：{type(e).__name__}: {str(e)[:160]}", {"error": True})
+                state["replies"].append(m)
                 await q.put(("message", m))
             finally:
                 await q.put(None)
+                if state["gone"] and body.stream:
+                    for m in state["replies"][-1:]:
+                        with contextlib.suppress(Exception):
+                            await chat.push_reply(m)
         job = chat.background(run())   # the reply finishes and is stored even if this client goes away
         if not body.stream:
             await job
@@ -1663,15 +1716,29 @@ def mount(app, chat: Chat, auth) -> None:
             return {"events": events, "messages": [e["data"] for e in events if e["event"] in ("user", "message", "task")]}
 
         async def gen():
-            yield ": ok\n\n"
-            while True:
-                it = await q.get()
-                if it is None:
-                    yield "event: done\ndata: {}\n\n"
-                    break
-                yield f"event: {it[0]}\ndata: {json.dumps(it[1], ensure_ascii=False)}\n\n"
+            finished = False
+            try:
+                yield ": ok\n\n"
+                while True:
+                    it = await q.get()
+                    if it is None:
+                        finished = True
+                        yield "event: done\ndata: {}\n\n"
+                        break
+                    yield f"event: {it[0]}\ndata: {json.dumps(it[1], ensure_ascii=False)}\n\n"
+            finally:
+                if not finished:   # the client went away (app in the background): the reply goes out by Bark
+                    state["gone"] = True
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.post("/api/chat/messages/{mid}/push", dependencies=dep)
+    async def chat_push(mid: str):
+        """v3.9.20: the iOS app got the reply while it was already in the background: push it (Bark)."""
+        m = chat.get(mid)
+        if not m:
+            raise HTTPException(404)
+        return {"pushed": await chat.push_reply(m)}
 
     @app.post("/api/chat/cancel", dependencies=dep)
     async def chat_cancel():
@@ -1701,3 +1768,13 @@ def mount(app, chat: Chat, auth) -> None:
             return await chat.to_task(mid, body.machine_id)
         except KeyError:
             raise HTTPException(404, "no task offer on this message")
+
+
+# v3.9.24 prompt management: the chat's originals, shown and restored in 设置 › 提示词
+try:
+    from agent_runtime import prompts as _prompts_reg
+    _prompts_reg.register("chat", "小秘聊天", SYSTEM, "聊天回复的系统提示词；可用占位符 {name} {now} {tools}，写错占位符时自动回到原版")
+    _prompts_reg.register("chat_route", "聊天分流", ROUTE_PROMPT, "判断一句话是聊天还是交给电脑做")
+    _prompts_reg.register("chat_summary", "聊天滚动摘要", SUMMARY_PROMPT, "长聊天的滚动摘要")
+except Exception:  # noqa: BLE001
+    pass

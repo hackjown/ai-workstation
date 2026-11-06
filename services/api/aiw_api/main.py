@@ -82,6 +82,8 @@ class TaskIn(BaseModel):
     timeout_s: Optional[float] = None  # None = AIW_TASK_TIMEOUT (default 0: no time budget)
     isolated: bool = False
     new_task: bool = False             # 3.8.5: a message in a thread continues its task unless this is set
+    model: Optional[str] = None        # v3.9.24: the user's model for this task (beats 模型路由)
+    effort: Optional[str] = None       # v3.9.24: off | low | medium | high
 
 class ContinueIn(BaseModel):          # 3.8.5: 继续 / 我已经上传了 / 补充要求 / 修改任务
     text: str = ""
@@ -245,11 +247,19 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             log.warning("recovery failed: %s", e)
         if settings.scheduler_enabled:
             scheduler.start()
+        try:
+            await app.state.v3924.on_start()
+        except Exception as e:  # noqa: BLE001
+            log.warning("v3924 start: %s", e)
         for e in cloud.list():  # a setup interrupted by an API restart carries on
             if e.get("status") in ("adding", "creating", "installing"):
                 cloud.start_setup(e["id"])
         yield
         await scheduler.stop()
+        try:
+            await app.state.v3924.on_stop()
+        except Exception as e:  # noqa: BLE001
+            log.warning("v3924 stop: %s", e)
         for s in sessions.live.values():
             s.control.stop()
 
@@ -304,6 +314,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     _search.mount(app, srch, auth)
     from . import greeting as _greeting   # 球球播报 on the home screen (/api/greeting)
     _greeting.mount(app, store, chat, mem, auth)
+    from . import v3924 as _v3924   # v3.9.24: routing, review, webhooks, usage, apps, prompts, context, teach, remote, 签到
+    ext24 = _v3924.mount(app, store, sessions, scheduler, notifier, secrets, settings, chat, auth)
+    app.state.v3924 = ext24
 
     # ------------------------------------------------------------- tasks
 
@@ -334,6 +347,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                     logging.getLogger("aiw").warning("roles continue: %s", e)
             res = await sessions.submit(body.prompt.strip(), mid, body.thread_id, max_steps=body.max_steps,
                                         timeout_s=body.timeout_s, isolated=body.isolated, link_thread=not body.new_task,
+                                        model=body.model, effort=body.effort,
                                         context_extra=(_roles.CONTINUE_ON_BACKUP if notice and notice.get("continue") else None))
             if notice:
                 res = {**res, "backup_vm": notice, "notice": _roles.notice_text(notice)}
@@ -358,6 +372,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if not t:
             raise HTTPException(404)
         t["plan"] = json.loads(t["plan"]) if t.get("plan") else None
+        t["route"] = store.kv_get(f"task_route:{task_id}")          # v3.9.24: model / effort this run used
+        t["model_pick"] = store.kv_get(f"task_model:{task_id}")
         return t
 
     @app.post("/api/tasks/{task_id}/retry", dependencies=[Depends(auth)])

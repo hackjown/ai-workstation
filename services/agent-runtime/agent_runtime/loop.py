@@ -50,6 +50,8 @@ from .planner import SYSTEM_PROMPT, make_plan
 from .recovery import Recovery
 from .validator import Validator
 
+SUBAGENT_SYSTEM = ("You are a helper agent with a Linux shell and the ~/workspace folder. No screen. "
+                   "One tool call per turn. Finish with done and a factual summary of what you did and produced.")
 EventSink = Callable[[AgentEvent], Awaitable[None]]
 AskFn = Callable[[str, list], Awaitable[Optional[str]]]
 RememberFn = Callable[[str], Awaitable[None]]
@@ -156,7 +158,9 @@ class AgentLoop:
         self.image_cfg = image_cfg or {}  # {"base_url", "key", "model"}: the AI image-editing model, if set
         self._seen_hash: Optional[str] = None
         self._seen_desc: Optional[str] = None
-        self.system = SYSTEM_PROMPT + (("\n" + system_extra) if system_extra else "")
+        from . import prompts as _prompts   # v3.9.24: the user's edited task prompt, when they made one
+        self.system = _prompts.get("task_agent", SYSTEM_PROMPT) + (("\n" + system_extra) if system_extra else "")
+        self._traced: Optional[tuple] = None   # v3.9.24: (system hash, tool names) last reported to the prompt trace
         self.plan_steps: list[str] = []
         self.plan_done: set[int] = set()
         self._fresh: Optional[str] = None  # post-action screenshot, reused as the next observation
@@ -551,11 +555,34 @@ class AgentLoop:
             if m and m.group(1).strip():   # aiw-fix-1: a continuation plans the new words; earlier runs did the rest
                 p = "（接着上次的任务：之前的部分已完成，不要重新规划克隆/安装等已做过的步骤）\n" + m.group(1).strip()
             steps = await make_plan(self.llm, p, self.task.context)
+            from . import prompts as _prompts
+            from .planner import PLAN_PROMPT
+            _prompts.trace(self.task.id, "planner", _prompts.get("planner", PLAN_PROMPT), [], model_name(self.llm))
         except Exception:  # noqa: BLE001
             return
         if self.task.status == TaskStatus.RUNNING and steps:
             self.plan_steps = steps
             await self.emit(EventType.PLAN, plan=self.plan_steps, done=sorted(self.plan_done))
+
+    def _v3924_prepare(self, req) -> None:
+        """v3.9.24: per-model context compression (8) and the prompt trace (7) for this step's request."""
+        try:
+            from . import context as _ctx
+            from . import prompts as _prompts
+            model = model_name(self.llm)
+            hist, info = _ctx.fit(list(req.history or []), model, (req.system or "") + "\n" + (req.task or ""))
+            if info:
+                req.history = hist
+                if not getattr(self, "_ctx_noted", False) or self.step % 20 == 0:
+                    self._ctx_noted = True
+                    __import__("logging").getLogger("aiw.loop").info("context compressed for %s: %s", model, info)
+            names = tuple(t.get("name") for t in (req.tools or []) if isinstance(t, dict))
+            key = (hash(req.system), names)
+            if key != self._traced:
+                self._traced = key
+                _prompts.trace(self.task.id, "task_agent", req.system, req.tools, model, step=self.step)
+        except Exception:  # noqa: BLE001  never breaks a step
+            pass
 
     def _finish(self, status: TaskStatus, result: str):
         self.task.status, self.task.result = status, result
@@ -739,6 +766,7 @@ class AgentLoop:
                           # step and then 540 s on one step (900 s budget gone with the result already made at 175 s)
                           else os.environ.get("AIW_IMAGE_THINKING", "off") if self._image_task else None),
                 on_reasoning=on_reasoning)
+            self._v3924_prepare(req)
             decision = None
             tries = int(os.environ.get("AIW_DECIDE_RETRIES", "4"))
             for attempt in range(tries):
@@ -2774,10 +2802,12 @@ class AgentLoop:
         schemas = tool_schemas(only=SUBAGENT_TOOLS)
         for i in range(self.cfg.subagent_steps):
             await self.control.checkpoint()
+            from . import prompts as _prompts
+            sub_sys = _prompts.get("subagent", SUBAGENT_SYSTEM)
+            if i == 0:
+                _prompts.trace(self.task.id, "subagent", sub_sys, schemas, model_name(llm))
             d = await llm.decide(LLMRequest(
-                system="You are a helper agent with a Linux shell and the ~/workspace folder. No screen. "
-                       "One tool call per turn. Finish with done and a factual summary of what you did and produced.",
-                task=goal, history=hist, screenshot_b64=None, tools=schemas))
+                system=sub_sys, task=goal, history=hist, screenshot_b64=None, tools=schemas))
             if d.tool not in SUBAGENT_TOOLS:
                 hist.append(f"{i+1}. {d.tool} is not available to the helper")
                 continue
@@ -3064,3 +3094,10 @@ def _thumb(b64: str):
 def json_short(d: dict) -> str:
     import json
     return json.dumps(d, ensure_ascii=False)[:600]
+
+
+try:   # v3.9.24 设置 › 提示词
+    from . import prompts as _prompts_reg
+    _prompts_reg.register("subagent", "子代理（delegate）", SUBAGENT_SYSTEM, "没有屏幕、只用 shell 的帮手")
+except Exception:  # noqa: BLE001
+    pass

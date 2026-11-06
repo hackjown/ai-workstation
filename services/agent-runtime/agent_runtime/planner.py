@@ -198,7 +198,8 @@ async def make_plan(llm, task: str, context: str | None = None) -> list[str]:
     """Ask the model for a short checklist; fall back to the offline split."""
     try:
         bg = plan_context(context)
-        text = await llm.complete(PLAN_PROMPT, (f"背景：\n{bg}\n\n" if bg else "") + f"请求：{task}", 1200)
+        from . import prompts as _prompts
+        text = await llm.complete(_prompts.get("planner", PLAN_PROMPT), (f"背景：\n{bg}\n\n" if bg else "") + f"请求：{task}", 1200)
         steps = parse_plan(text, task)
         if len(steps) >= 2:
             return steps
@@ -231,3 +232,12 @@ def parse_plan(text: str, task: str) -> list[str]:
             continue
         out.append(line)
     return out[:5]
+
+
+# v3.9.24 prompt management: the originals, shown and restored in 设置 › 提示词
+try:
+    from . import prompts as _prompts_reg
+    _prompts_reg.register("task_agent", "任务 Agent（主模型）", SYSTEM_PROMPT, "每个任务每一步的系统提示词（技能、电脑信息等附加段落另外拼在后面）")
+    _prompts_reg.register("planner", "任务规划", PLAN_PROMPT, "任务开始时拆解 2-5 步清单")
+except Exception:  # noqa: BLE001
+    pass

@@ -114,19 +114,26 @@ class LLMRouter:
         if not providers:
             raise ValueError("no LLM providers configured")
         self.providers = providers
+        self.role = ""   # v3.9.24: who calls (main / chat / small / vision …), tagged on each call's token usage
 
     @classmethod
     def from_settings(cls, model: str | None = None, fallback: str | None = None,
                       api_key: str | None = None, base_url: str | None = None,
-                      tool_choice: dict | None = None, thinking: str | None = None) -> "LLMRouter":
+                      tool_choice: dict | None = None, thinking: str | None = None,
+                      effort: str | None = None, role: str = "") -> "LLMRouter":
         """Models picked in the web console (OpenAI-compatible gateway). Falls back to env config."""
         from .providers.openai import OpenAIProvider
         key = api_key or os.environ.get("OPENAI_API_KEY")
         if not key or not (model or fallback):
             return cls.from_env()
         tc = tool_choice or {}
-        ps = [OpenAIProvider(model=m, api_key=key, base_url=base_url, tool_choice=tc.get(m), thinking=thinking) for m in (model, fallback) if m]
-        return cls(ps)
+        # effort (v3.9.24 auto routing) applies to the routed model only; the fallback keeps the plain settings
+        ps = [OpenAIProvider(model=m, api_key=key, base_url=base_url, tool_choice=tc.get(m), thinking=thinking,
+                             **({"effort": effort} if effort and i == 0 else {}))
+              for i, m in enumerate(x for x in (model, fallback) if x)]
+        r = cls(ps)
+        r.role = role
+        return r
 
     @classmethod
     def from_env(cls) -> "LLMRouter":
@@ -140,7 +147,23 @@ class LLMRouter:
         ps = [avail[n][0]() for n in order if n in avail and os.environ.get(avail[n][1])]
         return cls(ps)
 
+    def _tag(self):
+        from . import usage as _u
+        return _u.ROLE.set(self.role) if self.role else None
+
+    def _untag(self, tok) -> None:
+        if tok is not None:
+            from . import usage as _u
+            _u.ROLE.reset(tok)
+
     async def decide(self, req: LLMRequest) -> LLMDecision:
+        tok = self._tag()
+        try:
+            return await self._decide(req)
+        finally:
+            self._untag(tok)
+
+    async def _decide(self, req: LLMRequest) -> LLMDecision:
         """Try providers in order. A provider that takes longer than AIW_DECIDE_TIMEOUT (default 90s) is
         abandoned for the next one (the fallback model); the last provider gets no limit."""
         import asyncio
@@ -158,6 +181,13 @@ class LLMRouter:
         raise RuntimeError(f"all LLM providers failed: {type(last).__name__}: {last}")
 
     async def describe(self, system: str, user: str, image_b64: str, max_tokens: int = 900) -> str:
+        tok = self._tag()
+        try:
+            return await self._describe(system, user, image_b64, max_tokens)
+        finally:
+            self._untag(tok)
+
+    async def _describe(self, system: str, user: str, image_b64: str, max_tokens: int = 900) -> str:
         last = None
         for p in self.providers:
             try:
@@ -168,6 +198,14 @@ class LLMRouter:
 
     async def chat(self, messages: list[dict], tools: Optional[list[dict]] = None, max_tokens: int = 1500,
                    on_delta: Optional[Callable[[str], Awaitable[None]]] = None) -> dict:
+        tok = self._tag()
+        try:
+            return await self._chat(messages, tools, max_tokens, on_delta)
+        finally:
+            self._untag(tok)
+
+    async def _chat(self, messages: list[dict], tools: Optional[list[dict]] = None, max_tokens: int = 1500,
+                    on_delta: Optional[Callable[[str], Awaitable[None]]] = None) -> dict:
         """Chat reply with fallback across providers. Once a provider has streamed part of an answer the next one is
         not tried (the user would see two answers glued together); the error goes up instead."""
         last = None
@@ -187,6 +225,13 @@ class LLMRouter:
         raise RuntimeError(f"no provider could chat: {type(last).__name__}: {last}")
 
     async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
+        tok = self._tag()
+        try:
+            return await self._complete(system, user, max_tokens)
+        finally:
+            self._untag(tok)
+
+    async def _complete(self, system: str, user: str, max_tokens: int = 800) -> str:
         last = None
         for p in self.providers:
             try:

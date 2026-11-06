@@ -117,7 +117,38 @@ class SessionManager:
             return self._custom_llm()
         m = self.model_settings()
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m.get("model"), m.get("fallback"), key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"))
+        return LLMRouter.from_settings(m.get("model"), m.get("fallback"), key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"),
+                                       role="main")
+
+    async def _routed_llm(self, task: Task, small=None) -> tuple:
+        """v3.9.24 (2): (llm, route or None). A model the user picked for the task wins; then auto routing
+        (设置 › 模型路由); routing off / nothing to change -> exactly the old _task_llm."""
+        llm, video = self._task_llm(task.prompt)
+        if self._custom_llm:
+            return llm, None
+        pick = self.store.kv_get(f"task_model:{task.id}") or {}
+        if not pick and task.id:   # a continuation keeps the first run's pick
+            root = (self.store.task(task.id) or {}).get("continues")
+            pick = self.store.kv_get(f"task_model:{root}") or {} if root else {}
+        try:
+            from . import autoroute
+            if video and not pick:   # the video model stays for video production
+                return llm, {"tier": "video", "tier_cn": "视频", "model": video, "effort": "", "by": "video", "reason": "视频任务"}
+            route = await autoroute.decide(self.store, task.prompt, small, pick.get("model") or "", pick.get("effort") or "")
+        except Exception as e:  # noqa: BLE001
+            log.warning("auto route: %s", e)
+            return llm, None
+        if not route or (not route.get("model") and (route.get("effort") or "off") in ("", "off") and route.get("by") != "manual"):
+            return llm, route
+        m = self.model_settings()
+        key = self.secrets.get("openai_api_key") if self.secrets else None
+        name = route.get("model") or m.get("model")
+        back = m.get("model") if name != m.get("model") else m.get("fallback")
+        eff = route.get("effort") if route.get("effort") in ("low", "medium", "high") else None
+        thinking = "on" if eff else m.get("thinking")
+        route = {**route, "resolved_model": name}
+        return LLMRouter.from_settings(name, back, key, m.get("base_url") or None, self._tool_choices(), thinking,
+                                       effort=eff, role="main"), route
 
     def _task_llm(self, prompt: str) -> tuple[LLMRouter, Optional[str]]:
         """The main model, or the video model for making/editing a video (设置 video_model / AIW_VIDEO_MODEL).
@@ -132,7 +163,7 @@ class SessionManager:
             return self._llm(), None
         key = self.secrets.get("openai_api_key") if self.secrets else None
         return LLMRouter.from_settings(vm, m.get("model") or m.get("fallback"), key, m.get("base_url") or None,
-                                       self._tool_choices(), m.get("thinking")), vm
+                                       self._tool_choices(), m.get("thinking"), role="main"), vm
 
     def _subagent_llm(self) -> Optional[LLMRouter]:
         if self._custom_llm:
@@ -141,7 +172,8 @@ class SessionManager:
         if not m.get("subagent_model"):
             return None
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m["subagent_model"], None, key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"))
+        return LLMRouter.from_settings(m["subagent_model"], None, key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"),
+                                       role="subagent")
 
     def _tool_choices(self) -> dict:
         """tool_choice that the probe found working for each model ('auto' for gateways that break on 'required')."""
@@ -176,8 +208,10 @@ class SessionManager:
         from llm_router.providers.openai import OpenAIProvider
         key = key or os.environ.get("OPENAI_API_KEY")
         th = os.environ.get("AIW_VISION_THINKING", "off")
-        return LLMRouter([OpenAIProvider(model=n, api_key=key, base_url=m.get("base_url") or None, thinking=th)
-                          for n in chain])
+        r = LLMRouter([OpenAIProvider(model=n, api_key=key, base_url=m.get("base_url") or None, thinking=th)
+                       for n in chain])
+        r.role = "vision"
+        return r
 
     def _geometry_llm(self) -> Optional[LLMRouter]:
         """Model that boxes things for exact image moves (AIW_GEOMETRY_MODEL / 设置 geometry_model), else the eyes."""
@@ -188,7 +222,7 @@ class SessionManager:
         if not name:
             return None
         key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(name, None, key, m.get("base_url") or None, None, "off")
+        return LLMRouter.from_settings(name, None, key, m.get("base_url") or None, None, "off", role="geometry")
 
     def _image_cfg(self) -> Optional[dict]:
         """The AI image models (image_edit / generate_image), v3.9.15 two endpoints:
@@ -242,7 +276,7 @@ class SessionManager:
     async def submit(self, prompt: str, machine_id: Optional[str] = None, thread_id: Optional[str] = None,
                      source: str = "chat", max_steps: Optional[int] = None, timeout_s: Optional[float] = None, title: Optional[str] = None,
                      isolated: bool = False, context_extra: Optional[str] = None, continues: Optional[str] = None,
-                     link_thread: bool = True) -> dict:
+                     link_thread: bool = True, model: Optional[str] = None, effort: Optional[str] = None) -> dict:
         """context_extra: background the task gets on top of its thread and memory (the chat turns before a task
         the persistent chat started); kept in kv so a queued task still has it when it starts.
         continues: the root task this run continues (3.8.5). A message in a task's thread (source chat, the task
@@ -280,6 +314,8 @@ class SessionManager:
             self.store.kv_set(f"isolated:{task.id}", True)
         if context_extra:
             self.store.kv_set(f"task_ctx:{task.id}", str(context_extra)[:6000])
+        if model or effort:   # v3.9.24: the user picked the model for this task (beats auto routing)
+            self.store.kv_set(f"task_model:{task.id}", {"model": (model or "").strip()[:120], "effort": (effort or "").strip()[:10]})
         # 3.8: a NEW message in a thread whose queue was paused by 停止 resumes that queue. Before, the hold also caught
         # every later message: it was queued with the computer idle and nothing (on iOS) could ever release it.
         if thread_id in self.held_threads and source not in ("resume", "dispatch"):
@@ -684,6 +720,19 @@ class SessionManager:
             if scope.startswith("remote_diag:"):
                 summary["scope_note"] = f"本任务内允许对该主机（{scope.split(':', 1)[1]}）执行只读诊断：同意一次，后面同类操作不再询问"
             brief = {"title": summary["title"], "risk": summary["risk"], "what": summary["what"]}
+            ext = getattr(self, "v3924", None)
+            if ext is not None:   # v3.9.24 (3) 自动审核: deny rules win; allow rules / the review model; else the card
+                try:
+                    rv = await ext.review(tool, payload, summary, task)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("auto review: %s", e)
+                    rv = None
+                if rv and rv.get("verdict") in ("allow", "deny"):
+                    ok = rv["verdict"] == "allow"
+                    await emit(AgentEvent(session_id=sid, type=EventType.CONFIRM_ANSWERED,
+                                          data={"tool": tool, "approve": ok, "by": "review", "review_by": rv.get("by"),
+                                                "review_reason": rv.get("reason"), **brief, "summary": summary}))
+                    return ok
             if scope and scope in live.allowed_scopes:
                 # v3.9.17: same host, same kind of read-only diagnosis, already allowed in this task
                 await emit(AgentEvent(session_id=sid, type=EventType.CONFIRM_ANSWERED,
@@ -804,6 +853,8 @@ class SessionManager:
 
         async def runner():
             nonlocal computer, ssh_pool
+            from llm_router import usage as _usage   # v3.9.24: token usage rows carry this task
+            _usage.TASK.set(task.id)
             self.store.update_task(task.id, TaskStatus.RUNNING.value)
             try:
                 # integrations (MCP servers) are loaded here, off the request path: POST /api/tasks returns at once
@@ -875,6 +926,13 @@ class SessionManager:
                         extra.update(xhs.task_tools(self.store, self.notifier, task, computer, confirm, self))
                 except Exception as e:  # noqa: BLE001
                     log.warning("xhs tools unavailable: %s", e)
+                v24 = getattr(self, "v3924", None)
+                if v24 is not None:   # v3.9.24: apps (code / mcp), write_app, checkin_save_recipe
+                    try:
+                        extra.update(await v24.task_tools(task, computer))
+                        sx += v24.prompt_extra(task)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("v3924 tools: %s", e)
                 async with hold:
                     home = None
                     try:   # 3.8.5: the task's attachments + earlier runs' files onto THIS computer, real paths in the prompt
@@ -891,9 +949,14 @@ class SessionManager:
                         sx += await self._skill_preflight(task, computer, emit, sid)
                     except Exception as e:  # noqa: BLE001
                         log.warning("skill preflight: %s", e)
-                    llm, routed = self._task_llm(task.prompt)
-                    if routed:
-                        await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": f"视频任务，改用视频模型 {routed}"}))
+                    llm, route = await self._routed_llm(task, v24.small_llm() if v24 is not None else None)
+                    if route and route.get("by") == "video":
+                        await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": f"视频任务，改用视频模型 {route['model']}"}))
+                    elif route:   # v3.9.24 (2): which model / effort this run uses, on the timeline and the task
+                        from . import autoroute as _ar
+                        self.store.kv_set(f"task_route:{task.id}", route)
+                        await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE,
+                                              data={"text": _ar.label(route, self.model_settings().get("model") or ""), "route": route}))
                     live.executor = ToolExecutor(computer, confirm=confirm, audit=audit)
                     loop = AgentLoop(task, sid, computer, llm, live.executor,
                                      control=live.control, emit=emit, ask=ask, remember=remember, extra_tools=extra,

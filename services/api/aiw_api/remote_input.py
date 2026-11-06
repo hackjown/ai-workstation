@@ -51,6 +51,7 @@ class InputPump:
         self.at = (0, 0)
         self.busy = False
         self._last_err = ("", 0.0)
+        self.mid: Optional[str] = None   # v3.9.24: which computer (the teach recorder keys on it)
 
     @property
     def legacy(self) -> Optional[bool]:
@@ -95,6 +96,12 @@ class InputPump:
                 self.held = o["button"]
             elif o["t"] == "up":
                 self.held = None
+            if self.mid:   # v3.9.24 教学录制: the demonstration recorder sees every accepted op
+                try:
+                    from . import teach as _teach
+                    _teach.on_op(self.mid, o)
+                except Exception:  # noqa: BLE001
+                    pass
             if o["t"] == "move" and self.q and self.q[-1]["t"] == "move":
                 self.q[-1] = o
             else:
@@ -215,6 +222,7 @@ def mount(app, store, sessions, auth, ws_ok) -> None:
         if not isinstance(ops, list) or not ops:
             raise HTTPException(400, "ops must be a non-empty list")
         p = InputPump(c)
+        p.mid = mid
         await p.screen()
         n = p.push(ops[:200])
         try:
@@ -245,6 +253,7 @@ def mount(app, store, sessions, auth, ws_ok) -> None:
             return
         await ws.accept()
         p = InputPump(c)
+        p.mid = mid
         size = await p.screen()
         await ws.send_json({"op": "hello", "width": size[0] if size else None, "height": size[1] if size else None})
 

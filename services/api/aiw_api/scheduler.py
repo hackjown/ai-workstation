@@ -61,6 +61,7 @@ class Scheduler:
     def __init__(self, store, sessions, notifier, tick: float = 20.0):
         self.store, self.sessions, self.notifier, self.tick = store, sessions, notifier, tick
         self._task: asyncio.Task | None = None
+        self.extra_ticks: list = []   # v3.9.24: async fn(now) run each tick (自动签到)
         try:  # 京东/淘宝 watches keep their own columns on the watches table
             from . import shopwatch
             shopwatch.ensure_columns(store)
@@ -94,6 +95,11 @@ class Scheduler:
             await xhs.tick(self, now)
         except Exception as e:  # noqa: BLE001
             log.warning("xhs tick failed: %s", e)
+        for fn in list(self.extra_ticks):
+            try:
+                await fn(now)
+            except Exception as e:  # noqa: BLE001
+                log.warning("extra tick failed: %s", e)
 
     async def fire_routine(self, r: dict, now: float | None = None) -> dict:
         now = now or time.time()

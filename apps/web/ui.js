@@ -207,12 +207,14 @@ loadSettings = async function () {
       <div class="savebar"><span class="note">保存立即生效，不用重启</span>${vmnet.pve ? `<button type="button" class="btn sm" onclick="detectVmIp()">从 PVE 检测</button>` : ""}<button class="btn sm primary">保存</button></div>
     </form>
     <form class="rows" id="sCloud" onsubmit="cloudAdd(event)">
-      <div class="rw head"><div class="k">InstaBox 云电脑</div><div>${!cloudList.length ? '<span class="chip">未配置</span>' : cloudList.some((c) => c.status === "ready" && !c.paused) ? `<span class="chip ok">${cloudList.length} 台已连接</span>` : cloudList.every((c) => c.paused) ? `<span class="chip">${cloudList.length} 台 · 暂停中</span>` : '<span class="chip bad">未就绪</span>'}</div></div>
-      <div id="cloudList">${cloudRows || ""}</div>
+      <div class="rw head"><div class="k">云电脑</div><div>${!cloudList.length ? '<span class="chip">未配置</span>' : cloudList.some((c) => c.status === "ready" && !c.paused) ? `<span class="chip ok">${cloudList.length} 台已连接</span>` : cloudList.every((c) => c.paused) ? `<span class="chip">${cloudList.length} 台 · 暂停中</span>` : '<span class="chip bad">未就绪</span>'}</div></div>
+      <div id="cloudList">${cloudRows || ""}</div><div id="mcpCloudList"></div>
       <details class="more" ${cloudList.length ? "" : "open"}><summary>${icon("chev")}添加云电脑<span class="cnt">免费 1 台 · 4 核 8G</span></summary>
-        ${row("API Key", "ibk_…，加密保存", `<input name="api_key" type="password" autocomplete="off" placeholder="ibk_…" />`)}
-        ${row("名称 / 机器", "自动装好 LibreCAD、中文字体和 vm-agent", `<div class="inl"><input name="name" value="instabox" placeholder="instabox" /><select name="remote_id" style="flex:1;min-width:140px"><option value="">新建一台</option></select></div>`)}
-        <div class="savebar"><span class="note" id="cloudNote"></span><button type="button" class="btn sm" onclick="cloudLookup()">读取已有机器</button><button class="btn sm primary">添加</button></div>
+        ${row("类型", "InstaBox 装 vm-agent；MCP 云电脑直接把它的工具给 Agent", `<select name="provider" onchange="cloudKind(this.form)"><option value="instabox">InstaBox 兼容（REST）</option><option value="mcp">MCP 云电脑（如 Simular box）</option></select>`)}
+        ${row("地址", "可改，不写死", `<input name="api_base" autocomplete="off" placeholder="https://api.instabox.sh" />`)}
+        ${row("API Key", "加密保存", `<input name="api_key" type="password" autocomplete="off" placeholder="ibk_…" />`)}
+        ${row("名称 / 机器", "", `<div class="inl"><input name="name" value="instabox" placeholder="instabox" /><select name="remote_id" style="flex:1;min-width:140px"><option value="">新建一台</option></select></div>`)}
+        <div class="savebar"><span class="note" id="cloudNote">InstaBox：自动装好 LibreCAD、中文字体和 vm-agent</span><button type="button" class="btn sm" id="cloudLookupBtn" onclick="cloudLookup()">读取已有机器</button><button class="btn sm primary">添加</button></div>
       </details>
     </form>
     ${bosSection(bos)}
@@ -820,3 +822,59 @@ async function rhTest(id) {
 }
 async function rhMode(id, mode) { try { await api("PUT", `/api/remote-hosts/${id}`, { mode }); toast(mode === "auto" ? "只读命令不再询问" : "每条命令都会请你确认"); } catch (err) { toast(err.message); } }
 async function rhDel(id) { if (!confirm("移除这台主机的授权？保存的密码会一起删除。")) return; await api("DELETE", `/api/remote-hosts/${id}`); toast("已移除"); loadSettings(); }
+
+
+/* ---- 云电脑：地址不写死；MCP 云电脑（任意 Streamable HTTP MCP 桌面，例如 https://mcp.box.simular.ai/mcp） */
+const CLOUD_KIND = {
+  instabox: { base: "https://api.instabox.sh", key: "ibk_…", name: "instabox", note: "InstaBox：自动装好 LibreCAD、中文字体和 vm-agent" },
+  mcp: { base: "https://mcp.box.simular.ai/mcp", key: "Bearer 密钥，例如 cb_…（不需要可留空）", name: "box", note: "MCP 云电脑：不装 vm-agent，它的工具（shell、浏览器、桌面）会出现在每个任务里" },
+};
+function cloudKind(f) {
+  const k = CLOUD_KIND[f.provider.value] || CLOUD_KIND.instabox;
+  f.api_base.placeholder = k.base; f.api_key.placeholder = k.key;
+  if (!f.name.value || Object.values(CLOUD_KIND).some((x) => x.name === f.name.value)) f.name.value = k.name;
+  f.remote_id.style.display = f.provider.value === "mcp" ? "none" : "";
+  const lb = $("cloudLookupBtn"); if (lb) lb.style.display = f.provider.value === "mcp" ? "none" : "";
+  $("cloudNote").textContent = k.note;
+}
+cloudLookup = async function () {
+  const f = $("sCloud"); const key = f.api_key.value.trim();
+  if (!key) return toast("先填 API Key");
+  $("cloudNote").textContent = "读取中…";
+  try {
+    const r = await api("POST", "/api/cloud/instabox/machines", { api_key: key, api_base: f.api_base.value.trim() });
+    f.remote_id.innerHTML = `<option value="">新建一台</option>` + r.machines.map((m) => `<option value="${esc(m.id)}" ${m.in_use ? "disabled" : ""}>${esc(m.name)} · ${esc(m.state)} · ${m.spec ? m.spec.vcpus + "核 " + Math.round(m.spec.memMiB / 1024) + "G" : ""}${m.in_use ? "（已添加）" : ""}</option>`).join("");
+    const free = r.machines.find((m) => !m.in_use); if (free) f.remote_id.value = free.id;
+    $("cloudNote").textContent = `账号 ${r.account}：${r.machines.length} 台机器。选好机器后点「添加」才会保存`;
+  } catch (e) { $("cloudNote").textContent = "读取失败：" + e.message; }
+};
+cloudAdd = async function (e) {
+  e.preventDefault(); const f = e.target; const btn = f.querySelector("button.primary");
+  const mcp = f.provider.value === "mcp";
+  if (!mcp && !f.api_key.value.trim()) { $("cloudNote").textContent = "先填 API Key"; return; }
+  if (mcp && !f.api_base.value.trim()) { $("cloudNote").textContent = "先填 MCP 地址"; return; }
+  btn.disabled = true; $("cloudNote").textContent = mcp ? "连接中…" : "添加中…";
+  try {
+    const r = await api("POST", "/api/cloud", { provider: f.provider.value, name: f.name.value.trim(), api_key: f.api_key.value.trim(),
+      api_base: f.api_base.value.trim(), remote_id: mcp ? "" : f.remote_id.value });
+    f.api_key.value = "";
+    if (mcp) { $("cloudNote").textContent = `已连接「${r.title}」：${r.tools} 个工具，任务里可直接用`; toast("已添加"); mcpCloudRefresh(); }
+    else { $("cloudNote").textContent = `已保存为「${r.name}」，正在安装（约 3-6 分钟），完成后点该行的「使用」`; toast("已添加，正在安装"); cloudRefresh(); loadMachines(); }
+  } catch (err) { $("cloudNote").textContent = "添加失败：" + err.message; toast("添加失败：" + err.message); }
+  finally { btn.disabled = false; }
+};
+async function mcpCloudRefresh() {
+  const box = $("mcpCloudList"); if (!box) return;
+  const list = await api("GET", "/api/cloud/mcp").catch(() => []);
+  box.innerHTML = list.map((m) => `<div class="rw"><div class="k">${esc(m.title)}<div class="note">MCP 云电脑</div></div>
+    <div class="inl" style="align-items:center"><span class="mono" style="flex:1;min-width:0;overflow-wrap:anywhere">${esc(m.url)}</span><span class="chip ok">${m.tools} 个工具</span>
+    <button type="button" class="btn sm danger" onclick="mcpCloudRemove('${esc(m.name)}')">移除</button></div></div>`).join("");
+}
+async function mcpCloudRemove(name) {
+  if (!confirm("从 AIW 移除这台 MCP 云电脑？云端机器本身会保留。")) return;
+  try { await api("DELETE", `/api/cloud/mcp/${encodeURIComponent(name)}`); mcpCloudRefresh(); } catch (e) { toast(e.message); }
+}
+(function () {
+  const ls = loadSettings;
+  loadSettings = async function () { const r = await ls.apply(this, arguments); mcpCloudRefresh(); return r; };
+})();

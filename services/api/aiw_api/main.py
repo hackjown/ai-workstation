@@ -1036,11 +1036,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     async def cloud_remote_machines(body: dict):
         """The machines an InstaBox key can see, so 设置 can offer 'use an existing one'."""
         from .cloud import InstaBox
+        from .cloud import norm_base
         key = str(body.get("api_key") or "").strip()
         if not key:
             raise HTTPException(400, "api_key required")
         try:
-            ib = InstaBox(key)
+            ib = InstaBox(key, base=norm_base(body.get("api_base")))
             me, ms = await ib.me(), await ib.machines()
         except CloudError as e:
             raise HTTPException(400, str(e))
@@ -1052,13 +1053,64 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.post("/api/cloud", dependencies=[Depends(auth)])
     async def cloud_add(body: dict):
-        if str(body.get("provider") or "instabox") != "instabox":
-            raise HTTPException(400, "only InstaBox is supported for now")
+        prov = str(body.get("provider") or "instabox")
+        if prov == "mcp":
+            return await mcp_cloud_add(body)
+        if prov != "instabox":
+            raise HTTPException(400, "provider 只能是 instabox 或 mcp")
         try:
             return await cloud.add(str(body.get("name") or "").strip() or "instabox", str(body.get("api_key") or ""),
-                                   str(body.get("remote_id") or "").strip() or None)
+                                   str(body.get("remote_id") or "").strip() or None, body.get("api_base"))
         except CloudError as e:
             raise HTTPException(400, str(e))
+
+    # --- MCP 云电脑 (any Streamable-HTTP MCP desktop, e.g. https://mcp.box.simular.ai/mcp). It is not a vm-agent
+    # machine: it is saved as an MCP server flagged cloud=true, so every task gets its tools as mcp_<name>_*.
+    def _mcp_clouds() -> list:
+        return [m for m in (store.kv_get("mcp_servers", []) or []) if m.get("cloud")]
+
+    @app.get("/api/cloud/mcp", dependencies=[Depends(auth)])
+    async def mcp_cloud_list():
+        return [{"name": m["name"], "title": m.get("title") or m["name"], "url": m["url"], "tools": m.get("tools", 0),
+                 "added": m.get("added")} for m in _mcp_clouds()]
+
+    async def mcp_cloud_add(body: dict):
+        import re as _re
+        from .integrations import MCPClient
+        url = str(body.get("api_base") or body.get("url") or "").strip()
+        if not _re.match(r"^https?://[^\s/]+", url):
+            raise HTTPException(400, "填 MCP 地址，例如 https://mcp.box.simular.ai/mcp")
+        title = str(body.get("name") or "").strip() or "box"
+        slug = (_re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_") or "box")[:20]
+        servers = store.kv_get("mcp_servers", []) or []
+        names, n, base = {m.get("name") for m in servers}, 2, slug
+        while slug in names:
+            slug, n = f"{base}{n}", n + 1
+        key = str(body.get("api_key") or "").strip()
+        headers = {"Authorization": "Bearer {{secret:mcpcloud_%s}}" % slug} if key else {}
+        try:
+            tools = await MCPClient(url, {"Authorization": "Bearer " + key} if key else {}).list_tools()
+        except Exception as e:  # noqa: BLE001 - shown to the user
+            raise HTTPException(400, f"连不上这个 MCP 地址：{str(e)[:200]}")
+        if key:
+            secrets.put(f"mcpcloud_{slug}", key)
+        entry = {"name": slug, "title": title, "url": url, "headers": headers, "cloud": True,
+                 "tools": len(tools), "added": int(time.time())}
+        store.kv_set("mcp_servers", servers + [entry])
+        return {k: v for k, v in entry.items() if k != "headers"}
+
+    @app.delete("/api/cloud/mcp/{name}", dependencies=[Depends(auth)])
+    async def mcp_cloud_remove(name: str):
+        servers = store.kv_get("mcp_servers", []) or []
+        keep = [m for m in servers if not (m.get("cloud") and m.get("name") == name)]
+        if len(keep) == len(servers):
+            raise HTTPException(404)
+        store.kv_set("mcp_servers", keep)
+        try:
+            secrets.delete(f"mcpcloud_{name}")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True}
 
     @app.post("/api/cloud/{mid}/setup", dependencies=[Depends(auth)])
     async def cloud_setup(mid: str):

@@ -11,6 +11,8 @@ runs it holds an activity lease that it renews (`hold`), so the machine never pa
 """
 from __future__ import annotations
 
+import os
+
 from datetime import datetime, timedelta, timezone
 import asyncio
 import contextlib
@@ -26,7 +28,17 @@ import httpx
 
 log = logging.getLogger("aiw.cloud")
 
-API = "https://api.instabox.sh"
+API = (os.environ.get("AIW_INSTABOX_API") or "https://api.instabox.sh").rstrip("/")
+
+
+def norm_base(u) -> str:
+    """An InstaBox-compatible REST base the user typed (blank = AIW_INSTABOX_API / the public one)."""
+    u = str(u or "").strip().rstrip("/")
+    if not u:
+        return API
+    if not re.match(r"^https?://[^\s/]+", u):
+        raise CloudError("地址要以 http:// 或 https:// 开头")
+    return u
 SCRIPT = Path(__file__).resolve().parents[3] / "deploy" / "cloud" / "aiw-cloud.sh"
 REMOTE_SCRIPT = "$HOME/.config/aiw/aiw-cloud.sh"
 AGENT_PORT = 8765
@@ -174,7 +186,8 @@ class CloudManager:
         key = key or (self.secrets.get(f"cloud_key:{mid}") if mid else None)
         if not key:
             raise CloudError("no InstaBox API key saved for this machine")
-        return InstaBox(key, transport=self.transport)
+        base = ((self.entry(mid) or {}).get("api_base") if mid else None) or API
+        return InstaBox(key, base=base, transport=self.transport)
 
     def list(self) -> list[dict]:
         out = []
@@ -182,11 +195,14 @@ class CloudManager:
             out.append({"id": mid, **{k: v for k, v in e.items() if k != "log"}, "log": (e.get("log") or [])[-8:]})
         return out
 
-    async def add(self, name: str, api_key: str, remote_id: Optional[str] = None) -> dict:
+    async def add(self, name: str, api_key: str, remote_id: Optional[str] = None, api_base: Optional[str] = None) -> dict:
         api_key = (api_key or "").strip()
-        if not api_key.startswith("ibk_"):
+        root = norm_base(api_base)
+        if not api_key:
+            raise CloudError("先填 API Key")
+        if root == "https://api.instabox.sh" and not api_key.startswith("ibk_"):
             raise CloudError("InstaBox API key starts with ibk_ (Profile → API keys)")
-        ib = InstaBox(api_key, transport=self.transport)
+        ib = InstaBox(api_key, base=root, transport=self.transport)
         await ib.me()  # bad key -> 401 now, not in the background
         base = _ID.sub("-", (name or "cloud").lower()).strip("-")[:30] or "cloud"
         mid = f"cloud-{base}"
@@ -194,7 +210,8 @@ class CloudManager:
         while self.store.machine(mid) or self.is_cloud(mid):
             mid, n = f"cloud-{base}-{n}", n + 1
         self.secrets.put(f"cloud_key:{mid}", api_key)
-        self._save(mid, name=name or mid, provider="instabox", remote_id=remote_id or None, status="adding", log=[])
+        self._save(mid, name=name or mid, provider="instabox", remote_id=remote_id or None, status="adding", log=[],
+                   api_base=None if root == API else root)
         self.store.upsert_machine({"id": mid, "name": name or mid, "provider": "instabox",
                                    "provider_vm_id": remote_id or "", "agent_endpoint": "wss://pending.invalid",
                                    "desktop_endpoint": "instabox:"})

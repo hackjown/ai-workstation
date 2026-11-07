@@ -143,8 +143,26 @@ class MCPClient:
         async with httpx.AsyncClient(timeout=120) as c:
             await self._init(c)
             res = await self._rpc(c, "tools/call", {"name": name, "arguments": args})
-        texts = [b.get("text", "") for b in (res or {}).get("content", []) if b.get("type") == "text"]
-        return {"text": "\n".join(texts)[:6000], "is_error": bool((res or {}).get("isError"))}
+        content = (res or {}).get("content", []) or []
+        texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+        out = {"text": "\n".join(texts)[:6000], "is_error": bool((res or {}).get("isError"))}
+        img = next((b for b in content if b.get("type") == "image" and b.get("data")), None)
+        if img:   # screenshots (Simular box sends webp): re-encode to PNG so every vision model can read them
+            out["image_b64"], out["image_mime"] = to_png_b64(img["data"], img.get("mimeType") or "")
+        return out
+
+
+def to_png_b64(data: str, mime: str = "") -> tuple[str, str]:
+    if mime == "image/png":
+        return data, mime
+    try:
+        import base64, io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.open(io.BytesIO(base64.b64decode(data))).convert("RGB").save(buf, "PNG")
+        return base64.b64encode(buf.getvalue()).decode(), "image/png"
+    except Exception:  # noqa: BLE001 - keep the original when Pillow cannot read it
+        return data, mime or "image/png"
 
 
 _MCP_CACHE: dict[str, tuple[float, list]] = {}

@@ -1099,6 +1099,61 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         store.kv_set("mcp_servers", servers + [entry])
         return {k: v for k, v in entry.items() if k != "headers"}
 
+    _mcp_cc: dict = {}
+
+    def _mcp_cloud_client(name: str):
+        from .integrations import MCPClient
+        m = next((x for x in _mcp_clouds() if x.get("name") == name), None)
+        if not m:
+            raise HTTPException(404, "没有这台 MCP 云电脑")
+        key = m["url"] + json.dumps(m.get("headers") or {}, sort_keys=True)
+        c = _mcp_cc.get(name)
+        if not c or c[0] != key:
+            c = (key, MCPClient(secrets.expand(m["url"]), {k: secrets.expand(v) for k, v in (m.get("headers") or {}).items()}))
+            _mcp_cc[name] = c
+        return c[1]
+
+    async def _mcp_cloud_call(name: str, tool: str, args: dict) -> dict:
+        cl = _mcp_cloud_client(name)
+        try:
+            return await cl.call(tool, args)
+        except Exception as e:  # noqa: BLE001 - a dropped MCP session: start a new one once
+            cl.session_id = None
+            try:
+                return await cl.call(tool, args)
+            except Exception:  # noqa: BLE001
+                raise HTTPException(502, f"云电脑没有响应：{str(e)[:200]}")
+
+    @app.get("/api/cloud/mcp/{name}/screen", dependencies=[Depends(auth)])
+    async def mcp_cloud_screen(name: str):
+        """The live desktop as a PNG (full 1280x800, so clicks map 1:1) for the 桌面 viewer."""
+        r = await _mcp_cloud_call(name, "screenshot", {"max_edge": 0})
+        if not r.get("image_b64"):
+            raise HTTPException(502, (r.get("text") or "没有拿到截图")[:300])
+        return {"image": r["image_b64"], "mime": r.get("image_mime") or "image/png", "ts": time.time()}
+
+    _ACT_KEYS = {"action", "x", "y", "to_x", "to_y", "text", "key", "keys", "direction", "amount", "button", "app", "seconds"}
+
+    @app.post("/api/cloud/mcp/{name}/act", dependencies=[Depends(auth)])
+    async def mcp_cloud_act(name: str, body: dict):
+        """Takeover from the viewer: one click / type / key / scroll, then the fresh screen."""
+        args = {k: v for k, v in (body or {}).items() if k in _ACT_KEYS and v not in (None, "")}
+        if args.get("action") not in {"click", "double_click", "right_click", "type", "key", "hotkey", "scroll", "drag", "launch_app", "wait"}:
+            raise HTTPException(400, "不支持的操作")
+        r = await _mcp_cloud_call(name, "computer_act", args)
+        if r.get("is_error"):
+            raise HTTPException(400, (r.get("text") or "操作失败")[:300])
+        return {"ok": True, "image": r.get("image_b64"), "mime": r.get("image_mime"), "text": (r.get("text") or "")[:300]}
+
+    @app.get("/api/cloud/mcp/{name}/view", dependencies=[Depends(auth)])
+    async def mcp_cloud_view(name: str):
+        """The provider's own live page (Simular: box_view -> view_url), when the server has such a tool."""
+        r = await _mcp_cloud_call(name, "box_view", {})
+        try:
+            return {"view_url": json.loads(r.get("text") or "{}").get("view_url")}
+        except ValueError:
+            return {"view_url": None}
+
     @app.delete("/api/cloud/mcp/{name}", dependencies=[Depends(auth)])
     async def mcp_cloud_remove(name: str):
         servers = store.kv_get("mcp_servers", []) or []

@@ -729,6 +729,13 @@ class AgentLoop:
                     note = ((note + "\n") if note else "") + self._page_note
                     self._page_note = None
 
+            _xi = getattr(self, "_ext_image", None)   # an MCP cloud computer's screenshot from the last tool call
+            if _xi:
+                self._ext_image = None
+                before = _xi
+                note = ((note + "\n") if note else "") + (
+                    "The image is the screen your last MCP tool returned (the cloud computer, not the local VM); "
+                    "coordinates for that computer's tools are in this image's pixels.")
             desc = await self._look(before, shown) if self.vision_llm and before else None
             send_shot = before
             if before and self.cfg.skip_unchanged_screens and not desc:
@@ -1345,6 +1352,10 @@ class AgentLoop:
                 ok, err = True, None
             except Exception as e:  # noqa: BLE001
                 res, ok, err = {}, False, f"{type(e).__name__}: {e}"
+            if isinstance(res, dict) and res.get("image_b64"):   # MCP screenshot: shown to the model next step
+                self._ext_image = res.pop("image_b64")
+                res.pop("image_mime", None)
+                res["text"] = (res.get("text") or "") + "\n[screenshot attached to the next step]"
             self._acted = self._acted or ok
             if self._secrets:
                 res, err = _rd.mask_obj(res, self._secrets.values()), _rd.mask(err, self._secrets.values())

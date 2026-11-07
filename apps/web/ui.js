@@ -868,7 +868,7 @@ async function mcpCloudRefresh() {
   const list = await api("GET", "/api/cloud/mcp").catch(() => []);
   box.innerHTML = list.map((m) => `<div class="rw"><div class="k">${esc(m.title)}<div class="note">MCP 云电脑</div></div>
     <div class="inl" style="align-items:center"><span class="mono" style="flex:1;min-width:0;overflow-wrap:anywhere">${esc(m.url)}</span><span class="chip ok">${m.tools} 个工具</span>
-    <button type="button" class="btn sm danger" onclick="mcpCloudRemove('${esc(m.name)}')">移除</button></div></div>`).join("");
+    <button type="button" class="btn sm" onclick="mcpDesk('${esc(m.name)}','${esc(m.title)}')">桌面</button><button type="button" class="btn sm danger" onclick="mcpCloudRemove('${esc(m.name)}')">移除</button></div></div>`).join("");
 }
 async function mcpCloudRemove(name) {
   if (!confirm("从 AIW 移除这台 MCP 云电脑？云端机器本身会保留。")) return;
@@ -878,3 +878,66 @@ async function mcpCloudRemove(name) {
   const ls = loadSettings;
   loadSettings = async function () { const r = await ls.apply(this, arguments); mcpCloudRefresh(); return r; };
 })();
+
+/* ---- MCP 云电脑桌面：看（每 1.5 秒刷新截图）+ 控（点击 / 双击 / 右键 / 滚轮 / 输入 / 按键，走 computer_act） */
+const MD = {};
+function mcpDesk(name, title) {
+  mcpDeskClose();
+  MD.name = name; MD.busy = false; MD.stop = false;
+  const ov = document.createElement("div"); ov.id = "mcpDeskOv";
+  ov.style.cssText = "position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;padding:16px";
+  ov.innerHTML = `<div class="rows" style="width:min(1320px,100%);max-height:100%;display:flex;flex-direction:column">
+    <div class="rw head"><div class="k">${esc(title)} · 桌面</div><div class="inl" style="justify-content:flex-end;flex-wrap:wrap;gap:6px">
+      <span class="chip" id="mdState">连接中…</span>
+      <button type="button" class="btn sm" onclick="mcpDeskLive()">Simular 实时画面</button>
+      <button type="button" class="btn sm" onclick="mcpDeskClose()">关闭</button></div></div>
+    <div style="flex:1;min-height:0;overflow:auto;background:#000;display:flex;align-items:center;justify-content:center">
+      <img id="mdImg" alt="云电脑桌面" style="max-width:100%;max-height:72vh;cursor:crosshair;user-select:none" draggable="false" /></div>
+    <div class="savebar" style="flex-wrap:wrap;gap:6px">
+      <input id="mdText" placeholder="要输入的文字，回车发送" style="flex:1;min-width:180px" />
+      <button type="button" class="btn sm" onclick="mcpDeskType()">输入</button>
+      ${["return", "tab", "escape", "backspace"].map((k) => `<button type="button" class="btn sm" onclick="mcpDeskAct({action:'key',key:'${k}'})">${{ return: "回车", tab: "Tab", escape: "Esc", backspace: "退格" }[k]}</button>`).join("")}
+      <button type="button" class="btn sm" onclick="mcpDeskAct({action:'hotkey',keys:['ctrl','l']})">Ctrl+L</button>
+      <span class="note">单击＝点击，双击＝双击，右键＝右击，滚轮＝滚动</span></div></div>`;
+  document.body.appendChild(ov);
+  const img = $("mdImg");
+  const xy = (e) => { const r = img.getBoundingClientRect(); return { x: Math.round((e.clientX - r.left) * img.naturalWidth / r.width), y: Math.round((e.clientY - r.top) * img.naturalHeight / r.height) }; };
+  let clickT = null;
+  img.onclick = (e) => { const p = xy(e); clearTimeout(clickT); clickT = setTimeout(() => mcpDeskAct({ action: "click", ...p }), 260); };
+  img.ondblclick = (e) => { clearTimeout(clickT); mcpDeskAct({ action: "double_click", ...xy(e) }); };
+  img.oncontextmenu = (e) => { e.preventDefault(); mcpDeskAct({ action: "right_click", ...xy(e) }); };
+  img.onwheel = (e) => { e.preventDefault(); if (MD.wheel) return; MD.wheel = setTimeout(() => { MD.wheel = null; }, 350); mcpDeskAct({ action: "scroll", ...xy(e), direction: e.deltaY > 0 ? "down" : "up", amount: 3 }); };
+  $("mdText").onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); mcpDeskType(true); } };
+  ov.onclick = (e) => { if (e.target === ov) mcpDeskClose(); };
+  mcpDeskLoop();
+}
+function mcpDeskShow(r) { if (r && r.image) { $("mdImg").src = `data:${r.mime || "image/png"};base64,${r.image}`; const st = $("mdState"); if (st) { st.textContent = "在线"; st.className = "chip ok"; } } }
+async function mcpDeskLoop() {
+  if (MD.stop || !$("mcpDeskOv")) return;
+  if (!MD.busy && !document.hidden) {
+    MD.busy = true;
+    try { mcpDeskShow(await api("GET", `/api/cloud/mcp/${encodeURIComponent(MD.name)}/screen`)); }
+    catch (e) { const st = $("mdState"); if (st) { st.textContent = "连接失败：" + e.message.slice(0, 40); st.className = "chip bad"; } }
+    finally { MD.busy = false; }
+  }
+  MD.t = setTimeout(mcpDeskLoop, 1500);
+}
+async function mcpDeskAct(a) {
+  const st = $("mdState"); if (st) { st.textContent = "执行中…"; st.className = "chip"; }
+  MD.busy = true;
+  try {   // the act's own screenshot is scaled; fetch the full-size screen so the next click maps 1:1
+    await api("POST", `/api/cloud/mcp/${encodeURIComponent(MD.name)}/act`, a);
+    mcpDeskShow(await api("GET", `/api/cloud/mcp/${encodeURIComponent(MD.name)}/screen`));
+  }
+  catch (e) { toast("操作失败：" + e.message); if (st) { st.textContent = "操作失败"; st.className = "chip bad"; } }
+  finally { MD.busy = false; }
+}
+async function mcpDeskType(enter) {
+  const i = $("mdText"); const t = i.value; if (!t) return;
+  i.value = ""; await mcpDeskAct({ action: "type", text: t }); if (enter) await mcpDeskAct({ action: "key", key: "return" });
+}
+async function mcpDeskLive() {
+  try { const r = await api("GET", `/api/cloud/mcp/${encodeURIComponent(MD.name)}/view`); if (r.view_url) window.open(r.view_url, "_blank"); else toast("这台云电脑没有提供实时画面页面"); }
+  catch (e) { toast(e.message); }
+}
+function mcpDeskClose() { MD.stop = true; clearTimeout(MD.t); const ov = $("mcpDeskOv"); if (ov) ov.remove(); }

@@ -243,6 +243,21 @@ TOOLS: list[ToolSpec] = [
              {"url": {"type": "string"}, "page_match": {"type": "string"}, "reload": {"type": "boolean"},
               "seconds": {"type": "number"}, "match": {"type": "string"}, "limit": {"type": "integer"},
               "port": {"type": "integer", "description": "DevTools port, default 9222 (AIW Chrome) then 9110 (BrowserOS)"}}),
+    # v3.9.26 (task-830): the built-in page check (agent_runtime/verify_html.py), run by the loop on the computer
+    ToolSpec("verify_html", None,
+             "Check an HTML page in a real headless Chromium (built in; use this instead of starting chrome/chromium, "
+             "BrowserOS or CDP by hand). Loads `path` (file under ~/workspace or absolute, e.g. ~/aiw-news/x.html) or "
+             "`url`; returns JSON: console errors/exceptions, the count of each CSS selector in `selectors`, and for "
+             "each item of `clicks` ({click: selector, index, expect: selector that must become visible, min_text}) "
+             "whether it worked, plus an optional `screenshot` path. Hard timeout; the browser is always killed. Use it "
+             "as the acceptance / regression evidence of a dev fix.",
+             {"path": {"type": "string"}, "url": {"type": "string"},
+              "selectors": {"type": "array", "items": {"type": "string"}},
+              "clicks": {"type": "array", "items": {"type": "object", "properties": {
+                  "click": {"type": "string"}, "index": {"type": "integer"}, "expect": {"type": "string"},
+                  "min_text": {"type": "integer"}, "wait_ms": {"type": "integer"}}, "required": ["click"]}},
+              "screenshot": {"type": "string", "description": "png path to save, e.g. ~/workspace/verify.png"},
+              "timeout": {"type": "integer", "description": "seconds, default 60"}}),
     ToolSpec("update_plan", None, "Mark plan steps finished (0-based indexes) and optionally add a short progress note.",
              {"done": {"type": "array", "items": {"type": "integer"}}, "note": {"type": "string"}}, ["done"]),
     ToolSpec("ask_user", None, "Ask the user a question when required information is missing (login choice, which file, "
@@ -358,7 +373,7 @@ BY_NAME = {t.name: t for t in TOOLS}
 BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
-LOOP_TOOLS = {"done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
+LOOP_TOOLS = {"verify_html", "done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
 
 

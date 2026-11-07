@@ -42,6 +42,7 @@ class SetupActivity : AppCompatActivity() {
                 .setPrompt("扫描 Aiw 网页地址的二维码").setBeepEnabled(false).setOrientationLocked(false))
         }
         findViewById<Button>(R.id.btn_save).setOnClickListener { save() }
+        findViewById<Button>(R.id.btn_device).setOnClickListener { startActivity(Intent(this, DeviceActivity::class.java)) }   // v3.9.27
     }
 
     private fun save() {

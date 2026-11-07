@@ -35,3 +35,9 @@ class Task(BaseModel):
     context: Optional[str] = None      # earlier turns of the thread + memory, prepended for the model
     source: str = "chat"               # chat | routine | retry | resume
     continues: Optional[str] = None    # 3.8.8: root task this run continues (same task card): it inherits its folder
+    # v3.9.26 (task-830): dev_fix | run | other (agent_runtime/intent.py), decided once by the session manager from the
+    # words + the thread and persisted (kv task_intent:<id>) so every gate reads the same answer
+    intent: Optional[str] = None
+    # v3.9.26: what the session manager knows about the thread for this run: signals (sent files, script runs),
+    # provenance, fingerprints of earlier deliverables, cad_history, the old instructions a continuation overrides, git
+    meta: dict = Field(default_factory=dict)

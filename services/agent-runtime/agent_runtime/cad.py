@@ -1195,14 +1195,27 @@ _CAD_REVISE = re.compile(r"修改|修正|改一下|改完|改好|改下|也改|�
                          r"删掉|删除|去掉|补上|补画|加上|增加|添加|替换|换成|放大|缩小|对齐|压线|重叠|"
                          r"在(原|已有|画好|现有)的?(图|基础|图纸)", re.I)
 _CAD_REDRAW = re.compile(r"重新画|重画|从头|全部重|重新出图|redraw|from scratch", re.I)
-_CAD_TOPIC = re.compile(r"图|第\s*\d+\s*张|墙|标注|尺寸|文字|字|引线|节点|标题|板块|版面|线|框|天花|吊顶|门|踢脚|灯带|做法|比例|图例|dxf|pdf", re.I)
-_CAD_CONTEXT = re.compile(r"施工图|\.dxf|librecad|cad_command|立面图|平面图", re.I)
+# v3.9.26: no single-character topics: 字 matched inside 字段, 图/线/门/框 inside ordinary words, and a data task
+# ("…不要修改脚本…字段…", task-04d) became a drawing revision that ran pkill librecad / symlinked cad/.
+_CAD_TOPIC = re.compile(r"图纸|图号|图\s*\d+|第\s*\d+\s*张|墙面|墙体|[左右前后侧背主]墙|标注|尺寸|文字|引线|节点|标题|板块|版面|"
+                        r"线条|压线|边框|图框|天花|吊顶|门洞|门套|门窗|踢脚|灯带|做法|比例|图例|立面|平面|剖面|大样|dxf|pdf", re.I)
+# v3.9.26: the thread's CAD HISTORY, not CAD words: a drawing file it made or a drawing tool it ran. Words like 施工图 in
+# a memory line or an earlier unrelated turn made every follow-up in the thread a "revision". The session manager
+# passes `history` from the thread's stored tasks; this is only the fallback for callers that pass none.
+_CAD_HISTORY = re.compile(r"[\w./-]+\.dxf\b|\bcad_command\b|\bdrawing_build\b", re.I)
 
 
-def cad_mode(prompt: str, context: str | None = None) -> str | None:
+# a negated change verb ("不要修改脚本", "别改"): only the verb is dropped, the rest of the sentence stays
+_CAD_NEG = re.compile(r"(不要|不用|不必|不准|不许|不能|禁止|严禁|别|勿|无需)(再|去|随便|擅自)?(修改|修正|改动|改成|改为|改|调整|删除|删掉|去掉|"
+                      r"替换|换成|移动|挪)")
+
+
+def cad_mode(prompt: str, context: str | None = None, history: bool | None = None, source: str = "") -> str | None:
     """'fresh' (start from an empty cad/ folder), 'revise' (edit the drawing the thread already has), or None (not a
     drawing task). A follow-up in a drawing thread is a revision unless it asks for a redraw or is a whole new brief:
-    the user re-sent the full 12-sheet prompt in the same thread before, and that must still start fresh."""
+    the user re-sent the full 12-sheet prompt in the same thread before, and that must still start fresh.
+    v3.9.26: `history` = the thread really made a drawing (stored task type / .dxf sent); a dispatched child task is
+    never a revision; negated verbs ("不要修改") do not count."""
     p = prompt or ""
     try:                                   # 3.9.8: 户型图 → 装修设计器 is its own skill, not a CAD redraw
         from .skills import is_designer_task
@@ -1210,9 +1223,13 @@ def cad_mode(prompt: str, context: str | None = None) -> str | None:
             return None
     except Exception:  # noqa: BLE001
         pass
-    in_thread = bool(_CAD_CONTEXT.search(context or ""))
+    in_thread = bool(history) if history is not None else bool(_CAD_HISTORY.search(context or ""))
+    if str(source or "") == "dispatch":    # a child piece is a self-contained brief, never "the drawing above"
+        in_thread = False
+    plain = _CAD_NEG.sub(" ", p)
     full_brief = len(p) > 600 or "FRAME|" in p or "要出的图" in p
-    if in_thread and not full_brief and not _CAD_REDRAW.search(p) and (is_cad_task(p) or (_CAD_REVISE.search(p) and _CAD_TOPIC.search(p))):
+    if in_thread and not full_brief and not _CAD_REDRAW.search(plain) and (
+            is_cad_task(p) or (_CAD_REVISE.search(plain) and _CAD_TOPIC.search(plain))):
         return "revise"
     if is_cad_task(p):
         return "fresh"

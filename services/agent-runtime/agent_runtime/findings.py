@@ -10,7 +10,12 @@ Facts come from two places:
   automatic finding, so a model that never calls note_finding still builds the board (task-833 stated the cause
   at step 8 and then repeated it six times without delivering).
 
-Pure, tested in tests/test_v3917_findings.py.
+v3.9.26 (task-830): a dev_fix task takes facts only from tool results. Its model kept "confirming" the same guess
+about the HTML (steps 1-21) and the board filled with its own speculation. FindingsBoard(capture_thoughts=False)
+ignores thoughts; from_result() records what a tool actually returned (a failing command's error, a verify_html
+result) with source "result".
+
+Pure, tested in tests/test_v3917_findings.py and tests/test_v3926_devflow.py.
 """
 from __future__ import annotations
 
@@ -83,8 +88,9 @@ def names_missing(thought: str) -> bool:
 class FindingsBoard:
     DUP = 0.55
 
-    def __init__(self, items: Optional[list] = None):
+    def __init__(self, items: Optional[list] = None, capture_thoughts: bool = True):
         self.items: list[dict] = [dict(i) for i in (items or [])]
+        self.capture_thoughts = capture_thoughts   # v3.9.26: False = facts only from tool results
 
     # ------------------------------------------------------------ write
     def _next_id(self) -> str:
@@ -131,11 +137,29 @@ class FindingsBoard:
     def capture(self, thought: str, step: int) -> tuple[int, int]:
         """Auto findings from a thought: (new facts, repeats of known ones)."""
         new = rep = 0
+        if not self.capture_thoughts:
+            return 0, 0
         for c in conclusions(thought):
             st, _ = self.add(c, step, "auto")
             new += st == "added"
             rep += st == "dup"
         return new, rep
+
+    def from_result(self, tool: str, args: dict, ok: bool, text: str, step: int) -> tuple[str, Optional[dict]]:
+        """v3.9.26: a fact from what a tool returned (never from the model's words). Only results worth keeping:
+        a failed command (its first error line) and verify_html outcomes."""
+        t = str(text or "")
+        if tool == "verify_html":
+            return self.add(("页面验证通过：" if ok else "页面验证未通过：") + t[:220], step, "result", evidence="verify_html")
+        if ok or tool not in ("shell", "files_read", "files_write"):
+            return "empty", None
+        hits = [x.strip() for x in t.splitlines() if re.search(r"error|exception|not found|denied|refused|失败|错误|找不到", x, re.I)
+                and not re.match(r"\s*Traceback", x)]
+        line = hits[-1] if hits else ""   # the last error line is the real one (a traceback ends with it)
+        if not line:
+            return "empty", None
+        cmd = str((args or {}).get("command") or (args or {}).get("path") or "")[:80]
+        return self.add(f"{tool} 失败（{cmd}）：{line[:180]}", step, "result", evidence=line[:200])
 
     def max_repeats(self) -> int:
         return max([int(i.get("repeats") or 0) for i in self.live()] or [0])
@@ -147,7 +171,7 @@ class FindingsBoard:
             return ""
         lines = []
         for i in live:
-            tag = "" if i.get("source") == "model" else "（自动记录）"
+            tag = "" if i.get("source") == "model" else "（工具结果）" if i.get("source") == "result" else "（自动记录）"
             ev = f" 证据：{i['evidence']}" if i.get("evidence") and i.get("replaces") else ""
             lines.append(f"  {i['id']} [第{i['step']}步]{tag} {i['text']}{ev}")
         body = "\n".join(lines)

@@ -7,7 +7,10 @@ LDID=${LDID:-ldid}
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 OUT=build; APP=$OUT/Payload/AIW.app
 rm -rf $OUT AIWorkstation.ipa && mkdir -p $APP
-xcrun --sdk iphoneos swiftc -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -module-name Aiw \
+# v3.9.27: AIW_ALARMKIT=1 compiles the AlarmKit path (needs the iOS 26 SDK); HealthKit/EventKit/Contacts/CoreLocation
+# /AppIntents are autolinked. App Intents metadata (Shortcuts discovery) is only produced by an Xcode build.
+SWIFT_FLAGS=""; [ "${AIW_ALARMKIT:-0}" = "1" ] && SWIFT_FLAGS="-D AIW_ALARMKIT"
+xcrun --sdk iphoneos swiftc -target arm64-apple-ios16.0 -sdk "$SDK" -O -parse-as-library -module-name Aiw $SWIFT_FLAGS \
   Sources/*.swift -o $APP/AIW
 cp Info.plist $APP/
 # 球球 page for the chat header (MateView.swift): same files the web app serves (+ the non-commercial LICENSE/NOTICE)

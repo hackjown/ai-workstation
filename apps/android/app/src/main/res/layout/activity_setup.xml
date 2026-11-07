@@ -94,6 +94,15 @@
             android:layout_marginTop="8dp"
             android:text="@string/save" />
 
+        <!-- v3.9.27: device bridge capabilities (DeviceActivity) -->
+        <Button
+            android:id="@+id/btn_device"
+            style="?attr/borderlessButtonStyle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/device_title" />
+
         <TextView
             android:id="@+id/status"
             android:layout_width="match_parent"

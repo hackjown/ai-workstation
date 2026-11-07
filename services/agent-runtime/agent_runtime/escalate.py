@@ -115,6 +115,7 @@ KIND_TEXT = {
     "drawing_verify": "图纸 spec 已生成，但核对没通过、模型在原地打转",
     "stuck_fact": "同一个结论反复出现 / 很久没有新事实，先给你汇报",
     "rabbit": "同一个计划步骤做了很久还没完成，可能在环境问题上打转",
+    "dev_rabbit": "修复代码的任务做了很多步还没有改好，可能在重复诊断或在验证环境上打转",
 }
 
 OPT_RETRY, OPT_TAKEOVER, OPT_STOP = "继续，换个方法再试", "我来接管桌面", "停止任务"
@@ -131,6 +132,48 @@ def rabbit_steps() -> int:
         return max(0, int(os.environ.get("AIW_RABBIT_STEPS", "40") or 0))
     except ValueError:
         return 40
+
+
+def dev_rabbit_steps() -> int:
+    """v3.9.26 (task-830): a dev_fix task steps back much sooner — task-830 repeated one diagnosis ~10 times and the
+    user was only asked at step 80 (2 x 40). AIW_DEV_RABBIT_STEPS, default 15 (2x: the user is asked), 0 = off."""
+    try:
+        return max(0, int(os.environ.get("AIW_DEV_RABBIT_STEPS", "15") or 0))
+    except ValueError:
+        return 15
+
+
+# v3.9.26 (task-830): a headless chrome / soffice started from the shell hung the step until the tool's own limit and
+# left the process behind. They get a `timeout -k 5 N` in front unless the command already has one.
+_RENDER_PROG = re.compile(r"(?P<pre>(?:^|&&|\|\||;|\n|\(|\bthen\b|\bdo\b)\s*(?:(?:sudo|nohup|env(?:\s+\w+=\S+)*)\s+)?)"
+                          r"(?P<prog>(?:/[\w./-]+/)?(?:google-chrome(?:-stable)?|chromium(?:-browser)?|chrome|headless_shell|"
+                          r"soffice|libreoffice)(?:\.bin)?)(?=\s|$)")
+
+
+def render_timeout() -> int:
+    try:
+        return max(0, int(os.environ.get("AIW_RENDER_TIMEOUT", "120") or 0))
+    except ValueError:
+        return 120
+
+
+def wrap_timeout(command: str, seconds: Optional[int] = None) -> str:
+    """Put `timeout -k 5 N` in front of every chrome/chromium/soffice/libreoffice invocation that has none.
+    A backgrounded long-lived browser (`… &`) is wrapped too: it is killed after N s instead of hanging around."""
+    n = render_timeout() if seconds is None else seconds
+    c = command or ""
+    if not n or not _RENDER_PROG.search(c):
+        return c
+
+    def rep(m):
+        before = c[:m.start("prog")]
+        if re.search(r"\btimeout\s+(?:-\S+\s+(?:\d+\S*\s+)?)*\d+\S*\s*$", before) or re.search(r"\b(which|command -v|type|pkill|killall|kill|pgrep|apt|apt-get|dpkg|snap|echo|ls)\s+(-\S+\s+)*$", before):
+            return m.group(0)
+        seg = re.split(r"&&|\|\||;|\n|\|", c[m.end("prog"):], maxsplit=1)[0]
+        if not re.search(r"--headless|--convert-to|--screenshot|--dump-dom|--print-to-pdf|--remote-debugging|--cat\b", seg):
+            return m.group(0)   # a GUI app opened for the user stays as it is
+        return f"{m.group('pre')}timeout -k 5 {n} {m.group('prog')}"
+    return _RENDER_PROG.sub(rep, c)
 
 
 def rabbit_note(idx: int, item: str, since: int) -> str:

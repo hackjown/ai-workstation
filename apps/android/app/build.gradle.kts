@@ -64,4 +64,7 @@ dependencies {
     implementation("androidx.webkit:webkit:1.11.0")
     implementation("androidx.work:work-runtime-ktx:2.9.1")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    // v3.9.27 device bridge: WebSocket client + Health Connect
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.health.connect:connect-client:1.1.0-alpha07")
 }

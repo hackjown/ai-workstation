@@ -2,6 +2,7 @@
 <resources>
     <string name="app_name">Aiw</string>
     <string name="setup_title">服务器设置</string>
+    <string name="device_title">设备能力（让 Agent 用手机日历、健康…）</string>
     <string name="setup_hint">粘贴网页地址（例如 http://192.168.50.188:28000/?token=…），或扫二维码。</string>
     <string name="url_label">服务器地址或完整网址</string>
     <string name="token_label">Token</string>

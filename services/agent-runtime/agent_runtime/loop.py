@@ -33,6 +33,13 @@ from . import escalate as _es
 from . import vision_guard as _vg
 from . import redact as _rd
 from .breaker import Breaker
+from . import intent as _in
+from . import devflow as _df
+from . import provenance as _pv
+from . import fingerprint as _fpm
+from . import dev_contract as _dc
+from . import verify_html as _vh
+from . import git_ops as _git
 from .findings import FindingsBoard
 from .progress_guard import ProgressGuard
 from llm_router import vision as _vis
@@ -44,7 +51,7 @@ _CAD_RESUME = re.compile(r"(?i)(继续|接着|接上)(之前|上次|上一次|�
                          r"在(原|旧|之前|上次|已有)的?(图|图纸|dxf|文件)(上|基础|里)|(上次|之前|刚才)(没|未)(画完|完成)|"
                          r"\bresume\b|continue (the )?(previous|earlier|last|unfinished)")
 _LIBRECAD_PROC = re.compile(r"(?i)(nohup\s+librecad|(^|[;&|(]\s*)librecad\s*($|[&>;)])|p?kill(all)?\b[^;&|]*librecad)")
-from .control import AgentControl, StopRequested
+from .control import AgentControl, StopRequested, stop_text
 from .grounding import convert_desc, coord_instruction, coord_mode, locate, model_name
 from .planner import SYSTEM_PROMPT, make_plan
 from .recovery import Recovery
@@ -59,8 +66,13 @@ ExtTool = tuple[dict, Callable[[dict], Awaitable[dict]]]  # (schema, call)
 
 
 def _dev_task(prompt: str) -> bool:
-    """v3.9.19: a task the user tagged 【技能：dev】 (or that names the dev skill)."""
+    """v3.9.19: a task the user tagged 【技能：dev】 (or that names the dev skill).
+    v3.9.26: only the explicit tag; the loop decides by self._intent (intent.py), which also covers untagged fixes."""
     return bool(re.search(r"【技能[:：][^】]*\bdev\b", prompt or "", re.I))
+
+
+class _ContractDeclined(Exception):
+    """v3.9.26: the user stopped a dev_fix task at its contract card."""
 
 
 @dataclass
@@ -88,7 +100,21 @@ class AgentLoop:
         self.computer, self.llm, self.tools = computer, llm, tools
         self.control = control or AgentControl()
         self.cfg = config or LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s)
-        self._cad_mode = _cad.cad_mode(task.prompt, task.context)  # fresh | revise | None
+        # v3.9.26 (task-830): dev_fix / run / other, decided by the session manager from the words + the thread
+        # (task.intent, persisted on the task); classified here only when the caller gave none (tests, sub-tasks)
+        meta = getattr(task, "meta", None) or {}
+        if getattr(task, "intent", None) in _in.INTENTS:
+            self._intent_info = {"intent": task.intent, "forced": bool(meta.get("intent_forced")),
+                                 "reasons": list(meta.get("intent_reasons") or [])}
+        else:
+            self._intent_info = _in.classify(task.prompt or "", meta.get("signals"), task.context)
+        self._intent = self._intent_info["intent"]
+        # v3.9.26: the thread's real CAD history (stored by the session manager), not CAD words in the context
+        self._cad_mode = _cad.cad_mode(task.prompt, task.context, meta.get("cad_history"), getattr(task, "source", "") or "")
+        if self._cad_mode == "revise" and self._intent == _in.DEV_FIX and not _cad.is_cad_task(task.prompt or ""):
+            self._cad_mode = None   # a code fix in a thread that once drew something is not a drawing revision
+        self.dev = _df.DevFlow(self._intent, _pv.ProvenanceBook(meta.get("provenance")), meta.get("fingerprints"))
+        self.persist: Optional[Callable[[str, object], object]] = None   # set by the session manager: (kind, value)
         self._draw_rounds = 0          # drawing_build runs (3.8.7 pipeline; at most _draw.MAX_ROUNDS fix rounds)
         self._drawkit_ready = None     # kit version installed on the computer this task
         self._drawkit_built = False    # the drawing in cad/ was generated from a spec (layout check bypassed)
@@ -171,7 +197,8 @@ class AgentLoop:
         self.lesson_hint: Optional[Callable[..., Awaitable[Optional[str]]]] = None   # (error, tool, domain) -> note
         self._user_notes: list[str] = []      # 补充要求 the user sent while the task runs
         # v3.9.17
-        self.findings = FindingsBoard()       # 已确认事实板, in the task text every turn (never compressed)
+        # 已确认事实板, in the task text every turn (never compressed); v3.9.26: a dev_fix board takes tool results only
+        self.findings = FindingsBoard(capture_thoughts=self._intent != _in.DEV_FIX)
         self.guard = ProgressGuard(task.prompt or "", self.findings, question=_is_question(task.prompt or ""))
         if self._cad_task or self._designer_task or self._image_task or self._video_task:
             self.guard.off = True   # drawing / image / video jobs have their own loop guards (drawing_hooks, hpd_guard)
@@ -432,8 +459,22 @@ class AgentLoop:
             await self._cad_revise_start()
         elif self._cad_task and not self._cad_resuming():
             await self._cad_fresh_start()
+        go_on = True
+        if self._intent == _in.DEV_FIX:   # v3.9.26: the task contract + git snapshot before the first step
+            try:
+                go_on = await self._dev_start()
+            except (StopRequested, asyncio.CancelledError):
+                go_on = False
+                self._finish(TaskStatus.STOPPED, stop_text(getattr(self.control, "stop_source", "user"),
+                                                           getattr(self.control, "stop_reason", "")))
+            except Exception as e:  # noqa: BLE001  the workflow helps; it never blocks the task
+                __import__("logging").getLogger("aiw.loop").warning("dev start: %s", e)
         try:
+            if not go_on:
+                raise _ContractDeclined()
             await self._run_with_deadline()
+        except _ContractDeclined:
+            pass
         except asyncio.TimeoutError:
             msg = f"timeout after {self.cfg.timeout_s:.0f}s"
             if self._last_image and not getattr(self, "_sent_file", None):
@@ -450,13 +491,26 @@ class AgentLoop:
                     pass
             self._finish(TaskStatus.FAILED, _es.report("time", msg, self.history, getattr(self, "_last_page", None),
                                                        getattr(getattr(self, "_stall", None), "blocked", "")))
-        except StopRequested:
-            self._finish(TaskStatus.STOPPED, "stopped by user")
+        except StopRequested:   # v3.9.26: who stopped it (user / parent / dispatch / system / thread_delete / send_now)
+            self._finish(TaskStatus.STOPPED, stop_text(getattr(self.control, "stop_source", "user"),
+                                                       getattr(self.control, "stop_reason", "")))
         except Exception as e:  # noqa: BLE001
             self._finish(TaskStatus.FAILED, _es.report("error", f"{type(e).__name__}: {e}", self.history,
                                                        getattr(self, "_last_page", None)))
         if plan_job and not plan_job.done():
             plan_job.cancel()
+        if (self.task.status == TaskStatus.FAILED and self.dev.git.get("repo")
+                and os.environ.get("AIW_DEV_ROLLBACK_ON_FAIL", "0") == "1"):   # v3.9.26: optional automatic rollback
+            try:
+                r = await self._sys_shell(_git.command("rollback", {**{k: self.dev.git.get(k) for k in (
+                    "repo", "base", "branch", "orig_branch", "snapshot")}, "task": self._root_id or self.task.id}), 90)
+                rb = _git.parse(r.get("stdout") or "") if r else {}
+                if rb.get("ok"):
+                    self.dev.git.update(rolled_back=True, rollback=rb)
+                    self._persist("git", dict(self.dev.git))
+                    self.task.result = (self.task.result or "") + f"\n\n（已自动回滚到 {str(self.dev.git.get('base'))[:10]}）"
+            except Exception as e:  # noqa: BLE001
+                __import__("logging").getLogger("aiw.loop").warning("dev rollback: %s", e)
         if (self.task.status == TaskStatus.SUCCEEDED and self.plan_steps and len(self.plan_done) < len(self.plan_steps)
                 and os.environ.get("AIW_PLAN_AUTOTICK", "0") == "1"):   # aiw-fix-1: only what was really done is ticked
             self.plan_done = set(range(len(self.plan_steps)))
@@ -561,7 +615,8 @@ class AgentLoop:
         except Exception:  # noqa: BLE001
             return
         if self.task.status == TaskStatus.RUNNING and steps:
-            self.plan_steps = steps
+            self._plan_fallback = bool(getattr(steps, "fallback", False))   # v3.9.26: no gate on a heuristic split
+            self.plan_steps = list(steps)
             await self.emit(EventType.PLAN, plan=self.plan_steps, done=sorted(self.plan_done))
 
     def _v3924_prepare(self, req) -> None:
@@ -643,19 +698,30 @@ class AgentLoop:
             # v3.9.22 task-ca7: 200 steps (30 min) on one plan item, debugging a headless browser's WebGL instead of the
             # product. Plan items stop moving -> first a note (step back: environment problem? record it, work around,
             # or ask), then the user is asked with 继续执行 among the choices.
-            rab = _es.rabbit_steps()
-            if rab and self.plan_steps and len(self.plan_done) < len(self.plan_steps):
-                since = self.step - max(self._plan_tick_at, getattr(self, "_answered_at", 0))
+            # v3.9.26 (task-830): a dev_fix task steps back at 15 steps (AIW_DEV_RABBIT_STEPS) and asks at 30, counted
+            # from the last plan tick / user answer / real source edit / generator run, with or without a plan
+            is_dev = self._intent == _in.DEV_FIX
+            rab = _es.dev_rabbit_steps() if is_dev else _es.rabbit_steps()
+            if rab and ((self.plan_steps and len(self.plan_done) < len(self.plan_steps)) or (is_dev and not self.plan_steps)):
+                since = self.step - max(self._plan_tick_at, getattr(self, "_answered_at", 0),
+                                        *((self.dev.last_source_step, *self.dev.gen_runs[-1:]) if is_dev else ()))
                 cur = next((i for i in range(len(self.plan_steps)) if i not in self.plan_done), 0)
+                item = (self.plan_steps[cur] if self.plan_steps else
+                        str((self.dev.contract or {}).get("goal") or self.task.prompt or ""))
                 if since >= 2 * rab:
-                    n = await self._escalate("rabbit", f"计划第 {cur + 1} 项「{self.plan_steps[cur][:60]}」已经做了 {since} 步还没完成")
+                    n = await self._escalate("dev_rabbit" if is_dev else "rabbit",
+                                             f"计划第 {cur + 1} 项「{item[:60]}」已经做了 {since} 步还没完成")
                     if n is None:
                         return
                     self._plan_tick_at = self.step
                     note, failures, shots = n, 0, 0
-                elif since >= rab and self._rabbit_nudged < self._plan_tick_at:
+                elif since >= rab and self._rabbit_nudged < max(self._plan_tick_at, getattr(self, "_answered_at", 0),
+                                                                *((self.dev.last_source_step,) if is_dev else ())):
                     self._rabbit_nudged = self.step
-                    note = ((note + "\n") if note else "") + _es.rabbit_note(cur, self.plan_steps[cur], since)
+                    note = ((note + "\n") if note else "") + _es.rabbit_note(cur, item, since)
+                    if is_dev:
+                        note += ("\nDEV FIX: the fix belongs in the source of truth from the 【任务契约】. If the cause is "
+                                 "known, edit the source NOW, regenerate and verify with verify_html; do not diagnose again.")
             t0 = getattr(self, "_t0", None)
             if t0 and self.cfg.timeout_s > 0 and not self._time_asked and self.ask and (getattr(self, "_time_up", False) or (
                     self.cfg.timeout_s + self._waited - (time.monotonic() - t0)) < min(90.0, 0.15 * self.cfg.timeout_s)):
@@ -880,6 +946,7 @@ class AgentLoop:
                 continue
             # v3.9.19: the checklist is ticked as the work goes, not all at the end
             if self.plan_steps and decision.tool == "done" and len(self.plan_done) < len(self.plan_steps) \
+                    and not getattr(self, "_plan_fallback", False) \
                     and self._plan_rejects < 1 and os.environ.get("AIW_PLAN_GATE", "1") != "0":
                 self._plan_rejects += 1
                 await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
@@ -890,7 +957,17 @@ class AgentLoop:
                         "\nCall update_plan with the indexes of the steps that are REALLY finished. Then call done; in its "
                         "summary list every step you did not finish under 未完成, with the reason. Do not tick unfinished steps.")
                 continue
-            if decision.tool == "done" and _dev_task(self.task.prompt) and self._known_rejects < 1 \
+            # v3.9.26 (task-830): a dev_fix done needs a real source change, a regenerated artifact and acceptance +
+            # regression evidence (devflow.py); bounded, then it goes through with 已知问题
+            if decision.tool == "done" and self._intent == _in.DEV_FIX and os.environ.get("AIW_DEV_GATE", "1") != "0":
+                ok_done, dnote, dmsg = await self._dev_done_gate()
+                if not ok_done:
+                    await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                    await self.emit(EventType.VALIDATION, success=False, change=0.0, message=dmsg)
+                    self.history.append(f"{self.step}. done REJECTED by the dev workflow gate: {dmsg}")
+                    note = dnote
+                    continue
+            if decision.tool == "done" and self._intent == _in.DEV_FIX and self._known_rejects < 1 \
                     and not re.search(r"已知(未解决)?问题|未解决|未完成|遗留|known issue", str((decision.args or {}).get("summary") or ""), re.I):
                 self._known_rejects += 1
                 await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
@@ -945,6 +1022,7 @@ class AgentLoop:
                         "call update_plan with those indexes right now: the user watches the checklist tick live.")
             llm_ms = int((time.time() - t_llm) * 1000)
             if (self._sent_file and decision.tool not in ("done", "fail", "send_file")
+                    and self._intent != _in.DEV_FIX   # v3.9.26: a fix is verified after sending, never cut short
                     and not (self._cad_task and (not self._cad_pdf_ok or self._sheet_audit.get("thin")))):
                 self._after_send += 1
                 if self._after_send >= 2:  # the file is already with the user; stop wandering
@@ -992,6 +1070,18 @@ class AgentLoop:
                 note = "Paused before acting; previous decision discarded. Re-assess."
                 continue
 
+            dv, dn = self.dev.pre_tool(self.step, decision.tool, decision.args or {})   # v3.9.26 dev_fix rules
+            if dv == "skip":
+                await self.emit(EventType.ACTION_RESULT, tool=decision.tool, success=False, error="refused by dev workflow",
+                                result={})
+                await self.emit(EventType.VALIDATION, success=False, change=0.0,
+                                message=("拒绝：这是脚本生成的产物，请改源头脚本后重新生成" if "生成的产物" in dn else
+                                         "这种验证方法已失败两次：改用内置 verify_html"))
+                self.history.append(f"{self.step}. {decision.tool}({_args_short(decision.args)}) -> {dn}")
+                note = dn
+                continue
+            if dn:
+                self._guard_note = ((self._guard_note + "\n") if self._guard_note else "") + dn
             gate, gnote = await _dh.pre_tool(self, decision)
             if gate == "converge":   # 3.8.9: looping after a spec exists -> deterministic pipeline, then deliver
                 await self.emit(EventType.VALIDATION, success=False, change=0.0, message="换方法：确定性流水线出图")
@@ -1046,6 +1136,12 @@ class AgentLoop:
                     and float(run_args.get("timeout") or 60) > float(os.environ.get("AIW_OCR_TIMEOUT", "20"))):
                 # task-3fc: tesseract on the whole photo hung for 60 s; an OCR call gets 20 s, then falls back
                 run_args = dict(run_args, timeout=float(os.environ.get("AIW_OCR_TIMEOUT", "20")))
+            if decision.tool == "shell" and isinstance(run_args, dict) and os.environ.get("AIW_RENDER_WRAP", "1") != "0":
+                # v3.9.26 (task-830): a headless chrome / soffice never hangs a step: `timeout` in front
+                wrapped = _es.wrap_timeout(str(run_args.get("command") or ""))
+                if wrapped != run_args.get("command"):
+                    run_args = dict(run_args, command=wrapped)
+                    self.history.append(f"{self.step}. (browser/render command wrapped with timeout -k 5 {_es.render_timeout()})")
             if fixed:
                 self.history.append(f"{self.step}. (path fixed: /home/user/workspace → {self.home}/workspace; "
                                     "write ~/workspace next time)")
@@ -1085,6 +1181,7 @@ class AgentLoop:
                 note = refused
                 continue
             if decision.tool == "send_file" and outcome.success and isinstance(outcome.result, dict):
+                self._record_delivery(outcome.result, str((decision.args or {}).get("path") or ""))   # v3.9.26
                 await self._deliver_file(outcome.result)
                 _dh.record_delivery(self, outcome.result)
                 outcome.result = {k: v for k, v in outcome.result.items() if k != "content_b64"}
@@ -1107,6 +1204,7 @@ class AgentLoop:
             if bn:
                 self._guard_note = ((self._guard_note + "\n") if self._guard_note else "") + bn
                 await self.emit(EventType.MESSAGE, text=f"工具熔断：{bn[:200]}", breaker=True)
+            await self._dev_after(decision, run_args, outcome)   # v3.9.26: provenance log, dev guards, result facts
             seen = ""
             if isinstance(outcome.result, dict):
                 seen = str(outcome.result.get("text") or outcome.result.get("stdout") or "")[:20000]
@@ -1122,6 +1220,8 @@ class AgentLoop:
 
             if outcome.control == "done":
                 summ = str(decision.args.get("summary", "done"))
+                if self._intent == _in.DEV_FIX:
+                    summ = await self._dev_finish(summ)
                 if self.guard.mode == "deliver" and self.guard.reason in ("budget", "soft_cap") and "深挖" not in summ:
                     summ += self.guard.tail()
                 self._finish(TaskStatus.SUCCEEDED, summ)
@@ -1237,6 +1337,8 @@ class AgentLoop:
 
     def _task_with_plan(self) -> str:
         base = self.task_text + _dh.task_block(self) + self.findings.block()
+        if self._intent == _in.DEV_FIX and self.dev.contract:   # v3.9.26 【任务契约】, every turn
+            base += _dc.block(self.dev.contract)
         if self._images_read:
             base += ("\n\nIMAGES ALREADY READ (do not read again; their content is in cad/plan.md or above): "
                      + ", ".join(self._images_read))
@@ -1252,6 +1354,8 @@ class AgentLoop:
         t, a = decision.tool, decision.args or {}
         if t == "note_finding":   # v3.9.17 已确认事实板
             return await self._note_finding(a)
+        if t == "verify_html":    # v3.9.26 the built-in page check
+            return await self._verify_html(a)
         if t == "update_plan":
             self._since_plan = 0
             for i in a.get("done") or []:
@@ -1454,6 +1558,253 @@ class AgentLoop:
         await self.emit(EventType.ACTION_RESULT, tool="note_finding", success=not any(o.startswith("REFUSED") for o in out),
                         error=None, result={"status": out})
         return "; ".join(out)
+
+    # ------------------------------------------------- v3.9.26 dev/fix workflow (task-830)
+    def _persist(self, kind: str, value) -> None:
+        """Hand durable state to the session manager (provenance / fingerprints per thread, contract / git per task)."""
+        if self.persist is None:
+            return
+        try:
+            self.persist(kind, value)
+        except Exception as e:  # noqa: BLE001
+            __import__("logging").getLogger("aiw.loop").warning("persist %s: %s", kind, e)
+
+    async def _sys_shell(self, command: str, timeout: float = 60.0) -> dict:
+        """A command the SYSTEM runs on the computer (git snapshot, fingerprint, verify_html): straight to the
+        computer, not through the model's policy/confirm path. {} when the computer cannot run it."""
+        ex = getattr(self.computer, "execute", None)
+        if ex is None:
+            return {}
+        try:
+            r = await asyncio.wait_for(ex("shell.exec", {"command": command, "timeout": timeout}, observe=False,
+                                          timeout=timeout + 15), timeout + 25)
+        except (StopRequested, asyncio.CancelledError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}: {e}"}
+        res = r.result if (r is not None and isinstance(r.result, dict)) else {}
+        if r is not None and not r.success and not res:
+            res = {"error": str(r.error or "")}
+        return res
+
+    async def _dev_start(self) -> bool:
+        """Step 0 of a dev_fix task: the 【任务契约】 (dev_contract.py), a baseline fingerprint of the deliverable when the
+        thread has none, the git snapshot/branch, and a confirmation card when the change is large or unclear.
+        False = the user declined (the task stops)."""
+        meta = getattr(self.task, "meta", None) or {}
+        c = _dc.build(self.task.prompt or "", self.task.context or "", self.dev.book, self.dev.baselines,
+                      str(meta.get("old_instructions") or ""))
+        self.dev.contract = c
+        for d in (c.get("deliverables") or [])[-1:]:
+            if not (self.dev.baselines.get(d)):
+                r = await self._sys_shell(_fpm.remote_command(d), 60)
+                try:
+                    fp = json.loads(str(r.get("stdout") or "").strip().splitlines()[-1])
+                    if isinstance(fp, dict) and fp.get("size"):
+                        self.dev.baselines[d] = fp
+                except (ValueError, IndexError):
+                    pass
+        if self.dev.baselines and not c.get("must_keep"):
+            c2 = _dc.build(self.task.prompt or "", self.task.context or "", self.dev.book, self.dev.baselines,
+                           str(meta.get("old_instructions") or ""))
+            c.update(must_keep=c2["must_keep"], checks=c2["checks"])
+        if c.get("source_of_truth") and os.environ.get("AIW_DEV_GIT", "1") != "0":
+            prev = meta.get("git") or {}
+            r = await self._sys_shell(_git.command("start", {"path": c["source_of_truth"], "task": self._root_id or self.task.id,
+                                                             "prev": prev}), 60)
+            g = _git.parse(r.get("stdout") or "") if r else {}
+            if g.get("ok"):
+                g["machine_id"] = self.task.machine_id
+                self.dev.git = g
+                c["git"] = {k: g.get(k) for k in ("repo", "base", "branch", "orig_branch", "snapshot")}
+                self._persist("git", dict(g))
+        self._persist("contract", c)
+        lines = [f"任务契约（修复代码）：{c.get('goal')[:120]}"]
+        if c.get("source_of_truth"):
+            lines.append(f"源头：{c['source_of_truth']}")
+        if c.get("voided_constraints"):
+            lines.append("已失效的旧约束：" + "；".join(c["voided_constraints"]))
+        if (c.get("git") or {}).get("branch"):
+            lines.append(f"Git：已记录 {str(c['git'].get('base'))[:10]}，在分支 {c['git']['branch']} 上修改")
+        await self.emit(EventType.MESSAGE, text="\n".join(lines), contract=c, intent=self._intent_info)
+        self.history.append("0. DEV FIX: the 【任务契约】 in the task text is binding: edit the source of truth, regenerate, "
+                            "verify with verify_html, never patch the generated file.")
+        # a 【技能：dev】 build of something new (no thread artifacts) has the dev skill's own mockup rounds: no card
+        new_build = bool(self._intent_info.get("forced")) and not self.dev.book.artifacts()
+        if c.get("confirm") and self.ask and not new_build and os.environ.get("AIW_DEV_CONFIRM", "1") != "0":
+            q, opts = _dc.card(c)
+            await self.emit(EventType.INPUT_REQUIRED, question=q, options=opts, contract=c)
+            t0 = time.monotonic()
+            reply = await self._ask(q, opts)
+            self.add_wait(time.monotonic() - t0)
+            await self.emit(EventType.INPUT_ANSWERED, answer=reply)
+            if reply is not None and re.search(r"停止|取消|算了", str(reply)):
+                self._finish(TaskStatus.STOPPED, "stopped by user: 任务契约没有确认")
+                return False
+            if reply and reply not in opts:
+                c["goal"] = (c.get("goal") or "") + "\n用户补充：" + str(reply)[:600]
+                self._user_notes.append(str(reply)[:2000])
+            elif reply == opts[1]:
+                q2 = "请补充：要修改的源头文件/目录在哪里，改动范围是什么？"
+                await self.emit(EventType.INPUT_REQUIRED, question=q2, options=[])
+                t0 = time.monotonic()
+                more = await self._ask(q2, [])
+                self.add_wait(time.monotonic() - t0)
+                await self.emit(EventType.INPUT_ANSWERED, answer=more)
+                if more:
+                    c["goal"] = (c.get("goal") or "") + "\n用户补充：" + str(more)[:600]
+                    for pth in _dc.source_paths(str(more)):
+                        if pth not in c["allowed_paths"]:
+                            c["allowed_paths"].append(pth)
+                        if not c.get("source_of_truth"):
+                            c["source_of_truth"] = pth
+            self._persist("contract", c)
+        return True
+
+    async def _dev_facts(self) -> tuple[Optional[bool], list, str]:
+        """(git changed?, regression losses, git --stat) for the dev done gate, gathered on the computer."""
+        c = self.dev.contract or {}
+        changed, stat = None, ""
+        g = self.dev.git
+        if g.get("repo") and g.get("base"):
+            r = await self._sys_shell(_git.command("status", {"repo": g["repo"], "base": g["base"],
+                                                              "paths": c.get("allowed_paths") or []}), 60)
+            st = _git.parse(r.get("stdout") or "") if r else {}
+            if st.get("ok"):
+                changed, stat = bool(st.get("changed")), str(st.get("stat") or "")
+        losses: list = []
+        base = self.dev.baseline()
+        new_path = self.dev.deliverable()
+        if base and new_path:
+            new = None
+            r = await self._sys_shell(_fpm.remote_command(new_path), 60)
+            try:
+                new = json.loads(str(r.get("stdout") or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                new = self.dev.delivered.get(_pv.norm(new_path))
+            if isinstance(new, dict) and new.get("size") is not None:
+                losses = _fpm.diff(base, new, c.get("allow_remove"))
+        return changed, losses, stat
+
+    async def _dev_done_gate(self) -> tuple[bool, Optional[str], Optional[str]]:
+        try:
+            changed, losses, stat = await self._dev_facts()
+        except (StopRequested, asyncio.CancelledError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            __import__("logging").getLogger("aiw.loop").warning("dev facts: %s", e)
+            changed, losses, stat = None, [], ""
+        self.dev.git["stat"] = stat or self.dev.git.get("stat", "")
+        return self.dev.done_gate(changed, losses)
+
+    async def _dev_finish(self, summary: str) -> str:
+        """A dev_fix done that passed (or was let through): commit on the aiw branch, add diff --stat, commit id and
+        any 已知问题 to the summary."""
+        out = summary + self.dev.known_tail()
+        g = self.dev.git
+        if g.get("repo") and os.environ.get("AIW_DEV_COMMIT", "1") != "0":
+            goal = str((self.dev.contract or {}).get("goal") or self.task.prompt or "")
+            msg = "aiw: " + re.sub(r"\s+", " ", goal)[:72] + f"\n\n{goal[:1500]}\n\nTask: {self.task.id}"
+            if self.dev.known_issues:
+                msg += "\nKnown issues: " + "; ".join(self.dev.known_issues)[:800]
+            r = await self._sys_shell(_git.command("commit", {"repo": g["repo"], "base": g.get("base"), "message": msg,
+                                                              "paths": (self.dev.contract or {}).get("allowed_paths") or []}), 90)
+            cm = _git.parse(r.get("stdout") or "") if r else {}
+            if cm.get("ok"):
+                g.update(commit=cm.get("commit"), stat=cm.get("stat") or g.get("stat"), committed=cm.get("committed"))
+            else:
+                g["commit_error"] = cm.get("detail") or cm.get("error")
+            self._persist("git", dict(g))
+            line = _git.summary_line(g)
+            if line:
+                out += "\n\n" + line
+        return out
+
+    async def _dev_after(self, decision, run_args, outcome) -> None:
+        """After every tool the Tool Router ran: the shell log (provenance, for every task), then the dev_fix guards
+        (repeated diagnosis, verification breaker) and result-only facts."""
+        try:
+            res = outcome.result if isinstance(outcome.result, dict) else {}
+            ok = bool(outcome.success) and res.get("exit_code") in (0, None)
+            out = str(res.get("stdout") or "")
+            n = self.dev.post_tool(self.step, decision.tool, run_args if isinstance(run_args, dict) else {}, ok, out,
+                                   str(outcome.error or res.get("stderr") or ""))
+            if n:
+                self._guard_note = ((self._guard_note + "\n") if self._guard_note else "") + n
+                await self.emit(EventType.VALIDATION, success=False, change=0.0,
+                                message="已确认结论：下一步必须动手修改" if n.startswith("已确认结论") else "验证方法已熔断：改用 verify_html")
+            if self._intent == _in.DEV_FIX and not ok:
+                n0 = len(self.findings.items)
+                self.findings.from_result(decision.tool, run_args if isinstance(run_args, dict) else {}, ok,
+                                          str(res.get("stderr") or "") + "\n" + str(outcome.error or "") + "\n" + out[-1500:], self.step)
+                await self._emit_findings(n0)
+        except (StopRequested, asyncio.CancelledError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            __import__("logging").getLogger("aiw.loop").warning("dev after: %s", e)
+
+    def _record_delivery(self, res: dict, asked: str = "") -> None:
+        """send_file: which command made the file (provenance) and its feature fingerprint, kept per thread."""
+        try:
+            path = str(res.get("path") or asked or "")
+            if not path:
+                return
+            prod = _pv.producer_for(path, self.dev.shell_log, self.home or "")
+            if prod is None and asked and asked != path:
+                prod = _pv.producer_for(asked, self.dev.shell_log, self.home or "")
+            e = self.dev.book.record(path, prod, self.task.id, self.home or "")
+            b64 = res.get("content_b64")
+            if b64:
+                data = base64.b64decode(b64)
+                fp = _fpm.fingerprint(data, Path(path).name)
+                key = _pv.norm(path, self.home or "")
+                self.dev.record_delivery(key, fp)
+                self._persist("fingerprint", {key: fp})
+            self._persist("provenance", self.dev.book.to_dict())
+            if e.get("script"):
+                self.history.append(f"{self.step}. (provenance: {Path(path).name} is made by {e['script']})")
+        except Exception as ex:  # noqa: BLE001
+            __import__("logging").getLogger("aiw.loop").warning("record delivery: %s", ex)
+
+    async def _verify_html(self, a: dict) -> str:
+        """verify_html: run the built-in Chromium check on the computer (verify_html.py), never hangs."""
+        spec = {k: a[k] for k in ("path", "url", "selectors", "clicks", "screenshot", "timeout", "min_counts",
+                                  "viewport", "strict_console", "full_page") if a.get(k) not in (None, "", [])}
+        c = self.dev.contract or {}
+        if not spec.get("path") and not spec.get("url"):
+            d = self.dev.deliverable()
+            if d:
+                spec["path"] = d
+            else:
+                await self.emit(EventType.ACTION_RESULT, tool="verify_html", success=False, error="missing path", result={})
+                return "FAILED: verify_html needs `path` (or `url`)"
+        chk = c.get("checks") or {}
+        if self._intent == _in.DEV_FIX and chk.get("selectors"):   # the contract's regression selectors always ride along
+            spec["selectors"] = list(dict.fromkeys(list(spec.get("selectors") or []) + chk["selectors"]))
+            spec["min_counts"] = {**chk.get("min_counts", {}), **(spec.get("min_counts") or {})}
+        spec["timeout"] = int(min(300, max(10, float(spec.get("timeout") or os.environ.get("AIW_VERIFY_TIMEOUT", "60")))))
+        t0 = time.monotonic()
+        r = await self._sys_shell(_vh.command(spec), spec["timeout"] + 20)
+        res = _vh.parse(r.get("stdout") or "") if r.get("stdout") else {"ok": False, "error": r.get("error") or "no_output",
+                                                                         "detail": str(r.get("stderr") or "")[-300:]}
+        self.dev.record_verify(self.step, res)
+        await self.emit(EventType.ACTION_RESULT, tool="verify_html", success=bool(res.get("ok")), error=res.get("error"),
+                        result=_short({"ok": res.get("ok"), "url": res.get("url"), "error": res.get("error"),
+                                       "console_errors": len(res.get("console_errors") or []),
+                                       "clicks": json.dumps(res.get("clicks") or [], ensure_ascii=False),
+                                       "selectors": json.dumps(res.get("selectors") or {}, ensure_ascii=False)}),
+                        tool_ms=int((time.monotonic() - t0) * 1000))
+        if self._intent == _in.DEV_FIX:
+            n0 = len(self.findings.items)
+            self.findings.from_result("verify_html", spec, bool(res.get("ok")),
+                                      f"{Path(str(spec.get('path') or spec.get('url'))).name} clicks="
+                                      f"{[(x.get('click'), x.get('ok')) for x in res.get('clicks') or []]} "
+                                      f"errors={len(res.get('console_errors') or [])} {res.get('error') or ''}", self.step)
+            await self._emit_findings(n0)
+        if res.get("screenshot"):
+            self.history.append(f"{self.step}. (verify_html screenshot saved at {res['screenshot']}; send_file it if the user should see it)")
+        self._acted = True
+        return ("verify_html " + ("PASSED " if res.get("ok") else "FAILED ") + _vh.brief(res))
 
     async def _write_report(self) -> str:
         """The report a model that would not stop collecting did not write: from the findings board (one short model
@@ -2749,6 +3100,8 @@ class AgentLoop:
             hide.extend(BOS_TOOLS)
         if getattr(self, "breaker", None) is not None:
             hide.extend(self.breaker.hidden())   # v3.9.17 工具熔断
+        if os.environ.get("AIW_VERIFY_TOOL", "1") == "0":
+            hide.append("verify_html")
         return tuple(hide)
 
     async def _dispatch(self, a: dict) -> str:
@@ -2826,7 +3179,14 @@ class AgentLoop:
             if d.tool in ("done", "fail"):
                 summary = d.args.get("summary") or d.args.get("reason") or d.thought or d.tool
                 break
+            dv, dn = self.dev.pre_tool(self.step, d.tool, d.args or {})   # v3.9.26: the helper follows the dev rules too
+            if dv == "skip":
+                hist.append(f"{i+1}. {d.tool}({_args_short(d.args)}) -> {dn}")
+                continue
             o = await self.tools.run(d.tool, d.args, intent=d.thought)
+            _r = o.result if isinstance(o.result, dict) else {}
+            self.dev.post_tool(self.step, d.tool, d.args or {}, bool(o.success) and _r.get("exit_code") in (0, None),
+                               str(_r.get("stdout") or ""), str(o.error or ""))
             out = ""
             if o.action == "shell.exec" and o.result:
                 out = f" exit={o.result.get('exit_code')} out={_clip(str(o.result.get('stdout') or ''), 2000)!r} err={str(o.result.get('stderr',''))[:200]!r}"
@@ -3015,7 +3375,7 @@ def _gui_text(prompt: str) -> str:
     return _GIT_URL.sub(" ", p)
 
 
-_NON_GUI_TOOLS = {"ask_user", "update_plan", "remember", "done", "fail", "wait", "request_takeover",
+_NON_GUI_TOOLS = {"verify_html", "ask_user", "update_plan", "remember", "done", "fail", "wait", "request_takeover",
                   "note_finding", "ssh_exec", "remote_exec", "session_search", "deploy_server", "browser_network"}
 
 
@@ -3086,7 +3446,7 @@ def _ws_rel(p: str) -> str:
 
 
 _GUESSED_HOME = re.compile(r"(/home/(?:user|aiw|ubuntu|debian)/)workspace(?=/|\b)")
-_NO_SCREEN_TOOLS = {"read_image", "image_edit", "generate_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
+_NO_SCREEN_TOOLS = {"verify_html", "read_image", "image_edit", "generate_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
                     # 3.8.9 (task-3fc): file-only drawing steps; a desktop look + vision description cost 12-15 s each
                     "drawing_auto", "drawing_build", "drawing_note", "drawing_read",
                     # v3.9.17: facts, remote commands and the request log never change the screen

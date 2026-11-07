@@ -134,7 +134,8 @@ class SessionManager:
             from . import autoroute
             if video and not pick:   # the video model stays for video production
                 return llm, {"tier": "video", "tier_cn": "视频", "model": video, "effort": "", "by": "video", "reason": "视频任务"}
-            route = await autoroute.decide(self.store, task.prompt, small, pick.get("model") or "", pick.get("effort") or "")
+            route = await autoroute.decide(self.store, task.prompt, small, pick.get("model") or "", pick.get("effort") or "",
+                                           intent=getattr(task, "intent", None) or "", long_run=self._long_run(task))
         except Exception as e:  # noqa: BLE001
             log.warning("auto route: %s", e)
             return llm, None
@@ -149,6 +150,19 @@ class SessionManager:
         route = {**route, "resolved_model": name}
         return LLMRouter.from_settings(name, back, key, m.get("base_url") or None, self._tool_choices(), thinking,
                                        effort=eff, role="main"), route
+
+    def _long_run(self, task: Task) -> bool:
+        """v3.9.26: a 继续 / 重试 of a task that already ran many steps (AIW_DEV_LONG_STEPS, 40) gets the dev route too."""
+        try:
+            if (getattr(task, "source", "") or "") not in ("retry", "continue", "resume") or not task.continues:
+                return False
+            n = 0
+            for r in self.store.continuations(task.continues) or []:
+                if r.get("session_id") and r["id"] != task.id:
+                    n += sum(1 for e in self.store.events(r["session_id"], limit=3000) if e.get("type") == "agent.decision")
+            return n >= int(os.environ.get("AIW_DEV_LONG_STEPS", "40") or 40)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _task_llm(self, prompt: str) -> tuple[LLMRouter, Optional[str]]:
         """The main model, or the video model for making/editing a video (设置 video_model / AIW_VIDEO_MODEL).
@@ -341,13 +355,22 @@ class SessionManager:
             except Exception as e:  # noqa: BLE001
                 log.warning("memory prepare: %s", e)
         from . import continuation as _cont
+        from . import devflow as _dfa
         run_prompt, resume, chain_ids = row["prompt"], "", set()
+        try:   # v3.9.26 (task-830): what the thread holds (sent files, scripts, provenance, CAD history)
+            signals = _dfa.thread_signals(self.store, row.get("thread_id"), exclude={row["id"]})
+        except Exception as e:  # noqa: BLE001
+            log.warning("thread signals: %s", e)
+            signals = {}
         if row.get("continues"):   # 3.8.5: a 继续 / 修改 run of an earlier task picks up where it stopped
             try:
                 chain_ids = {r["id"] for r in self.store.continuations(row["continues"])}
-                run_prompt = _cont.run_prompt(self.store, row) or row["prompt"]
+                run_prompt = _cont.run_prompt(self.store, row, signals) or row["prompt"]
                 mname = (self.store.machine(row["machine_id"]) or {}).get("name")
                 resume = _cont.resume_block(self.store, row, mname)
+                if "【任务契约】" in (run_prompt or "") and resume:   # v3.9.26: the old request is background only
+                    resume = resume.replace("ORIGINAL REQUEST: ", "ORIGINAL REQUEST (BACKGROUND ONLY: the 【任务契约】 in the "
+                                            "current request overrides it; its conflicting constraints are void): ", 1)
                 plan = _cont.last_plan([r for r in self.store.continuations(row["continues"]) if r["id"] != row["id"]])
                 if (plan and (self.store.kv_get(f"task_run:{row['id']}", {}) or {}).get("mode") != "edit"
                         and "用户补充：" not in (run_prompt or "")):   # aiw-fix-1: new words get a new plan
@@ -376,10 +399,27 @@ class SessionManager:
         if row.get("source") not in ("xhs", "watch_order"):
             # 3.8.2: tasks have no step / time budget (rows saved before carry the old 40 steps / 900 s)
             steps, secs = _es.step_cap(), _es.time_cap()
-        steps, secs = _budget(run_prompt, int(steps or 0), float(secs or 0), ctx)
+        cad_hist = bool(signals.get("cad_history"))
+        steps, secs = _budget(run_prompt, int(steps or 0), float(secs or 0), ctx,
+                              cad_history=cad_hist, source=row.get("source") or "")
+        if row.get("parent_id") and row.get("source") == "dispatch":   # v3.9.26: a child gets a default budget
+            dsteps, dsecs = _dfa.dispatch_budget(self.store)
+            steps, secs = steps or dsteps, secs or dsecs
+        try:   # v3.9.26: dev_fix / run / other, persisted on the task (kv task_intent:<id>)
+            info = _dfa.task_intent(self.store, row, signals)
+        except Exception as e:  # noqa: BLE001
+            log.warning("task intent: %s", e)
+            info = {}
+        root_id = row.get("continues") if row.get("continues") and row.get("continues") != row["id"] else None
+        meta = {"signals": {k: signals.get(k) for k in ("sent_files", "script_runs", "repo_paths")},
+                "provenance": signals.get("provenance") or {}, "fingerprints": signals.get("fingerprints") or {},
+                "cad_history": cad_hist, "intent_reasons": info.get("reasons") or [], "intent_forced": bool(info.get("forced"))}
+        if root_id:
+            meta["old_instructions"] = _cont.instructions(self.store, self.store.task(root_id) or row)
+            meta["git"] = self.store.kv_get(f"task_git:{root_id}") or {}
         task = Task(id=row["id"], prompt=run_prompt, machine_id=row["machine_id"], thread_id=row.get("thread_id"),
-                    source=row.get("source") or "chat", max_steps=steps, timeout_s=secs,
-                    continues=(row.get("continues") if row.get("continues") and row.get("continues") != row["id"] else None))
+                    source=row.get("source") or "chat", max_steps=steps, timeout_s=secs, continues=root_id,
+                    intent=info.get("intent"), meta=meta)
         task.context = ctx
         return await self.start(task, allow_busy=allow_busy)
 
@@ -460,7 +500,7 @@ class SessionManager:
         stopped = None
         if busy and stop_current:
             stopped = busy.task.id
-            await self.control(busy.id, "stop")   # its runner ends and drains: this one is first
+            await self.control(busy.id, "stop", source="send_now", reason=f"立即发送 {task_id}")   # its runner ends and drains
         elif not busy:
             await self.drain(t["machine_id"])
         now = self.store.task(task_id) or t
@@ -489,7 +529,7 @@ class SessionManager:
                 for a in attachments if isinstance(a, dict))
         if live and live.runner and not live.runner.done():
             if mode == "edit":
-                await self.control(live.id, "stop")
+                await self.control(live.id, "stop", source="system", reason="修改任务后按新的说明重新运行")
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(asyncio.shield(live.runner), 15)
             else:
@@ -497,6 +537,15 @@ class SessionManager:
                 self._link_attachments(attachments, last["id"], last.get("thread_id"))
                 return {**res, "task": self.store.task(last["id"]), "thread_id": last.get("thread_id"),
                         "session_id": last.get("session_id"), "queued": False, "continued": root["id"]}
+        if mode == "continue" and text and not attachments:   # v3.9.26 「回滚 / 撤销」 a dev fix: git rollback, no new run
+            from agent_runtime import intent as _in
+            from . import devflow as _dfa
+            g = _dfa.git_state(self.store, last["id"]) or _dfa.git_state(self.store, root["id"])
+            if g and not g.get("rolled_back") and _in.is_rollback_request(text) and last.get("status") != "queued":
+                res = await _dfa.rollback(self, last["id"] if _dfa.git_state(self.store, last["id"]) else root["id"])
+                return {"task": self.store.task(last["id"]), "thread_id": last.get("thread_id"), "queued": False,
+                        "session_id": last.get("session_id"), "continued": root["id"], "rolled_back": res.get("ok"),
+                        "rollback": res}
         if last.get("status") == "queued" and mode != "edit":
             # not started yet: the words join it (one queued run per task, never two)
             if text:
@@ -965,6 +1014,11 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    try:   # v3.9.26: provenance / fingerprints per thread, contract / git per task
+                        from . import devflow as _dfa
+                        loop.persist = _dfa.persister(self.store, task)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("dev persist: %s", e)
                     try:   # v3.9.17 密码保护: {{task_cred_…}} fills in type / bos_act / shell; outputs mask the values
                         for c in creds:
                             v = self.secrets.get(c["key"]) if self.secrets else None
@@ -1052,7 +1106,8 @@ class SessionManager:
             if status == "succeeded":
                 await self._notify("done", "任务完成", result or "", task)
             elif status == "stopped":
-                if task.thread_id:
+                # v3.9.26: only the user's own stop pauses the thread's queue (not a parent / 立即发送 / system stop)
+                if task.thread_id and getattr(live.control, "stop_source", "user") == "user":
                     self.held_threads.add(task.thread_id)
             else:
                 await self._notify("failed", "任务失败", result or "", task)
@@ -1330,8 +1385,9 @@ class SessionManager:
                         "status": r["status"], "result": (r.get("result") or "")[:500], "session_id": r.get("session_id")})
         return out
 
-    async def stop_children(self, task_id: str) -> int:
-        """Stop on a parent stops every child it dispatched: running ones are stopped, queued ones dropped."""
+    async def stop_children(self, task_id: str, source: str = "parent", reason: str = "") -> int:
+        """Stop on a parent stops every child it dispatched: running ones are stopped, queued ones dropped.
+        v3.9.26: the children's stop says who did it (parent / dispatch time limit)."""
         n = 0
         for r in self.store.children(task_id):
             if r["status"] == "queued":
@@ -1339,7 +1395,7 @@ class SessionManager:
                 continue
             live = self.live_for_task(r["id"])
             if live and live.runner and not live.runner.done() and live.control.state.value != "stopped":
-                await self.control(live.id, "stop")
+                await self.control(live.id, "stop", source=source, reason=reason or f"主任务 {task_id} 停止")
                 n += 1
         return n
 
@@ -1431,7 +1487,7 @@ class SessionManager:
                     break
                 if time.monotonic() > deadline:
                     timed_out = True
-                    await self.stop_children(ptask.id)
+                    await self.stop_children(ptask.id, source="dispatch", reason=f"分派时间到（{int(timeout_s // 60)} 分钟）")
                     end = time.monotonic() + 15
                     while time.monotonic() < end and not all(
                             (self.store.task(c["task_id"]) or {}).get("status") in FINAL_STATES for c in kids):
@@ -1479,23 +1535,35 @@ class SessionManager:
             raise KeyError(sid)
         return self.live[sid]
 
-    async def control(self, sid: str, op: str) -> dict:
+    async def control(self, sid: str, op: str, source: str = "user", reason: str = "") -> dict:
+        """pause / takeover / resume / stop. v3.9.26: a stop carries its real source (user | parent | dispatch | system |
+        thread_delete | send_now) and reason: recorded on the event (by), the task (kv task_stop:<id>) and the result."""
         live = self.get(sid)
         c = live.control
-        {"pause": c.pause, "takeover": c.takeover, "resume": c.resume, "stop": c.stop}[op]()
+        if op == "stop":
+            try:
+                c.stop(source, reason)
+            except TypeError:   # an older control object
+                c.stop()
+        else:
+            {"pause": c.pause, "takeover": c.takeover, "resume": c.resume}[op]()
         if op == "stop":
             for fut in (live.confirm, live.question):
                 if fut and not fut.done():
                     fut.set_result(False if fut is live.confirm else None)
-            if live.task.thread_id:
+            if live.task.thread_id and source == "user":   # only the user's own stop pauses the thread's queue
                 self.held_threads.add(live.task.thread_id)
+            with contextlib.suppress(Exception):
+                self.store.kv_set(f"task_stop:{live.task.id}", {"source": source, "reason": reason, "at": time.time()})
         if op == "stop":
-            await self.stop_children(live.task.id)
+            await self.stop_children(live.task.id, source="parent")
         status = {"pause": "paused", "takeover": "takeover", "resume": "running", "stop": "stopped"}[op]
         self.store.update_task(live.task.id, status)
         etype = {"pause": EventType.PAUSED, "takeover": EventType.TAKEOVER, "resume": EventType.RESUMED,
                  "stop": EventType.TASK_FAILED}[op]
-        ev = AgentEvent(session_id=sid, type=etype, data={"by": "user", "op": op, **({"status": "stopped"} if op == "stop" else {})})
+        by = source if op == "stop" else "user"
+        ev = AgentEvent(session_id=sid, type=etype, data={"by": by, "op": op, **({"status": "stopped", "reason": reason}
+                                                                                 if op == "stop" else {})})
         self.store.add_event(ev.model_dump(mode="json"))
         await self._broadcast(live, {"kind": "event", "task_id": live.task.id, **ev.model_dump(mode="json")})
         return {"session_id": sid, "state": c.state.value}
@@ -1630,18 +1698,20 @@ def _title(prompt: str) -> str:
 _OFFICE_TASK = re.compile(r"officecli|\.?docx|\.?xlsx|\.?pptx|word|excel|空白页|分页|文档|表格|幻灯片|PPT", re.I)
 
 
-def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str] = None) -> tuple[int, float]:
+def _budget(prompt: str, max_steps: int, timeout_s: float, context: Optional[str] = None,
+            cad_history: Optional[bool] = None, source: str = "") -> tuple[int, float]:
     """0 means no budget (the 3.8.2 default) and stays 0: the per-skill bumps below only raise a budget that is set.
     """
-    st, secs = _budget_raw(prompt, max_steps, timeout_s, context)
+    st, secs = _budget_raw(prompt, max_steps, timeout_s, context, cad_history, source)
     return (st if max_steps and max_steps > 0 else 0), (secs if timeout_s and timeout_s > 0 else 0.0)
 
 
-def _budget_raw(prompt: str, max_steps: int, timeout_s: float, context: Optional[str] = None) -> tuple[int, float]:
+def _budget_raw(prompt: str, max_steps: int, timeout_s: float, context: Optional[str] = None,
+                cad_history: Optional[bool] = None, source: str = "") -> tuple[int, float]:
     """Drawing a construction set in the CAD GUI takes hundreds of steps and hours, not 40 steps / 15 min.
     A revision in a drawing thread gets the same budget (it saves, exports and sends the whole set again)."""
     from agent_runtime.cad import cad_mode
-    if cad_mode(prompt, context):
+    if cad_mode(prompt, context, cad_history, source):
         return (max(max_steps, int(os.environ.get("AIW_CAD_MAX_STEPS", "400"))),
                 max(timeout_s, float(os.environ.get("AIW_CAD_TIMEOUT", "10800"))))
     from agent_runtime.loop import _IMAGE_TASK, _VIDEO_TASK

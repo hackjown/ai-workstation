@@ -59,6 +59,9 @@ struct SettingsView: View {
                     NavigationLink { UsageView() } label: { Label("用量统计", systemImage: "chart.bar") }
                     NavigationLink { CheckinView() } label: { Label("自动签到", systemImage: "checkmark.seal") }
                 }
+                Section(footer: Text("让 Agent 用这台手机的日历、提醒事项、通讯录、健康、定位、闹钟和快捷指令；写操作先确认（v3.9.27）")) {
+                    NavigationLink { DeviceCapsView() } label: { Label("设备能力", systemImage: "iphone.gen3.radiowaves.left.and.right") }
+                }
                 Section(footer: Text("对话标题旁的球球随任务状态变表情：接收、思考、操作、等你、完成、出错（形象仅供个人学习研究，非商用）")) {
                     Toggle("表情助手", isOn: $mate)
                 }

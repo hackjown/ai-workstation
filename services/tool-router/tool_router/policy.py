@@ -109,6 +109,9 @@ def scratch_delete(cmd: str) -> bool:
     # v3.9.19: a project folder under ~/workspace counts too (cd ~/workspace/tasks/task-x && rm -rf pkg_out)
     # v3.9.22: a relative cd after that (cd src) stays inside it
     ws = r"(~|\$HOME|\$\{HOME\}|/data/home|/home/[\w.-]+|/root)/workspace(/[\w.@%+-]+)*"
+    # v3.9.26: cd'ed below ~/workspace itself (into a project): relative deletes must be re-created to count as scratch
+    in_project = bool(cds) and not re.fullmatch(r"(~|\$HOME|\$\{HOME\}|/data/home|/home/[\w.-]+|/root)/workspace", cds[-1].rstrip("/")) \
+        or len(cds) > 1
     rel_ok = bool(cds) and bool(re.fullmatch(ws, cds[0].rstrip("/"))) and ".." not in cds[0] and all(
         (re.fullmatch(ws, c.rstrip("/")) or re.fullmatch(r"[\w@%+-][\w.@%+-]*(/[\w.@%+-]+)*", c.rstrip("/")))
         and ".." not in c for c in cds)
@@ -131,10 +134,24 @@ def scratch_delete(cmd: str) -> bool:
             if re.match(r"^(~|\$HOME|/data/home|/home/[\w.-]+)/workspace/[\w.@%+-]", t) and \
                     t.rstrip("/").split("/")[-1] not in _PROTECTED and t.rstrip("/").count("/") >= 2:
                 continue
-            if rel_ok and not t.startswith(("/", "~", "$")) and first not in _PROTECTED and re.match(r"^[\w@%+-][\w.@%+-]*$", first):
+            if rel_ok and not t.startswith(("/", "~", "$")) and first not in _PROTECTED and re.match(r"^[\w@%+-][\w.@%+-]*$", first) \
+                    and (not in_project or _recreated(cmd, m.end(), t)):
                 continue
             return False
     return True
+
+
+def _recreated(cmd: str, after: int, target: str) -> bool:
+    """v3.9.26: inside a project folder (cd ~/workspace/<proj>...) a bare `rm -rf <name>` is only scratch when the same
+    command builds <name> again (mkdir / rsync / cp / unzip -d / tar -C / --outdir / git clone): ca7's
+    `rm -rf src && mkdir -p src && unzip …` and 3.9.19's `rm -rf pkg_out && rsync … pkg_out/` are re-extractions, but a
+    plain `rm -rf src` or `rm -rf build` in someone's project deletes their work and still asks (tests/test_approval_ux)."""
+    rest = cmd[after:]
+    t = re.escape(target.rstrip("/"))
+    return bool(re.search(r"\bmkdir\s+(?:-\S+\s+)*['\"]?(?:\./)?" + t + r"(?:/|['\"]|\s|$)", rest)
+                or re.search(r"\b(?:rsync|cp)\b[^;&|]*\s['\"]?(?:\./)?" + t + r"(?:/|['\"]?(?:\s|$|[;&|]))", rest)
+                or re.search(r"\b(?:unzip\b[^;&|]*\s-d|tar\b[^;&|]*\s-C|--outdir|-o)\s+['\"]?(?:\./)?" + t + r"(?:/|['\"]|\s|$)", rest)
+                or re.search(r"\bgit\s+clone\b[^;&|]*\s['\"]?(?:\./)?" + t + r"['\"]?\s*(?:$|[;&|])", rest))
 
 
 class PolicyEngine:

@@ -40,7 +40,8 @@ def test_rabbit_settings_and_card():
     assert "rabbit" in es.KIND_TEXT and es.OPT_GO in es.options("rabbit")
     assert "已知问题" in es.rabbit_note(3, "截图对比", 41)
     src = (ROOT / "services/agent-runtime/agent_runtime/loop.py").read_text()
-    assert '_escalate("rabbit"' in src and "_plan_tick_at = self.step" in src
+    # v3.9.26: dev_fix tasks escalate as "dev_rabbit" (15 steps) on the same call site
+    assert ('_escalate("rabbit"' in src or '"dev_rabbit" if is_dev else "rabbit"' in src) and "_plan_tick_at = self.step" in src
 
 
 def test_ios_answer_and_supplement_boxes_use_ime_field():

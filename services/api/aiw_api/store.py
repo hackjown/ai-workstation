@@ -40,6 +40,7 @@ CREATE INDEX IF NOT EXISTS ix_actions_session ON machine_actions(session_id, cre
 
 class Store:
     def __init__(self, path: str = "aiw.db"):
+        self.path = path   # v3.9.27: connector downloads go next to the DB
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.Lock()

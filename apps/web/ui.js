@@ -154,6 +154,10 @@ loadSettings = async function () {
   let localUp = null;
   if (localM) { try { const m = await api("GET", `/api/machines/${localM.id}`); localUp = !!(m.agent && m.agent.ok); } catch (e) { localUp = false; } }
   const mcp = integ.mcp_servers || [];
+  // v3.9.27: direct connectors (OAuth / API key / official MCP) and their redirect URI + client settings
+  const [connsR, oauthCfg] = await Promise.all([api("GET", "/api/connections").catch(() => ({ connections: [] })),
+    api("GET", "/api/oauth/settings").catch(() => ({ providers: {} }))]);
+  S.conns = connsR.connections || []; S.oauthCfg = oauthCfg;
   const roles = MODEL_ROLES.filter((r) => ["model", "vision_model", "video_model", "image_model"].includes(r.key));
   const extra = MODEL_ROLES.filter((r) => !roles.includes(r));
   const mrow = (r) => row(r.label, r.hint, `<div class="mrow"><select name="${r.key}" data-cur="${esc(models[r.key] || "")}" onchange="paintProbe(this)"></select>
@@ -474,61 +478,127 @@ async function delSkill(id) {
 }
 
 /* ======================================================= settings › 连接器 */
-// kind "token": an MCP server that takes a key/token. kind "url": OAuth apps — paste the personal MCP address
-// you get from Zapier / Composio / Pipedream after signing in there (it carries your login).
+// v3.9.27: every connector connects directly — no relay. kind:
+//   oauth      official remote MCP + OAuth (discovery, dynamic registration, PKCE); some also take an API key (alt)
+//   native     aiw's own Google / Microsoft tools with your OAuth client (高级 › OAuth 客户端)
+//   rest_oauth vendor REST API + OAuth (your client), preset tools
+//   token      official remote MCP with an API key;  rest_token  vendor REST API with an API key
+//   mcp_url    the vendor's own official MCP address from its open platform
 const SI = (slug) => `https://cdn.jsdelivr.net/npm/simple-icons@13/icons/${slug}.svg`;
 const CONNECTORS = [
-  { id: "gmail", name: "Gmail", cat: "办公", logo: "gmail", kind: "url", desc: "读邮件、搜邮件、起草和发送" },
-  { id: "gcal", name: "Google 日历", cat: "办公", logo: "googlecalendar", kind: "url", desc: "查日程、建会议、找空闲时间" },
-  { id: "gdrive", name: "Google 云端硬盘", cat: "文件", logo: "googledrive", kind: "url", desc: "搜索、读取、上传文件和表格" },
-  { id: "github", name: "GitHub", cat: "开发", logo: "github", kind: "token", url: "https://api.githubcopilot.com/mcp/", header: "Bearer", keyName: "个人访问令牌 ghp_… / github_pat_…", keyUrl: "https://github.com/settings/personal-access-tokens", desc: "仓库、Issue、PR、代码搜索" },
-  { id: "notion", name: "Notion", cat: "办公", logo: "notion", kind: "url", desc: "读写页面和数据库" },
-  { id: "slack", name: "Slack", cat: "沟通", logo: "slack", kind: "url", desc: "读频道、发消息、搜聊天记录" },
-  { id: "outlook", name: "Outlook", cat: "办公", logo: "", letter: "O", color: "#0a64d6", kind: "url", desc: "Microsoft 365 邮件和日历" },
-  { id: "onepassword", name: "1Password", cat: "安全", logo: "1password", kind: "url", desc: "按需读取登录信息（通过 Zapier / Composio）" },
-  { id: "asana", name: "Asana", cat: "项目", logo: "asana", kind: "url", desc: "任务、项目、评论" },
-  { id: "box", name: "Box", cat: "文件", logo: "box", kind: "url", desc: "企业文件搜索和读取" },
-  { id: "calendly", name: "Calendly", cat: "办公", logo: "calendly", kind: "url", desc: "预约链接和日程" },
-  { id: "canva", name: "Canva", cat: "设计", logo: "canva", kind: "url", desc: "生成和导出设计" },
-  { id: "dropbox", name: "Dropbox", cat: "文件", logo: "dropbox", kind: "url", desc: "文件搜索、读取、分享链接" },
-  { id: "figma", name: "Figma", cat: "设计", logo: "figma", kind: "url", desc: "读取设计稿、导出切图" },
-  { id: "linear", name: "Linear", cat: "项目", logo: "linear", kind: "token", url: "https://mcp.linear.app/mcp", header: "Bearer", keyName: "Linear API Key（lin_api_…）", keyUrl: "https://linear.app/settings/account/security", desc: "Issue、项目、周期" },
-  { id: "jira", name: "Jira / Confluence", cat: "项目", logo: "jira", kind: "url", desc: "工单和文档（Atlassian）" },
-  { id: "trello", name: "Trello", cat: "项目", logo: "trello", kind: "url", desc: "看板和卡片" },
-  { id: "todoist", name: "Todoist", cat: "项目", logo: "todoist", kind: "url", desc: "待办和提醒" },
-  { id: "feishu", name: "飞书", cat: "沟通", logo: "", letter: "飞", color: "#3370ff", kind: "url", desc: "消息、文档、多维表格（飞书开放平台 MCP 地址）" },
-  { id: "dingtalk", name: "钉钉", cat: "沟通", logo: "", letter: "钉", color: "#1a7cff", kind: "url", desc: "消息和待办（钉钉 MCP 地址）" },
+  { id: "gmail", name: "Gmail", cat: "办公", logo: "gmail", kind: "native", provider: "google", desc: "读邮件、搜邮件、起草和发送（Google 官方 API）" },
+  { id: "gcal", name: "Google 日历", cat: "办公", logo: "googlecalendar", kind: "native", provider: "google", desc: "查日程、建会议、改日程" },
+  { id: "gdrive", name: "Google 云端硬盘", cat: "文件", logo: "googledrive", kind: "native", provider: "google", desc: "搜索、下载、上传文件" },
+  { id: "github", name: "GitHub", cat: "开发", logo: "github", kind: "oauth", provider: "github", alt: { url: "https://api.githubcopilot.com/mcp/", header: "Bearer", keyName: "个人访问令牌 ghp_… / github_pat_…", keyUrl: "https://github.com/settings/personal-access-tokens" }, desc: "仓库、Issue、PR、代码搜索（官方 MCP）" },
+  { id: "notion", name: "Notion", cat: "办公", logo: "notion", kind: "oauth", desc: "读写页面和数据库（官方 MCP）" },
+  { id: "slack", name: "Slack", cat: "沟通", logo: "slack", kind: "oauth", provider: "slack", desc: "读频道、发消息、搜聊天记录（官方 MCP，需自建 Slack App）" },
+  { id: "outlook", name: "Outlook", cat: "办公", logo: "", letter: "O", color: "#0a64d6", kind: "native", provider: "microsoft", desc: "Outlook 邮件和日历（Microsoft Graph，个人和工作账号）" },
+  { id: "onepassword", name: "1Password", cat: "安全", logo: "1password", kind: "rest_token", keyName: "1Password Connect 令牌", keyUrl: "https://developer.1password.com/docs/connect/get-started/", baseName: "Connect 服务地址 https://…", desc: "按需读取登录信息（1Password Connect，自托管）" },
+  { id: "asana", name: "Asana", cat: "项目", logo: "asana", kind: "oauth", provider: "asana", desc: "任务、项目、评论（官方 MCP）" },
+  { id: "box", name: "Box", cat: "文件", logo: "box", kind: "rest_oauth", provider: "box", desc: "企业文件搜索和读取（Box API）" },
+  { id: "calendly", name: "Calendly", cat: "办公", logo: "calendly", kind: "rest_token", keyName: "Personal Access Token", keyUrl: "https://calendly.com/integrations/api_webhooks", desc: "预约链接和日程" },
+  { id: "canva", name: "Canva", cat: "设计", logo: "canva", kind: "rest_oauth", provider: "canva", desc: "列出、导出设计（Canva Connect API）" },
+  { id: "dropbox", name: "Dropbox", cat: "文件", logo: "dropbox", kind: "rest_oauth", provider: "dropbox", desc: "文件搜索、读取、分享链接" },
+  { id: "figma", name: "Figma", cat: "设计", logo: "figma", kind: "rest_token", keyName: "Personal access token（figd_…）", keyUrl: "https://www.figma.com/developers/api#access-tokens", desc: "读取设计稿、导出切图" },
+  { id: "linear", name: "Linear", cat: "项目", logo: "linear", kind: "oauth", alt: { url: "https://mcp.linear.app/mcp", header: "Bearer", keyName: "Linear API Key（lin_api_…）", keyUrl: "https://linear.app/settings/account/security" }, desc: "Issue、项目、周期（官方 MCP）" },
+  { id: "jira", name: "Jira / Confluence", cat: "项目", logo: "jira", kind: "oauth", desc: "工单和文档（Atlassian 官方 MCP）" },
+  { id: "trello", name: "Trello", cat: "项目", logo: "trello", kind: "rest_token", keyName: "Token", key2Name: "API Key", keyUrl: "https://trello.com/power-ups/admin", desc: "看板和卡片" },
+  { id: "todoist", name: "Todoist", cat: "项目", logo: "todoist", kind: "rest_token", keyName: "API Token", keyUrl: "https://app.todoist.com/app/settings/integrations/developer", desc: "待办和提醒" },
+  { id: "feishu", name: "飞书", cat: "沟通", logo: "", letter: "飞", color: "#3370ff", kind: "mcp_url", desc: "消息、文档、多维表格（飞书开放平台生成的官方 MCP 地址）" },
+  { id: "dingtalk", name: "钉钉", cat: "沟通", logo: "", letter: "钉", color: "#1a7cff", kind: "mcp_url", desc: "消息和待办（钉钉开放平台生成的官方 MCP 地址）" },
   { id: "huggingface", name: "Hugging Face", cat: "开发", logo: "huggingface", kind: "token", url: "https://huggingface.co/mcp", header: "Bearer", keyName: "Access Token（hf_…）", keyUrl: "https://huggingface.co/settings/tokens", desc: "搜模型、数据集、Spaces" },
   { id: "supabase", name: "Supabase", cat: "开发", logo: "supabase", kind: "token", url: "https://mcp.supabase.com/mcp", header: "Bearer", keyName: "Personal Access Token（sbp_…）", keyUrl: "https://supabase.com/dashboard/account/tokens", desc: "数据库查询、表结构、项目" },
-  { id: "stripe", name: "Stripe", cat: "开发", logo: "stripe", kind: "token", url: "https://mcp.stripe.com", header: "Bearer", keyName: "Secret / Restricted Key（rk_… 推荐只读）", keyUrl: "https://dashboard.stripe.com/apikeys", desc: "订单、客户、退款查询" },
+  { id: "stripe", name: "Stripe", cat: "开发", logo: "stripe", kind: "oauth", alt: { url: "https://mcp.stripe.com", header: "Bearer", keyName: "Restricted Key（rk_… 推荐只读）", keyUrl: "https://dashboard.stripe.com/apikeys" }, desc: "订单、客户、退款查询（官方 MCP）" },
   { id: "firecrawl", name: "Firecrawl", cat: "开发", logo: "", letter: "F", color: "#ff6a00", kind: "token", url: "https://mcp.firecrawl.dev/{{secret:conn_firecrawl}}/v2/mcp", keyName: "Firecrawl API Key（fc-…）", keyUrl: "https://www.firecrawl.dev/app/api-keys", desc: "整站抓取、网页转 Markdown" },
   { id: "tavily", name: "Tavily", cat: "开发", logo: "", letter: "T", color: "#3b5bdb", kind: "token", url: "https://mcp.tavily.com/mcp/?tavilyApiKey={{secret:conn_tavily}}", keyName: "Tavily API Key（tvly-…）", keyUrl: "https://app.tavily.com", desc: "面向 AI 的联网搜索" },
-  { id: "zapier", name: "Zapier", cat: "自动化", logo: "zapier", kind: "url", desc: "一个地址接 8000+ 应用（Gmail、日历、表格…）" },
-  { id: "composio", name: "Composio", cat: "自动化", logo: "", letter: "C", color: "#222", kind: "url", desc: "一个地址接 250+ 应用，含 OAuth 登录" },
 ];
-const CONN_CATS = ["全部", "已连接", "办公", "文件", "沟通", "项目", "设计", "开发", "安全", "自动化"];
+const CONN_CATS = ["全部", "已连接", "办公", "文件", "沟通", "项目", "设计", "开发", "安全"];
+const CONN_ST = { ok: ["ok", "已连接"], pending: ["", "等待授权"], needs_client: ["bad", "需要 OAuth 客户端"], needs_reauth: ["bad", "需要重新授权"], error: ["bad", "连接失败"] };
 const connLogo = (c) => `<span class="lg">${c.logo ? `<img src="${SI(c.logo)}" alt="" loading="lazy" onerror="this.outerHTML='<span>${esc(c.name[0])}</span>'">` : `<span style="color:${c.color || "#333"}">${esc(c.letter || c.name[0])}</span>`}</span>`;
+// the connection record behind a connector (native Google services share one record "google")
+function connRec(c) {
+  const all = S.conns || [];
+  if (c.kind === "native") return all.find((r) => r.id === c.provider && ((r.services || []).includes(c.id) || (r.legacy_services || []).includes(c.id)));
+  return all.find((r) => r.id === c.id);
+}
+function connState(c, mcp) {
+  if (["token", "mcp_url"].includes(c.kind) || (c.alt && mcp.some((m) => m.name === c.id))) {
+    if (mcp.some((m) => m.name === c.id)) return { st: "ok", via: "mcp" };
+  }
+  const r = connRec(c);
+  if (!r) return { st: "" };
+  if (c.kind === "native" && r.status === "ok" && !(r.services || []).includes(c.id)) return { st: "needs_reauth", msg: r.status_msg, rec: r };
+  return { st: r.status || "", msg: r.status_msg, rec: r };
+}
 function connSection(mcp) {
-  const on = (c) => mcp.some((m) => m.name === c.id);
-  const n = CONNECTORS.filter(on).length;
+  const states = Object.fromEntries(CONNECTORS.map((c) => [c.id, connState(c, mcp)]));
+  const n = CONNECTORS.filter((c) => states[c.id].st === "ok").length;
+  const nBad = CONNECTORS.filter((c) => ["needs_reauth", "error"].includes(states[c.id].st)).length;
+  const keyForm = (c, k) => `<div class="inl"><input type="password" autocomplete="off" placeholder="${esc(k.keyName)}" id="ck_${c.id}" /><button type="button" class="btn sm primary" onclick="connSave('${c.id}')">测试并连接</button></div>
+         <span class="small">加密保存在服务器，只用来调 ${esc(c.name)} 的官方接口。<a href="${esc(k.keyUrl)}" target="_blank" rel="noopener">去生成 →</a></span>`;
   const rows = CONNECTORS.map((c) => {
-    const connected = on(c);
-    const form = c.kind === "token"
-      ? `<div class="inl"><input type="password" autocomplete="off" placeholder="${esc(c.keyName)}" id="ck_${c.id}" /><button type="button" class="btn sm primary" onclick="connSave('${c.id}')">测试并连接</button></div>
-         <span class="small">加密保存在服务器，只用来调 ${esc(c.name)} 的官方 MCP。<a href="${esc(c.keyUrl)}" target="_blank" rel="noopener">去生成 →</a></span>`
-      : `<div class="inl"><input type="password" autocomplete="off" placeholder="https://…/mcp（含你的个人密钥）" id="ck_${c.id}" /><button type="button" class="btn sm primary" onclick="connSave('${c.id}')">测试并连接</button></div>
-         <span class="small">${esc(c.name)} 需要 OAuth 登录：在 <a href="https://mcp.zapier.com" target="_blank" rel="noopener">Zapier MCP</a> 或 <a href="https://mcp.composio.dev" target="_blank" rel="noopener">Composio</a> 登录并授权 ${esc(c.name)}，把生成的 MCP 地址粘到这里。地址加密保存。</span>`;
+    const s = states[c.id]; const connected = s.st === "ok";
+    let form = "";
+    if (c.kind === "token") form = keyForm(c, c);
+    else if (c.kind === "mcp_url") form = `<div class="inl"><input type="password" autocomplete="off" placeholder="https://…（开放平台生成的 MCP 地址）" id="ck_${c.id}" /><button type="button" class="btn sm primary" onclick="connSave('${c.id}')">测试并连接</button></div>
+         <span class="small">在 ${esc(c.name)} 开放平台创建应用并开通官方 MCP 服务，把生成的地址粘到这里（地址里含你的凭证，加密保存）。</span>`;
+    else if (c.kind === "rest_token") form = `${c.baseName ? `<input autocomplete="off" placeholder="${esc(c.baseName)}" id="cb_${c.id}" />` : ""}${c.key2Name ? `<input type="password" autocomplete="off" placeholder="${esc(c.key2Name)}" id="ck2_${c.id}" />` : ""}
+         <div class="inl"><input type="password" autocomplete="off" placeholder="${esc(c.keyName)}" id="ck_${c.id}" /><button type="button" class="btn sm primary" onclick="connSaveRest('${c.id}')">保存并连接</button></div>
+         <span class="small">直连 ${esc(c.name)} 官方 API，密钥加密保存。<a href="${esc(c.keyUrl)}" target="_blank" rel="noopener">去生成 →</a></span>`;
+    else {
+      const prov = c.provider && (S.oauthCfg.providers || {})[c.provider];
+      const needClient = ["native", "rest_oauth"].includes(c.kind) && prov && !prov.configured;
+      form = `<div class="inl">${c.id === "gmail" ? `<label class="small"><input type="checkbox" id="csend_gmail" /> 允许直接发送（多申请 gmail.send）</label>` : ""}<button type="button" class="btn sm primary" onclick="connOAuth('${c.id}')">${needClient ? "先填 OAuth 客户端" : `用 ${esc(c.provider ? (prov && prov.name) || c.name : c.name)} 账号登录`}</button></div>
+         <span class="small">${c.kind === "oauth" ? "官方远程 MCP，浏览器里登录授权，token 加密保存、自动刷新。" : `用你自己的 ${esc((prov && prov.name) || "")} OAuth 客户端直连官方 API（在下面「高级」里填）。`}${s.msg ? " · " + esc(s.msg) : ""}</span>
+         ${c.alt ? `<details class="more"><summary>${icon("chev")}或者用 API Key</summary>${keyForm(c, c.alt)}</details>` : ""}`;
+    }
+    const chip = s.st && s.st !== "ok" ? `<span class="chip ${CONN_ST[s.st] ? CONN_ST[s.st][0] : ""}">${esc(s.msg && s.st === "needs_reauth" ? s.msg : (CONN_ST[s.st] || ["", s.st])[1])}</span>` : connected ? '<span class="chip ok">已连接</span>' : "";
+    const act = connected ? `<button type="button" class="btn sm" onclick="connTest('${c.id}')">测试</button><button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="connRemove('${c.id}')">断开</button>`
+      : s.st === "needs_reauth" ? `<button type="button" class="btn sm primary" onclick="connOAuth('${c.id}')">重新授权</button><button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="connRemove('${c.id}')">删除</button>`
+      : `<button type="button" class="link" onclick="this.closest('.conn').classList.toggle('open');const i=document.getElementById('ck_${c.id}');i&&i.focus()">连接</button>`;
     return `<div class="conn ${connected ? "is-on" : ""}" data-cat="${c.cat}" data-name="${esc(c.name.toLowerCase())}" id="cn_${c.id}">${connLogo(c)}
-      <div class="nm">${esc(c.name)}${connected ? '<span class="chip ok">已连接</span>' : ""}</div>
-      <div class="t">${connected ? `<button type="button" class="btn sm" onclick="connTest('${c.id}')">测试</button><button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="connRemove('${c.id}')">断开</button>`
-        : `<button type="button" class="link" onclick="this.closest('.conn').classList.toggle('open');const i=document.getElementById('ck_${c.id}');i&&i.focus()">连接</button>`}</div>
+      <div class="nm">${esc(c.name)}${chip}</div>
+      <div class="t">${act}</div>
       <div class="ds" id="cs_${c.id}">${esc(c.desc)}</div>
       <div class="form">${form}</div></div>`; }).join("");
+  const custom = (S.conns || []).filter((r) => r.connector === "mcp");
+  const cfg = S.oauthCfg || { providers: {} };
+  const provRows = Object.entries(cfg.providers || {}).map(([pid, p]) => `<div class="rw"><div class="k">${esc(p.name)}${p.configured ? ' <span class="chip ok">已配置</span>' : ""}<div class="small">${esc(p.help || "")}${p.console ? ` <a href="${esc(p.console)}" target="_blank" rel="noopener">打开控制台 →</a>` : ""}</div></div>
+      <div class="v"><div class="inl"><input name="cid_${pid}" autocomplete="off" placeholder="client_id" value="${esc(p.client_id || "")}" /><input name="csec_${pid}" type="password" autocomplete="new-password" placeholder="${p.has_secret ? "client_secret 已保存，留空不改" : "client_secret"}" /></div></div></div>`).join("");
   return `<section class="grp" id="g-conn">
-    <div class="grp-h"><h2>${secNo("g-conn")}连接器</h2>${n ? `<span class="chip ok">${n} 个已连接</span>` : '<span class="chip">未连接</span>'}</div>
-    <div class="grp-d">连上后 Agent 直接调这些应用的接口，不用在电脑上点网页。每个连接都是一个 MCP 服务器，也会出现在下面的「集成」里。</div>
+    <div class="grp-h"><h2>${secNo("g-conn")}连接器</h2>${n ? `<span class="chip ok">${n} 个已连接</span>` : '<span class="chip">未连接</span>'}${nBad ? `<span class="chip bad">${nBad} 个需要重新授权</span>` : ""}</div>
+    <div class="grp-d">每个连接器都直连官方服务（官方远程 MCP + OAuth、官方 API + 你自己的 OAuth 客户端或 API Key），不经过任何第三方中转。token 加密保存在 aiw 服务器，模型看不到。发邮件、建日程、上传文件这类写操作执行前都会弹卡片请你允许。</div>
     <div class="rows"><div class="connfilter">${CONN_CATS.map((c) => `<button type="button" data-c="${c}" onclick="connFilter('${c}')">${c}</button>`).join("")}<input placeholder="搜索连接器" oninput="connFilter(S.connCat||'全部', this.value)" /></div>
-    <div id="connList">${rows}</div></div></section>`;
+    <div id="connList">${rows}</div></div>
+    <form class="rows" onsubmit="connAddMcp(event)">
+      <div class="rw head"><div class="k">自定义 MCP 服务器（URL）</div><div>${custom.length ? `<span class="chip ok">${custom.length} 个</span>` : ""}</div></div>
+      ${custom.map((r) => `<div class="rw"><div class="k"><b>${esc(r.name)}</b><span class="mono">${esc(r.mcp_url || "")}</span></div><div class="v"><span class="chip ${(CONN_ST[r.status] || [""])[0]}">${esc((CONN_ST[r.status] || ["", r.status])[1])}</span></div>
+        <div class="t">${r.status !== "ok" ? `<button type="button" class="btn sm primary" onclick="connReauth('${r.id}')">授权</button>` : ""}<button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="connDelete('${r.id}')">删除</button></div></div>`).join("")}
+      <details class="more"><summary>${icon("chev")}添加 MCP 服务器<span class="cnt">需要登录时自动走 OAuth</span></summary>
+        ${row("地址", "https:// 开头的远程 MCP（Streamable HTTP 或 SSE）", `<input name="url" placeholder="https://example.com/mcp" required />`)}
+        ${row("名称", "", `<input name="name" placeholder="如 sentry" />`)}
+        ${row("API Key", "服务用固定密钥时填（作为 Bearer），否则留空走 OAuth", `<input name="bearer" type="password" autocomplete="new-password" />`)}
+        ${row("client_id / secret", "服务不支持动态注册时，填你在它那里注册的客户端", `<div class="inl"><input name="client_id" autocomplete="off" placeholder="client_id" /><input name="client_secret" type="password" autocomplete="new-password" placeholder="client_secret（可选）" /></div>`)}
+        <div class="savebar"><span class="note" id="mcpAddNote">回调地址：<span class="mono">${esc(cfg.redirect_uri || "")}</span></span><button class="btn sm primary">连接</button></div>
+      </details>
+    </form>
+    <form class="rows" onsubmit="connImportOpenAPI(event)">
+      <div class="rw head"><div class="k">导入 OpenAPI（URL / JSON / YAML）</div><div></div></div>
+      <details class="more"><summary>${icon("chev")}导入 OpenAPI 文档<span class="cnt">每个接口变成一个工具</span></summary>
+        ${row("文档地址", "或者在下面粘贴", `<input name="url" placeholder="https://api.example.com/openapi.json" />`)}
+        ${row("文档内容", "JSON 或 YAML", `<textarea name="spec" rows="4" placeholder="openapi: 3.0.0 …"></textarea>`)}
+        ${row("前缀 / API Key", "按文档的 securitySchemes 自动放进请求头或查询参数", `<div class="inl"><input name="prefix" placeholder="acme" /><input name="api_key" type="password" autocomplete="new-password" placeholder="API Key（可选）" /></div>`)}
+        <div class="savebar"><span class="note" id="oaNote">GET 直接调用，其它方法执行前请你允许</span><button class="btn sm primary">导入</button></div>
+      </details>
+    </form>
+    <form class="rows" id="connAdv" onsubmit="connSaveAdv(event)">
+      <details class="more" ${(S.conns || []).some((r) => r.status === "needs_client") ? "open" : ""}><summary>${icon("chev")}高级 · OAuth 回调地址和客户端<span class="cnt">Google、Microsoft 等需要你自己的 OAuth 客户端</span></summary>
+        ${row("公网地址", "aiw 有公网 https 域名时填（Cloudflare Tunnel / Tailscale Funnel / 自有域名）；留空用本机回环地址", `<input name="public_url" placeholder="https://aiw.example.com" value="${esc(cfg.public_url || "")}" />`)}
+        ${row("要登记的重定向 URI", "在各家开发者控制台创建 OAuth 客户端时，把这个地址填进「重定向 URI / Callback URL」", `<span class="mono" id="connRedirect">${esc(cfg.redirect_uri || "")}</span>`)}
+        ${provRows}
+        <div class="savebar"><span class="note">client_secret 加密保存；用回环地址时只能在 aiw 服务器本机的浏览器里完成登录</span><button class="btn sm primary">保存</button></div>
+      </details>
+    </form></section>`;
 }
 function connFilter(cat, q) {
   S.connCat = cat; q = (q == null ? (document.querySelector(".connfilter input") || {}).value || "" : q).trim().toLowerCase();
@@ -538,16 +608,16 @@ function connFilter(cat, q) {
     r.style.display = ok ? "" : "none";
   });
 }
-function connSpec(c) {
-  const secret = "conn_" + c.id;
-  if (c.kind === "url") return { name: c.id, url: `{{secret:${secret}}}`, headers: {} };
-  if (c.url.includes("{{secret:")) return { name: c.id, url: c.url, headers: {} };
-  return { name: c.id, url: c.url, headers: { Authorization: `${c.header || "Bearer"} {{secret:${secret}}}` } };
+function connSpec(c) {   // token / mcp_url / API-key alternative of an OAuth connector -> a classic mcp_servers entry
+  const secret = "conn_" + c.id; const k = c.alt || c;
+  if (c.kind === "mcp_url") return { name: c.id, url: `{{secret:${secret}}}`, headers: {} };
+  if (k.url.includes("{{secret:")) return { name: c.id, url: k.url, headers: {} };
+  return { name: c.id, url: k.url, headers: { Authorization: `${k.header || "Bearer"} {{secret:${secret}}}` } };
 }
 async function connSave(id) {
   const c = CONNECTORS.find((x) => x.id === id); const v = ($("ck_" + id).value || "").trim(); const st = $("cs_" + id);
-  if (!v) { toast(c.kind === "url" ? "先粘贴 MCP 地址" : "先填 " + c.keyName); return; }
-  if (c.kind === "url" && !/^https?:\/\//.test(v)) { toast("MCP 地址要以 https:// 开头"); return; }
+  if (!v) { toast(c.kind === "mcp_url" ? "先粘贴 MCP 地址" : "先填 " + (c.alt || c).keyName); return; }
+  if (c.kind === "mcp_url" && !/^https:\/\//.test(v)) { toast("MCP 地址要以 https:// 开头"); return; }
   try {
     st.textContent = "连接测试中…";
     await api("PUT", `/api/secrets/conn_${id}`, { value: v });
@@ -559,16 +629,83 @@ async function connSave(id) {
     toast(`${c.name} 已连接 · ${t.tools.length} 个工具`); loadSettings();
   } catch (err) { st.textContent = "连接失败：" + err.message; st.style.color = "var(--bad)"; await api("DELETE", `/api/secrets/conn_${id}`).catch(() => {}); }
 }
+async function connSaveRest(id) {
+  const c = CONNECTORS.find((x) => x.id === id); const st = $("cs_" + id);
+  const body = { connector: id, token: ($("ck_" + id).value || "").trim() };
+  if (c.key2Name) body.key = ($("ck2_" + id).value || "").trim();
+  if (c.baseName) body.base_url = ($("cb_" + id).value || "").trim();
+  if (!body.token) { toast("先填 " + c.keyName); return; }
+  try { await api("POST", "/api/connections", body); const t = await api("POST", `/api/connections/${id}/test`); toast(`${c.name} 已连接 · ${(t.tools || []).length} 个工具`); loadSettings(); }
+  catch (err) { st.textContent = "连接失败：" + err.message; st.style.color = "var(--bad)"; }
+}
+// OAuth: the authorize page opens in a new tab; the callback page closes itself and we poll the record
+async function connOAuthResult(r, label, st) {
+  if (r.status === "ok") { toast(`${label} 已连接`); loadSettings(); return; }
+  if (r.status === "needs_client") {
+    if (st) { st.textContent = r.message || "需要 OAuth 客户端"; st.style.color = "var(--bad)"; }
+    const adv = document.querySelector("#connAdv details"); if (adv) { adv.open = true; adv.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    toast(`先在「高级」里填 ${r.provider || label} 的 OAuth 客户端（重定向 URI：${r.redirect_uri || ""}）`); return;
+  }
+  if (r.status !== "authorize") { if (st) { st.textContent = r.message || "连接失败"; st.style.color = "var(--bad)"; } return; }
+  const w = window.open(r.authorize_url, "_blank");
+  if (!w) location.href = r.authorize_url;
+  if (st) st.textContent = "在新页面里登录并授权…（回调地址 " + (r.redirect_uri || "") + "）";
+  const t0 = Date.now();
+  const poll = async () => {
+    let lst = {}; try { lst = await api("GET", "/api/connections"); } catch (e) { return; }
+    const rec = (lst.connections || []).find((x) => x.id === r.id);
+    if (rec && rec.status === "ok" && rec.has_token) { toast(`${label} 已连接`); loadSettings(); return; }
+    if (rec && rec.status === "error") { if (st) { st.textContent = rec.status_msg || "授权失败"; st.style.color = "var(--bad)"; } return; }
+    if (Date.now() - t0 < 5 * 60 * 1000) setTimeout(poll, 2000);
+  };
+  setTimeout(poll, 2000);
+}
+async function connOAuth(id) {
+  const c = CONNECTORS.find((x) => x.id === id); const st = $("cs_" + id); st.style.color = "";
+  const body = { connector: id }; const send = $("csend_gmail"); if (id === "gmail" && send && send.checked) body.send_mail = true;
+  try { await connOAuthResult(await api("POST", "/api/connections", body), c.name, st); } catch (err) { st.textContent = "连接失败：" + err.message; st.style.color = "var(--bad)"; }
+}
+async function connReauth(cid) { try { await connOAuthResult(await api("GET", `/api/connections/${cid}/start`), cid, $("mcpAddNote")); } catch (err) { toast(err.message); } }
+async function connDelete(cid) { if (!confirm("删除这个连接？会同时撤销授权。")) return; await api("DELETE", `/api/connections/${cid}`).catch((e) => toast(e.message)); loadSettings(); }
+async function connAddMcp(e) {
+  e.preventDefault(); const f = e.target.elements; const note = $("mcpAddNote");
+  const body = { type: "mcp", url: f.url.value.trim(), name: f.name.value.trim(), bearer: f.bearer.value.trim(), client_id: f.client_id.value.trim(), client_secret: f.client_secret.value };
+  try { note.textContent = "探测中…"; await connOAuthResult(await api("POST", "/api/connections", body), body.name || body.url, note); } catch (err) { note.textContent = "失败：" + err.message; }
+}
+async function connImportOpenAPI(e) {
+  e.preventDefault(); const f = e.target.elements; const note = $("oaNote");
+  const body = { url: f.url.value.trim() || null, spec: f.spec.value.trim() || null, prefix: f.prefix.value.trim(), api_key: f.api_key.value.trim() || null };
+  if (!body.url && !body.spec) { toast("填文档地址或粘贴内容"); return; }
+  try { const r = await api("POST", "/api/integrations/openapi", body); toast(`已导入 ${r.imported} 个工具`); loadSettings(); } catch (err) { note.textContent = "导入失败：" + err.message; }
+}
+async function connSaveAdv(e) {
+  e.preventDefault(); const f = e.target.elements; const providers = {};
+  Object.keys((S.oauthCfg || {}).providers || {}).forEach((pid) => {
+    const id = (f["cid_" + pid].value || "").trim(), sec = f["csec_" + pid].value || "";
+    const old = S.oauthCfg.providers[pid];
+    if (id !== (old.client_id || "") || sec) providers[pid] = { client_id: id, client_secret: sec };
+  });
+  try { S.oauthCfg = await api("PUT", "/api/oauth/settings", { public_url: f.public_url.value.trim(), providers }); toast("已保存 · 重定向 URI " + S.oauthCfg.redirect_uri); loadSettings(); }
+  catch (err) { toast("保存失败：" + err.message); }
+}
 async function connTest(id) {
-  const c = CONNECTORS.find((x) => x.id === id); const st = $("cs_" + id); const sp = connSpec(c);
-  st.textContent = "测试中…"; st.style.color = "";
-  try { const t = await api("POST", "/api/integrations/mcp/test", { url: sp.url, headers: sp.headers }); st.textContent = `可用 · ${t.tools.length} 个工具：${t.tools.slice(0, 6).join("、")}${t.tools.length > 6 ? "…" : ""}`; }
-  catch (err) { st.textContent = "不可用：" + err.message; st.style.color = "var(--bad)"; }
+  const c = CONNECTORS.find((x) => x.id === id); const st = $("cs_" + id); st.textContent = "测试中…"; st.style.color = "";
+  const s = connState(c, (await api("GET", "/api/integrations")).mcp_servers || []);
+  try {
+    if (s.via === "mcp") { const sp = connSpec(c); const t = await api("POST", "/api/integrations/mcp/test", { url: sp.url, headers: sp.headers }); st.textContent = `可用 · ${t.tools.length} 个工具：${t.tools.slice(0, 6).join("、")}${t.tools.length > 6 ? "…" : ""}`; return; }
+    const t = await api("POST", `/api/connections/${s.rec.id}/test`);
+    if (!t.ok) throw new Error(t.message || t.status);
+    st.textContent = `可用 · ${t.tools.length} 个工具：${t.tools.slice(0, 6).join("、")}${t.tools.length > 6 ? "…" : ""}`;
+  } catch (err) { st.textContent = "不可用：" + err.message; st.style.color = "var(--bad)"; }
 }
 async function connRemove(id) {
-  const c = CONNECTORS.find((x) => x.id === id); if (!confirm(`断开 ${c.name}？`)) return;
-  const cur = ((await api("GET", "/api/integrations")).mcp_servers || []).filter((m) => m.name !== id);
-  await api("PUT", "/api/integrations", { mcp_servers: cur }); await api("DELETE", `/api/secrets/conn_${id}`).catch(() => {});
+  const c = CONNECTORS.find((x) => x.id === id); if (!confirm(`断开 ${c.name}？会同时撤销授权。`)) return;
+  const integ = (await api("GET", "/api/integrations")).mcp_servers || [];
+  if (integ.some((m) => m.name === id)) {
+    await api("PUT", "/api/integrations", { mcp_servers: integ.filter((m) => m.name !== id) }); await api("DELETE", `/api/secrets/conn_${id}`).catch(() => {});
+  }
+  const r = connRec(c);
+  if (r) await api("DELETE", `/api/connections/${r.id}${c.kind === "native" ? "?service=" + id : ""}`).catch(() => {});
   toast(`已断开 ${c.name}`); loadSettings();
 }
 // recommended MCP presets that are now connectors don't show twice
@@ -941,3 +1078,34 @@ async function mcpDeskLive() {
   catch (e) { toast(e.message); }
 }
 function mcpDeskClose() { MD.stop = true; clearTimeout(MD.t); const ov = $("mcpDeskOv"); if (ov) ov.remove(); }
+
+/* ---------- v3.9.26 dev/fix workflow: git record + 回滚 on the task card, and who stopped a task */
+const STOP_BY = { user: "你手动停止", parent: "主任务停止了它", dispatch: "分派时间到被停止", system: "系统停止",
+  thread_delete: "对话被删除时停止", send_now: "为立即发送的消息让路而停止" };
+function devCardHtml(t) {
+  let h = "";
+  const g = t.devgit;
+  if (g && g.branch) {
+    const stat = (g.stat || "").trim().split("\n").slice(-6).join("\n");
+    h += `<div class="devgit"><div class="small"><b>Git</b> · 分支 <code>${esc(g.branch)}</code>${g.commit ? ` · 提交 <code>${esc(String(g.commit).slice(0, 10))}</code>` : ""}${g.rolled_back ? ' · <span class="chip">已回滚</span>' : ""}</div>`
+      + (stat ? `<pre class="small" style="white-space:pre-wrap;margin:4px 0">${esc(stat)}</pre>` : "")
+      + (!g.rolled_back && !LIVE.includes(t.status) ? `<button class="btn sm danger" onclick="devRollback('${t.id}')">回滚</button>` : "") + `</div>`;
+  }
+  if (t.status === "stopped" && t.stop && t.stop.source) {
+    h += `<div class="small muted">停止原因：${esc(STOP_BY[t.stop.source] || t.stop.source)}${t.stop.reason ? "（" + esc(t.stop.reason) + "）" : ""}</div>`;
+  }
+  return h;
+}
+const _renderTaskDev = renderTask;
+renderTask = function (t) {
+  const html = _renderTaskDev(t);
+  const extra = devCardHtml(t);
+  if (!extra) return html;
+  const i = html.lastIndexOf('<div class="foot">');
+  return i < 0 ? html + extra : html.slice(0, i) + extra + html.slice(i);
+};
+async function devRollback(id) {
+  if (!confirm("回滚这次修复？代码会恢复到任务开始前的版本（当前改动会先存进 git stash，不会丢）。")) return;
+  try { const r = await api("POST", `/api/tasks/${id}/rollback`); toast(r.ok ? "已回滚到任务开始前的版本" : "回滚失败：" + ((r.result || {}).detail || (r.result || {}).error || "")); refreshThread(); }
+  catch (e) { toast(e.message); }
+}

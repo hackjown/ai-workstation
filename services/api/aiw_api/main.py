@@ -22,6 +22,7 @@ REST (see README "API" for the full list)
 WebSocket
   /ws/session/{session_id}             live agent events
   /ws/desktop/{machine_id}             VNC websocket proxy (noVNC connects here)
+  /api/connections, /api/oauth/*       v3.9.27 direct connectors (oauth/routes.py); /ws/device phone bridge
 """
 from __future__ import annotations
 
@@ -35,8 +36,9 @@ import re
 import time
 import uuid
 from urllib.parse import quote
+import contextlib
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Union
 
 import httpx
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -140,10 +142,12 @@ class UploadIn(BaseModel):
 
 class OpenAPIIn(BaseModel):
     url: Optional[str] = None
-    spec: Optional[dict] = None
+    spec: Optional[Union[dict, str]] = None   # v3.9.27: dict, or pasted JSON / YAML text
     base_url: Optional[str] = None
     prefix: str = ""
     headers: dict = {}
+    api_key: Optional[str] = None             # v3.9.27: stored in the vault, wired by securitySchemes
+    limit: Optional[int] = None
 
 class SessionIn(BaseModel):
     task_id: str
@@ -261,7 +265,10 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         except Exception as e:  # noqa: BLE001
             log.warning("v3924 stop: %s", e)
         for s in sessions.live.values():
-            s.control.stop()
+            try:
+                s.control.stop("system", "API shutting down")   # v3.9.26: stop source
+            except TypeError:
+                s.control.stop()
 
     app = FastAPI(title="AI Workstation API", version="1.1.0", lifespan=lifespan)
     app.state.store, app.state.sessions, app.state.settings = store, sessions, settings
@@ -281,6 +288,19 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     def ws_token(ws: WebSocket) -> Optional[str]:
         return ws.query_params.get("token") or ws.cookies.get("aiw_token")
 
+    # v3.9.27: direct connectors (OAuth core, /api/connections, /api/oauth/callback) + the phone device bridge
+    from .oauth import migrate_relays
+    from .oauth import routes as _oauth_routes
+    try:   # pre-3.9.27 third-party relay MCP servers -> "需要重新授权（已改为直连）"
+        moved = migrate_relays(store, secrets)
+        if moved:
+            log.info("relay connectors moved to re-auth: %s", moved)
+    except Exception as e:  # noqa: BLE001
+        log.warning("relay migration: %s", e)
+    _oauth_routes.mount(app, store, secrets, notifier, auth)
+    from . import device_bridge as _devb
+    app.state.devices = _devb.hub_for(store, notifier)
+    _devb.mount(app, app.state.devices, auth, lambda ws: _ok(ws_token(ws)))
     from . import xhs   # 小红书运营: settings, approval queue, pause (/api/xhs/*)
     xhs.mount(app, store, sessions, notifier, auth)
     from . import remote_input   # 3.8.4: takeover input straight to the VM (/ws/input/{mid}, /api/machines/{mid}/input)
@@ -441,6 +461,32 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             return {"stopped": True}
         raise HTTPException(409, "task is not queued or running")
 
+    @app.post("/api/tasks/{task_id}/rollback", dependencies=[Depends(auth)])
+    async def rollback_task(task_id: str):
+        """v3.9.26 回滚 a dev_fix task: git back to the HEAD recorded when it started (the aiw/<task> branch is kept,
+        the tree before the rollback is stashed: nothing is lost)."""
+        from . import devflow as _dfa
+        try:
+            res = await _dfa.rollback(sessions, task_id)
+        except KeyError:
+            raise HTTPException(404)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        await sessions._event_all({"kind": "task", "task": store.task(task_id)})
+        return res
+
+    @app.get("/api/tasks/{task_id}/devflow", dependencies=[Depends(auth)])
+    async def task_devflow(task_id: str):
+        """v3.9.26: intent, task contract, git record and stop source of a task."""
+        from . import devflow as _dfa
+        t = store.task(task_id)
+        if not t:
+            raise HTTPException(404)
+        return {"intent": store.kv_get(f"task_intent:{task_id}"), "contract": store.kv_get(f"task_contract:{task_id}"),
+                "git": _dfa.git_state(store, task_id), "stop": store.kv_get(f"task_stop:{task_id}")}
+
     @app.post("/api/tasks/{task_id}/send_now", dependencies=[Depends(auth)])
     async def send_now(task_id: str, body: dict = Body(default={})):
         """立即发送 a queued message: starts it when its computer is idle, else puts it first in the queue
@@ -507,6 +553,16 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             t["pending_question"] = live.question_info if live else None
             if t.get("status") == "queued":   # why it waits (iOS / web show it under the queued message)
                 t["queue"] = sessions.queue_info(t)
+            with contextlib.suppress(Exception):   # v3.9.26: dev_fix git record (回滚), stop source, intent
+                g = store.kv_get(f"task_git:{t['id']}")
+                if g and g.get("branch"):
+                    t["devgit"] = {k: g.get(k) for k in ("branch", "commit", "stat", "base", "rolled_back", "committed")}
+                st = store.kv_get(f"task_stop:{t['id']}")
+                if st:
+                    t["stop"] = st
+                it = store.kv_get(f"task_intent:{t['id']}")
+                if it:
+                    t["intent"] = it.get("intent")
             kids = sessions.children_view(t["id"])
             if kids:   # pieces this task dispatched to other computers (each with its own thread)
                 t["children"] = kids
@@ -545,9 +601,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             if not sessions.cancel_queued(t["id"]):
                 live = sessions.live_for_task(t["id"])
                 if live and live.runner and not live.runner.done():
-                    await sessions.control(live.id, "stop")
+                    await sessions.control(live.id, "stop", source="thread_delete", reason="对话被删除")
         for t in store.thread_tasks(tid):   # child threads of dispatched pieces go with their parent
-            await sessions.stop_children(t["id"])
+            await sessions.stop_children(t["id"], source="thread_delete", reason="对话被删除")
             for c in store.children(t["id"]):
                 if c.get("thread_id"):
                     sessions.held_threads.discard(c["thread_id"])
@@ -1502,21 +1558,32 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.post("/api/integrations/openapi", dependencies=[Depends(auth)])
     async def import_openapi(body: OpenAPIIn):
+        from .integrations import openapi_security, parse_spec
         spec = body.spec
+        if isinstance(spec, str):   # v3.9.27: pasted JSON or YAML text
+            try:
+                spec = parse_spec(spec)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
         if not spec and body.url:
             async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
                 r = await c.get(body.url)
                 r.raise_for_status()
             try:
-                spec = r.json()
+                spec = parse_spec(r.text)
             except ValueError:
-                raise HTTPException(400, "OpenAPI spec must be JSON")
+                raise HTTPException(400, "OpenAPI 文档必须是 JSON 或 YAML")
         if not spec:
             raise HTTPException(400, "give url or spec")
-        new = openapi_to_tools(spec, body.base_url, body.headers, body.prefix)
+        secret = ""
+        if body.api_key:   # v3.9.27: the key goes to the vault, tools reference it as {{secret:openapi_<prefix>}}
+            secret = "openapi_" + re.sub(r"[^A-Za-z0-9_\-]+", "_", body.prefix or "api")[:40]
+            secrets.put(secret, body.api_key)
+        new = openapi_to_tools(spec, body.base_url, body.headers, body.prefix, limit=max(1, min(body.limit or 40, 200)),
+                               secret=secret)
         cur = [t for t in (store.kv_get("http_tools", []) or []) if t["name"] not in {n["name"] for n in new}]
         store.kv_set("http_tools", cur + new)
-        return {"imported": len(new), "tools": [t["name"] for t in new]}
+        return {"imported": len(new), "tools": [t["name"] for t in new], "security": openapi_security(spec)}
 
     @app.get("/api/integrations/tools", dependencies=[Depends(auth)])
     async def integration_tools():

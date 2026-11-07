@@ -149,8 +149,9 @@ class MainActivity : AppCompatActivity() {
         if (::web.isInitialized) web.saveState(outState)
     }
 
-    override fun onResume() { super.onResume(); if (::web.isInitialized) web.onResume() }
+    override fun onResume() { super.onResume(); if (::web.isInitialized) web.onResume(); DeviceBridge.get(this).start() }   // v3.9.27
     override fun onPause() { if (::web.isInitialized) web.onPause(); CookieManager.getInstance().flush(); super.onPause() }
+    override fun onStop() { DeviceBridge.get(this).stop(); super.onStop() }   // v3.9.27: calls queue on the server while away
 
     /** EXTRA_OPEN from a notification, or aiw://task/<id> from a Bark / ntfy push link. */
     private fun deepOf(i: Intent?): String? {

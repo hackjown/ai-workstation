@@ -6,8 +6,15 @@ unsure and 「用小模型判断」 is on, by one short call to the small model.
 (off = the model's normal setting / low / medium / high, sent as reasoning_effort) in 设置 › 模型路由. A model the user picked for the task (POST /api/tasks {model, effort})
 always wins. A tier with no model keeps the normal main model (only the effort changes).
 
-kv "autoroute": {enabled, use_model, apply_chat, tiers: {easy|normal|hard: {model, effort}}, rules: [{pattern, tier}]}
+kv "autoroute": {enabled, use_model, apply_chat, tiers: {easy|normal|hard: {model, effort}}, rules: [{pattern, tier}],
+                 dev: {enabled, model, effort}}
 Env: AIW_AUTOROUTE=0 forces it off; =1 forces it on (settings still give the tiers).
+
+v3.9.26 (task-830 ran a 98-step code fix on deepseek-v4.1-flash with thinking off): a dev_fix task, and a long 继续 /
+重试 of any task, goes to the STRONGEST configured model with thinking on, unless the user picked a model for the task.
+This route applies even when tier routing is off (kv autoroute.dev.enabled, default on; AIW_DEV_ROUTE=0 turns it off).
+The model: autoroute.dev.model, else models.dev_model / models.strong_model, else AIW_DEV_MODEL, else the hard tier's
+model, else the main model (then only thinking/effort change). Effort: autoroute.dev.effort, else AIW_DEV_EFFORT, else high.
 """
 from __future__ import annotations
 
@@ -26,7 +33,7 @@ EFFORTS = ("off", "low", "medium", "high")
 DEFAULT = {"enabled": False, "use_model": False, "apply_chat": False,
            "tiers": {"easy": {"model": "", "effort": "off"}, "normal": {"model": "", "effort": "off"},
                      "hard": {"model": "", "effort": "high"}},
-           "rules": []}
+           "rules": [], "dev": {"enabled": True, "model": "", "effort": "high"}}
 
 HARD_RE = re.compile(r"开发|写(一个|个)?(程序|脚本|代码|插件|网站|应用|App|app)|重构|调试|debug|修(复)?\s*bug|报错|逆向|复刻|"
                      r"架构|设计方案|部署|上线|迁移|诊断|排查|深挖|分析报告|研究报告|论文|CAD|户型|平面图|渲染|视频|剪辑|"
@@ -38,7 +45,10 @@ EASY_RE = re.compile(r"^(帮我)?(查一?下|搜一?下|打开|看看|翻译|几
 def cfg(store) -> dict:
     c = store.kv_get(KV, {}) or {}
     out = json.loads(json.dumps(DEFAULT))
-    out.update({k: v for k, v in c.items() if k in DEFAULT and k != "tiers"})
+    out.update({k: v for k, v in c.items() if k in DEFAULT and k not in ("tiers", "dev")})
+    out["dev"].update({k: v for k, v in (c.get("dev") or {}).items() if k in ("enabled", "model", "effort")})
+    if out["dev"].get("effort") not in EFFORTS:
+        out["dev"]["effort"] = "high"
     for t in TIERS:
         out["tiers"][t].update((c.get("tiers") or {}).get(t) or {})
         if out["tiers"][t].get("effort") not in EFFORTS:
@@ -57,6 +67,14 @@ def save(store, body: dict) -> dict:
             c["tiers"][t]["model"] = str(tb["model"] or "").strip()[:120]
         if tb.get("effort") in EFFORTS:
             c["tiers"][t]["effort"] = tb["effort"]
+    if isinstance(body.get("dev"), dict):   # v3.9.26 dev route
+        d = body["dev"]
+        if "enabled" in d:
+            c["dev"]["enabled"] = bool(d["enabled"])
+        if "model" in d:
+            c["dev"]["model"] = str(d["model"] or "").strip()[:120]
+        if d.get("effort") in EFFORTS:
+            c["dev"]["effort"] = d["effort"]
     if "rules" in body:
         rules = []
         for r in body.get("rules") or []:
@@ -123,12 +141,38 @@ async def by_model(llm, text: str) -> Optional[tuple[str, str]]:
     return None
 
 
+def dev_on(store) -> bool:
+    env = os.environ.get("AIW_DEV_ROUTE")
+    if env is not None:
+        return env != "0"
+    return bool(cfg(store)["dev"].get("enabled", True))
+
+
+def dev_route(store, why: str) -> dict:
+    """v3.9.26: the strongest configured model, thinking on (see the module doc)."""
+    c = cfg(store)
+    m = {}
+    try:
+        m = store.kv_get("models", {}) or {}
+    except Exception:  # noqa: BLE001
+        pass
+    model = (c["dev"].get("model") or m.get("dev_model") or m.get("strong_model") or os.environ.get("AIW_DEV_MODEL")
+             or (c["tiers"].get("hard") or {}).get("model") or "")
+    effort = c["dev"].get("effort") or os.environ.get("AIW_DEV_EFFORT") or "high"
+    if effort in ("", "off"):
+        effort = os.environ.get("AIW_DEV_EFFORT") or "high"
+    return {"tier": "dev", "tier_cn": "修复代码", "model": model, "effort": effort, "by": "dev", "reason": why}
+
+
 async def decide(store, text: str, small_llm=None, manual_model: str = "", manual_effort: str = "",
-                 for_chat: bool = False) -> Optional[dict]:
-    """The route for one request, or None to keep today's behaviour (routing off, or nothing to change)."""
+                 for_chat: bool = False, intent: str = "", long_run: bool = False) -> Optional[dict]:
+    """The route for one request, or None to keep today's behaviour (routing off, or nothing to change).
+    v3.9.26: intent == "dev_fix" or long_run (a long 继续/重试) -> dev_route, unless the user picked a model."""
     if manual_model or manual_effort:
         return {"tier": "manual", "tier_cn": "手动", "model": manual_model or "", "effort": manual_effort or "",
                 "by": "manual", "reason": "你为这个任务指定了模型"}
+    if not for_chat and (intent == "dev_fix" or long_run) and dev_on(store):
+        return dev_route(store, "修复/修改代码的任务" if intent == "dev_fix" else "长任务的继续/重试")
     if not on(store):
         return None
     c = cfg(store)

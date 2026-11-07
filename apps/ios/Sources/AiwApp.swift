@@ -20,13 +20,19 @@ struct AiwApp: App {
             .onAppear {
                 UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
                 UNUserNotificationCenter.current().delegate = NotifyDelegate.shared
-                if api.configured { hub.start() }
+                if api.configured { hub.start(); DeviceBridge.shared.start() }
             }
-            .onChange(of: api.token) { _ in api.configured ? hub.start() : hub.stop() }
+            .onChange(of: api.token) { _ in
+                api.configured ? hub.start() : hub.stop()
+                api.configured ? DeviceBridge.shared.restart() : DeviceBridge.shared.stop()   // v3.9.27 device bridge
+            }
             // 微信「用其他应用打开」/ Open In delivers a file URL; the share extension opens aiw://import (Import.swift)
             // 3.8: aiw://task|takeover|monitor|chat… are push deep links (DeepLink.swift), the rest imports
             .onOpenURL { u in if !DeepLinks.shared.handle(u) { ImportCenter.shared.handle(u) } }
-            .onChange(of: phase) { p in if p == .active { ImportCenter.shared.collectShared() } }
+            .onChange(of: phase) { p in
+                if p == .active { ImportCenter.shared.collectShared(); if api.configured { DeviceBridge.shared.start() } }
+                if p == .background { DeviceBridge.shared.stop() }   // v3.9.27: iOS drops the socket anyway; calls queue on the server
+            }
         }
     }
 }

@@ -115,6 +115,10 @@ Rules:
   `pip install --user --break-system-packages <pkg>` (plain pip is blocked). The desktop folder is ~/Desktop or ~/桌面.
 - If a shell command fails, read its stderr in PREVIOUS STEPS and fix the cause; never resend the same command.
 - For Word/Excel/PPT prefer python (python-docx / openpyxl / python-pptx) or `libreoffice --headless` via `shell`.
+- To check an HTML page (does a click open the detail, console errors, how many elements match a selector), call
+  verify_html (built in: headless Chromium with a hard timeout). Do not start chrome/chromium/CDP/BrowserOS by hand for it.
+- Fixing code that GENERATES a file (a script that writes an html/report): change the script, run it again, verify the
+  new output. Never patch the generated file itself or write side scripts (inject*/patch*) that edit it.
 - Verify with the screenshot before calling `done`. Never claim success you cannot see.
 - Never try to gain root, touch Proxmox, or change the network. Payments and bulk deletes require user confirmation.
 - If the user took over and returned control, the screen may differ: re-assess from the current screenshot.
@@ -194,8 +198,15 @@ def plan_context(context: str | None) -> str:
     return "\n\n".join(p for p in (mem, tail) if p)
 
 
+class FallbackPlan(list):
+    """v3.9.26: the offline clause split used when the planner model gave nothing usable. The loop shows it, but the
+    "清单还有未勾选的步骤" done gate does not hold the task to a checklist no model made (it rejected every scripted /
+    plannerless run's single done since v3.9.19: tests/test_phase5_agent_loop, test_phase7_api, test_shopwatch)."""
+    fallback = True
+
+
 async def make_plan(llm, task: str, context: str | None = None) -> list[str]:
-    """Ask the model for a short checklist; fall back to the offline split."""
+    """Ask the model for a short checklist; fall back to the offline split (a FallbackPlan)."""
     try:
         bg = plan_context(context)
         from . import prompts as _prompts
@@ -205,7 +216,7 @@ async def make_plan(llm, task: str, context: str | None = None) -> list[str]:
             return steps
     except Exception:  # noqa: BLE001
         pass
-    return plan(task)
+    return FallbackPlan(plan(task))
 
 
 def parse_plan(text: str, task: str) -> list[str]:

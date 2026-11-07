@@ -224,8 +224,12 @@ def resume_block(store, row: dict, machine_name: Optional[str] = None) -> str:
     return "\n\n".join(parts)
 
 
-def run_prompt(store, row: dict) -> str:
-    """The prompt the agent loop gets for a continuation run (the task's instructions + the user's new words)."""
+def run_prompt(store, row: dict, signals: Optional[dict] = None) -> str:
+    """The prompt the agent loop gets for a continuation run (the task's instructions + the user's new words).
+    v3.9.26 (task-830): when the new words change the KIND of job (run -> dev_fix: "…进入不了详情，GitHub也没了，修复"
+    after "运行 aiw_news.py，不要修改脚本"), the old instructions are no longer the goal: a 【任务契约】 section makes the new
+    request the goal, keeps the old instructions as background only and lists the old constraints that conflict with it
+    as 已失效. Same-kind continuations keep the plain concatenation."""
     root_ = store.task(row.get("continues") or row["id"]) or row
     if root_["id"] == row["id"]:
         return row.get("prompt") or ""
@@ -236,4 +240,27 @@ def run_prompt(store, row: dict) -> str:
         return instr
     if not new or is_bare_continue(new):
         return f"{instr}\n\n【接着上次继续做】"
+    try:
+        from agent_runtime import intent as _in
+        from . import devflow as _dfa
+        if signals is None:
+            signals = _dfa.thread_signals(store, row.get("thread_id"), exclude={row["id"]})
+        old_kind = _dfa.root_intent(store, root_, signals)
+        new_kind = _in.classify(new, signals).get("intent")
+    except Exception:  # noqa: BLE001  a broken classifier never blocks the run
+        old_kind = new_kind = None
+    if new_kind and old_kind and new_kind != old_kind and new_kind == "dev_fix":
+        return contract_prompt(instr, new, _in.voided_constraints(instr, new_kind))
     return f"{instr}\n\n【接着上次继续做】用户补充：{new}"
+
+
+def contract_prompt(old_instructions: str, new: str, voided: list) -> str:
+    """v3.9.26: the continuation prompt when the job changed kind (see run_prompt)."""
+    parts = ["【任务契约】这次是一个新的目标（修复/修改代码），以下面的「目标」为准。",
+             f"目标（本次请求）：{new}",
+             "背景（原任务说明，仅作参考，不是本次目标）：\n" + _short(old_instructions, 1500)]
+    if voided:
+        parts.append("已失效的旧约束（与本次修复冲突，不再适用；本次可以修改源头脚本/代码）：\n" +
+                     "\n".join(f"- {v}（已失效）" for v in voided))
+    parts.append("要求：找到生成交付物的源头脚本，在源头修复，重新生成后验证；不要直接修改生成出来的文件。")
+    return "\n\n".join(parts) + f"\n\n【接着上次继续做】用户补充：{new}"

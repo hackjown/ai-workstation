@@ -53,6 +53,7 @@
   <key>CFBundleURLTypes</key><array><dict>
     <key>CFBundleURLName</key><string>com.hackjown.aiworkstation.links</string>
     <key>CFBundleURLSchemes</key><array><string>aiw</string></array></dict></array>
+  <key>LSApplicationQueriesSchemes</key><array><string>shortcuts</string></array>
   <key>NSAppTransportSecurity</key><dict>
     <key>NSAllowsArbitraryLoads</key><true/>
     <key>NSAllowsArbitraryLoadsInWebContent</key><true/>
@@ -61,5 +62,15 @@
   <key>NSSpeechRecognitionUsageDescription</key><string>语音输入：把你说的话实时转成文字填进输入框（优先在手机上离线识别）</string>
   <key>NSCameraUsageDescription</key><string>拍照或录像作为附件发给 Agent</string>
   <key>NSPhotoLibraryUsageDescription</key><string>选择图片或视频作为附件发给 Agent</string>
+  <key>NSCalendarsFullAccessUsageDescription</key><string>让 Agent 按你的要求查看和新建日程（新建前会先请你确认）</string>
+  <key>NSCalendarsUsageDescription</key><string>让 Agent 按你的要求查看和新建日程（新建前会先请你确认）</string>
+  <key>NSCalendarsWriteOnlyAccessUsageDescription</key><string>让 Agent 在你确认后新建日程</string>
+  <key>NSRemindersFullAccessUsageDescription</key><string>让 Agent 查看、新建和完成提醒事项（改动前会先请你确认）</string>
+  <key>NSRemindersUsageDescription</key><string>让 Agent 查看、新建和完成提醒事项（改动前会先请你确认）</string>
+  <key>NSContactsUsageDescription</key><string>让 Agent 在你的通讯录里查找联系人的电话和邮箱</string>
+  <key>NSHealthShareUsageDescription</key><string>让 Agent 读取步数、睡眠、心率和体能训练，回答你关于健康的问题</string>
+  <key>NSHealthUpdateUsageDescription</key><string>在你确认后记录饮水、体重和正念时长</string>
+  <key>NSLocationWhenInUseUsageDescription</key><string>Agent 需要知道你在哪里时（附近的店、路线、天气），在你使用 App 时获取一次位置</string>
+  <key>NSAlarmKitUsageDescription</key><string>在你确认后让 Agent 帮你设闹钟</string>
   <key>NSLocalNetworkUsageDescription</key><string>连接局域网里的 Aiw 服务器</string>
 </dict></plist>

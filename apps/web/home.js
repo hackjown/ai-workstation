@@ -140,21 +140,23 @@ function htcResult(r) {
 }
 function hTaskCard(m) {
   const d = m.data || {};
+  const phone = d.fast_path === "device";   // v3.9.28 手机快通道: no computer bar / 接管, a 手机 label ("escalated" = normal)
   const st = d.status || "running", live = LIVE.includes(st) || st === "queued";
   const pct = d.plan_total ? 100 * (d.plan_done || 0) / d.plan_total : st === "succeeded" ? 100 : live && d.step && d.max_steps ? 100 * d.step / d.max_steps : live ? 4 : 0;
-  const plan = pct && live ? `<div class="hc-bar"><i style="width:${Math.max(3, Math.min(100, Math.round(pct)))}%"></i></div>` : "";
+  const plan = pct && live && !phone ? `<div class="hc-bar"><i style="width:${Math.max(3, Math.min(100, Math.round(pct)))}%"></i></div>` : "";
   const step = d.step ? `第 ${d.step}${d.max_steps ? "/" + d.max_steps : ""} 步` : "";
   const sub = [d.status_line && d.status_line !== (STATUS_CN[st] || [])[0] && d.status_line !== (HTC_CHIP[st] || [])[0] ? d.status_line : "",
-    d.plan_total ? `${d.plan_done || 0}/${d.plan_total} 项` : "", step, hElapsed(d, m), d.machine_name || ""].filter(Boolean);
+    d.plan_total ? `${d.plan_done || 0}/${d.plan_total} 项` : "", step, hElapsed(d, m), phone ? "📱 手机" : d.machine_name || ""].filter(Boolean);
   const tid = esc(d.task_id || m.task_id || "");
   const head = `<div class="htc-head" role="button" tabindex="0" onclick="hOpenTask('${m.id}')" onkeydown="if(event.key==='Enter')hOpenTask('${m.id}')">
     <div class="hc-ic">${live && st === "running" ? '<span class="spin"></span>' : st === "succeeded" ? icon("check") : icon("monitor")}</div>
     <div class="grow"><div class="hc-t">${esc(d.title || m.text || "任务")}</div>${d.prompt && d.prompt !== d.title ? `<div class="htc-p">${esc(d.prompt)}</div>` : ""}
-    <div class="hc-s">${sub.map((x) => (x.startsWith("<span") ? x : esc(x))).join(" · ") || "交给电脑的任务"}</div>${plan}</div>
+    <div class="hc-s">${sub.map((x) => (x.startsWith("<span") ? x : esc(x))).join(" · ") || (phone ? "在手机上处理" : "交给电脑的任务")}</div>${plan}</div>
     <div class="hc-r">${htcChip(st)}<span class="hc-go">${icon("chev")}</span></div></div>`;
   const prog = live && d.progress ? `<div class="htc-prog">${esc(d.progress)}</div>` : "";
   const fu = d.runs > 1 ? `<div class="htc-fu">↻ 接着做${d.followup ? "：" + esc(d.followup) : ""}</div>` : "";
-  const acts = (d.actions || []).map((a) => htcAction(m, a)).join("");
+  let acts = (d.actions || []).map((a) => htcAction(m, a)).join("");
+  if (phone) acts = acts.replace(/<button[^>]*hTakeover\([^)]*\)[^>]*>[\s\S]*?<\/button>/g, "");   // nothing to take over on the phone
   const res = live ? "" : htcResult(d.result);
   let foot = `<button class="link small" onclick="hOpenTask('${m.id}')">查看任务 ›</button>`;
   if (tid && d.card) {
@@ -463,6 +465,17 @@ async function hSend(e) {
   if (hRec) hRec.stop();
   if (HS.attach.some((a) => a.up)) { toast("附件还在上传，传完再发"); return; }
   if (!body && !HS.attach.length) { if (HS.skills.length) toast("说说要用这个技能做什么"); return; }
+  // v3.9.28 手机快通道 (Android app): 打电话给X / 今天日程 are answered by the phone itself (FastPath.kt); the
+  // result comes back through window.aiwFastResult. false = not handled there -> the server, as before.
+  if (HS.mode === "auto" && !HS.attach.length && !HS.skills.length && window.AiwAndroid && typeof AiwAndroid.fastTry === "function") {
+    let took = false;
+    try { took = AiwAndroid.fastTry(body) === true; } catch (err) { took = false; }
+    if (took) {
+      if (hStaged()) { HS.stageOff = true; hStage(false); }
+      box.value = ""; autoGrow(box); localStorage.removeItem("aiw_hdraft"); hKeys();
+      return;
+    }
+  }
   const skills = HS.skills.slice();
   const text = skills.length ? `【技能：${skills.join("、")}】\n${body}` : body;   // the old + menu's marker (agent_runtime/skills.py)
   const attachments = HS.attach.map(({ up, pct, uid, ...a }) => a), mode = HS.mode;
@@ -1068,3 +1081,24 @@ function tSheet(on) {
 function tPick(id) { tSheet(false); $(id).click(); }
 
 setTimeout(() => { try { hKeys(); } catch (e) { /* composer not on this page */ } }, 0);
+
+/* v3.9.28 手机快通道, Android app: the phone answered 打电话给X / 今天日程 itself (FastPath.kt calls this with
+   {user, reply, tool, ok, args, result, error}). Show it at once, then write it into the chat history
+   (POST /api/chat/device_result, client_id = cid so a retry is not written twice); the server message replaces it. */
+window.aiwFastResult = async function (cid, json) {
+  let r; try { r = typeof json === "string" ? JSON.parse(json) : json; } catch (e) { return; }
+  const now = Date.now() / 1000, uid = "local-u-" + cid, aid = "local-a-" + cid;
+  if (typeof hStaged === "function" && hStaged()) { HS.stageOff = true; hStage(false); }
+  HS.msgs.push({ id: uid, role: "user", kind: "text", text: r.user || "", data: {}, created_at: now });
+  HS.msgs.push({ id: aid, role: "assistant", kind: "text", text: r.reply || "", data: { device_result: true, tool: r.tool }, created_at: now });
+  hRender(); hScrollLatest();
+  const body = { tool: r.tool, ok: r.ok !== false, args: r.args || {}, result: r.result || null, error: r.error || null,
+    text: `「${r.user || ""}」\n${r.reply || ""}`, device_id: r.device_id || null, client_id: cid };
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await api("POST", "/api/chat/device_result", body);
+      if (res && res.message) { HS.msgs = HS.msgs.filter((x) => x.id !== uid && x.id !== aid); hUpsert(res.message, { stick: true }); hRender(); return; }
+    } catch (e) { /* retry */ }
+    await new Promise((ok) => setTimeout(ok, 1500 * (i + 1)));
+  }
+};

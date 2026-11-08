@@ -12,6 +12,7 @@ from ..browser.playwright import Browser
 from ..computer import keyboard, mouse, remote_input
 from ..computer.desktop import DesktopBackend
 from ..computer.screenshot import screenshot
+from .. import files as files_pkg
 from ..files import read as fread, transfer, write as fwrite
 from ..heartbeat.heartbeat import health
 from ..shell import executor
@@ -58,6 +59,8 @@ class Router:
             A.FILES_LIST: lambda p: _sync(fread.list_dir, p["path"]),
             A.FILES_READ: lambda p: _sync(fread.read, p["path"], p.get("binary", False)),
             A.FILES_WRITE: lambda p: _sync(fwrite.write, p["path"], p["content"], p.get("append", False)),
+            A.FILES_PATCH: lambda p: _sync(files_pkg.patch, p["path"], p["old"], p["new"], int(p.get("count") or 1),
+                                           bool(p.get("allow_outside")), bool(p.get("dry_run"))),
             A.FILES_DOWNLOAD: lambda p: transfer.download(p["url"], p.get("path")),
             A.FILES_UPLOAD: lambda p: _sync(transfer.upload, p["path"], p["content_b64"], bool(p.get("append"))),
             A.HEALTH: lambda p: _sync(health, b.name),

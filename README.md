@@ -93,6 +93,43 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.29 开发/修复流程修正（task-68b）
+- **模型路由**：修复代码（dev_fix）任务按顺序选模型：`autoroute.dev.model`（设置 › 模型路由 › 修复代码）→ `models.dev_model` →
+  `models.strong_model` → `AIW_DEV_MODEL` → 困难档模型 → 主模型是 flash/lite/mini 类时先用 `models.fallback`（如 deveco-glm-5.3）→ 主模型；
+  候选里非 flash 的优先，思考始终开、推理强度默认高。时间线上的「模型路由」写明来源设置；仍落到 flash 时显示 ⚠ 警告并写日志。
+  flash 只留给普通档/聊天。**建议在 `autoroute.dev.model` 填一个强代码模型。**
+- **files_patch 工具**（动作 `files.patch`）：精确字符串替换，`count` 指定期望匹配次数（默认 1，0=全部），不匹配不改文件并报告实际次数，
+  返回 unified diff。任务契约里的源文件/目录在 ~/workspace 之外也能改（由系统按契约放行，模型不能自己打开；密钥/.ssh 等路径永远拒绝；
+  vm-agent 允许的根目录 `VM_AGENT_PATCH_ROOTS`，默认 ~）。改契约源文件的脚本不再触发「临时补丁脚本」警告，改为提示用 files_patch。
+- **写了不执行**：.py/.sh 写好后 2 步内没执行，系统点名提醒（执行命令或改用 files_patch）；第二个带同样替换内容的脚本直接拒绝；
+  这些都计入卡住检测。
+- **源头识别**：请求里的裸文件名（「做进 aiw_news.py」）按本线程以前运行过的脚本（`cd X && python3 Y.py`、shell 的 cwd）解析成完整路径；
+  继续/重试沿用上一轮契约的源头、生成命令和交付物；已知生成脚本时生成的 .html 等产物不进允许路径；交付的是 `cp` 出来的副本时追溯到原生成脚本。
+  源文件未被 git 跟踪、不在仓库里、或在 aiw 平台自身仓库里时，不建分支，改为把源文件复制到 `~/.aiw/snapshots/<任务>/`（`AIW_SNAPSHOT_DIR`），
+  「回滚」把快照拷回（当前文件留作 `.aiw-before-rollback`）。
+- **卡住提示具体化**：dev_rabbit 卡片/提示写明具体模式（N 个脚本写了没执行 / 同一处修改重复 N 次 / 在几种改法之间来回切换）；出现严重模式
+  （≥4 个未执行脚本、同一修改 ≥4 次）立即询问。事实板：同一句话数字变了视为更新（旧条目被替代），源文件改动后关于它的行数/大小等事实自动过期。
+- **需求验收检查**：契约从用户原话生成检查项（深色/浅色随系统切换、指定字体、配图数量、新增栏目/#id 区块、返回首页按钮、文件大小、不内嵌字体），
+  verify_html 自动执行（结果在 `checks[]`，不影响页面本身的 ok）；done 必须：最后一次改动后跑过检查、未通过项列入「已知问题」并写原因、
+  总结不能声称已完成一个检查未通过的项、每项检查都要在总结里写明结果。交付总结末尾自动附「需求检查」清单。
+- **生成器快速迭代**：契约字段 `generator_cmd_fast` —— 生成脚本源码里支持 `--from-cache`/`--cached`/`--use-cache`/`--offline`/`--no-fetch`/
+  `--fast`/`--skip-fetch` 之一时，系统自动给出带该参数的命令，迭代时用它（不重新抓取网络）；done 之前必须完整运行一次 `generator_cmd`
+  并验证其产物，否则拒绝 done。生成脚本想享受这个能力，需要自己实现其中一个参数（读上次抓取的缓存）。
+
+## v3.9.28 手机快通道（App）
+- iOS / Android 设备桥新增 phone_call、sms_send、reminders_delete（仅 iOS）、calendar_today，hello 里声明 phone.call / sms.send；过了 expires_at 的调用直接丢弃；收到唤醒推送（aiw://open）或回到前台立即连 /ws/device。
+- 首页聊天里「打电话给X / 我有什么提醒 / 今天有什么安排」直接在手机上处理（通讯录多个号码弹选择，拨号前本地确认），结果写进聊天记录（POST /api/chat/device_result）。没匹配或没权限照旧发给服务器。Android 没有系统提醒事项，提醒类仍走服务器。
+- 任务卡片 fast_path=="device" 时不显示电脑进度条和「接管」，改标「手机」；"escalated" 照常显示。
+
+## v3.9.28 手机快通道（后端）
+
+只用手机就能完成的请求（提醒事项、日历/日程、通讯录、打电话、短信、闹钟、快捷指令、位置、健康）不再走 LLM 路由、不选/不唤醒云电脑、
+不排在忙碌的电脑后面：任务立即开始，在 API 进程内用一个小工具循环（只有 device_* 工具 + ask_user + escalate_to_computer）完成，
+写入类操作照常弹确认卡。提到文件/浏览器/网页/代码/附件的请求照旧交给电脑；手机做不了时 escalate_to_computer 在同一任务里
+转到电脑继续，手机已返回的结果带进上下文。新设备工具：phone_call、sms_send、reminders_complete、reminders_delete、calendar_today。
+设备待执行命令持久化（重启后仍会送达）。新接口 POST /api/chat/device_result。
+环境变量：AIW_PHONE_FAST=0 关闭；AIW_DEVICE_FAST_TTL（默认 8 秒，先推送唤醒，超时返回「手机 App 未连接/不在前台」）。
+
 ## 安全设计（§19、§30）
 - Agent 不持有 PVE 凭据；PVE Token 只在 VM Runtime，且仅限 VM 100 的电源/快照权限。
 - 所有工具调用必经 Tool Router → Policy Engine：L4（root、碰 PVE、关机、改防火墙、写裸盘）直接拒绝；L3（删除/覆盖工作区以外或你上传的文件、安装软件、sudo、上传/外发数据、`git push`、`curl|sh`、ssh/scp、内网地址、敏感文件、付款意图、白名单外域名）弹窗等你确认；L2 执行并审计。只读命令、在新文件夹里转换文件、删除本任务自己建的临时文件夹不再打扰你。`AIW_AUTO_INSTALL=1` 让 pip/npm 安装恢复免确认（apt/sudo 仍要确认）。

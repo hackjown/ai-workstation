@@ -23,6 +23,12 @@ WebSocket
   /ws/session/{session_id}             live agent events
   /ws/desktop/{machine_id}             VNC websocket proxy (noVNC connects here)
   /api/connections, /api/oauth/*       v3.9.27 direct connectors (oauth/routes.py); /ws/device phone bridge
+  POST /api/chat/device_result         v3.9.28 手机快通道: a result the phone app produced on its own -> chat history
+                                       (phone-only requests run as fast tasks: phone_fast.py, no cloud wake, no queue)
+v3.9.29 devflow fixes from task-68b: dev/fix route prefers a strong model (autoroute.dev.model / models.dev_model, then
+models.fallback before a flash main model, thinking on, warning on flash), files_patch tool (files.patch), unexecuted-script
+detection, bare source names + parent contract, copy snapshots for untracked/platform-repo sources, concrete stuck
+messages, requirement-derived acceptance checks (verify_html req_checks + done gate), generator_cmd_fast.
 """
 from __future__ import annotations
 

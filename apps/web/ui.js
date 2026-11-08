@@ -43,7 +43,10 @@ function patchChat() {
     const ctl = document.createElement("div"); ctl.className = "ctl";
     if (pause) { pause.className = "btn sm"; ctl.appendChild(pause); }
     if (stop) { stop.className = "btn sm danger"; ctl.appendChild(stop); }
-    ctl.insertAdjacentHTML("beforeend", `<button class="btn sm primary" onclick="toggleTakeover()">${icon("hand")}接管</button>`);
+    // v3.9.28 手机快通道: a task running on the phone (its chat card says fast_path "device") has no computer to take
+    // over; "escalated" (handed to the computer) keeps the normal bar
+    if (live && taskOnPhone(live)) ctl.insertAdjacentHTML("beforeend", `<span class="chip">📱 手机</span>`);
+    else ctl.insertAdjacentHTML("beforeend", `<button class="btn sm primary" onclick="toggleTakeover()">${icon("hand")}接管</button>`);
     card.appendChild(ctl);
     if (see) see.remove();   // the live screen is already beside the chat on wide screens
   });
@@ -57,6 +60,14 @@ function patchChat() {
       fr.insertAdjacentHTML("beforeend", `<div class="vfnow"><small>${esc(last ? last.querySelector("b").textContent + " " + (last.querySelector(".ms") || { textContent: "" }).textContent : "")}</small>${esc(c.querySelector(".tx").textContent)}</div>`);
     }
   }
+}
+
+function taskOnPhone(t) {   // v3.9.28: the task's card in the home chat, or the task itself, says where it runs
+  if (!t) return false;
+  if (t.fast_path) return t.fast_path === "device";
+  const msgs = (typeof HS !== "undefined" && HS && HS.msgs) || [];
+  const card = msgs.find((m) => m.kind === "task" && ((m.data || {}).task_id === t.id || m.task_id === t.id));
+  return !!(card && (card.data || {}).fast_path === "device");
 }
 
 /* ---------- thread list: status dot per thread */

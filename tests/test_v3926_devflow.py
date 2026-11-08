@@ -427,9 +427,12 @@ def test_git_snapshot_commit_rollback(tmp_path):
     assert "aiw/task-830" in _git(repo, "branch")                        # the fix stays reachable on its branch
 
 
-def test_git_start_outside_repo(tmp_path):
+def test_git_start_outside_repo(tmp_path, monkeypatch):
+    # v3.9.29: outside a repo the source is snapshotted by copy (was: error no_repo, no snapshot at all)
+    monkeypatch.setenv("AIW_SNAPSHOT_DIR", str(tmp_path / "snaps"))
     (tmp_path / "x.py").write_text("x")
-    assert _op("start", {"path": str(tmp_path / "x.py"), "task": "t"})["error"] == "no_repo"
+    g = _op("start", {"path": str(tmp_path / "x.py"), "task": "t"})
+    assert g["ok"] and g["mode"] == "copy" and g["reason"] == "not_in_repo"
 
 
 # ------------------------------------------------------------------------------------------------ 12. verify_html

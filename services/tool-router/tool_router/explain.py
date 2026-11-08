@@ -1096,7 +1096,7 @@ def _summarize(tool: str, p: dict, reason: str, created: Optional[set]) -> dict:
         return {"title": f"确认：{'下载文件自' if dl else '打开网站'} {name or '网址'}",
                 "what": f"在浏览器里打开 {short(url, 60)}。" if not dl else f"从 {name} 下载文件到这台电脑。",
                 "impact": impact, "risks": r, "sev": MED, "category": "network"}
-    if tool in ("files_write", "files_upload"):
+    if tool in ("files_write", "files_upload", "files_patch"):
         path = norm_path(str(p.get("path") or ""), "~/workspace")
         op = Op()
         _write_target(op, path)

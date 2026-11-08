@@ -798,6 +798,8 @@ class Chat:
                 route = {"route": "chat", "title": "", "image": True}   # v3.9.15: the image model, right in the chat
             elif attachments_want_task(text, attachments):   # v3.9.3: shared files + "帮我转成…" go straight to the computer
                 route = {"route": "task", "title": ""}
+            elif mode == "auto" and self.phone_fast(text, attachments):   # v3.9.28 手机快通道: no LLM router
+                route = {"route": "task", "title": "", "fast": "device"}
             else:
                 route = await self.classify(text, [c for c in cands if c["run"]["status"] not in ("succeeded",)] or cands,
                                             attachments)
@@ -816,7 +818,8 @@ class Chat:
             await say("route", route)
             if route["route"] == "task":
                 self.last_notice = None
-                card = await self.start_task(text, route.get("title") or "", machine_id, attachments, origin=user["id"])
+                card = await self.start_task(text, route.get("title") or "", machine_id, attachments, origin=user["id"],
+                                             fast=route.get("fast"))
                 note, self.last_notice = self.last_notice, None
                 if note:   # v3.9.3: "用了备用电脑" shows in the chat, before the card
                     await say("message", note)
@@ -1295,9 +1298,12 @@ class Chat:
             return mid or ""
 
     async def start_task(self, prompt: str, title: str = "", machine_id: Optional[str] = None,
-                         attachments: Optional[list] = None, origin: Optional[str] = None, source: str = "chat") -> dict:
+                         attachments: Optional[list] = None, origin: Optional[str] = None, source: str = "chat",
+                         fast: Optional[str] = None) -> dict:
         prompt = (prompt or "").strip()
         notice = None
+        if fast:   # v3.9.28 手机快通道: the phone does it, no computer is picked, woken or queued
+            return await self._start_fast_task(prompt, title, machine_id, origin, source, fast)
         if source == "chat":   # aiw-roles-1: a new task goes to the computer whose role fits it
             try:
                 from . import roles as _roles
@@ -1336,6 +1342,52 @@ class Chat:
             "prompt": one_line(SKILL_RE.sub("", prompt), 120), "started_at": time.time() if st != "queued" else None,
             "actions": [], **({"backup_vm": notice} if notice else {})}, task_id=t["id"])
         return self._catch_up_sync(card)
+
+    def phone_fast(self, text: str, attachments: Optional[list] = None) -> Optional[dict]:
+        """v3.9.28: {"path": "device", "kind"} for a phone-only request with a phone online or registered."""
+        try:
+            from . import device_bridge as _devb, phone_fast as _pf
+            return _pf.classify(text, attachments, _devb.existing_hub(self.store))
+        except Exception as e:  # noqa: BLE001
+            log.warning("phone fast classify: %s", e)
+            return None
+
+    async def _start_fast_task(self, prompt: str, title: str, machine_id: Optional[str], origin: Optional[str],
+                               source: str, fast: str) -> dict:
+        title = (title or "").strip() or _short_title(prompt)
+        try:
+            res = await self.sessions.submit(prompt, machine_id or None, None, source=source, title=title,
+                                             context_extra=self.recent_text(6) or None, fast=fast)
+        except Exception as e:  # noqa: BLE001
+            return self.add("assistant", "text", f"没能交给手机：{type(e).__name__}: {str(e)[:160]}",
+                            {"error": True, "offer_task": prompt[:500]})
+        t = res["task"]
+        st = t.get("status") or "running"
+        card = self.add("assistant", "task", title, {
+            "task_id": t["id"], "thread_id": res.get("thread_id") or t.get("thread_id"), "session_id": t.get("session_id"),
+            "machine_id": t.get("machine_id"), "machine_name": "手机", "fast_path": "device",
+            "title": title, "status": st, "status_line": STATUS_CN.get(st, st),
+            "step": 0, "max_steps": t.get("max_steps"), "origin": origin, "card": CARD_V, "root_id": t.get("continues") or t["id"],
+            "prompt": one_line(prompt, 120), "started_at": time.time(), "actions": []}, task_id=t["id"])
+        return self._catch_up_sync(card)
+
+    def device_result(self, body: dict) -> dict:
+        """v3.9.28 POST /api/chat/device_result: something the phone app already did on its own (e.g. a Siri / App
+        Intent run) goes into the chat history, so the chat and later tasks know about it."""
+        tool = str(body.get("tool") or "")[:60]
+        ok = bool(body.get("ok", True))
+        text = str(body.get("text") or "").strip()[:2000]
+        if not text:
+            text = (f"［手机已执行 {tool}］" if ok else f"［手机执行 {tool} 失败：{str(body.get('error') or '')[:300]}］")
+        data = {"device_result": True, "tool": tool, "ok": ok, "args": body.get("args") or {},
+                "result": body.get("result"), "error": (str(body.get("error"))[:500] if body.get("error") else None),
+                "device_id": str(body.get("device_id") or "")[:80], "client_id": str(body.get("client_id") or "")[:80] or None}
+        if data["client_id"]:   # the app retries: one message per client_id
+            for r in self._recent_rows(200):
+                if (r.get("data") or {}).get("client_id") == data["client_id"] and (r.get("data") or {}).get("device_result"):
+                    return {"ok": True, "message": r, "duplicate": True}
+        m = self.add("assistant", "text", text, data)
+        return {"ok": True, "message": m}
 
     def _catch_up_sync(self, card: dict) -> dict:
         """Events of a task that starts at once can fire before its card exists (submit returns after the run began):
@@ -1440,6 +1492,9 @@ class Chat:
             self.update(card["id"], data={**base, "status": "cancelled", "status_line": "已从排队中删除",
                                           "queue": None, "ended_at": time.time()}, task_id=task.id)
             return
+        if typ == "agent.message" and d.get("fast_path") == "escalate":   # v3.9.28: the phone handed it to the computer
+            self.update(card["id"], data={**base, "fast_path": "escalated",
+                                          "machine_name": self._machine_label(task.machine_id)}, task_id=task.id)
         if typ == "task.started":
             new_run = bool(cd.get("task_id")) and cd.get("task_id") != task.id
             data = {**base, "status": "running", "status_line": "进行中", "step": 0, "max_steps": task.max_steps,
@@ -1646,6 +1701,17 @@ class ChatIn(BaseModel):
     mode: str = "auto"          # auto | chat | task (新建任务 / a forced route)
     stream: bool = True
 
+class DeviceResultIn(BaseModel):   # v3.9.28
+    tool: str
+    ok: bool = True
+    args: Optional[dict] = None
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    text: Optional[str] = None
+    device_id: Optional[str] = None
+    client_id: Optional[str] = None
+
+
 class AnswerIn(BaseModel):
     action_id: Optional[str] = None     # 3.8.8: which action of a task card
     choice: Optional[str] = None
@@ -1676,6 +1742,10 @@ def mount(app, chat: Chat, auth) -> None:
     @app.post("/api/chat/read", dependencies=dep)
     async def chat_read(body: ReadIn):
         return chat.mark_read(body.seq)
+
+    @app.post("/api/chat/device_result", dependencies=dep)
+    async def chat_device_result(body: DeviceResultIn):   # v3.9.28: a result the phone produced on its own
+        return chat.device_result(body.model_dump())
 
     @app.post("/api/chat/send", dependencies=dep)
     async def chat_send(body: ChatIn):

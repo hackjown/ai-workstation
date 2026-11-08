@@ -8,13 +8,23 @@
 * rollback(state): back to the recorded HEAD: the current tree is stashed first (nothing lost), the aiw branch reset,
   the original branch checked out and the start snapshot re-applied — the repo is as it was before the task.
 
+v3.9.29 (task-68b): ~/ai-workstation/news/aiw_news.py is an UNTRACKED file inside the aiw platform's own checkout.
+Checking out an aiw/<task> branch there switches the running platform's code. So when the source is untracked, not in
+a repo at all, or inside the platform repo (it has services/agent-runtime/agent_runtime, or AIW_PLATFORM_REPO), start
+uses mode "copy": the source files are copied to ~/.aiw/snapshots/<task>/ (sha256 recorded); status compares hashes
+(+ a line count diff), commit is a no-op that reports the change, rollback copies the snapshot back (the current file is
+kept as <file>.aiw-before-rollback). The platform repo's branch is never touched.
+
 Everything runs ON THE COMPUTER: command(op, args) embeds the part above `# ---- loop side` in a python3 heredoc and
 prints one JSON line. The API's rollback endpoint uses the same command.
 """
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -42,10 +52,60 @@ def _ident(repo):
     return [] if out else ["-c", "user.name=aiw", "-c", "user.email=aiw@localhost"]
 
 
+def _is_platform(repo):
+    env = os.environ.get("AIW_PLATFORM_REPO")
+    if env and os.path.realpath(os.path.expanduser(env)) == os.path.realpath(repo):
+        return True
+    return os.path.isdir(os.path.join(repo, "services", "agent-runtime", "agent_runtime"))
+
+
+def _tracked(repo, path):
+    rc, _, _ = _git(repo, "ls-files", "--error-unmatch", "--", os.path.expanduser(path))
+    return rc == 0
+
+
+def _sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _snap_root():
+    return os.path.expanduser(os.environ.get("AIW_SNAPSHOT_DIR", "~/.aiw/snapshots"))
+
+
+def copy_start(a, repo, why):
+    task = a.get("task") or "task"
+    prev = a.get("prev") or {}
+    if prev.get("mode") == "copy" and prev.get("files") and all(os.path.exists(f.get("snap", "")) for f in prev["files"]):
+        return {**prev, "ok": True, "reused": True}
+    d = os.path.join(_snap_root(), task)
+    os.makedirs(d, exist_ok=True)
+    files = []
+    srcs = [a.get("path")] + [x for x in (a.get("files") or []) if x != a.get("path")]
+    for i, f in enumerate(srcs):
+        p = os.path.expanduser(f or "")
+        if not p or not os.path.isfile(p):
+            continue
+        snap = os.path.join(d, f"{i}_{os.path.basename(p)}")
+        shutil.copy2(p, snap)
+        files.append({"orig": p, "snap": snap, "sha": _sha(p)})
+    if not files:
+        return {"ok": False, "error": "no_source_file", "repo": repo}
+    return {"ok": True, "mode": "copy", "reason": why, "repo": repo, "snapdir": d, "files": files,
+            "base": "copy:" + task, "branch": None}
+
+
 def op_start(a):
     repo = _repo_of(a.get("path"))
     if not repo:
-        return {"ok": False, "error": "no_repo"}
+        return copy_start(a, None, "not_in_repo")
+    if _is_platform(repo):
+        return copy_start(a, repo, "platform_repo")
+    if not _tracked(repo, a.get("path")):
+        return copy_start(a, repo, "untracked")
     rc, head, err = _git(repo, "rev-parse", "HEAD")
     if rc != 0:
         return {"ok": False, "error": "no_commits", "repo": repo}
@@ -88,7 +148,31 @@ def _paths(repo, paths):
     return out
 
 
+def _line_stat(files):
+    out, changed = [], []
+    for f in files or []:
+        try:
+            old = open(f["snap"], encoding="utf-8", errors="replace").read().splitlines()
+            new = open(f["orig"], encoding="utf-8", errors="replace").read().splitlines() if os.path.exists(f["orig"]) else []
+        except OSError:
+            continue
+        if _sha(f["orig"]) == f.get("sha") if os.path.exists(f["orig"]) else False:
+            continue
+        add = rem = 0
+        for ln in difflib.unified_diff(old, new, lineterm="", n=0):
+            if ln.startswith("+") and not ln.startswith("+++"):
+                add += 1
+            elif ln.startswith("-") and not ln.startswith("---"):
+                rem += 1
+        changed.append(f["orig"])
+        out.append(f" {f['orig']} | +{add} -{rem}")
+    return changed, "\n".join(out)
+
+
 def op_status(a):
+    if a.get("mode") == "copy":
+        changed, stat = _line_stat(a.get("files"))
+        return {"ok": True, "changed": bool(changed), "files": changed, "stat": stat}
     repo, base = a.get("repo"), a.get("base")
     if not repo or not base:
         return {"ok": False, "error": "no_state"}
@@ -102,6 +186,9 @@ def op_status(a):
 
 
 def op_commit(a):
+    if a.get("mode") == "copy":   # nothing to commit on: the snapshot stays for rollback
+        changed, stat = _line_stat(a.get("files"))
+        return {"ok": True, "committed": False, "commit": None, "stat": stat, "mode": "copy"}
     repo, base = a.get("repo"), a.get("base")
     if not repo:
         return {"ok": False, "error": "no_state"}
@@ -122,6 +209,17 @@ def op_commit(a):
 
 
 def op_rollback(a):
+    if a.get("mode") == "copy":
+        restored = []
+        for f in a.get("files") or []:
+            if not os.path.exists(f.get("snap", "")):
+                continue
+            if os.path.exists(f["orig"]):
+                shutil.copy2(f["orig"], f["orig"] + ".aiw-before-rollback")
+            shutil.copy2(f["snap"], f["orig"])
+            restored.append(f["orig"])
+        return {"ok": bool(restored), "mode": "copy", "restored": restored,
+                "error": None if restored else "no_snapshot"}
     repo, base = a.get("repo"), a.get("base")
     if not repo or not base:
         return {"ok": False, "error": "no_state"}
@@ -188,7 +286,15 @@ def parse(stdout: str) -> dict:
     return {"ok": False, "error": "no_result", "detail": str(stdout or "")[-300:]}
 
 
+STATE_KEYS = ("repo", "base", "branch", "orig_branch", "snapshot", "mode", "files", "snapdir")
+
+
 def summary_line(g: dict) -> str:
+    if g and g.get("mode") == "copy":
+        s = f"快照：改动前的源文件已复制到 {g.get('snapdir')}（源文件不在 git 跟踪中或位于平台仓库内，未建分支）"
+        if g.get("stat"):
+            s += "\n" + str(g["stat"]).strip()[-800:]
+        return s + "\n（如需撤销，可在任务卡片上点「回滚」，或回复「回滚」：把源文件恢复成快照）"
     if not g or not g.get("branch"):
         return ""
     s = f"Git：分支 {g['branch']}"

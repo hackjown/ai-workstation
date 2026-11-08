@@ -335,6 +335,8 @@ struct HomeChatView: View {
     @State private var queuedPick: JSON? = nil
     @State private var deletePick: JSON? = nil
     @State private var cardAsk: CardTextAsk? = nil     // 3.8.8: 修改后重新发布 / 补充 on a task card
+    @State private var fastPick: FastPick? = nil        // v3.9.28: 打电话给X matched several numbers
+    @State private var fastCall: FastCandidate? = nil   // v3.9.28: the local confirm before dialling
     /// 3.8.2: older pages load only after the opening jump to the newest message (the "加载更早的消息" row is on screen
     /// while the list still sits at the top, and its onAppear used to load a page and pin the view to it)
     @State private var olderOK = false
@@ -383,6 +385,68 @@ struct HomeChatView: View {
             Button(deleteTitle(d), role: .destructive) { let id = d.s("id"); deletePick = nil; Task { await m.deleteMessage(id) } }
             Button("取消", role: .cancel) { deletePick = nil }
         } message: { d in Text(deleteNote(d)) }
+        // v3.9.28 手机快通道 (PhoneFast.swift): pick a number, then always confirm before dialling
+        .sheet(item: $fastPick) { p in
+            NavigationStack {
+                List(p.list) { c in
+                    Button {
+                        fastPick = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { fastCall = c }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(c.name).font(.body.weight(.semibold))
+                            Text([c.label, c.number].filter { !$0.isEmpty }.joined(separator: "  ")).font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .navigationTitle("打给哪一个？").navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { fastPick = nil } } }
+            }
+            .presentationDetents([.medium, .large])
+        }
+        .alert("拨打电话？", isPresented: Binding(get: { fastCall != nil }, set: { if !$0 { fastCall = nil } }), presenting: fastCall) { c in
+            Button("拨打") { fastCall = nil; placeCall(c) }
+            Button("取消", role: .cancel) { fastCall = nil }
+        } message: { c in Text(c.name.isEmpty ? c.number : "\(c.name)  \(c.number)") }
+    }
+
+    /// v3.9.28: answer on the phone itself; false = not handled here (no permission yet / nobody found) -> server
+    @MainActor func runFast(_ intent: PhoneFastIntent, _ user: String) async -> Bool {
+        switch intent {
+        case .reminders:
+            guard PhoneFast.granted(.reminder) else { return false }
+            guard let r = try? await DeviceBridge.shared.run("reminders_list", [:], local: true) else { return false }
+            m.fastLocal(user: user, reply: PhoneFast.remindersText(r), tool: "reminders_list", ok: true, args: [:], result: r, error: nil)
+            return true
+        case .calendarToday:
+            guard PhoneFast.granted(.event) else { return false }
+            guard let r = try? await DeviceBridge.shared.run("calendar_today", [:], local: true) else { return false }
+            m.fastLocal(user: user, reply: PhoneFast.calendarText(r), tool: "calendar_today", ok: true, args: [:], result: r, error: nil)
+            return true
+        case .call(let who):
+            if let num = PhoneFast.directNumber(who) {
+                fastCall = FastCandidate(name: "", number: num, label: "", user: user); return true
+            }
+            guard PhoneFast.contactsGranted else { return false }
+            let list = PhoneFast.lookup(who, user: user)
+            if list.isEmpty { return false }
+            if list.count == 1 { fastCall = list[0] } else { fastPick = FastPick(user: user, query: who, list: list) }
+            return true
+        }
+    }
+    func placeCall(_ c: FastCandidate) {
+        Task { @MainActor in
+            var args: JSON = ["number": c.number]
+            if !c.name.isEmpty { args["name"] = c.name }
+            let who = c.name.isEmpty ? c.number : "\(c.name)（\(c.number)）"
+            do {
+                let r = try await DeviceBridge.shared.run("phone_call", args, local: true)
+                m.fastLocal(user: c.user, reply: "已在手机上拨打 \(who)", tool: "phone_call", ok: true, args: args, result: r, error: nil)
+            } catch {
+                m.fastLocal(user: c.user, reply: "没能拨打 \(who)：\(error.localizedDescription)", tool: "phone_call", ok: false,
+                            args: args, result: nil, error: error.localizedDescription)
+            }
+        }
     }
 
     var main: some View {
@@ -833,6 +897,12 @@ struct HomeChatView: View {
         if voice.active { voice.stop() }
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.isEmpty && attach.isEmpty { if !picked.isEmpty { m.err = "说说要用这个技能做什么" }; return }
+        // v3.9.28 手机快通道: a call / reminders / today's calendar is answered on the phone (PhoneFast.swift)
+        if mode == "auto", attach.isEmpty, picked.isEmpty, let intent = PhoneFast.match(body), await runFast(intent, body) {
+            text = ""; draft = ""
+            pin.toEnd(follow: 2)
+            return
+        }
         let sk = picked
         let t = sk.isEmpty ? body : "【技能：\(sk.joined(separator: "、"))】\n" + body
         let files = attach, md = mode

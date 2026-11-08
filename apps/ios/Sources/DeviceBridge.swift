@@ -5,6 +5,7 @@ import EventKit
 import Contacts
 import HealthKit
 import CoreLocation
+import MessageUI
 #if AIW_ALARMKIT && canImport(AlarmKit)
 import AlarmKit
 #endif
@@ -19,8 +20,8 @@ final class DeviceBridge: NSObject, ObservableObject {
     static let shared = DeviceBridge()
     static let allCaps: [(String, String)] = [
         ("calendar.read", "读取日历"), ("calendar.write", "新建日程"),
-        ("reminders.read", "读取提醒事项"), ("reminders.write", "新建/完成提醒事项"),
-        ("contacts.read", "搜索通讯录"),
+        ("reminders.read", "读取提醒事项"), ("reminders.write", "新建/完成/删除提醒事项"),
+        ("contacts.read", "搜索通讯录"), ("phone.call", "打电话（拨号前确认）"), ("sms.send", "发短信（系统短信界面，你点发送）"),
         ("health.read", "读取健康（步数、睡眠、心率、体能训练）"), ("health.write", "写入健康（饮水、体重、正念）"),
         ("location.read", "当前位置"), ("alarm.write", "设闹钟（iOS 26+）"), ("shortcuts.run", "运行快捷指令"),
     ]
@@ -57,7 +58,14 @@ final class DeviceBridge: NSObject, ObservableObject {
     // ------------------------------------------------------------------ socket
     func start() {
         guard !alive, Self.allCaps.contains(where: { enabled($0.0) }) else { return }
-        alive = true; connect()
+        alive = true; backoff = 2; connect()
+    }
+    /// v3.9.28: a wake push (aiw://open) or coming back to the foreground: the server's fast path waits only ~8 s,
+    /// so (re)connect right now instead of waiting out the backoff.
+    func connectNow() {
+        if !alive { start(); return }
+        if online { return }
+        backoff = 2; task?.cancel(with: .goingAway, reason: nil); task = nil; connect()
     }
     func stop() { alive = false; task?.cancel(with: .goingAway, reason: nil); task = nil; DispatchQueue.main.async { self.online = false } }
     func restart() { stop(); start() }
@@ -100,6 +108,8 @@ final class DeviceBridge: NSObject, ObservableObject {
         case "welcome": backoff = 2; DispatchQueue.main.async { self.online = true; self.lastError = "" }
         case "call":
             guard let id = m["id"] as? String, let tool = m["tool"] as? String else { return }
+            // v3.9.28: a call the server already gave up on (fast path ~8 s TTL) is dropped, never run late
+            if let exp = Self.number(m["expires_at"]), exp > 0, exp < Date().timeIntervalSince1970 { return }
             let args = m["args"] as? [String: Any] ?? [:]
             DispatchQueue.main.async { self.lastCall = tool }
             Task {
@@ -112,6 +122,14 @@ final class DeviceBridge: NSObject, ObservableObject {
             }
         default: break
         }
+    }
+
+    static func number(_ v: Any?) -> Double? {
+        if let d = v as? Double { return d }
+        if let i = v as? Int { return Double(i) }
+        if let n = v as? NSNumber { return n.doubleValue }
+        if let s = v as? String { return Double(s) }
+        return nil
     }
 
     // ------------------------------------------------------------------ tools
@@ -130,13 +148,28 @@ final class DeviceBridge: NSObject, ObservableObject {
     }
     private func iso(_ d: Date?) -> String { d.map { ISO8601DateFormatter().string(from: $0) } ?? "" }
 
-    func run(_ tool: String, _ a: [String: Any]) async throws -> [String: Any] {
+    /// `local`: the user asked for it in this app's own chat (v3.9.28 on-device fast answers), so the 设备能力 switch
+    /// is not required; iOS permissions still are.
+    func run(_ tool: String, _ a: [String: Any], local: Bool = false) async throws -> [String: Any] {
+        if local {
+            switch tool {
+            case "reminders_list": return try await remindersList(a)
+            case "calendar_today": return try await calendarToday(a)
+            case "phone_call": return try await phoneCall(a)
+            case "contacts_search": return try await contactsSearch(a)
+            default: break
+            }
+        }
         switch tool {
         case "calendar_list": try need("calendar.read"); return try await calendarList(a)
         case "calendar_create": try need("calendar.write"); return try await calendarCreate(a)
         case "reminders_list": try need("reminders.read"); return try await remindersList(a)
         case "reminders_create": try need("reminders.write"); return try await remindersCreate(a)
         case "reminders_complete": try need("reminders.write"); return try await remindersComplete(a)
+        case "reminders_delete": try need("reminders.write"); return try await remindersDelete(a)
+        case "calendar_today": try need("calendar.read"); return try await calendarToday(a)
+        case "phone_call": try need("phone.call"); return try await phoneCall(a)
+        case "sms_send": try need("sms.send"); return try await smsSend(a)
         case "contacts_search": try need("contacts.read"); return try await contactsSearch(a)
         case "health_read": try need("health.read"); return try await healthRead(a)
         case "health_write": try need("health.write"); return try await healthWrite(a)
@@ -224,6 +257,70 @@ final class DeviceBridge: NSObject, ObservableObject {
         r.isCompleted = true
         try events.save(r, commit: true)
         return ["completed": true, "id": id]
+    }
+    private func remindersDelete(_ a: [String: Any]) async throws -> [String: Any] {
+        guard try await remindersAccess() else { throw BridgeError(msg: "没有提醒事项权限") }
+        guard let id = a["id"] as? String, let r = events.calendarItem(withIdentifier: id) as? EKReminder else { throw BridgeError(msg: "找不到这条提醒") }
+        try events.remove(r, commit: true)
+        return ["deleted": true, "id": id]
+    }
+    /// v3.9.28 calendar_today: today's events in the phone's own time zone
+    func calendarToday(_ a: [String: Any]) async throws -> [String: Any] {
+        guard try await calendarAccess() else { throw BridgeError(msg: "没有日历权限（设置 › 隐私 › 日历 › AIW）") }
+        let start = Calendar.current.startOfDay(for: Date())
+        let end = Calendar.current.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86400)
+        let pred = events.predicateForEvents(withStart: start, end: end, calendars: nil)
+        let list = events.events(matching: pred).sorted { $0.startDate < $1.startDate }.prefix(100)
+        let df = DateFormatter(); df.calendar = Calendar(identifier: .gregorian); df.locale = Locale(identifier: "en_US_POSIX")
+        df.timeZone = .current; df.dateFormat = "yyyy-MM-dd"
+        return ["events": list.map { ["id": $0.eventIdentifier ?? "", "title": $0.title ?? "", "start": iso($0.startDate),
+                                       "end": iso($0.endDate), "all_day": $0.isAllDay, "location": $0.location ?? "",
+                                       "calendar": $0.calendar?.title ?? ""] as [String: Any] },
+                "date": df.string(from: start), "tz": TimeZone.current.identifier]
+    }
+
+    // MARK: Phone / SMS (v3.9.28)
+    static func cleanNumber(_ s: String) -> String {
+        s.filter { ($0.isASCII && $0.isNumber) || $0 == "+" || $0 == "*" || $0 == "#" || $0 == "," }
+    }
+    private func phoneCall(_ a: [String: Any]) async throws -> [String: Any] {
+        let num = Self.cleanNumber(a["number"] as? String ?? "")
+        guard num.filter(\.isNumber).count >= 3, let u = URL(string: "tel:" + num) else { throw BridgeError(msg: "号码不对") }
+        let active = await MainActor.run { UIApplication.shared.applicationState == .active }
+        guard active else { throw BridgeError(msg: "App 不在前台，不能拨号") }
+        let opened: Bool = await withCheckedContinuation { cc in DispatchQueue.main.async { UIApplication.shared.open(u) { cc.resume(returning: $0) } } }
+        if !opened { throw BridgeError(msg: "这台设备不能打电话") }
+        var out: [String: Any] = ["started": true, "number": num]
+        if let n = a["name"] as? String, !n.isEmpty { out["name"] = n }
+        return out
+    }
+    private var smsWait: CheckedContinuation<MessageComposeResult?, Never>?
+    private func smsSend(_ a: [String: Any]) async throws -> [String: Any] {
+        let to = (a["to"] as? String ?? "").split(whereSeparator: { $0 == "," || $0 == "，" || $0 == ";" })
+            .map { Self.cleanNumber(String($0)) }.filter { !$0.isEmpty }
+        guard !to.isEmpty else { throw BridgeError(msg: "缺少收件人号码") }
+        let body = a["body"] as? String ?? ""
+        let can = await MainActor.run { MFMessageComposeViewController.canSendText() && UIApplication.shared.applicationState == .active }
+        guard can else { throw BridgeError(msg: "这台设备现在不能发短信（App 需在前台）") }
+        let res: MessageComposeResult? = await withCheckedContinuation { (c: CheckedContinuation<MessageComposeResult?, Never>) in
+            DispatchQueue.main.async {
+                guard self.smsWait == nil, let top = Self.topController() else { c.resume(returning: nil); return }
+                let vc = MFMessageComposeViewController()
+                vc.recipients = to; vc.body = body; vc.messageComposeDelegate = self
+                self.smsWait = c
+                top.present(vc, animated: true)
+            }
+        }
+        guard let result = res else { throw BridgeError(msg: "短信界面已打开或无法显示") }
+        if result == .failed { throw BridgeError(msg: "短信发送失败") }
+        return ["sent": result == .sent, "presented": true, "to": to.joined(separator: ",")]
+    }
+    static func topController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let win = scenes.flatMap { $0.windows }.first { $0.isKeyWindow } ?? scenes.first?.windows.first
+        var top = win?.rootViewController
+        while let p = top?.presentedViewController { top = p }
+        return top
     }
 
     // MARK: Contacts
@@ -413,6 +510,14 @@ final class DeviceBridge: NSObject, ObservableObject {
 @available(iOS 26.0, *)
 struct AiwAlarmMeta: AlarmMetadata {}
 #endif
+
+extension DeviceBridge: MFMessageComposeViewControllerDelegate {
+    func messageComposeViewController(_ controller: MFMessageComposeViewController, didFinishWith result: MessageComposeResult) {
+        controller.dismiss(animated: true)
+        let w = smsWait; smsWait = nil
+        w?.resume(returning: result)
+    }
+}
 
 extension DeviceBridge: CLLocationManagerDelegate {
     func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {

@@ -254,6 +254,29 @@ def run_prompt(store, row: dict, signals: Optional[dict] = None) -> str:
     return f"{instr}\n\n【接着上次继续做】用户补充：{new}"
 
 
+def parent_contract(store, row: dict) -> dict:
+    """v3.9.29 (task-68b): the newest dev contract of an earlier run of this task (its source of truth, generator
+    command, deliverables, git/snapshot state), so a 继续 run does not lose the source the previous run found. {} if none."""
+    root = row.get("continues") or row.get("id")
+    if not root:
+        return {}
+    try:
+        runs = [r for r in (store.continuations(root) or []) if r.get("id") != row.get("id")]
+    except Exception:  # noqa: BLE001
+        runs = []
+    if not runs and root != row.get("id"):
+        runs = [store.task(root) or {}]
+    for r in reversed(runs):
+        c = store.kv_get(f"task_contract:{r.get('id')}") if r.get("id") else None
+        if isinstance(c, dict) and c.get("source_of_truth"):
+            keep = ("source_of_truth", "source_how", "generator_cmd", "generator_cmd_fast", "deliverables", "allowed_paths",
+                    "req_checks", "git")
+            out = {k: c.get(k) for k in keep if c.get(k)}
+            out["from_task"] = r.get("id")
+            return out
+    return {}
+
+
 def contract_prompt(old_instructions: str, new: str, voided: list) -> str:
     """v3.9.26: the continuation prompt when the job changed kind (see run_prompt)."""
     parts = ["【任务契约】这次是一个新的目标（修复/修改代码），以下面的「目标」为准。",

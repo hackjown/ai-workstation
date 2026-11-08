@@ -64,6 +64,14 @@ TOOLS: list[ToolSpec] = [
     ToolSpec("files_write", "files.write", "Write a text file in the VM workspace. append=true adds the content to the "
              "end of the file instead of replacing it (write a long file in parts, e.g. one sheet of plan.md per call).",
              {"path": {"type": "string"}, "content": {"type": "string"}, "append": {"type": "boolean"}}, ["path", "content"]),
+    ToolSpec("files_patch", "files.patch",
+             "Edit a text file IN PLACE by exact string replacement (v3.9.29): `old` must occur exactly `count` times "
+             "(default 1; 0 = every occurrence), it is replaced by `new` and a unified diff is returned. Use this to change "
+             "a source file (also the dev task contract's source files outside ~/workspace, e.g. ~/project/gen.py) instead "
+             "of writing a fix_*.py script. A count mismatch fails without changing the file and names the real count.",
+             {"path": {"type": "string"}, "old": {"type": "string", "description": "exact text to replace (copy it from the file)"},
+              "new": {"type": "string"}, "count": {"type": "integer", "description": "expected number of matches, default 1"},
+              "dry_run": {"type": "boolean"}}, ["path", "old", "new"]),
     ToolSpec("files_download", "files.download", "Download a URL into the VM workspace (downloads/).",
              {"url": {"type": "string"}, "path": {"type": "string"}}, ["url"]),
     ToolSpec("send_file", "files.read",
@@ -374,7 +382,7 @@ BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
 LOOP_TOOLS = {"verify_html", "done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
-SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_download", "done", "fail")
+SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_patch", "files_download", "done", "fail")
 
 
 def tool_schemas(extra: list[dict] | None = None, only: tuple[str, ...] | None = None,

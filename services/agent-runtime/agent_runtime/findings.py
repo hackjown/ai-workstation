@@ -15,7 +15,12 @@ about the HTML (steps 1-21) and the board filled with its own speculation. Findi
 ignores thoughts; from_result() records what a tool actually returned (a failing command's error, a verify_html
 result) with source "result".
 
-Pure, tested in tests/test_v3917_findings.py and tests/test_v3926_devflow.py.
+v3.9.29 (task-68b): facts can go stale. "源码共 303 行" stayed on the board after the source grew to 639 lines.
+* a new fact with the same wording but different numbers supersedes the old one (it is not a "repeat");
+* expire(pred) / expire_about(path) retire facts that a change made stale (the loop calls expire_about() after every
+  source write: facts naming that file, or the source's size/line count, are dropped from the board).
+
+Pure, tested in tests/test_v3917_findings.py, tests/test_v3926_devflow.py and tests/test_v3929_devflow_fixes.py.
 """
 from __future__ import annotations
 
@@ -97,7 +102,28 @@ class FindingsBoard:
         return f"F{len(self.items) + 1}"
 
     def live(self) -> list[dict]:
-        return [i for i in self.items if not i.get("replaced_by")]
+        return [i for i in self.items if not i.get("replaced_by") and not i.get("expired")]
+
+    def expire(self, pred, step: int = 0, reason: str = "") -> list[str]:
+        """Retire live facts for which pred(entry) is true; -> their ids."""
+        out = []
+        for i in self.live():
+            try:
+                hit = pred(i)
+            except Exception:  # noqa: BLE001
+                hit = False
+            if hit:
+                i["expired"], i["expired_step"], i["expired_reason"] = True, step, reason[:120]
+                out.append(i["id"])
+        return out
+
+    def expire_about(self, path: str, step: int = 0) -> list[str]:
+        """v3.9.29: after `path` changed, facts naming it, or giving the source's size / line count, are stale."""
+        import os as _os
+        name = _os.path.basename(str(path or "")).lower()
+        size = re.compile(r"(源码|源文件|源头|脚本|source|文件)[^。；;\n]{0,10}\d+\s*(行|lines?|KB|字节|bytes|个函数)", re.I)
+        return self.expire(lambda i: (name and name in i["text"].lower()) or bool(size.search(i["text"])),
+                           step, f"{name or 'source'} changed")
 
     def find(self, fid: str) -> Optional[dict]:
         fid = str(fid or "").strip().upper()
@@ -121,6 +147,16 @@ class FindingsBoard:
             old["replaced_by"] = new["id"]
             self.items.append(new)
             return "replaced", new
+        nums = re.findall(r"\d+(?:\.\d+)?", text)
+        for i in self.live():   # v3.9.29: same statement, other numbers -> the new reading supersedes the old one
+            old_nums = re.findall(r"\d+(?:\.\d+)?", i["text"])
+            if nums and old_nums and nums != old_nums and \
+                    similarity(re.sub(r"\d+(?:\.\d+)?", "#", i["text"]), re.sub(r"\d+(?:\.\d+)?", "#", text)) >= 0.75:
+                new = {"id": self._next_id(), "text": text, "step": step, "source": source, "repeats": 0,
+                       "replaces": i["id"], "evidence": str(evidence or "")[:300] or "newer reading"}
+                i["replaced_by"], i["superseded"] = new["id"], True
+                self.items.append(new)
+                return "replaced", new
         for i in self.live():
             if similarity(i["text"], text) >= self.DUP or (len(text) > 12 and text in i["text"]):
                 i["repeats"] = int(i.get("repeats") or 0) + 1

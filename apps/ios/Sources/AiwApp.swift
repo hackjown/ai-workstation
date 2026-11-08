@@ -30,7 +30,7 @@ struct AiwApp: App {
             // 3.8: aiw://task|takeover|monitor|chat… are push deep links (DeepLink.swift), the rest imports
             .onOpenURL { u in if !DeepLinks.shared.handle(u) { ImportCenter.shared.handle(u) } }
             .onChange(of: phase) { p in
-                if p == .active { ImportCenter.shared.collectShared(); if api.configured { DeviceBridge.shared.start() } }
+                if p == .active { ImportCenter.shared.collectShared(); if api.configured { DeviceBridge.shared.connectNow() } }   // v3.9.28: at once
                 if p == .background { DeviceBridge.shared.stop() }   // v3.9.27: iOS drops the socket anyway; calls queue on the server
             }
         }

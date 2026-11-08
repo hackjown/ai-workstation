@@ -19,6 +19,7 @@ import base64
 import glob
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -198,6 +199,74 @@ CLICK_JS = ("(function(s,i){const els=document.querySelectorAll(s);if(!els.lengt
             "return{found:els.length}})(%s,%d)")
 
 
+BG_JS = ("(function(){const b=document.body||document.documentElement,h=document.documentElement;const cb=getComputedStyle(b),"
+         "ch=getComputedStyle(h);return [cb.backgroundColor,ch.backgroundColor,cb.color].join('|')})()")
+MEDIA_JS = ("(function(){let n=0;for(const s of document.styleSheets){let r;try{r=s.cssRules}catch(e){continue}"
+            "for(const x of r){if(x.media&&/prefers-color-scheme/.test(x.media.mediaText))n++}}return n})()")
+FONT_JS = ("(function(s){const els=[...document.querySelectorAll(s)].filter(e=>e.offsetParent!==null||e.getClientRects().length);"
+           "const e=els[0]||document.querySelector(s);return e?getComputedStyle(e).fontFamily:null})(%s)")
+IMG_JS = ("(function(s){const els=[...document.querySelectorAll(s)];let loaded=0;for(const e of els){if(e.tagName==='IMG'){"
+          "if(e.naturalWidth>0||!e.complete)loaded++}else loaded++}return {n:els.length,loaded:loaded}})(%s)")
+TEXT_JS = "(document.documentElement.textContent||'')"
+
+
+def _norm_text(t):
+    return "".join(str(t or "").split()).lower()
+
+
+def eval_checks(cdp, checks, url, html=None):
+    """v3.9.29: requirement checks derived from the user's request (dev_contract.requirement_checks)."""
+    res = []
+    for c in checks or []:
+        if not isinstance(c, dict) or not c.get("kind"):
+            continue
+        r = {"id": c.get("id"), "label": c.get("label"), "ok": False}
+        k = c["kind"]
+        try:
+            if k == "dark_mode":
+                rules = cdp.js(MEDIA_JS) or 0
+                looks = {}
+                for mode in ("light", "dark"):
+                    cdp.call("Emulation.setEmulatedMedia", {"features": [{"name": "prefers-color-scheme", "value": mode}]})
+                    cdp.pump(0.15)
+                    looks[mode] = cdp.js(BG_JS)
+                cdp.call("Emulation.setEmulatedMedia", {"features": []})
+                r["ok"] = bool(looks.get("light")) and looks.get("light") != looks.get("dark")
+                r["detail"] = f"media rules={rules}; light={looks.get('light')}; dark={looks.get('dark')}"
+            elif k == "font":
+                fam = cdp.js(FONT_JS % json.dumps(c.get("selector") or "h1"))
+                want = [str(x).lower() for x in c.get("any_of") or []]
+                r["ok"] = bool(fam) and any(w in str(fam).lower() for w in want)
+                r["detail"] = f"font-family={fam}"
+            elif k in ("min_count", "selector"):
+                v = cdp.js(IMG_JS % json.dumps(c.get("selector") or "img"))
+                v = v if isinstance(v, dict) else {"n": 0, "loaded": 0}
+                r["ok"] = int(v.get("loaded") or 0) >= int(c.get("min") or 1)
+                r["detail"] = f"count={v.get('n')} loaded={v.get('loaded')} min={c.get('min') or 1}"
+            elif k == "text":
+                txt = cdp.js(TEXT_JS)
+                r["ok"] = _norm_text(c.get("contains")) in _norm_text(txt)
+                r["detail"] = ("found " if r["ok"] else "missing ") + repr(c.get("contains"))
+            elif k == "max_bytes":
+                n = os.path.getsize(url[7:]) if url.startswith("file://") else len((html or "").encode())
+                r["ok"] = n <= int(c.get("max") or 0)
+                r["detail"] = f"size={n} max={c.get('max')}"
+            elif k == "no_embedded_font":
+                body = html
+                if body is None and url.startswith("file://"):
+                    with open(url[7:], encoding="utf-8", errors="replace") as fh:
+                        body = fh.read()
+                hits = len(re.findall(r"@font-face[^}]*url\(\s*['\"]?data:|data:(font|application)/(woff2?|ttf|otf|x-font)", body or "", re.I))
+                r["ok"] = hits == 0
+                r["detail"] = f"embedded fonts={hits}"
+            else:
+                r["detail"] = "unknown check"
+        except Exception as e:  # noqa: BLE001
+            r["detail"] = f"{type(e).__name__}: {str(e)[:120]}"
+        res.append(r)
+    return res
+
+
 def to_url(target):
     t = str(target or "").strip()
     if t.startswith(("http://", "https://", "file://", "data:", "about:")):
@@ -265,6 +334,10 @@ def run(spec):
         for sel in spec.get("selectors") or []:
             v = cdp.js("document.querySelectorAll(%s).length" % json.dumps(sel))
             out["selectors"][sel] = v if isinstance(v, int) else -1
+        if spec.get("req_checks"):   # v3.9.29
+            html = None if url.startswith("file://") else cdp.js("document.documentElement.outerHTML")
+            out["checks"] = eval_checks(cdp, spec["req_checks"], url, html)
+            out["checks_ok"] = all(c.get("ok") for c in out["checks"])
         for c in spec.get("clicks") or []:
             if not isinstance(c, dict) or not c.get("click"):
                 continue
@@ -384,7 +457,7 @@ SCHEMA_DESC = ("Check an HTML page in a real headless Chromium (built in; use th
                "BrowserOS or CDP by hand). Loads `path` (file under ~/workspace or absolute) or `url`, returns JSON: "
                "console errors/exceptions, the count of each CSS selector in `selectors`, and for each item of `clicks` "
                "({click: selector, index, expect: selector that must become visible, min_text}) whether it worked, plus an "
-               "optional screenshot path. Hard timeout, the browser is always killed. Use it as the acceptance / "
+               "optional screenshot path; `req_checks` (added by the system for dev tasks) report each requirement as checks[]. Hard timeout, the browser is always killed. Use it as the acceptance / "
                "regression evidence of a dev fix.")
 
 if __name__ == "__main__":

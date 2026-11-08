@@ -186,6 +186,21 @@ def rabbit_note(idx: int, item: str, since: int) -> str:
             "for the same error.")
 
 
+def dev_stuck_detail(item: str, since: int, pattern: str = "") -> str:
+    """v3.9.29 (task-68b): the dev_rabbit card names the concrete loop instead of a generic "在打转"."""
+    base = f"修复「{item[:60]}」已经 {since} 步没有进展"
+    return base + (f"：{pattern}" if pattern else "")
+
+
+def dev_rabbit_note(pattern: str, source: str = "") -> str:
+    """v3.9.29: the step-back note of a dev_fix task, naming the pattern and the one way out."""
+    src = source or "the source of truth from the 【任务契约】"
+    head = f"STUCK PATTERN: {pattern}. " if pattern else ""
+    return (head + f"DEV FIX: stop writing patch scripts. Edit {src} directly with files_patch (exact old text -> new text, "
+            "it returns the diff), then run the generator once and verify with verify_html. If a script you already wrote "
+            "does the edit, RUN it now instead of writing another one. Do not diagnose again.")
+
+
 def snooze_steps() -> int:
     try:
         return max(0, int(os.environ.get("AIW_STUCK_SNOOZE", "30") or 0))

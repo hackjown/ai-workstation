@@ -49,6 +49,12 @@ final class DeepLinks: ObservableObject {
     /// true when the URL was a deep link (else it is an import / file for ImportCenter)
     @discardableResult
     func handle(_ url: URL) -> Bool {
+        // v3.9.28: aiw://open is the server's wake push for the phone fast path (it waits ~8 s): connect the device
+        // bridge at once; the app just comes to the foreground
+        if url.scheme?.lowercased() == "aiw", (url.host ?? "").lowercased() == "open" {
+            DispatchQueue.main.async { DeviceBridge.shared.connectNow() }
+            return true
+        }
         guard let t = DeepTarget(url) else { return false }
         DispatchQueue.main.async { self.pending = t }
         return true

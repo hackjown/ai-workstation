@@ -62,6 +62,15 @@ class LiveSession:
     pending_notes: list = field(default_factory=list)   # 补充要求 sent before the loop existed (3.8.5)
     allowed_scopes: set = field(default_factory=set)    # v3.9.17: "remote_diag:<host>" the user allowed once
     secret_values: list = field(default_factory=list)   # v3.9.17: this task's vault values, masked in every event
+    fast: bool = False                  # v3.9.28 手机快通道: runs in-process, never makes its computer busy
+
+
+class _FastDone(Exception):
+    """v3.9.28: the phone fast path finished the task without the computer."""
+
+    def __init__(self, status: str, result: str):
+        super().__init__(status)
+        self.status, self.result = status, result
 
 
 class SessionManager:
@@ -146,8 +155,12 @@ class SessionManager:
         name = route.get("model") or m.get("model")
         back = m.get("model") if name != m.get("model") else m.get("fallback")
         eff = route.get("effort") if route.get("effort") in ("low", "medium", "high") else None
-        thinking = "on" if eff else m.get("thinking")
-        route = {**route, "resolved_model": name}
+        thinking = "on" if (eff or route.get("thinking") == "on") else m.get("thinking")
+        route = {**route, "resolved_model": name, "thinking": thinking}
+        if route.get("by") == "dev":   # v3.9.29: which model a dev/fix run got, and a warning on a flash fallback
+            (log.warning if route.get("warning") else log.info)(
+                "task %s dev route -> %s (from %s, effort %s, thinking %s)%s", task.id, name,
+                route.get("model_source"), eff, thinking, " FLASH FALLBACK" if route.get("warning") else "")
         return LLMRouter.from_settings(name, back, key, m.get("base_url") or None, self._tool_choices(), thinking,
                                        effort=eff, role="main"), route
 
@@ -283,14 +296,15 @@ class SessionManager:
     # ------------------------------------------------------------------ submit / queue
     def busy_session(self, machine_id: str) -> Optional[LiveSession]:
         for s in self.live.values():
-            if s.task.machine_id == machine_id and s.runner and not s.runner.done():
+            if s.task.machine_id == machine_id and s.runner and not s.runner.done() and not s.fast:
                 return s
         return None
 
     async def submit(self, prompt: str, machine_id: Optional[str] = None, thread_id: Optional[str] = None,
                      source: str = "chat", max_steps: Optional[int] = None, timeout_s: Optional[float] = None, title: Optional[str] = None,
                      isolated: bool = False, context_extra: Optional[str] = None, continues: Optional[str] = None,
-                     link_thread: bool = True, model: Optional[str] = None, effort: Optional[str] = None) -> dict:
+                     link_thread: bool = True, model: Optional[str] = None, effort: Optional[str] = None,
+                     fast: Optional[str] = None) -> dict:
         """context_extra: background the task gets on top of its thread and memory (the chat turns before a task
         the persistent chat started); kept in kv so a queued task still has it when it starts.
         continues: the root task this run continues (3.8.5). A message in a task's thread (source chat, the task
@@ -334,6 +348,11 @@ class SessionManager:
         # every later message: it was queued with the computer idle and nothing (on iOS) could ever release it.
         if thread_id in self.held_threads and source not in ("resume", "dispatch"):
             self.held_threads.discard(thread_id)
+        if fast:   # v3.9.28 手机快通道: starts now, never queued behind a busy computer
+            self.store.kv_set(f"task_fast:{task.id}", {"path": fast})
+            await self._start_fast_row(self.store.task(task.id))
+            t = self.store.task(task.id)
+            return {"task": t, "session_id": t.get("session_id"), "queued": False, "thread_id": thread_id, "fast": fast}
         older = any(r["id"] != task.id and r["machine_id"] == machine_id and r.get("thread_id") not in self.held_threads
                     for r in self.store.tasks_by_status(("queued",)))
         queued = bool(self.busy_session(machine_id)) or thread_id in self.held_threads or older
@@ -347,6 +366,63 @@ class SessionManager:
             await self._event_all({"kind": "task", "task": self.store.task(task.id)})
         t = self.store.task(task.id)
         return {"task": t, "session_id": t.get("session_id"), "queued": queued, "thread_id": thread_id}
+
+    async def _start_fast_row(self, row: dict) -> LiveSession:
+        """v3.9.28: a phone fast-path task skips the heavy context build (it is done on escalation instead)."""
+        task = Task(id=row["id"], prompt=row["prompt"], machine_id=row["machine_id"], thread_id=row.get("thread_id"),
+                    source=row.get("source") or "chat", max_steps=row.get("max_steps") or 0, timeout_s=row.get("timeout_s") or 0)
+        task.context = self.store.kv_get(f"task_ctx:{row['id']}") or ""
+        return await self.start(task, allow_busy=True)
+
+    def _fast_llm(self, task: Task):
+        """The model for the phone fast loop: the small model when one is set, else the task's model."""
+        v24 = getattr(self, "v3924", None)
+        if v24 is not None:
+            with contextlib.suppress(Exception):
+                small = v24.small_llm()
+                if small is not None:
+                    return small
+        return self._task_llm(task.prompt)[0]
+
+    def _device_hub(self):
+        from . import device_bridge as _devb
+        return _devb.existing_hub(self.store)
+
+    async def _run_fast(self, task: Task, sid: str, live: "LiveSession", emit, confirm, ask) -> Optional[dict]:
+        """v3.9.28 手机快通道. Returns None when it escalated (the caller goes on with the computer path); raises
+        _FastDone when the phone finished it."""
+        from . import phone_fast as _pf
+        hub = self._device_hub()
+        tools = hub.tools(fast=True) if hub is not None else {}
+        await emit(AgentEvent(session_id=sid, type=EventType.TASK_STARTED, data={"prompt": task.prompt, "fast_path": "device"}))
+
+        async def note(text, data):
+            await emit(AgentEvent(session_id=sid, type=EventType.TOOL_CALL, data={"text": text, "fast_path": "device", **data}))
+        out = await _pf.run(task.prompt, self._fast_llm(task), tools, confirm, ask, note, context=task.context or "")
+        if out["status"] != "escalate":
+            log.info("phone_fast task=%s path=device status=%s", task.id, out["status"])
+            await emit(AgentEvent(session_id=sid, type=EventType.TASK_FINISHED, data={"result": out["result"], "fast_path": "device"}))
+            raise _FastDone(out["status"], out["result"])
+        log.info("phone_fast task=%s path=escalate reason=%s", task.id, out.get("reason"))
+        self.store.kv_set(f"task_fast:{task.id}", {"path": "device", "escalated": True, "reason": out.get("reason") or ""})
+        await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE,
+                              data={"text": f"手机做不了，转到电脑上继续：{out.get('reason') or ''}".strip("："), "fast_path": "escalate"}))
+        block = _pf.results_block(out.get("log") or [])
+        with contextlib.suppress(Exception):
+            ctx = self.build_context(task.thread_id, exclude_task=task.id, query=task.prompt)
+            if ctx:
+                task.context = (task.context + "\n\n" if task.context else "") + ctx
+        if block:
+            task.context = (task.context + "\n\n" if task.context else "") + block
+        live.fast = False   # from here on it is a normal computer task: wait for the computer to be free
+        while any(s is not live and s.task.machine_id == task.machine_id and s.runner and not s.runner.done() and not s.fast
+                  for s in self.live.values()):
+            await asyncio.sleep(1)
+        if not task.max_steps:
+            task.max_steps = _es.step_cap()
+        if not task.timeout_s:
+            task.timeout_s = _es.time_cap()
+        return out
 
     async def _start_task_row(self, row: dict, allow_busy: bool = False) -> LiveSession:
         if getattr(self, "memory", None) is not None:   # embeds the request when an embedding model is set
@@ -417,6 +493,12 @@ class SessionManager:
         if root_id:
             meta["old_instructions"] = _cont.instructions(self.store, self.store.task(root_id) or row)
             meta["git"] = self.store.kv_get(f"task_git:{root_id}") or {}
+            try:   # v3.9.29: the parent run's contract (source of truth / generator) carries over
+                meta["parent_contract"] = _cont.parent_contract(self.store, row)
+                if not meta["git"] and meta["parent_contract"].get("from_task"):
+                    meta["git"] = self.store.kv_get(f"task_git:{meta['parent_contract']['from_task']}") or {}
+            except Exception as e:  # noqa: BLE001
+                log.warning("parent contract: %s", e)
         task = Task(id=row["id"], prompt=run_prompt, machine_id=row["machine_id"], thread_id=row.get("thread_id"),
                     source=row.get("source") or "chat", max_steps=steps, timeout_s=secs, continues=root_id,
                     intent=info.get("intent"), meta=meta)
@@ -714,6 +796,7 @@ class SessionManager:
         self.store.set_task_session(task.id, sid)
         self.store.update_task(task.id, TaskStatus.RUNNING.value)
         live = LiveSession(sid, task, AgentControl())
+        live.fast = bool(self.store.kv_get(f"task_fast:{task.id}"))
         self.live[sid] = live
         with contextlib.suppress(Exception):   # v3.9.17: this task's vault values, masked in every event
             live.secret_values = self.task_secret_values(task.id)
@@ -906,6 +989,8 @@ class SessionManager:
             _usage.TASK.set(task.id)
             self.store.update_task(task.id, TaskStatus.RUNNING.value)
             try:
+                if live.fast:   # v3.9.28 手机快通道: no cloud.wake / cloud.hold, no AgentLoop unless it escalates
+                    await self._run_fast(task, sid, live, emit, confirm, ask)
                 # integrations (MCP servers) are loaded here, off the request path: POST /api/tasks returns at once
                 from .integrations import load_tools
                 try:
@@ -1080,6 +1165,8 @@ class SessionManager:
                             except Exception:  # noqa: BLE001
                                 pass
                 status, result = t.status.value, t.result
+            except _FastDone as fd:
+                status, result = fd.status, fd.result
             except Exception as e:  # noqa: BLE001
                 status, result = "failed", f"{type(e).__name__}: {e}"
             finally:
@@ -1101,7 +1188,7 @@ class SessionManager:
                     await cleanup()
                 except Exception as e:  # noqa: BLE001
                     log.warning("isolated cleanup: %s", e)
-            if status == "succeeded" and self.lessons is not None and not parent_id:
+            if status == "succeeded" and self.lessons is not None and not parent_id and not live.fast:
                 self._background(self._learn(task.id, getattr(getattr(live, "loop", None), "home", None)))
             if status == "succeeded":
                 await self._notify("done", "任务完成", result or "", task)

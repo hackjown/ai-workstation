@@ -103,11 +103,32 @@ def _mentions(command: str, path: str) -> bool:
     return False
 
 
-def producer_for(path: str, shell_log: list, home: str = "") -> Optional[dict]:
-    """shell_log: [{step, command, stdout}] oldest first. -> {script, command, step, how} or None."""
+def copy_source(command: str, target: str) -> Optional[str]:
+    """v3.9.29 (task-68b): `cp ~/aiw-news/a.html ~/workspace/a.html` -> the file the delivered copy came from."""
+    t = norm(target)
+    for m in re.finditer(r"\b(?:cp|rsync)\s+(?:-\w+\s+)*['\"]?([^\s;&|'\"]+)['\"]?\s+['\"]?([^\s;&|'\"]+)['\"]?", command or ""):
+        src, dst = norm(m.group(1)), norm(m.group(2))
+        if dst == t or (dst.endswith("/") and os.path.basename(src) == os.path.basename(t)) or \
+                (os.path.basename(dst) == os.path.basename(t) and (t.endswith(dst.lstrip("~")) or dst.endswith(t.lstrip("~")))):
+            return src
+        if os.path.basename(t) == os.path.basename(src) and dst.rstrip("/") == os.path.dirname(t):
+            return src
+    return None
+
+
+def producer_for(path: str, shell_log: list, home: str = "", _depth: int = 0) -> Optional[dict]:
+    """shell_log: [{step, command, stdout}] oldest first. -> {script, command, step, how} or None.
+    v3.9.29: a delivered COPY (cp gen-output ~/workspace/x) is traced back to the generator of the original."""
     target = norm(path, home)
     base = os.path.basename(target)
     for e in reversed(shell_log or []):
+        if _depth < 3:
+            src = copy_source(norm(str(e.get("command") or ""), home), target)
+            if src and src != target:
+                earlier = [x for x in shell_log if (x.get("step") or 0) <= (e.get("step") or 0)]
+                prod = producer_for(src, earlier, home, _depth + 1)
+                if prod:
+                    return {**prod, "how": "copy", "copy_of": src}
         cmd = str(e.get("command") or "")
         out = str(e.get("stdout") or "")
         for f in json_file_line(out):
@@ -289,7 +310,21 @@ def adhoc_patch_script(tool: str, args: dict) -> Optional[str]:
     return None
 
 
-def adhoc_warning(path: str, generator: Optional[str]) -> str:
+def script_targets(content: str, sources) -> Optional[str]:
+    """v3.9.29: the contract source a side script edits (it names the source and writes/replace()s it), else None."""
+    for src in sources or ():
+        if src and code_writes(content, src):
+            return src
+        if src and _mentions(content or "", src) and re.search(r"\.replace\(|re\.sub\(|write_text|\.write\(", content or ""):
+            return src
+    return None
+
+
+def adhoc_warning(path: str, generator: Optional[str], targets_source: Optional[str] = None) -> str:
+    if targets_source:   # v3.9.29: editing the real source is right — just do it directly, and run what you write
+        return (f"NOTE: {path} edits the contract source {targets_source}. That is the right file, but edit it directly "
+                f"with files_patch (path={targets_source}, old=<exact text>, new=<replacement>) instead of a side script; "
+                "if you keep the script, RUN it in your very next step.")
     return (f"WARNING: {path} looks like an ad-hoc patch script. Patching a generated file with a side script loses the "
             "change the next time the generator runs (task-830). Put the change into the source "
             + (f"({generator}) " if generator else "") + "and re-run the generator instead.")

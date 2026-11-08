@@ -36,7 +36,7 @@ class DeviceActivity : AppCompatActivity() {
         status = TextView(this).apply { textSize = 14f }
         col.addView(status)
         col.addView(TextView(this).apply {
-            text = "新建日程、写健康数据、设闹钟前，都会先在 Aiw 里弹确认卡片。Aiw 不在前台时，Agent 的调用会在服务器排队，推送提醒你打开 App。"
+            text = "新建日程、写健康数据、设闹钟、打电话、发短信前，都会先在 Aiw 里弹确认卡片。Aiw 不在前台时，Agent 的调用会在服务器排队，推送提醒你打开 App。"
             textSize = 13f; setPadding(0, pad / 2, 0, pad)
         })
         for ((cap, label) in DeviceBridge.CAPS) {
@@ -53,6 +53,8 @@ class DeviceActivity : AppCompatActivity() {
         when (cap) {
             "calendar.read", "calendar.write" -> perms.launch(arrayOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR))
             "contacts.read" -> perms.launch(arrayOf(Manifest.permission.READ_CONTACTS))
+            "phone.call" -> perms.launch(arrayOf(Manifest.permission.CALL_PHONE, Manifest.permission.READ_CONTACTS))   // v3.9.28
+            "sms.send" -> perms.launch(arrayOf(Manifest.permission.SEND_SMS))
             "location.read" -> perms.launch(arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION))
             "health.read" -> if (bridge.healthAvailable()) healthPerms.launch(healthRead)
             "health.write" -> if (bridge.healthAvailable()) healthPerms.launch(healthWrite)

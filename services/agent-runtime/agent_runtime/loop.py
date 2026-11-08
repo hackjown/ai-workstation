@@ -215,7 +215,7 @@ class AgentLoop:
         """A guessed home (/home/user/workspace on a computer whose home is /data/home) becomes the real one.
         task-7bd: the model hard-coded /home/user/workspace in a python-docx script and the save failed."""
         home = (self.home or "").rstrip("/")
-        if not home or tool not in ("shell", "files_write", "files_read", "files_list", "send_file") or not isinstance(args, dict):
+        if not home or tool not in ("shell", "files_write", "files_patch", "files_read", "files_list", "send_file") or not isinstance(args, dict):
             return args, False
         changed = False
         out = dict(args)
@@ -499,11 +499,11 @@ class AgentLoop:
                                                        getattr(self, "_last_page", None)))
         if plan_job and not plan_job.done():
             plan_job.cancel()
-        if (self.task.status == TaskStatus.FAILED and self.dev.git.get("repo")
+        if (self.task.status == TaskStatus.FAILED and (self.dev.git.get("repo") or self.dev.git.get("mode") == "copy")
                 and os.environ.get("AIW_DEV_ROLLBACK_ON_FAIL", "0") == "1"):   # v3.9.26: optional automatic rollback
             try:
-                r = await self._sys_shell(_git.command("rollback", {**{k: self.dev.git.get(k) for k in (
-                    "repo", "base", "branch", "orig_branch", "snapshot")}, "task": self._root_id or self.task.id}), 90)
+                r = await self._sys_shell(_git.command("rollback", {**{k: self.dev.git.get(k) for k in _git.STATE_KEYS},
+                                                                    "task": self._root_id or self.task.id}), 90)
                 rb = _git.parse(r.get("stdout") or "") if r else {}
                 if rb.get("ok"):
                     self.dev.git.update(rolled_back=True, rollback=rb)
@@ -708,8 +708,15 @@ class AgentLoop:
                 cur = next((i for i in range(len(self.plan_steps)) if i not in self.plan_done), 0)
                 item = (self.plan_steps[cur] if self.plan_steps else
                         str((self.dev.contract or {}).get("goal") or self.task.prompt or ""))
-                if since >= 2 * rab:
+                pattern = self.dev.stuck_text() if is_dev else ""
+                # v3.9.29 (task-68b): a concrete stuck pattern (4 scripts written unexecuted, the same edit 4x,
+                # alternating approaches) asks at once instead of waiting for 2x the step threshold
+                hard_stuck = is_dev and self.dev.stuck_ask() and self.step >= getattr(self, "_dev_stuck_asked", -1)
+                if since >= 2 * rab or (hard_stuck and since >= max(3, rab // 3)):
+                    if hard_stuck:
+                        self._dev_stuck_asked = self.step + 2 * rab
                     n = await self._escalate("dev_rabbit" if is_dev else "rabbit",
+                                             _es.dev_stuck_detail(item, since, pattern) if is_dev else
                                              f"计划第 {cur + 1} 项「{item[:60]}」已经做了 {since} 步还没完成")
                     if n is None:
                         return
@@ -720,8 +727,7 @@ class AgentLoop:
                     self._rabbit_nudged = self.step
                     note = ((note + "\n") if note else "") + _es.rabbit_note(cur, item, since)
                     if is_dev:
-                        note += ("\nDEV FIX: the fix belongs in the source of truth from the 【任务契约】. If the cause is "
-                                 "known, edit the source NOW, regenerate and verify with verify_html; do not diagnose again.")
+                        note += "\n" + _es.dev_rabbit_note(pattern, str((self.dev.contract or {}).get("source_of_truth") or ""))
             t0 = getattr(self, "_t0", None)
             if t0 and self.cfg.timeout_s > 0 and not self._time_asked and self.ask and (getattr(self, "_time_up", False) or (
                     self.cfg.timeout_s + self._waited - (time.monotonic() - t0)) < min(90.0, 0.15 * self.cfg.timeout_s)):
@@ -960,7 +966,7 @@ class AgentLoop:
             # v3.9.26 (task-830): a dev_fix done needs a real source change, a regenerated artifact and acceptance +
             # regression evidence (devflow.py); bounded, then it goes through with 已知问题
             if decision.tool == "done" and self._intent == _in.DEV_FIX and os.environ.get("AIW_DEV_GATE", "1") != "0":
-                ok_done, dnote, dmsg = await self._dev_done_gate()
+                ok_done, dnote, dmsg = await self._dev_done_gate(str((decision.args or {}).get("summary") or ""))
                 if not ok_done:
                     await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
                     await self.emit(EventType.VALIDATION, success=False, change=0.0, message=dmsg)
@@ -1142,6 +1148,11 @@ class AgentLoop:
                 if wrapped != run_args.get("command"):
                     run_args = dict(run_args, command=wrapped)
                     self.history.append(f"{self.step}. (browser/render command wrapped with timeout -k 5 {_es.render_timeout()})")
+            if decision.tool == "files_patch" and isinstance(run_args, dict):
+                # v3.9.29: outside ~/workspace only on the dev contract's own sources (the model cannot set this)
+                run_args = {k: v for k, v in run_args.items() if k != "allow_outside"}
+                if self.dev.patch_allowed(str(run_args.get("path") or "")):
+                    run_args["allow_outside"] = True
             if fixed:
                 self.history.append(f"{self.step}. (path fixed: /home/user/workspace → {self.home}/workspace; "
                                     "write ~/workspace next time)")
@@ -1270,8 +1281,13 @@ class AgentLoop:
                         return
                     note, failures = n, 0
                     continue
+                src = str((self.dev.contract or {}).get("source_of_truth") or "") if self._intent == _in.DEV_FIX else ""
                 note = (f"Your last {decision.tool} call had no arguments ({outcome.error}). Call it again WITH the "
-                        "required arguments. If the content is long, use files_write to save a script first, then run it.")
+                        "required arguments. " + (
+                            f"To change the source ({src}) use files_patch with a SHORT exact `old` snippet and its `new` "
+                            "text (several small patches instead of one huge call); do not write a fix_*.py script."
+                            if src else "If the content is long, use files_write to save a script first, then RUN it in "
+                            "your very next step (shell python3 <file>)."))
                 continue
             if outcome.decision.forbidden or (outcome.decision.needs_confirm and not outcome.success):
                 failures += 1
@@ -1592,8 +1608,20 @@ class AgentLoop:
         thread has none, the git snapshot/branch, and a confirmation card when the change is large or unclear.
         False = the user declined (the task stops)."""
         meta = getattr(self.task, "meta", None) or {}
+        runs = list(((meta.get("signals") or {}).get("script_runs")) or [])
+        prev = meta.get("parent_contract") or {}
         c = _dc.build(self.task.prompt or "", self.task.context or "", self.dev.book, self.dev.baselines,
-                      str(meta.get("old_instructions") or ""))
+                      str(meta.get("old_instructions") or ""), script_runs=runs, prev=prev)
+        if c.get("source_of_truth") and c.get("generator_cmd") and re.search(r"\.(py|js|mjs|ts|sh)$", c["source_of_truth"]):
+            # v3.9.29: does the generator support a cache/fast flag? (grep its source on the computer)
+            flags = "|".join(_dc.FAST_FLAGS)
+            src_q = c["source_of_truth"].replace("~", "$HOME", 1) if c["source_of_truth"].startswith("~") else \
+                __import__("shlex").quote(c["source_of_truth"])
+            r = await self._sys_shell("grep -oE -- " + __import__("shlex").quote("(" + flags + ")") + " " + src_q
+                                      + " 2>/dev/null | sort -u | head -5", 20)
+            found = [x.strip() for x in str((r or {}).get("stdout") or "").splitlines() if x.strip()]
+            if found:
+                c["generator_cmd_fast"] = _dc.fast_cmd(c.get("generator_cmd"), found)
         self.dev.contract = c
         for d in (c.get("deliverables") or [])[-1:]:
             if not (self.dev.baselines.get(d)):
@@ -1611,21 +1639,30 @@ class AgentLoop:
         if c.get("source_of_truth") and os.environ.get("AIW_DEV_GIT", "1") != "0":
             prev = meta.get("git") or {}
             r = await self._sys_shell(_git.command("start", {"path": c["source_of_truth"], "task": self._root_id or self.task.id,
-                                                             "prev": prev}), 60)
+                                                             "prev": meta.get("git") or {},
+                                                             "files": [x for x in c.get("allowed_paths") or []
+                                                                       if _pv.SOURCE_EXT.search(x)]}), 60)
             g = _git.parse(r.get("stdout") or "") if r else {}
             if g.get("ok"):
                 g["machine_id"] = self.task.machine_id
                 self.dev.git = g
-                c["git"] = {k: g.get(k) for k in ("repo", "base", "branch", "orig_branch", "snapshot")}
+                c["git"] = {k: g.get(k) for k in _git.STATE_KEYS if k != "files"}
                 self._persist("git", dict(g))
         self._persist("contract", c)
         lines = [f"任务契约（修复代码）：{c.get('goal')[:120]}"]
         if c.get("source_of_truth"):
-            lines.append(f"源头：{c['source_of_truth']}")
+            lines.append(f"源头：{c['source_of_truth']}" + {"named": "（你在请求里点名的脚本）", "parent": "（沿用上一轮的契约）",
+                                                              "provenance": "（生成交付物的脚本）"}.get(c.get("source_how") or "", ""))
+        if c.get("generator_cmd_fast"):
+            lines.append(f"迭代用快速生成：{c['generator_cmd_fast']}（done 前完整跑一次）")
+        if c.get("req_checks"):
+            lines.append("需求检查：" + "、".join(r["label"] for r in c["req_checks"][:10]))
         if c.get("voided_constraints"):
             lines.append("已失效的旧约束：" + "；".join(c["voided_constraints"]))
         if (c.get("git") or {}).get("branch"):
             lines.append(f"Git：已记录 {str(c['git'].get('base'))[:10]}，在分支 {c['git']['branch']} 上修改")
+        elif (c.get("git") or {}).get("mode") == "copy":
+            lines.append(f"快照：源文件已复制到 {c['git'].get('snapdir')}（不在平台仓库上建分支），可一键回滚")
         await self.emit(EventType.MESSAGE, text="\n".join(lines), contract=c, intent=self._intent_info)
         self.history.append("0. DEV FIX: the 【任务契约】 in the task text is binding: edit the source of truth, regenerate, "
                             "verify with verify_html, never patch the generated file.")
@@ -1666,8 +1703,9 @@ class AgentLoop:
         c = self.dev.contract or {}
         changed, stat = None, ""
         g = self.dev.git
-        if g.get("repo") and g.get("base"):
-            r = await self._sys_shell(_git.command("status", {"repo": g["repo"], "base": g["base"],
+        if (g.get("repo") and g.get("base")) or g.get("mode") == "copy":
+            r = await self._sys_shell(_git.command("status", {"repo": g.get("repo"), "base": g.get("base"),
+                                                              "mode": g.get("mode"), "files": g.get("files"),
                                                               "paths": c.get("allowed_paths") or []}), 60)
             st = _git.parse(r.get("stdout") or "") if r else {}
             if st.get("ok"):
@@ -1686,7 +1724,7 @@ class AgentLoop:
                 losses = _fpm.diff(base, new, c.get("allow_remove"))
         return changed, losses, stat
 
-    async def _dev_done_gate(self) -> tuple[bool, Optional[str], Optional[str]]:
+    async def _dev_done_gate(self, summary: str = "") -> tuple[bool, Optional[str], Optional[str]]:
         try:
             changed, losses, stat = await self._dev_facts()
         except (StopRequested, asyncio.CancelledError):
@@ -1695,19 +1733,20 @@ class AgentLoop:
             __import__("logging").getLogger("aiw.loop").warning("dev facts: %s", e)
             changed, losses, stat = None, [], ""
         self.dev.git["stat"] = stat or self.dev.git.get("stat", "")
-        return self.dev.done_gate(changed, losses)
+        return self.dev.done_gate(changed, losses, summary)
 
     async def _dev_finish(self, summary: str) -> str:
         """A dev_fix done that passed (or was let through): commit on the aiw branch, add diff --stat, commit id and
         any 已知问题 to the summary."""
         out = summary + self.dev.known_tail()
         g = self.dev.git
-        if g.get("repo") and os.environ.get("AIW_DEV_COMMIT", "1") != "0":
+        if (g.get("repo") or g.get("mode") == "copy") and os.environ.get("AIW_DEV_COMMIT", "1") != "0":
             goal = str((self.dev.contract or {}).get("goal") or self.task.prompt or "")
             msg = "aiw: " + re.sub(r"\s+", " ", goal)[:72] + f"\n\n{goal[:1500]}\n\nTask: {self.task.id}"
             if self.dev.known_issues:
                 msg += "\nKnown issues: " + "; ".join(self.dev.known_issues)[:800]
-            r = await self._sys_shell(_git.command("commit", {"repo": g["repo"], "base": g.get("base"), "message": msg,
+            r = await self._sys_shell(_git.command("commit", {"repo": g.get("repo"), "base": g.get("base"), "message": msg,
+                                                              "mode": g.get("mode"), "files": g.get("files"),
                                                               "paths": (self.dev.contract or {}).get("allowed_paths") or []}), 90)
             cm = _git.parse(r.get("stdout") or "") if r else {}
             if cm.get("ok"):
@@ -1733,6 +1772,10 @@ class AgentLoop:
                 self._guard_note = ((self._guard_note + "\n") if self._guard_note else "") + n
                 await self.emit(EventType.VALIDATION, success=False, change=0.0,
                                 message="已确认结论：下一步必须动手修改" if n.startswith("已确认结论") else "验证方法已熔断：改用 verify_html")
+            for p in sorted(self.dev.just_written):   # v3.9.29: facts about a source that just changed are stale
+                gone = self.findings.expire_about(p, self.step)
+                if gone:
+                    self.history.append(f"{self.step}. (findings {', '.join(gone)} expired: {Path(p).name} changed)")
             if self._intent == _in.DEV_FIX and not ok:
                 n0 = len(self.findings.items)
                 self.findings.from_result(decision.tool, run_args if isinstance(run_args, dict) else {}, ok,
@@ -1779,6 +1822,8 @@ class AgentLoop:
                 await self.emit(EventType.ACTION_RESULT, tool="verify_html", success=False, error="missing path", result={})
                 return "FAILED: verify_html needs `path` (or `url`)"
         chk = c.get("checks") or {}
+        if self._intent == _in.DEV_FIX and c.get("req_checks"):   # v3.9.29 requirement-derived checks ride along
+            spec["req_checks"] = c["req_checks"]
         if self._intent == _in.DEV_FIX and chk.get("selectors"):   # the contract's regression selectors always ride along
             spec["selectors"] = list(dict.fromkeys(list(spec.get("selectors") or []) + chk["selectors"]))
             spec["min_counts"] = {**chk.get("min_counts", {}), **(spec.get("min_counts") or {})}
@@ -1792,7 +1837,9 @@ class AgentLoop:
                         result=_short({"ok": res.get("ok"), "url": res.get("url"), "error": res.get("error"),
                                        "console_errors": len(res.get("console_errors") or []),
                                        "clicks": json.dumps(res.get("clicks") or [], ensure_ascii=False),
-                                       "selectors": json.dumps(res.get("selectors") or {}, ensure_ascii=False)}),
+                                       "selectors": json.dumps(res.get("selectors") or {}, ensure_ascii=False),
+                                       "checks": json.dumps([(x.get("id"), x.get("ok")) for x in res.get("checks") or []],
+                                                            ensure_ascii=False)}),
                         tool_ms=int((time.monotonic() - t0) * 1000))
         if self._intent == _in.DEV_FIX:
             n0 = len(self.findings.items)

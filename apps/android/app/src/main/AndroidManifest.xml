@@ -16,6 +16,11 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <!-- v3.9.28 手机快通道: phone_call dials directly with CALL_PHONE (else the dialer), sms_send sends with SEND_SMS
+         (else the SMS app); both optional and asked only when switched on in 设备能力 -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
     <uses-permission android:name="android.permission.health.READ_STEPS" />
     <uses-permission android:name="android.permission.health.READ_SLEEP" />
     <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
@@ -25,6 +30,9 @@
     <queries>
         <package android:name="com.google.android.apps.healthdata" />
         <intent><action android:name="android.intent.action.SET_ALARM" /></intent>
+        <intent><action android:name="android.intent.action.DIAL" /><data android:scheme="tel" /></intent>
+        <intent><action android:name="android.intent.action.CALL" /><data android:scheme="tel" /></intent>
+        <intent><action android:name="android.intent.action.SENDTO" /><data android:scheme="smsto" /></intent>
     </queries>
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />

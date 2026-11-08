@@ -44,7 +44,7 @@ def _scan(store, thread_id: Optional[str], exclude: set) -> dict:
             continue
         acts: dict = {}
         for e in _events(store, row["session_id"]):
-            d = e.get("data") if isinstance(e.get("data"), dict) else {}
+            d = e.get("data") if isinstance(e.get("data"), dict) else e   # v3.9.29: exported/flattened events too
             typ, st = e.get("type"), e.get("step")
             if typ == "agent.decision" and d.get("tool"):
                 acts[st] = {"tool": d.get("tool"), "args": d.get("args") or {}}
@@ -55,11 +55,16 @@ def _scan(store, thread_id: Optional[str], exclude: set) -> dict:
                 res = d.get("result") if isinstance(d.get("result"), dict) else {}
                 if a["tool"] == "shell":
                     cmd = str((a["args"] or {}).get("command") or "")
+                    cwd = str((a["args"] or {}).get("cwd") or "").strip()
+                    if cwd and not re.match(r"\s*cd\s", cmd):   # v3.9.29: the shell tool's cwd = a leading cd
+                        cmd = f"cd {cwd} && {cmd}"
                     shell_log.append({"step": st, "command": cmd, "stdout": str(res.get("stdout") or "")})
-                    sc = _pv.script_of(cmd)
-                    if sc and sc not in out["script_runs"]:
+                    from agent_runtime import devflow as _rdf   # every script of `cd X && python3 Y.py && …`
+                    for sc in _rdf.scripts_run(cmd) or [x for x in [_pv.script_of(cmd)] if x]:
+                        if sc in out["script_runs"]:
+                            out["script_runs"].remove(sc)   # newest last
                         out["script_runs"].append(sc)
-                        if not sc.startswith("~/workspace") and "/workspace/" not in sc:
+                        if not sc.startswith("~/workspace") and "/workspace/" not in sc and sc not in out["repo_paths"]:
                             out["repo_paths"].append(sc)
                 elif a["tool"] == "send_file" and d.get("success"):
                     p = str(res.get("path") or (a["args"] or {}).get("path") or "")
@@ -155,7 +160,7 @@ def git_state(store, task_id: str) -> Optional[dict]:
     for k in (task_id, t.get("continues")):
         if k:
             g = store.kv_get(f"task_git:{k}")
-            if g and g.get("repo"):
+            if g and (g.get("repo") or g.get("mode") == "copy"):
                 return g
     return None
 
@@ -176,8 +181,7 @@ async def rollback(sessions, task_id: str) -> dict:
         if live and live.runner and not live.runner.done():
             raise RuntimeError("任务还在运行，先停止再回滚")
     comp = sessions.computer(g.get("machine_id") or t.get("machine_id"))
-    cmd = _git.command("rollback", {**{k: g.get(k) for k in ("repo", "base", "branch", "orig_branch", "snapshot")},
-                                    "task": root})
+    cmd = _git.command("rollback", {**{k: g.get(k) for k in _git.STATE_KEYS}, "task": root})
     r = await comp.execute("shell.exec", {"command": cmd, "timeout": 90}, observe=False, timeout=110)
     res = _git.parse((r.result or {}).get("stdout") if isinstance(r.result, dict) else "")
     if res.get("ok"):

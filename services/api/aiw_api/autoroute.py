@@ -15,6 +15,13 @@ v3.9.26 (task-830 ran a 98-step code fix on deepseek-v4.1-flash with thinking of
 This route applies even when tier routing is off (kv autoroute.dev.enabled, default on; AIW_DEV_ROUTE=0 turns it off).
 The model: autoroute.dev.model, else models.dev_model / models.strong_model, else AIW_DEV_MODEL, else the hard tier's
 model, else the main model (then only thinking/effort change). Effort: autoroute.dev.effort, else AIW_DEV_EFFORT, else high.
+
+v3.9.29 (task-68b: the dev route had no dev model set and fell back to the main deepseek-v4.1-flash, which wrote 11 patch
+scripts it never ran): before the main model the chain now tries the configured fallback model (models.fallback, e.g.
+deveco-glm-5.3) when the main model is a flash/lite/mini class model, so a dev/fix run never lands on a flash model while
+a stronger one is configured. Thinking is always on for the dev route. The route carries `model_source` (which setting
+chose it) and `warning` when the dev route still ends on a flash-class model (shown on the timeline and logged).
+Flash models stay for routine/chat tiers.
 """
 from __future__ import annotations
 
@@ -148,20 +155,59 @@ def dev_on(store) -> bool:
     return bool(cfg(store)["dev"].get("enabled", True))
 
 
-def dev_route(store, why: str) -> dict:
-    """v3.9.26: the strongest configured model, thinking on (see the module doc)."""
+FLASH_RE = re.compile(r"flash|lite|mini|small|haiku|nano|tiny|turbo|air\b|8b\b|7b\b", re.I)
+
+
+def is_flash(model: str) -> bool:
+    """v3.9.29: a cheap/fast model class that should not run a dev/fix task when something stronger is configured."""
+    return bool(model) and bool(FLASH_RE.search(str(model)))
+
+
+def dev_model_chain(store) -> list[tuple[str, str]]:
+    """[(model, which setting)] in the order the dev route tries them (empty values dropped)."""
     c = cfg(store)
     m = {}
     try:
         m = store.kv_get("models", {}) or {}
     except Exception:  # noqa: BLE001
         pass
-    model = (c["dev"].get("model") or m.get("dev_model") or m.get("strong_model") or os.environ.get("AIW_DEV_MODEL")
-             or (c["tiers"].get("hard") or {}).get("model") or "")
+    chain = [(c["dev"].get("model"), "autoroute.dev.model"), (m.get("dev_model"), "models.dev_model"),
+             (m.get("strong_model"), "models.strong_model"), (os.environ.get("AIW_DEV_MODEL"), "AIW_DEV_MODEL"),
+             ((c["tiers"].get("hard") or {}).get("model"), "autoroute.tiers.hard.model")]
+    main = m.get("model") or os.environ.get("AIW_MODEL") or ""
+    fb = m.get("fallback") or ""
+    if fb and fb != main and (is_flash(main) or not main):   # task-68b: deveco-glm-5.3 before the flash main model
+        chain.append((fb, "models.fallback"))
+    chain.append((main, "models.model"))
+    out, seen = [], set()
+    for v, k in chain:
+        v = str(v or "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append((v, k))
+    return out
+
+
+def dev_route(store, why: str) -> dict:
+    """v3.9.26/v3.9.29: the strongest configured model, thinking on (see the module doc)."""
+    c = cfg(store)
+    chain = dev_model_chain(store)
+    # a non-flash candidate wins over a flash one even when the flash one comes first in the chain
+    pick = next(((v, k) for v, k in chain if not is_flash(v)), chain[0] if chain else ("", ""))
+    model, source = pick
     effort = c["dev"].get("effort") or os.environ.get("AIW_DEV_EFFORT") or "high"
     if effort in ("", "off"):
         effort = os.environ.get("AIW_DEV_EFFORT") or "high"
-    return {"tier": "dev", "tier_cn": "修复代码", "model": model, "effort": effort, "by": "dev", "reason": why}
+    r = {"tier": "dev", "tier_cn": "修复代码", "model": model if source != "models.model" else "",
+         "effort": effort, "thinking": "on", "by": "dev", "reason": why, "model_source": source or "models.model",
+         "dev_model": model}
+    if not model or is_flash(model):
+        r["warning"] = (f"修复代码的任务仍在用 {model or '主模型'}（快速/轻量模型），容易反复写脚本不执行、原地打转。"
+                        "请在 设置 › 模型路由 › 修复代码 填一个强模型（kv autoroute.dev.model 或 models.dev_model）。")
+        log.warning("dev route falls back to a flash-class model: %s (%s)", model or "main", source or "-")
+    else:
+        log.info("dev route: %s (from %s), effort %s, thinking on", model, source, effort)
+    return r
 
 
 async def decide(store, text: str, small_llm=None, manual_model: str = "", manual_effort: str = "",
@@ -194,7 +240,12 @@ def label(route: dict, main_model: str = "") -> str:
     m = route.get("model") or main_model or "主模型"
     eff = route.get("effort") or "off"
     eff_cn = {"off": "默认", "": "默认", "low": "低", "medium": "中", "high": "高"}.get(eff, eff)
-    return f"模型路由：{route.get('tier_cn')} → {m} · 推理强度 {eff_cn}（{route.get('reason')}）"
+    s = f"模型路由：{route.get('tier_cn')} → {m} · 推理强度 {eff_cn}（{route.get('reason')}）"
+    if route.get("by") == "dev":   # v3.9.29: say which setting chose the dev model, and warn on a flash fallback
+        s += f" · 来源 {route.get('model_source') or 'models.model'} · 思考 开"
+        if route.get("warning"):
+            s += "\n⚠ " + route["warning"]
+    return s
 
 
 try:   # 设置 › 提示词

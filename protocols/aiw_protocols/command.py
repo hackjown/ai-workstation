@@ -49,6 +49,7 @@ class ActionType(str, Enum):
     FILES_LIST = "files.list"
     FILES_READ = "files.read"
     FILES_WRITE = "files.write"
+    FILES_PATCH = "files.patch"  # v3.9.29: exact string replace with an expected match count, returns a diff
     FILES_DOWNLOAD = "files.download"
     FILES_UPLOAD = "files.upload"
     # system
@@ -83,6 +84,7 @@ PAYLOAD_SCHEMA: dict[str, list[str]] = {
     ActionType.FILES_LIST.value: ["path"],
     ActionType.FILES_READ.value: ["path"],
     ActionType.FILES_WRITE.value: ["path", "content"],
+    ActionType.FILES_PATCH.value: ["path", "old", "new"],
     ActionType.FILES_DOWNLOAD.value: ["url"],
     ActionType.FILES_UPLOAD.value: ["path", "content_b64"],
 }

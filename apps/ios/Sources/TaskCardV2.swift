@@ -37,6 +37,10 @@ func promptLine(_ s: String) -> String {
 /// a plain string field, never "<null>" (a JSON null reads as NSNull)
 func jstr(_ d: JSON, _ k: String) -> String { (d[k] as? String) ?? "" }
 
+/// v3.9.28 手机快通道: the task runs on the phone (card data.fast_path == "device"): no computer bar, no 接管,
+/// a 手机 label. "escalated" (handed to the computer) shows the normal card.
+func cardOnPhone(_ d: JSON) -> Bool { jstr(d, "fast_path") == "device" }
+
 /// A follow-up typed on a card: 修改后重新发布 (edit) or 补充 (instruct).
 struct CardTextAsk: Identifiable {
     let ask: TaskTextAsk
@@ -124,10 +128,12 @@ struct TaskCardHead: View {
                     Text(promptLine(jstr(d, "prompt"))).font(.caption).foregroundColor(.secondary).lineLimit(1)
                 }
                 CardSubLine(msg: msg).foregroundColor(cardAccent(tone, cs))
-                if !d.s("machine_name").isEmpty {   // aiw-roles-1: the computer (and its role) this task runs on
+                if cardOnPhone(d) {   // v3.9.28
+                    Label("手机", systemImage: "iphone").font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                } else if !d.s("machine_name").isEmpty {   // aiw-roles-1: the computer (and its role) this task runs on
                     Label(d.s("machine_name"), systemImage: "desktopcomputer").font(.caption2).foregroundColor(.secondary).lineLimit(1)
                 }
-                if isLive(st) { CardProgress(frac: frac(d, st), tone: tone).padding(.top, 3) }
+                if isLive(st) && !cardOnPhone(d) { CardProgress(frac: frac(d, st), tone: tone).padding(.top, 3) }
             }
             Spacer(minLength: 4)
             Chip(text: cardChip(st), color: tone == .failed ? cardRed : (cs == .dark ? hAmber : hHLLight), dot: true)
@@ -164,7 +170,7 @@ struct CardSubLine: View {
             parts.append(durText(end - start))
         }
         if st == "queued" { parts.append("点开可立即发送或删除") }
-        return parts.isEmpty ? "交给电脑的任务" : parts.joined(separator: " · ")
+        return parts.isEmpty ? (cardOnPhone(d) ? "在手机上处理" : "交给电脑的任务") : parts.joined(separator: " · ")
     }
 }
 
@@ -237,7 +243,9 @@ struct CardActionView: View {
             }.controlSize(.small).disabled(busy)
         case "takeover":
             HStack {
-                Button { open(true) } label: { Label("接管桌面", systemImage: "hand.raised.fill") }.buttonStyle(.borderedProminent).tint(amber)
+                if !cardOnPhone(card.o("data")) {   // v3.9.28: nothing to take over on the phone path
+                    Button { open(true) } label: { Label("接管桌面", systemImage: "hand.raised.fill") }.buttonStyle(.borderedProminent).tint(amber)
+                }
                 Button("完成，继续") { go(["choice": "done"]) }.buttonStyle(.bordered)
             }.controlSize(.small).disabled(busy)
         case "form":

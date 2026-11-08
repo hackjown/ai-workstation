@@ -59,6 +59,12 @@ class MainActivity : AppCompatActivity() {
     private var pendingWebPermission: PermissionRequest? = null
     private var pendingDownload: (() -> Unit)? = null
     private var loadedServer = ""
+    // v3.9.28 手机快通道: on-device answers; results go back to the page (home.js window.aiwFastResult)
+    private val fast by lazy {
+        FastPath(this) { cid, payload ->
+            runOnUiThread { if (::web.isInitialized) web.evaluateJavascript("window.aiwFastResult&&window.aiwFastResult(${jsStr(cid)},${jsStr(payload)})", null) }
+        }
+    }
 
     // ---------------------------------------------------------------- activity results
     private val pickFiles = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
@@ -127,7 +133,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (savedInstanceState != null) web.restoreState(savedInstanceState)
-        if (web.url == null) { loadedServer = Prefs.server(this); web.loadUrl(Prefs.webUrl(this, deepOf(intent))) }
+        if (deepOf(intent) == "open") DeviceBridge.get(this).connectNow()   // v3.9.28 wake push
+        if (web.url == null) { loadedServer = Prefs.server(this); web.loadUrl(Prefs.webUrl(this, deepOf(intent)?.takeIf { it != "open" })) }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -138,6 +145,7 @@ class MainActivity : AppCompatActivity() {
             web.clearHistory(); web.loadUrl(Prefs.webUrl(this, deepOf(intent))); return
         }
         val open = deepOf(intent) ?: return
+        if (open == "open") { DeviceBridge.get(this).connectNow(); return }   // v3.9.28: wake push for the phone fast path
         // route inside the running page (deeplink.js window.aiwOpen); load ?open= when the page has no router
         web.evaluateJavascript("(function(p){if(typeof window.aiwOpen==='function'){window.aiwOpen(p);return 1}return 0})(${jsStr(open)})") {
             if (it != "1") web.loadUrl(Prefs.webUrl(this, open))
@@ -149,7 +157,7 @@ class MainActivity : AppCompatActivity() {
         if (::web.isInitialized) web.saveState(outState)
     }
 
-    override fun onResume() { super.onResume(); if (::web.isInitialized) web.onResume(); DeviceBridge.get(this).start() }   // v3.9.27
+    override fun onResume() { super.onResume(); if (::web.isInitialized) web.onResume(); DeviceBridge.get(this).connectNow() }   // v3.9.27; v3.9.28 at once
     override fun onPause() { if (::web.isInitialized) web.onPause(); CookieManager.getInstance().flush(); super.onPause() }
     override fun onStop() { DeviceBridge.get(this).stop(); super.onStop() }   // v3.9.27: calls queue on the server while away
 
@@ -192,7 +200,7 @@ class MainActivity : AppCompatActivity() {
             override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
                 val u = req.url
                 return when (u.scheme?.lowercase()) {
-                    "aiw" -> { routeDeep(u.toString().removePrefix("aiw://")); true }
+                    "aiw" -> { val p = u.toString().removePrefix("aiw://").trim('/'); if (p == "open") DeviceBridge.get(this@MainActivity).connectNow() else routeDeep(p); true }
                     "http", "https" -> if (Prefs.sameServer(this@MainActivity, u.toString())) false else { external(u); true }
                     "blob", "data", "about", "javascript" -> false
                     else -> { external(u); true }   // tel:, mailto:, intent: …
@@ -393,6 +401,8 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface fun openSettings() { runOnUiThread { this@MainActivity.openSettings() } }
         @JavascriptInterface fun toast(s: String) { this@MainActivity.toast(s) }
         @JavascriptInterface fun version(): String = BuildConfig.VERSION_NAME
+        /** v3.9.28 手机快通道: true = the phone answers this message itself (FastPath.kt), the page must not send it */
+        @JavascriptInterface fun fastTry(text: String): Boolean = try { fast.tryHandle(text) } catch (e: Exception) { false }
         @JavascriptInterface fun saveBase64(name: String, mime: String, b64: String) {
             try { saveBytes(name.ifEmpty { "download" }, mime, Base64.decode(b64, Base64.DEFAULT)) } catch (e: Exception) { toast("保存失败") }
         }

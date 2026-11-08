@@ -14,6 +14,7 @@ import android.os.Build
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
+import android.telephony.SmsManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.health.connect.client.HealthConnectClient
@@ -59,7 +60,8 @@ class DeviceBridge private constructor(private val ctx: Context) {
         val CAPS = listOf(
             "calendar.read" to "读取日历", "calendar.write" to "新建日程", "contacts.read" to "搜索通讯录",
             "health.read" to "读取健康（Health Connect：步数、睡眠、心率、运动）", "health.write" to "写入健康（饮水、体重）",
-            "location.read" to "当前位置", "alarm.write" to "设闹钟（系统闹钟 App）")
+            "location.read" to "当前位置", "alarm.write" to "设闹钟（系统闹钟 App）",
+            "phone.call" to "打电话（有拨号权限直接拨出，否则打开拨号盘）", "sms.send" to "发短信（有短信权限直接发送，否则打开短信 App）")
         @SuppressLint("StaticFieldLeak") @Volatile private var inst: DeviceBridge? = null
         fun get(c: Context): DeviceBridge = inst ?: synchronized(this) { inst ?: DeviceBridge(c.applicationContext).also { inst = it } }
     }
@@ -79,7 +81,13 @@ class DeviceBridge private constructor(private val ctx: Context) {
 
     fun start() {
         if (alive || !Prefs.configured(ctx) || CAPS.none { enabled(it.first) }) return
-        alive = true; connect()
+        alive = true; backoff = 2; connect()
+    }
+    /** v3.9.28: a wake push (aiw://open) or back in the foreground: the fast path waits ~8 s, so connect right now. */
+    fun connectNow() {
+        if (!alive) { start(); return }
+        if (online) return
+        backoff = 2; ws?.cancel(); ws = null; connect()
     }
     fun stop() { alive = false; ws?.close(1000, "background"); ws = null; online = false }
 
@@ -90,8 +98,9 @@ class DeviceBridge private constructor(private val ctx: Context) {
         ws = http.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) { hello() }
             override fun onMessage(webSocket: WebSocket, text: String) { handle(JSONObject(text)) }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { retry(t.message ?: "连接失败") }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { if (code == 4401) lastError = "Token 不对" else retry(reason) }
+            // v3.9.28: a socket replaced by connectNow() must not schedule another reconnect
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { if (webSocket === ws) retry(t.message ?: "连接失败") }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { if (webSocket !== ws) return; if (code == 4401) lastError = "Token 不对" else retry(reason) }
         })
     }
     private fun retry(why: String) {
@@ -111,6 +120,9 @@ class DeviceBridge private constructor(private val ctx: Context) {
             "welcome" -> { online = true; backoff = 2; lastError = "" }
             "call" -> {
                 val id = m.optString("id"); val tool = m.optString("tool"); val args = m.optJSONObject("args") ?: JSONObject()
+                // v3.9.28: a call the server already gave up on (fast path TTL) is dropped, never run late
+                val exp = m.optDouble("expires_at", 0.0)
+                if (!exp.isNaN() && exp > 0 && exp * 1000 < System.currentTimeMillis()) return
                 scope.launch {
                     val res = try { JSONObject().put("type", "result").put("id", id).put("ok", true).put("result", run(tool, args)) }
                     catch (e: Exception) { Log.w(TAG, "tool $tool", e); JSONObject().put("type", "result").put("id", id).put("ok", false).put("error", e.message ?: e.javaClass.simpleName) }
@@ -134,7 +146,14 @@ class DeviceBridge private constructor(private val ctx: Context) {
     }
     private fun iso(ms: Long) = Instant.ofEpochMilli(ms).toString()
 
-    suspend fun run(tool: String, a: JSONObject): JSONObject = when (tool) {
+    /** `local`: asked in this app's own chat (v3.9.28 on-device fast answers): the 设备能力 switch is not needed,
+     *  the Android permission still is. */
+    suspend fun run(tool: String, a: JSONObject, local: Boolean = false): JSONObject = if (local) when (tool) {
+        "calendar_today" -> { perm(Manifest.permission.READ_CALENDAR); calendarToday() }
+        "contacts_search" -> { perm(Manifest.permission.READ_CONTACTS); contactsSearch(a) }
+        "phone_call" -> phoneCall(a)
+        else -> run(tool, a, false)
+    } else when (tool) {
         "calendar_list" -> { need("calendar.read", Manifest.permission.READ_CALENDAR); calendarList(a) }
         "calendar_create" -> { need("calendar.write", Manifest.permission.WRITE_CALENDAR, Manifest.permission.READ_CALENDAR); calendarCreate(a) }
         "contacts_search" -> { need("contacts.read", Manifest.permission.READ_CONTACTS); contactsSearch(a) }
@@ -142,7 +161,76 @@ class DeviceBridge private constructor(private val ctx: Context) {
         "health_write" -> { need("health.write"); healthWrite(a) }
         "location_get" -> { need("location.read", Manifest.permission.ACCESS_COARSE_LOCATION); locationGet() }
         "alarm_set" -> { need("alarm.write"); alarmSet(a) }
+        "calendar_today" -> { need("calendar.read", Manifest.permission.READ_CALENDAR); calendarToday() }
+        "phone_call" -> { need("phone.call"); phoneCall(a) }
+        "sms_send" -> { need("sms.send"); smsSend(a) }
         else -> throw IllegalArgumentException("这台 Android 手机不支持 $tool（提醒事项、快捷指令只在 iOS 上有）")
+    }
+
+    private fun perm(p: String) {
+        if (!granted(p)) throw IllegalStateException("没有系统权限 $p")
+    }
+    fun granted(p: String) = ContextCompat.checkSelfPermission(ctx, p) == PackageManager.PERMISSION_GRANTED
+
+    /** v3.9.28 calendar_today: today's instances in the phone's own time zone. */
+    fun calendarToday(): JSONObject {
+        val zone = ZoneId.systemDefault()
+        val day = java.time.LocalDate.now(zone)
+        val start = day.atStartOfDay(zone).toInstant().toEpochMilli()
+        val end = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        val uri = CalendarContract.Instances.CONTENT_URI.buildUpon().also { ContentUris.appendId(it, start); ContentUris.appendId(it, end) }.build()
+        val out = JSONArray()
+        ctx.contentResolver.query(uri, arrayOf(CalendarContract.Instances.EVENT_ID, CalendarContract.Instances.TITLE,
+            CalendarContract.Instances.BEGIN, CalendarContract.Instances.END, CalendarContract.Instances.ALL_DAY,
+            CalendarContract.Instances.EVENT_LOCATION, CalendarContract.Instances.CALENDAR_DISPLAY_NAME), null, null,
+            CalendarContract.Instances.BEGIN + " ASC")?.use { c ->
+            while (c.moveToNext() && out.length() < 100) {
+                out.put(JSONObject().put("id", c.getLong(0).toString()).put("title", c.getString(1) ?: "").put("start", iso(c.getLong(2)))
+                    .put("end", iso(c.getLong(3))).put("all_day", c.getInt(4) == 1).put("location", c.getString(5) ?: "")
+                    .put("calendar", c.getString(6) ?: ""))
+            }
+        }
+        return JSONObject().put("events", out).put("date", day.toString()).put("tz", zone.id)
+    }
+
+    // ------------------------------------------------------------------ v3.9.28 phone / SMS
+    private fun cleanNumber(s: String) = s.filter { (it in '0'..'9') || it == '+' || it == '*' || it == '#' || it == ',' }
+
+    /** ACTION_CALL with CALL_PHONE granted, else the dialer with the number filled in (the user presses call). */
+    @SuppressLint("MissingPermission")
+    fun phoneCall(a: JSONObject): JSONObject {
+        val num = cleanNumber(a.optString("number"))
+        if (num.count { it in '0'..'9' } < 3) throw IllegalArgumentException("号码不对")
+        val direct = granted(Manifest.permission.CALL_PHONE)
+        val i = Intent(if (direct) Intent.ACTION_CALL else Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(num)))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (i.resolveActivity(ctx.packageManager) == null) throw IllegalStateException("这台设备不能打电话")
+        ctx.startActivity(i)
+        val out = JSONObject().put("started", true).put("number", num).put("dialer_only", !direct)
+        a.optString("name").takeIf { it.isNotEmpty() }?.let { out.put("name", it) }
+        return out
+    }
+
+    /** SmsManager with SEND_SMS granted (sent = true), else the SMS app with the text filled in (presented). */
+    @SuppressLint("MissingPermission")
+    private fun smsSend(a: JSONObject): JSONObject {
+        val to = a.optString("to").split(',', '，', ';').map { cleanNumber(it) }.filter { it.isNotEmpty() }
+        if (to.isEmpty()) throw IllegalArgumentException("缺少收件人号码")
+        val body = a.optString("body")
+        if (granted(Manifest.permission.SEND_SMS)) {
+            @Suppress("DEPRECATION")
+            val sm: SmsManager = if (Build.VERSION.SDK_INT >= 31) ctx.getSystemService(SmsManager::class.java) else SmsManager.getDefault()
+            for (n in to) {
+                val parts = sm.divideMessage(body)
+                if (parts.size > 1) sm.sendMultipartTextMessage(n, null, parts, null, null) else sm.sendTextMessage(n, null, body, null, null)
+            }
+            return JSONObject().put("sent", true).put("presented", false).put("to", to.joinToString(","))
+        }
+        val i = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + to.joinToString(";"))).putExtra("sms_body", body)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (i.resolveActivity(ctx.packageManager) == null) throw IllegalStateException("没有短信 App")
+        ctx.startActivity(i)
+        return JSONObject().put("sent", false).put("presented", true).put("to", to.joinToString(","))
     }
 
     private fun calendarList(a: JSONObject): JSONObject {
@@ -193,7 +281,7 @@ class DeviceBridge private constructor(private val ctx: Context) {
         return JSONObject().put("created", true).put("id", uri.lastPathSegment ?: "")
     }
 
-    private fun contactsSearch(a: JSONObject): JSONObject {
+    fun contactsSearch(a: JSONObject): JSONObject {
         val q = a.optString("query"); val limit = a.optInt("limit", 20)
         val out = JSONArray()
         val uri = Uri.withAppendedPath(ContactsContract.CommonDataKinds.Phone.CONTENT_FILTER_URI, Uri.encode(q))

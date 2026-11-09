@@ -1014,6 +1014,7 @@ const MODEL_ROLES = [
   { key: "subagent_model", label: "子 Agent 模型", hint: "纯文本命令行任务", need: "tools" },
   { key: "video_model", label: "视频模型", hint: "可选，制作/修改视频的任务用它（如 claude-opus），失败回到主模型", need: "tools" },
   { key: "image_model", label: "生图/改图模型", hint: "主网关上的 AI 生图和改图模型，如 gpt-image-1、gemini-2.5-flash-image", need: "image" },
+  { key: "omni_model", label: "通话模型（全模态）", hint: "视频/语音通话用，如 qwen3.8-omni-flash", need: "omni" },
 ];
 S.modelIds = []; S.probes = {};
 async function fetchModels(manual) {
@@ -1025,7 +1026,7 @@ async function fetchModels(manual) {
     const cur = sel.value || sel.dataset.cur || "";
     const ids = [...new Set([...(cur ? [cur] : []), ...S.modelIds])];
     const role = MODEL_ROLES.find((x) => x.key === sel.name);
-    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" || role.key === "vision_fallback" ? "不用" : role.key === "image_model" ? "不用（只用生图接口）" : "同主模型"}</option>`
+    sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" || role.key === "vision_fallback" ? "不用" : role.key === "image_model" ? "不用（只用生图接口）" : role.key === "omni_model" ? "不用（关闭通话）" : "同主模型"}</option>`
       + ids.map((m) => `<option value="${esc(m)}" ${m === cur ? "selected" : ""}>${esc(m)}${probeTag(m)}</option>`).join("")
       + `<option value="__custom">手动输入…</option>`;
     paintProbe(sel);
@@ -1042,6 +1043,7 @@ function paintProbe(sel) {
   const role = MODEL_ROLES.find((x) => x.key === sel.name);
   if (!sel.value) { box.innerHTML = ""; return; }
   if (role.need === "image") { box.innerHTML = `<span class="muted">需要网关支持图片输出，第一次改图时验证</span>`; return; }
+  if (role.need === "omni") { box.innerHTML = omniProbeHTML((S.omniProbes || {})[sel.value]); return; }
   if (!p) { box.innerHTML = `<span class="muted">未探测</span>`; return; }
   const ok = (b, t) => `<span class="chip ${b ? "ok" : "bad"}">${b ? "✓" : "✕"} ${t}</span>`;
   let warn = "";
@@ -1053,8 +1055,32 @@ function paintProbe(sel) {
     + (warn ? `<div style="color:var(--danger)">${esc(warn)}</div>` : "")
     + (p.notes && p.notes.length && (!p.tools || !p.vision || p.reasoning_tokens) ? `<div class="muted">${esc(p.notes.join("；").slice(0, 200))}</div>` : "");
 }
+/* v3.9.31 通话模型 › 探测: saves the omni settings on screen first, then tries the realtime endpoint and a tiny turn-mode
+   request (POST /api/omni/probe) and shows which mode works and whether the model speaks */
+function omniProbeHTML(p) {
+  if (!p) return `<span class="muted">未探测：点「探测」试实时接口和轮流模式</span>`;
+  const ok = (b, t) => `<span class="chip ${b ? "ok" : "bad"}">${b ? "✓" : "✕"} ${t}</span>`;
+  const rt = p.realtime || {}, tn = p.turn || {};
+  return `${ok(rt.ok, "实时" + (rt.ms ? " " + (rt.ms / 1000).toFixed(1) + "s" : ""))} ${ok(tn.ok, "轮流" + (tn.ms ? " " + (tn.ms / 1000).toFixed(1) + "s" : ""))} ${tn.ok ? ok(tn.audio, "会说话") : ""}`
+    + `<div class="muted">${p.mode ? "通话会用：" + (p.mode === "realtime" ? "实时模式" : "轮流模式") : "两种都不通"}${rt.error ? "；实时：" + esc(rt.error.slice(0, 100)) : ""}${tn.error ? "；轮流：" + esc(tn.error.slice(0, 100)) : ""}</div>`
+    + ((p.notes || []).length ? `<div class="muted">${esc(p.notes.join("；").slice(0, 240))}</div>` : "");
+}
+async function probeOmni(sel, box, btn) {
+  box.innerHTML = `<span class="spin"></span> 正在试实时接口和轮流模式…`; btn.disabled = true;
+  try {
+    const f = sel.closest("form"); const body = { omni_model: sel.value };
+    for (const k of ["omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model"]) if (f && f[k]) body[k] = f[k].value.trim();
+    if (f && f.omni_mode) body.omni_mode = (f.querySelector("[name=omni_mode]:checked") || {}).value || "auto";
+    if (f && f.omni_key && f.omni_key.value) await api("PUT", "/api/secrets/omni_realtime_key", { value: f.omni_key.value });
+    await api("PATCH", "/api/settings/models", body);
+    const r = await api("POST", "/api/omni/probe", {});
+    S.omniProbes = S.omniProbes || {}; S.omniProbes[sel.value] = r;
+    box.innerHTML = r.error ? esc(r.error) : omniProbeHTML(r);
+  } catch (e) { box.textContent = "探测失败：" + e.message; } finally { btn.disabled = false; }
+}
 async function probeModel(btn) {
   const sel = btn.parentNode.querySelector("select"); if (!sel.value) return toast("先选一个模型");
+  if (sel.name === "omni_model") return probeOmni(sel, btn.parentNode.querySelector(".probe"), btn);
   const box = btn.parentNode.querySelector(".probe"); box.innerHTML = `<span class="spin"></span> 正在实测…`; btn.disabled = true;
   try {
     const base = document.querySelector("#sModel [name=base_url]").value.trim();
@@ -1071,6 +1097,13 @@ async function saveModels(e) {
   const v = (n) => (f[n].value === "__custom" ? "" : f[n].value);
   const body = { model: v("model"), vision_model: v("vision_model"), vision_fallback: v("vision_fallback"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value };
   if (f.image2_base_url) { body.image2_base_url = f.image2_base_url.value.trim(); body.image2_model = f.image2_model.value.trim(); body.image_default = (f.image_default && f.image_default.value) || ""; }
+  if (f.omni_model) body.omni_model = v("omni_model");
+  if (f.omni_voice) {   // v3.9.31 视频通话
+    body.omni_voice = f.omni_voice.value; body.omni_realtime_url = f.omni_realtime_url.value.trim(); body.omni_realtime_model = f.omni_realtime_model.value.trim();
+    body.omni_tts_model = f.omni_tts_model.value.trim(); body.omni_mode = (f.querySelector("[name=omni_mode]:checked") || {}).value || "auto";
+    body.omni_max_minutes = f.omni_max_minutes.value.trim();
+    if (f.omni_key && f.omni_key.value) await api("PUT", "/api/secrets/omni_realtime_key", { value: f.omni_key.value });
+  }
   await api("PUT", "/api/settings/models", body);
   toast("已保存，下个任务生效"); loadSettings();
 }

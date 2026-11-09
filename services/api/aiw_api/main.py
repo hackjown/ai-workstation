@@ -347,6 +347,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     from . import v3924 as _v3924   # v3.9.24: routing, review, webhooks, usage, apps, prompts, context, teach, remote, 签到
     ext24 = _v3924.mount(app, store, sessions, scheduler, notifier, secrets, settings, chat, auth)
     app.state.v3924 = ext24
+    from . import omni_call as _omni   # v3.9.31: 视频通话 (/ws/omni-call, /api/omni/status, /api/omni/probe)
+    _omni.mount(app, store, secrets, chat, auth, lambda ws: _ok(ws_token(ws)))
 
     # ------------------------------------------------------------- tasks
 
@@ -908,7 +910,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         m = store.kv_get("models", {}) or {}
         return {**m, "env_model": os.environ.get("OPENAI_MODEL"), "env_base_url": os.environ.get("OPENAI_BASE_URL"),
                 "has_key": bool(secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")),
-                "has_image2_key": bool(secrets.get("image2_api_key") or os.environ.get("AIW_IMAGE2_API_KEY"))}
+                "has_image2_key": bool(secrets.get("image2_api_key") or os.environ.get("AIW_IMAGE2_API_KEY")),
+                "has_omni_key": bool(secrets.get("omni_realtime_key"))}
 
     @app.put("/api/settings/models", dependencies=[Depends(auth)])
     async def put_models(body: dict):
@@ -920,6 +923,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                 m[k] = str(body.get(k) or "").strip() or None
         if m.get("image_default") not in (None, "gateway", "custom"):
             raise HTTPException(400, "image_default must be gateway or custom")
+        _check_omni(m)
         if m.get("image2_base_url"):
             m["image2_base_url"] = m["image2_base_url"].rstrip("/")
         store.kv_set("models", m)
@@ -929,7 +933,11 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     # of the two is tried first (gateway | custom), the other is the fallback
     MODEL_KEYS = ("model", "vision_model", "vision_fallback", "fallback", "subagent_model", "image_model", "video_model",
                   "base_url", "thinking", "chat_model", "small_model", "embed_model",
-                  "image2_base_url", "image2_model", "image_default")
+                  "image2_base_url", "image2_model", "image_default",
+                  # v3.9.31 视频通话: the omni model (empty = calls off), its voice, the realtime endpoint / model, the
+                  # model that reads a text-only omni model's answers aloud, auto|realtime|turn, max minutes a call
+                  "omni_model", "omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model", "omni_mode",
+                  "omni_max_minutes")
 
     @app.post("/api/image/test", dependencies=[Depends(auth)])
     async def image_test(body: dict | None = None):
@@ -966,8 +974,20 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                 if k == "thinking" and v not in (None, "on", "off"):
                     raise HTTPException(400, "thinking must be on or off")
                 m[k] = v
+        _check_omni(m)
         store.kv_set("models", m)
         return m
+
+    def _check_omni(m: dict) -> None:
+        """v3.9.31: omni_mode is auto | realtime | turn; omni_max_minutes a number of minutes (1-240)."""
+        if m.get("omni_mode") not in (None, "auto", "realtime", "turn"):
+            raise HTTPException(400, "omni_mode must be auto, realtime or turn")
+        if m.get("omni_max_minutes") is not None:
+            try:
+                if not 1 <= float(m["omni_max_minutes"]) <= 240:
+                    raise ValueError
+            except ValueError:
+                raise HTTPException(400, "omni_max_minutes must be 1-240")
 
     @app.post("/api/models/probe", dependencies=[Depends(auth)])
     async def probe_model(body: dict):

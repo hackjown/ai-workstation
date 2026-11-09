@@ -326,6 +326,7 @@ struct HomeChatView: View {
     @State private var showPhotos = false
     @State private var showFiles = false
     @State private var preview: Preview?
+    @State private var showCall = false   // v3.9.31 视频通话 (CallView.swift)
     @StateObject private var pin = BottomPin()
     @Environment(\.colorScheme) private var cs
     @State private var focused = false   // v3.9.17: IMEField (UITextView) takes a plain Bool binding
@@ -519,6 +520,9 @@ struct HomeChatView: View {
             }
             ToolbarItem(placement: .principal) { MateTitle(title: m.agent, status: liveStatus, threadId: nil, showMate: !m.staged) }
             ToolbarItemGroup(placement: .navigationBarTrailing) {
+                // v3.9.31: 视频通话 with 球球 (voice + camera; the transcript lands in this chat at hang-up)
+                Button { showCall = true } label: { Image(systemName: "phone").font(.system(size: 17)) }
+                    .accessibilityLabel("视频通话")
                 // v3.9.14: 搜索 replaces the pencil (新建任务 is still the first item of the "+" menu)
                 Button { openSheet(.search) } label: { Image(systemName: "magnifyingglass").font(.system(size: 17)) }
                     .accessibilityLabel("搜索")
@@ -573,6 +577,7 @@ struct HomeChatView: View {
             AttachSheet { k in pending = k; showAttach = false }
                 .presentationDetents([.height(AttachSheet.height)]).presentationDragIndicator(.hidden)
         }
+        .fullScreenCover(isPresented: $showCall) { CallView(video: true) }
         .fullScreenCover(item: $camera) { md in
             HomeCamera(mode: md) { u, img in camera = nil; Task { await gotCamera(u, img) } }.ignoresSafeArea()
         }

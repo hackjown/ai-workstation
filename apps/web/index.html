@@ -22,6 +22,7 @@
 <link rel="stylesheet" href="home.css" />
 <link rel="stylesheet" href="shop.css" />
 <link rel="stylesheet" href="search.css" />
+<link rel="stylesheet" href="call.css" />
 </head>
 <body>
 <div id="app">
@@ -56,6 +57,7 @@
       <div class="ttl"><div class="heading" id="viewTitle">对话</div><div class="small" id="viewSub"></div></div>
       <span class="chip" id="pillAgent">Agent …</span>
       <button class="btn sm primary" id="newTaskBtn" onclick="newTaskMode()" title="新建任务"><i data-i="plus"></i><span>新建任务</span></button>
+      <button class="icon" id="callBtn" onclick="openCall(true)" aria-label="视频通话" title="和球球视频通话（声音 + 摄像头）"><span data-hi="phone"></span></button>
       <button class="icon" id="searchBtn" onclick="openSearch()" aria-label="搜索" title="搜索对话、任务和文件（/）"><i data-i="search"></i></button>
       <button class="icon" id="bell" onclick="toggleNotes()" aria-label="通知"><i data-i="bell"></i><span class="dot" id="bellDot"></span></button>
       <button class="icon only-wide" id="deskToggle" onclick="toggleDeskPane()" aria-label="桌面" title="显示/隐藏桌面"><i data-i="monitor"></i></button>
@@ -98,6 +100,7 @@
           <button class="hs-it" onclick="hPick('hfile')"><span class="hs-ic" data-hi="folder"></span>文件</button>
           <button class="hs-it" onclick="hSheet(false);newTaskMode()"><span class="hs-ic" data-hi="monitor"></span>新建任务</button>
           <button class="hs-it" id="hVoiceIt" onclick="hSheet(false);hVoice()"><span class="hs-ic" data-hi="mic"></span>语音</button>
+          <button class="hs-it" onclick="hSheet(false);openCall(true)"><span class="hs-ic" data-hi="phone"></span>视频通话</button>
           <button class="hs-it" onclick="hSheet(false);hLink()"><span class="hs-ic" data-hi="link"></span>链接</button>
           <button class="hs-it" onclick="hSheet(false);hSlash()"><span class="hs-ic" data-hi="sparkle"></span>技能 /</button>
         </div>
@@ -276,5 +279,6 @@
 <script src="deeplink.js"></script>
 <script src="search.js"></script>
 <script src="paste.js"></script>
+<script src="call.js"></script>
 </body>
 </html>

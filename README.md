@@ -93,6 +93,22 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.31 视频通话（全模态实时语音 + 摄像头）
+
+聊天顶部的电话按钮（web；iOS 首页聊天右上角）打开全屏通话：说话、看摄像头画面（前/后摄像头、可关）、静音、点字幕打断、挂断。
+实现在 `services/api/aiw_api/omni_call.py`，客户端 `apps/web/call.js`、`apps/ios/Sources/CallView.swift`。
+
+- **设置 › 模型 › 通话模型（全模态）** `omni_model`：留空 = 通话关闭（按钮会提示去设置）。还有「视频通话」一组：音色 `omni_voice`（默认 Tina）、
+  模式 `omni_mode`（自动/只用实时/只用轮流）、实时接口地址 `omni_realtime_url`、实时接口 Key（密钥 `omni_realtime_key`，留空用主网关 Key）、
+  实时模型 `omni_realtime_model`（留空 = 通话模型名加 `-realtime`）、朗读模型 `omni_tts_model`、最长通话 `omni_max_minutes`（默认 30）。「探测」会试两种模式。
+- **实时模式**：服务端连 OpenAI-Realtime 风格的 WebSocket（百炼 Qwen-Omni-Realtime：`wss://dashscope.aliyuncs.com/api-ws/v1/realtime?model=…`；
+  `qwen3.8-omni-flash-realtime` 必须用业务空间地址 `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime`），服务端 VAD、打断、工具调用。
+- **轮流模式**（任何 OpenAI 兼容网关）：服务端能量 VAD 切句 → `chat/completions`（stream、modalities text+audio、input_audio wav + 最新一帧画面 + 最近几轮），
+  音频流式回放，说话即打断。只出文字的模型（如 `qwen3.8-omni-flash`）自动降级：由朗读模型（如 `qwen3.5-omni-flash`）或手机/浏览器朗读。
+- **自动**：先短超时连实时接口，连不上就用轮流模式，并告诉客户端当前模式。
+- **工具**：只有 `create_aiw_task`（走聊天的正常建任务流程，任务自己的确认卡照常弹）和 `task_status`。挂断后整通对话作为一条消息写进小秘聊天。
+- 限制：单帧 ≤256 KB、服务端 ≤1 帧/秒、消息限速、30 秒没消息挂断、同时最多 2 通（`AIW_OMNI_MAX_CALLS`）。
+
 ## v3.9.30 编码任务的 Codex / Claude Code 式循环
 
 编码/开发/修复任务自动进入（不用手动选）：选了「开发 程序」技能（【技能：dev】）、请求是写程序/网站/工具、对已有代码的修复/修改（含「继续」），或模型路由判为开发任务（长任务继续且对话里有代码）。实现在 `services/agent-runtime/agent_runtime/devloop.py`。

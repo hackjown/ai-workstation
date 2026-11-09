@@ -169,7 +169,9 @@ loadSettings = async function () {
   const [connsR, oauthCfg] = await Promise.all([api("GET", "/api/connections").catch(() => ({ connections: [] })),
     api("GET", "/api/oauth/settings").catch(() => ({ providers: {} }))]);
   S.conns = connsR.connections || []; S.oauthCfg = oauthCfg;
-  const roles = MODEL_ROLES.filter((r) => ["model", "vision_model", "video_model", "image_model"].includes(r.key));
+  const roles = MODEL_ROLES.filter((r) => ["model", "vision_model", "video_model", "image_model", "omni_model"].includes(r.key));
+  const omniSt = await api("GET", "/api/omni/status").catch(() => ({ voices: [] }));
+  S.omniProbes = S.omniProbes || {}; if (omniSt.model && omniSt.probe) S.omniProbes[omniSt.model] = omniSt.probe;
   const extra = MODEL_ROLES.filter((r) => !roles.includes(r));
   const mrow = (r) => row(r.label, r.hint, `<div class="mrow"><select name="${r.key}" data-cur="${esc(models[r.key] || "")}" onchange="paintProbe(this)"></select>
       <button type="button" class="btn sm" onclick="probeModel(this)">探测</button><div class="probe"></div></div>`, "", "top");
@@ -206,6 +208,16 @@ loadSettings = async function () {
       ${row("默认用", "默认的出错或不可用时自动换另一个", `<div class="segsw"><label><input type="radio" name="image_default" value="custom" ${(models.image_default || (models.image2_model ? "custom" : "gateway")) === "custom" ? "checked" : ""}>生图接口</label><label><input type="radio" name="image_default" value="gateway" ${(models.image_default || (models.image2_model ? "custom" : "gateway")) === "gateway" ? "checked" : ""}>主网关（生图/改图模型）</label></div>`,
         `<button type="button" class="btn sm" onclick="testImage(this)">测试</button>`)}
       <div class="rw"><div class="k"></div><div class="v"><span class="small" id="imageTestOut"></span></div><div class="t"></div></div>
+    </div>
+    <div class="rows" id="g-call">
+      <div class="rw head"><div class="k">视频通话<small>聊天顶部的电话按钮：和球球语音/视频通话，能看摄像头画面，能把事交给 aiw</small></div><div>${models.omni_model ? '<span class="chip ok">已开启</span>' : '<span class="chip">未开启（先选通话模型）</span>'}</div></div>
+      ${row("音色", "Qwen3.5/3.8-Omni 默认 Tina；Cherry 只适用 Qwen3-Omni", `<select name="omni_voice">${[...new Set([models.omni_voice || "Tina", ...(omniSt.voices || ["Tina"])])].map((v) => `<option value="${esc(v)}" ${v === (models.omni_voice || "Tina") ? "selected" : ""}>${esc(v)}</option>`).join("")}</select>`)}
+      ${row("模式", "自动：先连实时接口，不通就用轮流对话", `<div class="segsw">${[["auto", "自动"], ["realtime", "只用实时"], ["turn", "只用轮流"]].map(([k, t]) => `<label><input type="radio" name="omni_mode" value="${k}" ${(models.omni_mode || "auto") === k ? "checked" : ""}>${t}</label>`).join("")}</div>`)}
+      ${row("实时接口地址", "留空自动推算；qwen3.8-omni-flash-realtime 要填业务空间地址", `<input name="omni_realtime_url" value="${esc(models.omni_realtime_url || "")}" placeholder="${esc(omniSt.realtime_url || "wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime")}" />`)}
+      ${row("实时接口 Key", "可选，留空用主网关 Key（如百炼 API Key）", `<input name="omni_key" type="password" placeholder="${models.has_omni_key ? "已设置，留空不修改" : "sk-…"}" autocomplete="off" />`, models.has_omni_key ? '<span class="chip ok">已设置</span>' : "")}
+      ${row("实时模型", "留空 = 通话模型名加 -realtime", `<input name="omni_realtime_model" value="${esc(models.omni_realtime_model || "")}" placeholder="${esc(omniSt.realtime_model || "qwen3.8-omni-flash-realtime")}" />`)}
+      ${row("朗读模型", "可选：通话模型只出文字时（如 qwen3.8-omni-flash）用它把回答读出来，如 qwen3.5-omni-flash；留空由手机/浏览器朗读", `<input name="omni_tts_model" value="${esc(models.omni_tts_model || "")}" placeholder="qwen3.5-omni-flash" />`)}
+      ${row("最长通话", "分钟，到点自动挂断", `<input name="omni_max_minutes" value="${esc(models.omni_max_minutes || "30")}" inputmode="numeric" style="max-width:120px" />`)}
     </div>
     <div class="rows">
       ${row("深度思考", "关掉可快很多", `<div class="segsw"><label><input type="radio" name="thinking" value="off" ${(models.thinking || "off") === "off" ? "checked" : ""}>关闭</label><label><input type="radio" name="thinking" value="on" ${models.thinking === "on" ? "checked" : ""}>模型默认</label></div>`)}

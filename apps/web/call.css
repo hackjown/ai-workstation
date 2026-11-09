@@ -1,0 +1,27 @@
+/* v3.9.31 视频通话: full-screen call view (call.js) — camera full-bleed, 球球 in the middle when the camera is off,
+   live captions above a row of round controls; dark so the camera picture reads well in both themes. */
+#callView { position:fixed; inset:0; z-index:90; background:#0f1214; color:#fff; display:none; overflow:hidden; }
+#callView.on { display:block; }
+body.in-call { overflow:hidden; }
+#callView video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; display:none; background:#000; }
+#callView video.mirror { transform:scaleX(-1); }
+#callView.cam video { display:block; }
+#callView .call-orb { position:absolute; left:50%; top:38%; transform:translate(-50%,-50%); width:168px; height:168px; display:flex; align-items:center; justify-content:center; }
+#callView .call-orb .mate { width:168px; height:168px; display:block; }
+#callView.cam .call-orb { top:auto; bottom:calc(150px + var(--safe-b)); left:auto; right:16px; transform:none; width:84px; height:84px; }
+#callView.cam .call-orb .mate { width:84px; height:84px; }
+#callView.talking .call-orb { animation:callPulse 1.2s ease-in-out infinite; }
+@keyframes callPulse { 50% { filter:drop-shadow(0 0 18px rgba(200,118,24,.75)); } }
+#callView .call-top { position:absolute; top:calc(12px + var(--safe-t)); left:0; right:0; display:flex; justify-content:center; gap:10px; align-items:center; }
+#callView .call-badge, #callView .call-clock { background:rgba(0,0,0,.42); border-radius:20px; padding:4px 12px; font-size:13px; backdrop-filter:blur(6px); }
+#callView .call-caps { position:absolute; left:16px; right:16px; bottom:calc(120px + var(--safe-b)); max-width:760px; margin:0 auto; text-align:center; cursor:pointer; text-shadow:0 1px 3px rgba(0,0,0,.7); }
+#callView .cap-u { font-size:14px; opacity:.72; min-height:20px; }
+#callView .cap-a { font-size:19px; line-height:1.5; margin-top:6px; max-height:6em; overflow:hidden; display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; }
+#callView .call-bar { position:absolute; left:0; right:0; bottom:calc(28px + var(--safe-b)); display:flex; justify-content:center; gap:22px; }
+#callView .cbtn { width:62px; height:62px; border-radius:50%; border:0; background:rgba(255,255,255,.16); color:#fff; display:flex; align-items:center; justify-content:center; cursor:pointer; backdrop-filter:blur(8px); }
+#callView .cbtn svg.i { width:26px; height:26px; }
+#callView .cbtn.off { background:#fff; color:#11191C; }
+#callView .cbtn.end { background:#E5484D; }
+#callView .cbtn[hidden] { display:none; }
+.callnote { display:flex; flex-direction:column; gap:12px; padding:6px; }
+.callnote h3 { margin:0; display:flex; gap:8px; align-items:center; }

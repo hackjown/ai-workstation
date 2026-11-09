@@ -1014,7 +1014,7 @@ const MODEL_ROLES = [
   { key: "subagent_model", label: "子 Agent 模型", hint: "纯文本命令行任务", need: "tools" },
   { key: "video_model", label: "视频模型", hint: "可选，制作/修改视频的任务用它（如 claude-opus），失败回到主模型", need: "tools" },
   { key: "image_model", label: "生图/改图模型", hint: "主网关上的 AI 生图和改图模型，如 gpt-image-1、gemini-2.5-flash-image", need: "image" },
-  { key: "omni_model", label: "通话模型（全模态）", hint: "视频/语音通话用，如 qwen3.8-omni-flash", need: "omni" },
+  { key: "omni_model", label: "通话模型（全模态）", hint: "视频/语音通话用：全模态模型或 Gemini Live 模型", need: "omni" },
 ];
 S.modelIds = []; S.probes = {}; S.modelGroups = [];
 /* v3.9.33 供应商 (设置 › 模型): kv providers + the implicit 默认 (网关地址 + API Key). Each model slot has a
@@ -1125,7 +1125,7 @@ function paintProbe(sel) {
   const role = MODEL_ROLES.find((x) => x.key === sel.name);
   if (!sel.value) { box.innerHTML = ""; return; }
   if (role.need === "image") { box.innerHTML = `<span class="muted">需要网关支持图片输出，第一次改图时验证</span>`; return; }
-  if (role.need === "omni") { box.innerHTML = omniProbeHTML((S.omniProbes || {})[sel.value]); return; }
+  if (role.need === "omni") { box.innerHTML = omniProbeHTML((S.omniProbes || {})[sel.value], omniFamily(sel)); return; }
   if (!p) { box.innerHTML = `<span class="muted">未探测</span>`; return; }
   const ok = (b, t) => `<span class="chip ${b ? "ok" : "bad"}">${b ? "✓" : "✕"} ${t}</span>`;
   let warn = "";
@@ -1139,21 +1139,44 @@ function paintProbe(sel) {
 }
 /* v3.9.31 通话模型 › 探测: saves the omni settings on screen first, then tries the realtime endpoint and a tiny turn-mode
    request (POST /api/omni/probe) and shows which mode works and whether the model speaks */
-function omniProbeHTML(p) {
-  if (!p) return `<span class="muted">未探测：点「探测」试实时接口和轮流模式</span>`;
+/* v3.9.34: which kind of call model the slot holds - "gemini" (a Gemini provider or a Gemini Live model name: routed
+   to Gemini Live), "qwen" (qwen*-omni) or "" - mirrors omni_call.family(); the probe result's family wins */
+const OMNI_HINTS = { gemini: "Gemini Live：国内需代理（填「出站代理」或在供应商里填代理）；免费层数据会用于改进产品",
+  qwen: "Qwen-Omni：qwen3.8-omni-flash 只输出文字（轮流模式配「朗读模型」）；qwen3.8-omni-flash-realtime 要填业务空间实时接口地址" };
+function omniFamily(sel) {
+  const m = (sel.value || "").trim().toLowerCase().replace(/^models\//, ""); if (!m) return "";
+  const pr = (S.omniProbes || {})[sel.value]; if (pr && pr.family !== undefined) return pr.family;
+  const ps = sel.parentNode.querySelector(".psel"); const pid = ps ? ps.value : "";
+  const p = pid ? (S.providers || []).find((x) => x.id === pid) : null;
+  const host = (u) => { try { return new URL(/^[a-z]+:\/\//i.test(u || "") ? u : "https://" + u).hostname.toLowerCase(); } catch (e) { return ""; } };
+  const f = sel.closest("form"); const relay = f && f.omni_gemini_url ? host(f.omni_gemini_url.value.trim()) : "";
+  const gp = p && (host(p.base_url) === "generativelanguage.googleapis.com" || p.id === "gemini" || (p.name || "").trim().toLowerCase() === "gemini" || (relay && host(p.base_url) === relay));
+  if (gp || (m.startsWith("gemini-") && m.includes("live")) || m.includes("native-audio")) return "gemini";
+  return m.startsWith("qwen") && m.includes("omni") ? "qwen" : "";
+}
+function omniProbeHTML(p, fam) {
+  fam = p && p.family !== undefined ? p.family : (fam || "");
+  const hint = OMNI_HINTS[fam] ? `<div class="muted">${esc(OMNI_HINTS[fam])}</div>` : "";
+  if (!p) return `<span class="muted">未探测：点「探测」试${fam === "gemini" ? " Gemini Live" : "实时接口和轮流模式"}</span>` + hint;
   const ok = (b, t) => `<span class="chip ${b ? "ok" : "bad"}">${b ? "✓" : "✕"} ${t}</span>`;
   const rt = p.realtime || {}, tn = p.turn || {}, gm = p.gemini;
+  const notes = (p.notes || []).length ? `<div class="muted">${esc(p.notes.join("；").slice(0, 240))}</div>` : "";
+  if (p.route === "gemini" && gm) {   // v3.9.34: the call slot is routed to Gemini Live - only its badge
+    return `${ok(gm.ok, "Gemini Live" + (gm.ms ? " " + (gm.ms / 1000).toFixed(1) + "s" : ""))} ${gm.ok ? ok(gm.audio !== false, "会说话") : ""}`
+      + `<div class="muted">${gm.ok ? "通话会用：Gemini Live（" + esc(gm.model || "") + "）" : "Gemini Live 不通：" + esc((gm.error || "").slice(0, 120))}</div>` + notes + hint;
+  }
   const gHTML = gm ? `${ok(gm.ok, "Gemini" + (gm.ms ? " " + (gm.ms / 1000).toFixed(1) + "s" : ""))} ` : "";
-  if (gm && !p.model) return gHTML + `<div class="muted">${gm.ok ? "通话会用：Gemini Live" : "Gemini 不通：" + esc((gm.error || "").slice(0, 120))}</div>`
-    + ((p.notes || []).length ? `<div class="muted">${esc(p.notes.join("；").slice(0, 240))}</div>` : "");
-  return gHTML + `${ok(rt.ok, "实时" + (rt.ms ? " " + (rt.ms / 1000).toFixed(1) + "s" : ""))} ${ok(tn.ok, "轮流" + (tn.ms ? " " + (tn.ms / 1000).toFixed(1) + "s" : ""))} ${tn.ok ? ok(tn.audio, "会说话") : ""}`
-    + `<div class="muted">${p.mode ? "通话会用：" + ({ realtime: "实时模式", gemini: "Gemini Live" }[p.mode] || "轮流模式") : "都不通"}${gm && gm.error ? "；Gemini：" + esc(gm.error.slice(0, 100)) : ""}${rt.error ? "；实时：" + esc(rt.error.slice(0, 100)) : ""}${tn.error ? "；轮流：" + esc(tn.error.slice(0, 100)) : ""}</div>`
-    + ((p.notes || []).length ? `<div class="muted">${esc(p.notes.join("；").slice(0, 240))}</div>` : "");
+  if (gm && !p.model) return gHTML + `<div class="muted">${gm.ok ? "通话会用：Gemini Live" : "Gemini 不通：" + esc((gm.error || "").slice(0, 120))}</div>` + notes;
+  const rtHTML = rt.skipped ? "" : `${ok(rt.ok, "实时" + (rt.ms ? " " + (rt.ms / 1000).toFixed(1) + "s" : ""))} `;
+  return gHTML + rtHTML + `${ok(tn.ok, "轮流" + (tn.ms ? " " + (tn.ms / 1000).toFixed(1) + "s" : ""))} ${tn.ok ? ok(tn.audio, "会说话") : ""}`
+    + `<div class="muted">${p.mode ? "通话会用：" + ({ realtime: "实时模式", gemini: "Gemini Live" }[p.mode] || "轮流模式") : "都不通"}${gm && gm.error ? "；Gemini：" + esc(gm.error.slice(0, 100)) : ""}${rt.error ? "；实时：" + esc(rt.error.slice(0, 100)) : ""}${tn.error ? "；轮流：" + esc(tn.error.slice(0, 100)) : ""}${rt.skipped ? "；实时接口未试（供应商不是百炼）" : ""}</div>`
+    + notes + hint;
 }
 async function probeOmni(sel, box, btn) {
   box.innerHTML = `<span class="spin"></span> 正在试 Gemini / 实时接口 / 轮流模式…`; btn.disabled = true;
   try {
     const f = sel.closest("form"); const body = { omni_model: sel.value };
+    const ps = sel.parentNode.querySelector(".psel"); if (ps) body.omni_model_provider = ps.value;   // v3.9.34: probe the provider on screen
     for (const k of ["omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model", "omni_gemini_model", "omni_gemini_voice", "omni_gemini_url", "omni_proxy"]) if (f && f[k]) body[k] = f[k].value.trim();
     if (f && f.omni_mode) body.omni_mode = (f.querySelector("[name=omni_mode]:checked") || {}).value || "auto";
     if (f && f.omni_key && f.omni_key.value) await api("PUT", "/api/secrets/omni_realtime_key", { value: f.omni_key.value });
@@ -1161,7 +1184,7 @@ async function probeOmni(sel, box, btn) {
     await api("PATCH", "/api/settings/models", body);
     const r = await api("POST", "/api/omni/probe", {});
     S.omniProbes = S.omniProbes || {}; S.omniProbes[sel.value] = r;
-    box.innerHTML = r.error ? esc(r.error) : omniProbeHTML(r);
+    box.innerHTML = r.error ? esc(r.error) : omniProbeHTML(r, omniFamily(sel));
   } catch (e) { box.textContent = "探测失败：" + e.message; } finally { btn.disabled = false; }
 }
 async function probeModel(btn) {

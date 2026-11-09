@@ -93,6 +93,20 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.34 通话模型槽位按模型/供应商自动选后端
+
+「通话模型（全模态）」槽位（`omni_model` + `omni_model_provider`）里放的是 Gemini 时，通话直接走 Gemini Live，不再把 Gemini 的 Key 发给百炼实时接口（之前探测会出现「实时 ✗ HTTP 401」）。
+实现在 `services/api/aiw_api/omni_call.py`（`config` / `plan` / `probe`）和 `providers.py`（`is_gemini` / `is_dashscope`）。
+
+- **判定为 Gemini Live**：槽位的供应商是 Gemini（地址主机为 `generativelanguage.googleapis.com`，或 id/名称为 `gemini`，或与「Gemini 中转地址」同主机），
+  或模型名像 Live 模型（`gemini-` 开头且含 `live`，或含 `native-audio`）。此时 Gemini 模型 = 通话模型；Key = 「Gemini Key」，留空用该 Gemini 供应商的 Key（不会借用非 Gemini 供应商的 Key），
+  再空用「Gemini Live 的供应商」/ 环境变量；代理 = 「出站代理」，留空用该供应商的代理。
+- 「自动」模式下这种情况**只用 Gemini Live**：不试实时接口，也不退到轮流（Live 模型一般不是 chat/completions 模型），Live 断线就结束通话。手动选「只用轮流」仍按轮流走该供应商。
+- **实时接口（DashScope 协议）只在以下情况尝试**：填了「实时接口地址」，或槽位供应商是百炼（`dashscope*.aliyuncs.com`、`*.maas.aliyuncs.com`），或槽位用的是「默认」网关（与 v3.9.31 相同）。
+  其他供应商不会再把 Key 发到 `dashscope.aliyuncs.com`；「只用实时」模式此时直接报错说明原因。
+- 探测：Gemini 路线只显示「Gemini Live」和「会说话」（Live 会话固定输出语音，连接 + setupComplete 成功即算），附 Gemini 提示（国内需代理；免费层数据会用于改进产品）；
+  实时接口未尝试时不显示「实时」徽章；Qwen 的说明只在模型名是 `qwen*-omni` 时显示。`/api/omni/status` 和探测结果多了 `family`、`hint`，状态里多了 `realtime_on`、`gemini.route`。
+
 ## v3.9.33 模型供应商列表
 
 设置 › 模型 › **供应商**：除了原来的「网关地址 + API Key」（现在叫「默认」供应商，id `default`，原样保留、不迁移），可以再加多个 OpenAI 兼容供应商

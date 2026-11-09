@@ -45,6 +45,16 @@ omni_gemini_model (gemini-3.8-live), omni_gemini_voice (Puck), omni_gemini_url (
 omni_proxy (http://, https://, socks5:// for the Gemini connection; else HTTPS_PROXY / ALL_PROXY from the environment).
 Secrets omni_realtime_key (else the gateway key), omni_gemini_key (else env GEMINI_API_KEY / GOOGLE_API_KEY).
 Calls are on when omni_model is set, or when a Gemini key is set and the mode is auto or gemini.
+v3.9.34 routing of the call slot (omni_model + omni_model_provider):
+  * Gemini Live route: the slot's provider is a Gemini provider (base_url host generativelanguage.googleapis.com, id or
+    name "gemini", or the same host as omni_gemini_url) or omni_model looks like a Live model (gemini-…live…, …native-
+    audio…). Then gemini_model = omni_model, the Gemini key = omni_gemini_key, else the slot provider's key (Gemini
+    provider only), else the omni_gemini provider's, else env; the proxy = omni_proxy, else the slot provider's. auto
+    mode = Gemini only (no realtime, no turn: Live models are not chat-completion models; a dropped Live call ends
+    instead of falling back). Explicit turn mode still uses turn on the slot provider.
+  * realtime (DashScope protocol) is only tried when omni_realtime_url is set, or the slot provider is DashScope /
+    Bailian (dashscope*.aliyuncs.com, *.maas.aliyuncs.com), or the slot is the default gateway (as before). Otherwise
+    auto = [Gemini if its key is set] + turn, and a third-party provider's key never goes to dashscope.aliyuncs.com.
 Tools from a call are deliberately few: create_aiw_task (a normal aiw task via Chat.start_task, whose own confirm cards
 still apply) and task_status. The call's transcript lands in the 小秘 chat as one message at hang-up.
 """
@@ -123,6 +133,8 @@ def with_model(url: str, model: str) -> str:
 
 
 MODES = ("auto", "realtime", "turn", "gemini")
+RT_OFF_NOTE = ("实时接口只用于百炼 / DashScope：通话模型的供应商不是百炼，也没有填「实时接口地址」，"
+               "不会把这个供应商的 Key 发给 DashScope")
 
 
 def gemini_url_for(base: str) -> str:
@@ -148,7 +160,7 @@ def gemini_on(cfg: dict) -> bool:
 
 def enabled(cfg: dict) -> bool:
     """Calls are possible: an omni model (realtime / turn), or a Gemini key in auto / gemini mode."""
-    if cfg.get("mode") == "gemini":
+    if cfg.get("mode") == "gemini" or (cfg.get("gemini_route") and cfg.get("mode") == "auto"):
         return bool(cfg.get("gemini_key"))
     return bool(cfg.get("model")) or gemini_on(cfg)
 
@@ -156,6 +168,9 @@ def enabled(cfg: dict) -> bool:
 def disabled_message(cfg: dict) -> str:
     if cfg.get("mode") == "gemini":
         return "选了 Gemini Live 模式但还没有 Gemini API Key：设置 › 模型 › 视频通话 › Gemini Key"
+    if cfg.get("gemini_route") and cfg.get("mode") == "auto":
+        return ("通话模型是 Gemini Live 模型，但没有 Gemini API Key：给它的供应商填 Key，"
+                "或填 设置 › 模型 › 视频通话 › Gemini Key")
     return "还没有设置通话模型：设置 › 模型 › 通话模型（全模态），如 qwen3.8-omni-flash；或填 Gemini Live 的 Key"
 
 
@@ -173,18 +188,49 @@ def with_defaults(cfg: dict) -> dict:
     return c
 
 
+def gemini_live_name(model: str) -> bool:
+    """v3.9.34: a model name that is a Gemini Live (BidiGenerateContent) model: gemini-…live… or …native-audio…."""
+    n = (model or "").strip().lower()
+    if n.startswith("models/"):
+        n = n[7:]
+    return (n.startswith("gemini-") and "live" in n) or "native-audio" in n
+
+
+def qwen_omni_name(model: str) -> bool:
+    n = (model or "").strip().lower()
+    return n.startswith("qwen") and "omni" in n
+
+
+HINT_GEMINI = "Gemini Live：国内需代理（填「出站代理」或在供应商里填代理）；免费层数据会用于改进产品"
+HINT_QWEN = ("Qwen-Omni：qwen3.8-omni-flash 只输出文字（轮流模式配「朗读模型」）；"
+             "qwen3.8-omni-flash-realtime 要填业务空间实时接口地址")
+
+
+def family(cfg: dict) -> str:
+    """"gemini" when the call slot is routed to Gemini Live, "qwen" for a qwen*-omni model, else ""."""
+    if cfg.get("gemini_route"):
+        return "gemini"
+    return "qwen" if qwen_omni_name(cfg.get("model") or "") else ""
+
+
+def hint_for(cfg: dict) -> str:
+    return {"gemini": HINT_GEMINI, "qwen": HINT_QWEN}.get(family(cfg), "")
+
+
 def config(store, secrets) -> dict:
     m = store.kv_get("models", {}) or {}
     base = (m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
     key = (secrets.get("openai_api_key") if secrets else None) or os.environ.get("OPENAI_API_KEY") or ""
     tts_base, tts_key, gem_pkey, gem_pproxy = base, key, "", ""
+    from . import providers as _pv
+    # the call slot's provider (the implicit default when omni_model_provider is empty / unknown / disabled)
+    slot = _pv.slot_conn(store, secrets, "omni_model", m) if m.get("omni_model_provider") else \
+        {"id": _pv.DEFAULT_ID, "name": _pv.DEFAULT_NAME, "base_url": base, "key": key, "proxy": "", "default": True}
     if any(m.get(f) for f in ("omni_model_provider", "omni_tts_model_provider", "omni_gemini_provider")):
         # v3.9.33: providers for the omni model (turn mode, and the realtime key / URL when they are empty), the TTS
         # model, and Gemini Live (its key when omni_gemini_key is empty, its proxy when omni_proxy is empty)
-        from . import providers as _pv
         if m.get("omni_model_provider"):
-            c = _pv.slot_conn(store, secrets, "omni_model", m)
-            base, key = c["base_url"], c["key"]
+            base, key = slot["base_url"], slot["key"]
         tts_base, tts_key = base, key
         if m.get("omni_tts_model_provider"):
             c = _pv.slot_conn(store, secrets, "omni_tts_model", m)
@@ -194,7 +240,19 @@ def config(store, secrets) -> dict:
             if not c["default"]:
                 gem_pkey, gem_pproxy = c["key"], c.get("proxy") or ""
     model = str(m.get("omni_model") or "").strip()
-    rt_url = str(m.get("omni_realtime_url") or "").strip() or realtime_url_for(base)
+    rt_url_set = str(m.get("omni_realtime_url") or "").strip()
+    # v3.9.34: a Gemini provider or a Gemini Live model name in the call slot = Gemini Live with that model, the
+    # provider's key and proxy (omni_gemini_key / omni_proxy still win); the DashScope realtime endpoint never sees it
+    slot_gem_provider = _pv.is_gemini(slot, str(m.get("omni_gemini_url") or ""))
+    gemini_route = bool(model) and (slot_gem_provider or gemini_live_name(model))
+    if gemini_route and slot_gem_provider and slot.get("key"):
+        gem_pkey = slot["key"]
+    if gemini_route and slot_gem_provider and slot.get("proxy"):
+        gem_pproxy = slot["proxy"]
+    # realtime (DashScope protocol) only with an explicit omni_realtime_url, a DashScope / Bailian provider, or the
+    # default gateway (as before v3.9.34) - never a third-party provider's key to dashscope.aliyuncs.com
+    rt_on = not gemini_route and (bool(rt_url_set) or slot.get("default", False) or _pv.is_dashscope(slot))
+    rt_url = rt_url_set or realtime_url_for(base)
     if rt_url.startswith("http"):
         rt_url = "ws" + rt_url[4:]
     mode = str(m.get("omni_mode") or "auto").strip().lower()
@@ -204,13 +262,16 @@ def config(store, secrets) -> dict:
         minutes = float(m.get("omni_max_minutes") or 30)
     except (TypeError, ValueError):
         minutes = 30.0
+    gmodel = (model[7:] if model.startswith("models/") else model) if gemini_route else \
+        (str(m.get("omni_gemini_model") or "").strip() or DEFAULT_GEMINI_MODEL)
     return {"model": model, "voice": str(m.get("omni_voice") or "").strip() or DEFAULT_VOICE,
             "base_url": base, "key": key, "tts_base_url": tts_base, "tts_key": tts_key,
             "rt_url": rt_url, "rt_model": str(m.get("omni_realtime_model") or "").strip() or realtime_model_for(model),
             "rt_key": (secrets.get("omni_realtime_key") if secrets else None) or key,
+            "rt_on": rt_on, "gemini_route": gemini_route,
             "tts_model": str(m.get("omni_tts_model") or "").strip(),
             "mode": mode if mode in MODES else "auto",
-            "gemini_model": str(m.get("omni_gemini_model") or "").strip() or DEFAULT_GEMINI_MODEL,
+            "gemini_model": gmodel,
             "gemini_voice": str(m.get("omni_gemini_voice") or "").strip() or DEFAULT_GEMINI_VOICE,
             "gemini_url": gemini_url_for(str(m.get("omni_gemini_url") or "")), "gemini_key": gkey,
             "proxy": str(m.get("omni_proxy") or "").strip() or gem_pproxy,
@@ -227,7 +288,8 @@ def public(cfg: dict, store=None) -> dict:
            "mode": cfg["mode"], "max_minutes": int(cfg["max_seconds"] // 60), "has_realtime_key": bool(cfg["rt_key"]),
            "gemini": {"on": gemini_on(cfg), "model": cfg["gemini_model"], "voice": cfg["gemini_voice"],
                       "voices": GEMINI_VOICES, "url": cfg["gemini_url"], "has_key": bool(cfg["gemini_key"]),
-                      "proxy": bool(cfg["proxy"])}}
+                      "proxy": bool(cfg["proxy"]), "route": bool(cfg.get("gemini_route"))},
+           "realtime_on": bool(cfg.get("rt_on", True)), "family": family(cfg), "hint": hint_for(cfg)}
     if not out["enabled"]:
         out["message"] = disabled_message(cfg)
     if store is not None:
@@ -1289,7 +1351,7 @@ class OmniCall:
         t = ev.get("type")
         if t == "_closed":   # the realtime / Gemini upstream dropped mid-call: carry on in turn mode when possible
             if not self.ended and self.backend is not None and self.backend.mode in ("realtime", "gemini"):
-                if self.cfg["model"] and self.cfg["mode"] == "auto":
+                if self.cfg["model"] and self.cfg["mode"] == "auto" and not self.cfg.get("gemini_route"):
                     await self._fallback("实时连接断开" if self.backend.mode == "realtime" else "Gemini 连接断开")
                 else:
                     self.dead = "upstream_closed"
@@ -1346,15 +1408,21 @@ class OmniCall:
             return f"{label}连不上（{type(e).__name__}: {str(e)[:120]}）"
 
     def plan(self) -> list:
-        """Backends to try, in order. auto: Gemini first when its key is set, then realtime and turn when omni_model
-        is set. gemini / realtime / turn: only that one."""
+        """Backends to try, in order. auto: Gemini first when its key is set, then realtime (only when allowed, see
+        config rt_on) and turn when omni_model is set; a call slot routed to Gemini Live (v3.9.34) = Gemini only.
+        gemini / realtime / turn: only that one (realtime not at all when it is not allowed)."""
         cfg = self.cfg
+        rt_on = cfg.get("rt_on", True)
         if cfg["mode"] == "gemini":
             return ["gemini"]
-        if cfg["mode"] in ("realtime", "turn"):
-            return [cfg["mode"]]
+        if cfg["mode"] == "realtime":
+            return ["realtime"] if rt_on else []
+        if cfg["mode"] == "turn":
+            return ["turn"]
+        if cfg.get("gemini_route"):
+            return ["gemini"]
         out = ["gemini"] if cfg["gemini_key"] else []
-        return out + (["realtime", "turn"] if cfg["model"] else [])
+        return out + ((["realtime"] if rt_on else []) + ["turn"] if cfg["model"] else [])
 
     async def start(self) -> dict:
         cfg = self.cfg
@@ -1371,6 +1439,8 @@ class OmniCall:
                 break
             notes.append(n)
         if self.backend is None:
+            if cfg["mode"] == "realtime" and not cfg.get("rt_on", True):
+                notes.append(RT_OFF_NOTE)
             raise RuntimeError("；".join(notes) or disabled_message(cfg))
         b = self.backend
         model = {"realtime": cfg["rt_model"], "gemini": cfg["gemini_model"]}.get(b.mode, cfg["model"])
@@ -1471,7 +1541,24 @@ async def probe(cfg: dict) -> dict:
     """设置 › 通话模型 › 探测: can Gemini Live / the realtime endpoint be opened, and does a tiny turn-mode request
     return audio? Only the backends that are configured are tried."""
     cfg = with_defaults(cfg)
-    out: dict = {"model": cfg["model"], "ts": time.time(), "realtime": {}, "turn": {}, "mode": None, "notes": []}
+    out: dict = {"model": cfg["model"], "ts": time.time(), "realtime": {}, "turn": {}, "mode": None, "notes": [],
+                 "family": family(cfg), "hint": hint_for(cfg), "route": "gemini" if cfg.get("gemini_route") else ""}
+    if cfg.get("gemini_route") and cfg["mode"] in ("auto", "gemini"):
+        # v3.9.34: the call slot holds a Gemini Live model / Gemini provider: only Gemini Live is probed (no realtime,
+        # no turn); a Live session always answers with audio (responseModalities AUDIO), so it "speaks" when it opens
+        out["gemini"] = await probe_gemini(cfg)
+        g = out["gemini"]
+        g["audio"] = bool(g.get("ok"))
+        out["realtime"] = {"skipped": True}
+        out["turn"] = {"skipped": True}
+        out["mode"] = "gemini" if g.get("ok") else None
+        if not g.get("ok"):
+            err = g.get("error") or ""
+            if not cfg.get("proxy") and not env_proxy(cfg["gemini_url"]) and "googleapis.com" in cfg["gemini_url"]:
+                out["notes"].append("国内直连 Google 通常不通：在供应商或「出站代理」填 http://… 或 socks5://… 代理，或填中转地址")
+            if "API key" in err or "PERMISSION" in err.upper() or "1008" in err:
+                out["notes"].append(f"Gemini 拒绝了 Key 或模型名：检查供应商的 Key 和模型名（{cfg['gemini_model']}）")
+        return out
     if cfg.get("gemini_key"):
         out["gemini"] = await probe_gemini(cfg)
         if not out["gemini"].get("ok"):
@@ -1486,17 +1573,20 @@ async def probe(cfg: dict) -> dict:
         out["mode"] = "gemini" if out["gemini"].get("ok") else None
         return out
     t0 = time.time()
-    rt = RealtimeBackend(cfg, _noop_emit, None, "probe", False)
-    try:
-        await asyncio.wait_for(rt.start(), cfg["rt_timeout"] + 3)
-        out["realtime"] = {"ok": True, "url": cfg["rt_url"], "model": cfg["rt_model"]}
-        _RT_FAIL.pop((cfg["rt_url"], cfg["rt_model"]), None)
-    except Exception as e:  # noqa: BLE001
-        out["realtime"] = {"ok": False, "url": cfg["rt_url"], "model": cfg["rt_model"],
-                           "error": f"{type(e).__name__}: {str(e)[:160]}"}
-    finally:
-        await rt.close()
-    out["realtime"]["ms"] = int((time.time() - t0) * 1000)
+    if not cfg.get("rt_on", True):   # v3.9.34: never a non-DashScope provider's key to the DashScope endpoint
+        out["realtime"] = {"skipped": True, "reason": RT_OFF_NOTE}
+    else:
+        rt = RealtimeBackend(cfg, _noop_emit, None, "probe", False)
+        try:
+            await asyncio.wait_for(rt.start(), cfg["rt_timeout"] + 3)
+            out["realtime"] = {"ok": True, "url": cfg["rt_url"], "model": cfg["rt_model"]}
+            _RT_FAIL.pop((cfg["rt_url"], cfg["rt_model"]), None)
+        except Exception as e:  # noqa: BLE001
+            out["realtime"] = {"ok": False, "url": cfg["rt_url"], "model": cfg["rt_model"],
+                               "error": f"{type(e).__name__}: {str(e)[:160]}"}
+        finally:
+            await rt.close()
+        out["realtime"]["ms"] = int((time.time() - t0) * 1000)
     t0 = time.time()
     tb = TurnBackend({**cfg, "tts_model": ""}, _noop_emit, None, "你在做连通测试。", False)
     try:
@@ -1538,7 +1628,7 @@ async def probe(cfg: dict) -> dict:
         out["mode"] = "gemini"
     elif cfg["mode"] == "gemini":
         out["mode"] = None
-    if not out["realtime"].get("ok") and "qwen3.8" in cfg["rt_model"] and ".maas." not in cfg["rt_url"]:
+    if out["realtime"].get("ok") is False and "qwen3.8" in cfg["rt_model"] and ".maas." not in cfg["rt_url"]:
         out["notes"].append("qwen3.8-omni-flash-realtime 必须用业务空间专属地址："
                             "wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime（填到「实时接口地址」）")
     return out

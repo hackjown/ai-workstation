@@ -92,6 +92,41 @@ def conn(store, secrets, pid: Optional[str], m: Optional[dict] = None) -> dict:
             "proxy": str(p.get("proxy") or "").strip(), "enabled": True, "default": False}
 
 
+def host_of(url: str) -> str:
+    from urllib.parse import urlsplit
+    u = (url or "").strip()
+    if u and "://" not in u:
+        u = "https://" + u
+    try:
+        return (urlsplit(u).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+GEMINI_HOST = "generativelanguage.googleapis.com"
+
+
+def is_gemini(c: Optional[dict], relay: str = "") -> bool:
+    """v3.9.34: a provider connection that talks to Gemini: its base_url host is generativelanguage.googleapis.com,
+    its id or name is "gemini" (the 快速添加 preset), or its host is the same as the Gemini relay (omni_gemini_url)."""
+    if not c:
+        return False
+    h = host_of(c.get("base_url") or "")
+    if h == GEMINI_HOST:
+        return True
+    if not c.get("default") and (str(c.get("id") or "").lower() == "gemini"
+                                 or str(c.get("name") or "").strip().lower() == "gemini"):
+        return True
+    rh = host_of(relay)
+    return bool(rh and h and rh == h and rh != GEMINI_HOST)
+
+
+def is_dashscope(c: Optional[dict]) -> bool:
+    """Bailian / DashScope: dashscope*.aliyuncs.com or a workspace *.maas.aliyuncs.com host."""
+    h = host_of((c or {}).get("base_url") or "")
+    return h.endswith(".maas.aliyuncs.com") or h in ("dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com")
+
+
 def slot_conn(store, secrets, slot: str, m: Optional[dict] = None) -> dict:
     m = m if m is not None else _models(store)
     return conn(store, secrets, m.get(slot + "_provider"), m)

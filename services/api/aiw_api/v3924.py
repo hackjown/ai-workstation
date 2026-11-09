@@ -47,9 +47,11 @@ class Ext:
             return self.small_llm()
         from llm_router import LLMRouter
         m = self.sessions.model_settings()
-        key = self.sessions.secrets.get("openai_api_key") if self.sessions.secrets else None
-        return LLMRouter.from_settings(model, m.get("small_model") or m.get("model"), key, m.get("base_url") or None,
-                                       None, "off", role="review")
+        from . import providers as _pv   # v3.9.33
+        back = m.get("small_model") or m.get("model")
+        return _pv.router(self.sessions.store, self.sessions.secrets,
+                          [(model, ""), (back, "small_model" if back == m.get("small_model") else "model")],
+                          None, "off", role="review", m=m)
 
     async def review(self, tool, payload, summary, task) -> Optional[dict]:
         if self.reviewer is None:

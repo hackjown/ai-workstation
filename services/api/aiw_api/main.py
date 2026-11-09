@@ -59,6 +59,7 @@ from websockets.asyncio.client import connect as ws_connect
 
 from agent_runtime import redact as _rd
 from . import cron
+from . import providers as _pv
 from . import desktop_view
 from . import uploads as _uploads
 from .config import Settings
@@ -349,6 +350,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     app.state.v3924 = ext24
     from . import omni_call as _omni   # v3.9.31: 视频通话 (/ws/omni-call, /api/omni/status, /api/omni/probe)
     _omni.mount(app, store, secrets, chat, auth, lambda ws: _ok(ws_token(ws)))
+    _pv.mount(app, store, secrets, auth)   # v3.9.33: 设置 › 模型 › 供应商 (/api/providers)
 
     # ------------------------------------------------------------- tasks
 
@@ -911,7 +913,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         return {**m, "env_model": os.environ.get("OPENAI_MODEL"), "env_base_url": os.environ.get("OPENAI_BASE_URL"),
                 "has_key": bool(secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")),
                 "has_image2_key": bool(secrets.get("image2_api_key") or os.environ.get("AIW_IMAGE2_API_KEY")),
-                "has_omni_key": bool(secrets.get("omni_realtime_key"))}
+                "has_omni_key": bool(secrets.get("omni_realtime_key")),
+                "has_gemini_key": bool(secrets.get("omni_gemini_key") or os.environ.get("GEMINI_API_KEY")
+                                       or os.environ.get("GOOGLE_API_KEY"))}
 
     @app.put("/api/settings/models", dependencies=[Depends(auth)])
     async def put_models(body: dict):
@@ -924,6 +928,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         if m.get("image_default") not in (None, "gateway", "custom"):
             raise HTTPException(400, "image_default must be gateway or custom")
         _check_omni(m)
+        _check_providers(m)
         if m.get("image2_base_url"):
             m["image2_base_url"] = m["image2_base_url"].rstrip("/")
         store.kv_set("models", m)
@@ -937,7 +942,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                   # v3.9.31 视频通话: the omni model (empty = calls off), its voice, the realtime endpoint / model, the
                   # model that reads a text-only omni model's answers aloud, auto|realtime|turn, max minutes a call
                   "omni_model", "omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model", "omni_mode",
-                  "omni_max_minutes")
+                  "omni_max_minutes",
+                  # v3.9.32 Gemini Live backend: model, prebuilt voice, relay base URL (optional), outbound proxy for the
+                  # Gemini connection (http/https/socks; its key is the secret omni_gemini_key)
+                  "omni_gemini_model", "omni_gemini_voice", "omni_gemini_url", "omni_proxy",
+                  # v3.9.33 model provider list: "<slot>_provider" = a provider id per model slot (empty = 默认)
+                  *_pv.PROVIDER_FIELDS)
 
     @app.post("/api/image/test", dependencies=[Depends(auth)])
     async def image_test(body: dict | None = None):
@@ -945,7 +955,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         import time as _t
         from agent_runtime import image_edit as _ie
         from .sessions import image_cfg_from
-        cfg = image_cfg_from(store.kv_get("models", {}) or {}, secrets)
+        cfg = image_cfg_from(store.kv_get("models", {}) or {}, secrets, store)
         if not cfg:
             return {"ok": False, "error": "没有配置生图模型", "results": []}
         which = (body or {}).get("which")
@@ -975,13 +985,27 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                     raise HTTPException(400, "thinking must be on or off")
                 m[k] = v
         _check_omni(m)
+        _check_providers(m)
         store.kv_set("models", m)
         return m
 
+    def _check_providers(m: dict) -> None:
+        """v3.9.33: a *_provider field names an existing provider (or default / empty)."""
+        ids = {p["id"] for p in _pv.stored(store)}
+        for f in _pv.PROVIDER_FIELDS:
+            v = m.get(f)
+            if v and v != _pv.DEFAULT_ID and v not in ids:
+                raise HTTPException(400, f"{f}: 没有 id 为 {v} 的供应商")
+            if v == _pv.DEFAULT_ID:
+                m[f] = None
+
     def _check_omni(m: dict) -> None:
-        """v3.9.31: omni_mode is auto | realtime | turn; omni_max_minutes a number of minutes (1-240)."""
-        if m.get("omni_mode") not in (None, "auto", "realtime", "turn"):
-            raise HTTPException(400, "omni_mode must be auto, realtime or turn")
+        """v3.9.31: omni_mode is auto | realtime | turn (v3.9.32: | gemini); omni_max_minutes a number of minutes
+        (1-240); v3.9.32: omni_proxy an http(s):// or socks4/5(h):// URL."""
+        if m.get("omni_mode") not in (None, "auto", "realtime", "turn", "gemini"):
+            raise HTTPException(400, "omni_mode must be auto, realtime, turn or gemini")
+        if m.get("omni_proxy") and not re.match(r"^(https?|socks5h?|socks4a?)://[^\s/]+", m["omni_proxy"]):
+            raise HTTPException(400, "omni_proxy must look like http://host:port or socks5://host:port")
         if m.get("omni_max_minutes") is not None:
             try:
                 if not 1 <= float(m["omni_max_minutes"]) <= 240:
@@ -997,11 +1021,20 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         model = (body.get("model") or "").strip()
         if not model:
             raise HTTPException(400, "model required")
-        base = (body.get("base_url") or m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
-        key = secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        # v3.9.33: the slot's provider (body.provider, else body.slot's *_provider, else by model name)
+        pid = body.get("provider")
+        if pid is None and body.get("slot") in _pv.SLOTS:
+            pid = m.get(body["slot"] + "_provider") or ""
+        if pid is None:
+            c = _pv.model_conn(store, secrets, model, m)
+        else:
+            c = _pv.conn(store, secrets, pid, m)
+        base = ((body.get("base_url") if c["default"] else None) or c["base_url"]).rstrip("/")
+        key = c["key"]
         if not key:
-            return {"model": model, "error": "no API key"}
-        res = await probe(base, key, model)
+            return {"model": model, "error": "no API key", "provider": c["id"]}
+        res = await (probe(base, key, model, proxy=c["proxy"]) if c.get("proxy") else probe(base, key, model))
+        res["provider"] = c["id"]
         probes = store.kv_get("model_probes", {}) or {}
         probes[model] = res
         store.kv_set("model_probes", probes)
@@ -1019,15 +1052,19 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         chain = vision_chain(m, probes)
         main = m.get("model") or os.environ.get("OPENAI_MODEL") or ""
         names = chain or ([main] if main else [])
-        base = (m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
-        key = secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        conns = {n: _pv.model_conn(store, secrets, n, m, "vision_model" if n == m.get("vision_model") else
+                                   "vision_fallback" if n == m.get("vision_fallback") else "model" if n == main else "")
+                 for n in names}   # v3.9.33: each model through its own provider
+        key = any(c["key"] for c in conns.values()) or secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
         out = {"chain": chain, "main_looks": not chain, "missing": no_vision_text(m, probes), "results": []}
         if not key:
             return {**out, "ok": False, "error": "no API key"}
         if not names:
             return {**out, "ok": False, "error": out["missing"] or "没有配置视觉模型"}
-        async with httpx.AsyncClient(timeout=60) as c:
-            for n in names:
+        for n in names:
+            cn = conns[n]
+            base, key = cn["base_url"], cn["key"]
+            async with httpx.AsyncClient(timeout=60, **_pv.httpx_kw(cn)) as c:
                 r = await probe_vision(c, base + "/chat/completions", key, n)
                 if r.get("error"):
                     e = classify(RuntimeError(r["error"] + " " + base), n)
@@ -1045,19 +1082,33 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.get("/api/models", dependencies=[Depends(auth)])
     async def list_models():
-        """Model ids offered by the OpenAI-compatible gateway, for the picker."""
+        """Model ids offered by the OpenAI-compatible gateway, for the picker. v3.9.33: "groups" = one entry per
+        enabled provider ({provider, name, models, error?}, the default first; fetched in parallel, cached in kv
+        provider_models for name -> provider lookups); "models" stays the default provider's list."""
         m = store.kv_get("models", {}) or {}
-        base = (m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
-        key = secrets.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
-        if not key:
-            return {"models": [], "error": "no API key"}
-        try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.get(f"{base}/models", headers={"Authorization": f"Bearer {key}"})
-                r.raise_for_status()
-            return {"models": sorted(x.get("id") for x in r.json().get("data", []) if x.get("id"))}
-        except Exception as e:  # noqa: BLE001
-            return {"models": [], "error": str(e)[:300]}
+        conns = [_pv.default_conn(store, secrets, m)] + [
+            _pv.conn(store, secrets, p["id"], m) for p in _pv.stored(store) if p.get("enabled") is not False]
+
+        async def one(c):
+            g = {"provider": c["id"], "name": c["name"], "models": []}
+            if not c["key"]:
+                return {**g, "error": "no API key"}
+            try:
+                g["models"] = await _pv.list_models(c, _pv.TRANSPORT)
+            except Exception as e:  # noqa: BLE001
+                g["error"] = str(e)[:300]
+            return g
+        groups = list(await asyncio.gather(*(one(c) for c in conns)))
+        cache = store.kv_get(_pv.MODELS_KV, {}) or {}
+        for g in groups:
+            if g["models"]:
+                cache[g["provider"]] = g["models"]
+        store.kv_set(_pv.MODELS_KV, cache)
+        d = groups[0]
+        out = {"models": d["models"], "groups": groups}
+        if d.get("error"):
+            out["error"] = d["error"]
+        return out
 
     # ------------------------------------------------------------- settings: VM address
     def _main_mid() -> str:

@@ -125,9 +125,9 @@ class SessionManager:
         if self._custom_llm:
             return self._custom_llm()
         m = self.model_settings()
-        key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m.get("model"), m.get("fallback"), key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"),
-                                       role="main")
+        from . import providers as _pv   # v3.9.33: each model on its slot's provider (default = base_url + key)
+        return _pv.router(self.store, self.secrets, [(m.get("model"), "model"), (m.get("fallback"), "fallback")],
+                          self._tool_choices(), m.get("thinking"), role="main", m=m)
 
     async def _routed_llm(self, task: Task, small=None) -> tuple:
         """v3.9.24 (2): (llm, route or None). A model the user picked for the task wins; then auto routing
@@ -151,7 +151,6 @@ class SessionManager:
         if not route or (not route.get("model") and (route.get("effort") or "off") in ("", "off") and route.get("by") != "manual"):
             return llm, route
         m = self.model_settings()
-        key = self.secrets.get("openai_api_key") if self.secrets else None
         name = route.get("model") or m.get("model")
         back = m.get("model") if name != m.get("model") else m.get("fallback")
         eff = route.get("effort") if route.get("effort") in ("low", "medium", "high") else None
@@ -161,8 +160,11 @@ class SessionManager:
             (log.warning if route.get("warning") else log.info)(
                 "task %s dev route -> %s (from %s, effort %s, thinking %s)%s", task.id, name,
                 route.get("model_source"), eff, thinking, " FLASH FALLBACK" if route.get("warning") else "")
-        return LLMRouter.from_settings(name, back, key, m.get("base_url") or None, self._tool_choices(), thinking,
-                                       effort=eff, role="main"), route
+        from . import providers as _pv
+        return _pv.router(self.store, self.secrets,
+                          [(name, "model" if name == m.get("model") else "", route.get("provider") or ""),
+                           (back, "model" if back == m.get("model") else "fallback")],
+                          self._tool_choices(), thinking, effort=eff, role="main", m=m), route
 
     def _long_run(self, task: Task) -> bool:
         """v3.9.26: a 继续 / 重试 of a task that already ran many steps (AIW_DEV_LONG_STEPS, 40) gets the dev route too."""
@@ -188,9 +190,10 @@ class SessionManager:
         from agent_runtime.video import is_video_production
         if not vm or vm == m.get("model") or not is_video_production(prompt):
             return self._llm(), None
-        key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(vm, m.get("model") or m.get("fallback"), key, m.get("base_url") or None,
-                                       self._tool_choices(), m.get("thinking"), role="main"), vm
+        from . import providers as _pv
+        back = m.get("model") or m.get("fallback")
+        return _pv.router(self.store, self.secrets, [(vm, "video_model"), (back, "model" if back == m.get("model") else "fallback")],
+                          self._tool_choices(), m.get("thinking"), role="main", m=m), vm
 
     def _summary_llm(self, small=None) -> Optional[LLMRouter]:
         """v3.9.30: the cheap model for context compaction / summaries (never the dev steps): models.summary_model,
@@ -199,15 +202,15 @@ class SessionManager:
         if self._custom_llm:
             return None
         m = self.model_settings()
-        key = self.secrets.get("openai_api_key") if self.secrets else None
         name = m.get("summary_model") or os.environ.get("AIW_SUMMARY_MODEL") or ""
         if not name:
             from . import autoroute as _ar
             if _ar.is_flash(m.get("model") or ""):
                 name = m.get("model")
         if name:
-            return LLMRouter.from_settings(name, None, key, m.get("base_url") or None, self._tool_choices(), "off",
-                                           role="subagent")
+            from . import providers as _pv
+            return _pv.router(self.store, self.secrets, [(name, "summary_model" if name == m.get("summary_model") else "model")],
+                              self._tool_choices(), "off", role="subagent", m=m)
         return small
 
     def _subagent_llm(self) -> Optional[LLMRouter]:
@@ -216,9 +219,9 @@ class SessionManager:
         m = self.model_settings()
         if not m.get("subagent_model"):
             return None
-        key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(m["subagent_model"], None, key, m.get("base_url") or None, self._tool_choices(), m.get("thinking"),
-                                       role="subagent")
+        from . import providers as _pv
+        return _pv.router(self.store, self.secrets, [(m["subagent_model"], "subagent_model")], self._tool_choices(),
+                          m.get("thinking"), role="subagent", m=m)
 
     def _tool_choices(self) -> dict:
         """tool_choice that the probe found working for each model ('auto' for gateways that break on 'required')."""
@@ -245,16 +248,23 @@ class SessionManager:
         chain = self.vision_chain()
         if not chain:
             return None
-        key = self.secrets.get("openai_api_key") if self.secrets else None
-        if not (key or os.environ.get("OPENAI_API_KEY")):
-            return None
         # the eyes describe pictures; thinking there only adds latency (AIW_VISION_THINKING=on to restore).
         # The router tries the chain in order: a 500 from the first vision model falls through to the next.
+        # v3.9.33: each model on its own provider (vision_model_provider, vision_fallback_provider, ...)
         from llm_router.providers.openai import OpenAIProvider
-        key = key or os.environ.get("OPENAI_API_KEY")
+        from . import providers as _pv
         th = os.environ.get("AIW_VISION_THINKING", "off")
-        r = LLMRouter([OpenAIProvider(model=n, api_key=key, base_url=m.get("base_url") or None, thinking=th)
-                       for n in chain])
+        ps = []
+        for n in chain:
+            c = _pv.model_conn(self.store, self.secrets, n, m, "vision_model" if n == m.get("vision_model") else
+                               "vision_fallback" if n == m.get("vision_fallback") else "")
+            key = c["key"] or (os.environ.get("OPENAI_API_KEY") if c["default"] else "")
+            if key:
+                ps.append(OpenAIProvider(model=n, api_key=key, base_url=c["raw_base"], thinking=th,
+                                         **({"proxy": c["proxy"]} if c.get("proxy") else {})))
+        if not ps:
+            return None
+        r = LLMRouter(ps)
         r.role = "vision"
         return r
 
@@ -266,8 +276,8 @@ class SessionManager:
         name = m.get("geometry_model") or os.environ.get("AIW_GEOMETRY_MODEL")
         if not name:
             return None
-        key = self.secrets.get("openai_api_key") if self.secrets else None
-        return LLMRouter.from_settings(name, None, key, m.get("base_url") or None, None, "off", role="geometry")
+        from . import providers as _pv
+        return _pv.router(self.store, self.secrets, [(name, "geometry_model")], None, "off", role="geometry", m=m)
 
     def _image_cfg(self) -> Optional[dict]:
         """The AI image models (image_edit / generate_image), v3.9.15 two endpoints:
@@ -277,7 +287,7 @@ class SessionManager:
         endpoint first when it is filled in. Top-level model/key/base_url = the default, for older callers."""
         if self._custom_llm:
             return None
-        return image_cfg_from(self.model_settings(), self.secrets)
+        return image_cfg_from(self.model_settings(), self.secrets, self.store)
 
     # ------------------------------------------------------------------ context
     def build_context(self, thread_id: Optional[str], exclude_task: Optional[str] = None,
@@ -1850,7 +1860,7 @@ def _budget_raw(prompt: str, max_steps: int, timeout_s: float, context: Optional
     return max_steps, timeout_s
 
 
-def image_cfg_from(m: dict, secrets=None) -> Optional[dict]:
+def image_cfg_from(m: dict, secrets=None, store=None) -> Optional[dict]:
     """See SessionManager._image_cfg. Also used by the chat and by /api/image/test."""
     m = m or {}
     gw_model = m.get("image_model") or os.environ.get("AIW_IMAGE_MODEL")
@@ -1859,6 +1869,15 @@ def image_cfg_from(m: dict, secrets=None) -> Optional[dict]:
     c_model = m.get("image2_model") or os.environ.get("AIW_IMAGE2_MODEL")
     c_key = (secrets.get("image2_api_key") if secrets else None) or os.environ.get("AIW_IMAGE2_API_KEY")
     c_base = m.get("image2_base_url") or os.environ.get("AIW_IMAGE2_BASE_URL")
+    if store is not None and (m.get("image_model_provider") or m.get("image2_model_provider")):
+        # v3.9.33: a provider picked for 改图/生图模型 or the 生图接口 replaces that endpoint's base URL + key
+        from . import providers as _pv
+        if m.get("image_model_provider"):
+            c = _pv.slot_conn(store, secrets, "image_model", m)
+            gw_key, gw_base = c["key"] or gw_key, c["base_url"]
+        if m.get("image2_model_provider"):
+            c = _pv.slot_conn(store, secrets, "image2_model", m)
+            c_key, c_base = c["key"], c["base_url"]
     gw = {"id": "gateway", "name": "主网关", "base_url": gw_base, "key": gw_key, "model": gw_model} \
         if gw_model and gw_key else None
     cu = {"id": "custom", "name": "自定义生图接口", "base_url": c_base.rstrip("/"), "key": c_key, "model": c_model} \

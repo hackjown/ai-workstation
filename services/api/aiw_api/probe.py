@@ -60,12 +60,12 @@ async def probe_vision(c: httpx.AsyncClient, url: str, key: str, model: str) -> 
     return res
 
 
-async def probe(base: str, key: str, model: str) -> dict:
+async def probe(base: str, key: str, model: str, proxy: str = "") -> dict:
     url = base.rstrip("/") + "/chat/completions"
     out: dict = {"model": model, "tools": False, "tool_choice": None, "vision": False, "ts": time.time()}
     notes = []
     long_cmd = "python3 -c \"print('" + "x" * 400 + "')\""
-    async with httpx.AsyncClient(timeout=60) as c:
+    async with httpx.AsyncClient(timeout=60, **({"proxy": proxy} if proxy else {})) as c:   # v3.9.33 provider proxy
         t0 = time.time()
         for choice in ("required", "auto"):
             try:

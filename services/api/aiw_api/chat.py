@@ -563,9 +563,11 @@ class Chat:
         else:   # classifier, summaries, memory extraction: the small model
             name = m.get("small_model") or m.get("subagent_model") or m.get("chat_model") or main
         back = main if name != main else m.get("fallback")
-        key = s.secrets.get("openai_api_key") if s.secrets else None
-        return LLMRouter.from_settings(name, back, key, m.get("base_url") or None, None, "off",
-                                       role="chat" if role == "chat" else "small")
+        from . import providers as _pv   # v3.9.33: chat_model / small_model ... on their own providers
+        slot = next((k for k in ("chat_model", "small_model", "subagent_model") if m.get(k) == name and
+                     (role == "chat") == (k == "chat_model")), "model")
+        return _pv.router(getattr(s, "store", None) or self.store, s.secrets, [(name, slot), (back, "model" if back == main else "fallback")], None, "off",
+                          role="chat" if role == "chat" else "small", m=m)
 
     async def _chat_llm(self, text: str):
         """v3.9.24 (2): the chat model for this turn; with 模型路由 on for chat, the tier's model / effort."""
@@ -580,11 +582,15 @@ class Chat:
             m = self.sessions.model_settings()
             main = m.get("chat_model") or m.get("model")
             name = route.get("model") or main
-            key = self.sessions.secrets.get("openai_api_key") if self.sessions.secrets else None
             self.last_route = route
             eff = route.get("effort") if route.get("effort") != "off" else None
-            return LLMRouter.from_settings(name, main if name != main else m.get("fallback"), key,
-                                           m.get("base_url") or None, None, "on" if eff else "off", effort=eff, role="chat")
+            from . import providers as _pv
+            back = main if name != main else m.get("fallback")
+            mslot = "chat_model" if main == m.get("chat_model") else "model"
+            return _pv.router(self.store, self.sessions.secrets,
+                              [(name, mslot if name == main else "", route.get("provider") or ""),
+                               (back, mslot if back == main else "fallback")],
+                              None, "on" if eff else "off", effort=eff, role="chat", m=m)
         except Exception as e:  # noqa: BLE001
             log.warning("chat route: %s", e)
             return self.llm("chat")

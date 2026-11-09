@@ -12,7 +12,7 @@ import CoreImage
 // with AVSpeechSynthesizer. The server saves the call's transcript to the 小秘 chat at hang-up.
 
 final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    @Published var mode = ""          // "realtime" | "turn" once the server is ready
+    @Published var mode = ""          // "realtime" | "turn" | "gemini" (v3.9.32) once the server is ready
     @Published var model = ""
     @Published var note = ""
     @Published var userText = ""
@@ -341,7 +341,7 @@ struct CallView: View {
             if c.cameraOn { CallCameraPreview(session: c.capture).ignoresSafeArea() }
             VStack(spacing: 14) {
                 HStack(spacing: 10) {
-                    Text(c.mode.isEmpty ? "连接中…" : "\(c.mode == "realtime" ? "实时" : "轮流") · \(c.model)")
+                    Text(c.mode.isEmpty ? "连接中…" : "\(c.mode == "realtime" ? "实时" : c.mode == "gemini" ? "Gemini" : "轮流") · \(c.model)")
                         .font(.footnote).padding(.horizontal, 12).padding(.vertical, 4)
                         .background(Color.black.opacity(0.42)).clipShape(Capsule())
                     Text(String(format: "%02d:%02d", c.seconds / 60, c.seconds % 60))

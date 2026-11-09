@@ -40,7 +40,7 @@ EFFORTS = ("off", "low", "medium", "high")
 DEFAULT = {"enabled": False, "use_model": False, "apply_chat": False,
            "tiers": {"easy": {"model": "", "effort": "off"}, "normal": {"model": "", "effort": "off"},
                      "hard": {"model": "", "effort": "high"}},
-           "rules": [], "dev": {"enabled": True, "model": "", "effort": "high"}}
+           "rules": [], "dev": {"enabled": True, "model": "", "effort": "high", "provider": ""}}
 
 HARD_RE = re.compile(r"开发|写(一个|个)?(程序|脚本|代码|插件|网站|应用|App|app)|重构|调试|debug|修(复)?\s*bug|报错|逆向|复刻|"
                      r"架构|设计方案|部署|上线|迁移|诊断|排查|深挖|分析报告|研究报告|论文|CAD|户型|平面图|渲染|视频|剪辑|"
@@ -53,7 +53,7 @@ def cfg(store) -> dict:
     c = store.kv_get(KV, {}) or {}
     out = json.loads(json.dumps(DEFAULT))
     out.update({k: v for k, v in c.items() if k in DEFAULT and k not in ("tiers", "dev")})
-    out["dev"].update({k: v for k, v in (c.get("dev") or {}).items() if k in ("enabled", "model", "effort")})
+    out["dev"].update({k: v for k, v in (c.get("dev") or {}).items() if k in ("enabled", "model", "effort", "provider")})
     if out["dev"].get("effort") not in EFFORTS:
         out["dev"]["effort"] = "high"
     for t in TIERS:
@@ -82,6 +82,8 @@ def save(store, body: dict) -> dict:
             c["dev"]["model"] = str(d["model"] or "").strip()[:120]
         if d.get("effort") in EFFORTS:
             c["dev"]["effort"] = d["effort"]
+        if "provider" in d:   # v3.9.33: the provider of autoroute.dev.model (empty = by model name, else 默认)
+            c["dev"]["provider"] = str(d["provider"] or "").strip()[:32]
     if "rules" in body:
         rules = []
         for r in body.get("rules") or []:
@@ -201,6 +203,8 @@ def dev_route(store, why: str) -> dict:
     r = {"tier": "dev", "tier_cn": "修复代码", "model": model if source != "models.model" else "",
          "effort": effort, "thinking": "on", "by": "dev", "reason": why, "model_source": source or "models.model",
          "dev_model": model}
+    if source == "autoroute.dev.model" and c["dev"].get("provider"):
+        r["provider"] = c["dev"]["provider"]
     if not model or is_flash(model):
         r["warning"] = (f"修复代码的任务仍在用 {model or '主模型'}（快速/轻量模型），容易反复写脚本不执行、原地打转。"
                         "请在 设置 › 模型路由 › 修复代码 填一个强模型（kv autoroute.dev.model 或 models.dev_model）。")

@@ -260,6 +260,10 @@ class Memory:
             return None
         model = (m.get("embed_model") or "").strip()
         key = s.secrets.get("openai_api_key") if getattr(s, "secrets", None) else None
+        if model and m.get("embed_model_provider") and getattr(s, "store", None) is not None:   # v3.9.33
+            from . import providers as _pv
+            c = _pv.slot_conn(s.store, s.secrets, "embed_model", m)
+            return {"model": model, "key": c["key"], "base": c["base_url"], "proxy": c.get("proxy") or ""} if c["key"] else None
         if not model or not key:
             return None
         return {"model": model, "key": key, "base": (m.get("base_url") or "https://api.openai.com/v1").rstrip("/")}
@@ -272,7 +276,7 @@ class Memory:
             return None
         import httpx
         try:
-            async with httpx.AsyncClient(timeout=20) as c:
+            async with httpx.AsyncClient(timeout=20, **({"proxy": cfg["proxy"]} if cfg.get("proxy") else {})) as c:
                 r = await c.post(cfg["base"] + "/embeddings", headers={"Authorization": f"Bearer {cfg['key']}"},
                                  json={"model": cfg["model"], "input": texts})
             r.raise_for_status()

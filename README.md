@@ -93,6 +93,38 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.33 模型供应商列表
+
+设置 › 模型 › **供应商**：除了原来的「网关地址 + API Key」（现在叫「默认」供应商，id `default`，原样保留、不迁移），可以再加多个 OpenAI 兼容供应商
+（名称、类型、地址、Key、代理、启用；「测试连接」读一次 `/models`）。快速添加：百炼 `https://dashscope.aliyuncs.com/compatible-mode/v1`、
+Gemini `https://generativelanguage.googleapis.com/v1beta/openai`（国内需代理）、OpenAI `https://api.openai.com/v1`、DeepSeek `https://api.deepseek.com`。
+实现在 `services/api/aiw_api/providers.py`（`/api/providers` 增删改、`/api/providers/{id}/test`）。
+
+- 存储：kv `providers` = `[{id, name, kind, base_url, proxy, enabled}]`；每个供应商的 Key 是加密密钥 `provider_key_<id>`，接口只返回 `has_key`。
+- **方案（唯一）**：kv `models` 里每个模型槽位旁边可选一个 `<槽位>_provider` 字段（供应商 id，空 = 默认），模型名照旧是纯模型名。
+  槽位：`model`、`fallback`、`vision_model`、`vision_fallback`、`video_model`、`subagent_model`、`chat_model`、`small_model`、`embed_model`、
+  `summary_model`、`geometry_model`、`image_model`、`image2_model`（选了就代替「生图接口」的地址/Key）、`omni_model`（轮流模式；实时接口 Key/地址留空时也用它）、
+  `omni_tts_model`、`omni_gemini`（Gemini Key 留空时借用该供应商的 Key 和代理）。
+- 不在槽位里的模型名（模型路由的档位、`autoroute.dev.model`）：同名槽位的供应商 → 只有某个供应商的模型列表里有它（默认列表里没有）→ 默认；
+  `autoroute.dev.provider` 可显式指定。
+- 模型下拉框按「供应商 · 模型」分组（`GET /api/models` 多了 `groups`，`models` 仍是默认供应商的列表）；选某组里的模型会同时选上该槽位的供应商；「探测」走该槽位的供应商。
+- 删除/停用还在用的供应商会被拒绝（409，列出在用的设置）；强制删除（`?force=1`）把这些设置改回「默认」。kv 里残留的未知 id 一律回落到默认。
+- 类型只有 `openai`：llm-router 的 GoogleProvider 太简陋（单次工具调用、无流式/思考/重试），Gemini 走它的 OpenAI 兼容地址。
+- 代理：每个供应商可填 `http(s)://` 或 `socks5://`；socks 需要 `pip install 'httpx[socks]'`。
+
+## v3.9.32 视频通话：Gemini Live 后端
+
+通话多了第三种后端 `gemini`：服务端用 WebSocket 连 Gemini Live API（`BidiGenerateContent`，`wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=…`），
+原生语音进出、服务端 VAD 打断、输入/输出字幕、工具调用（`create_aiw_task` / `task_status`）、上下文压缩（slidingWindow，否则音视频会话约 2 分钟就断）、
+goAway / 断线时用 sessionResumption 句柄自动重连（客户端无感）。客户端协议不变。
+
+- 设置 › 模型 › 视频通话：模式多了「Gemini Live」；Gemini Key（密钥 `omni_gemini_key`，也读环境变量 `GEMINI_API_KEY`/`GOOGLE_API_KEY`，在 https://aistudio.google.com/api-keys 创建）、
+  Gemini 模型 `omni_gemini_model`（默认 `gemini-3.8-live`）、Gemini 音色 `omni_gemini_voice`（默认 `Puck`，30 个预置音色）、出站代理 `omni_proxy`（`http://`、`https://`、`socks5://`；留空用 `HTTPS_PROXY`/`ALL_PROXY`）、
+  中转地址 `omni_gemini_url`（反向代理/中转的 wss 地址，可选）。
+- **规则**：「自动」模式下填了 Gemini Key 就先连 Gemini，不通再连实时接口、再轮流（后两者需要 `omni_model`）；「Gemini Live」模式只用 Gemini。只填 Gemini Key、不设通话模型也能通话。
+- **国内**：直连 Google 不通，必须填出站代理或中转地址。socks 代理需要 websockets≥15 且装 `python-socks[asyncio]`；websockets 13/14 只支持 `http://` 代理（aiw 自己建 CONNECT 隧道）。
+- 免费层可用，但免费层数据会被 Google 用于改进产品。
+
 ## v3.9.31 视频通话（全模态实时语音 + 摄像头）
 
 聊天顶部的电话按钮（web；iOS 首页聊天右上角）打开全屏通话：说话、看摄像头画面（前/后摄像头、可关）、静音、点字幕打断、挂断。

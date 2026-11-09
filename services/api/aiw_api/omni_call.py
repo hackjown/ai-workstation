@@ -6,7 +6,7 @@ camera frame a second, the full-modality model (Qwen-Omni) answers with speech, 
     app -> {"type":"audio","data":"<base64 pcm16 16 kHz mono>"}   20-100 ms a chunk
     app -> {"type":"frame","data":"<base64 jpeg>"}                ≤1 fps, ≤720p (the server drops faster frames)
     app -> {"type":"interrupt"} | {"type":"hangup"} | {"type":"ping"}
-    srv -> {"type":"ready","mode":"realtime"|"turn","model","voice","audio_out":bool,"max_seconds","note"?}
+    srv -> {"type":"ready","mode":"realtime"|"turn"|"gemini","model","voice","audio_out":bool,"max_seconds","note"?}
     srv -> {"type":"audio","data":"<base64 pcm16 24 kHz mono>"}
     srv -> {"type":"transcript","role":"user"|"assistant","text","final":bool,"speak"?:true}
            text is the whole utterance so far; speak=true: no audio came for it, the client reads it out itself
@@ -27,10 +27,24 @@ Two backends behind that one protocol:
             (wav) + the latest camera frame + the recent call; audio deltas (delta.audio.data, pcm16 24 kHz) stream back.
             New speech cancels the answer in flight. A model that only outputs text (qwen3.8-omni-flash) is detected
             and its sentences are read by models.omni_tts_model (an audio-output omni model) or by the client itself.
-"auto" (models.omni_mode, default) tries realtime with a short timeout and falls back to turn, telling the client.
+  gemini    v3.9.32: Gemini Live API (BidiGenerateContent) as a server-side WebSocket client: setup (models/<name>,
+            responseModalities AUDIO, prebuilt voice, systemInstruction, functionDeclarations, input/output audio
+            transcription, automatic activity detection, contextWindowCompression slidingWindow so audio+video sessions
+            are not cut at 2 minutes, sessionResumption) -> setupComplete; realtimeInput audio (audio/pcm;rate=16000) and
+            video (image/jpeg); serverContent modelTurn inlineData (pcm16 24 kHz), input/outputTranscription,
+            interrupted (-> speech_started), turnComplete; toolCall -> toolResponse; goAway / a dropped connection ->
+            a new connection resumed with the last sessionResumptionUpdate handle, invisible to the client.
+            Barge-in is the server's VAD. From China it needs models.omni_proxy (http/https/socks) or a relay URL.
+"auto" (models.omni_mode, default) tries Gemini first when omni_gemini_key is set, then realtime (when omni_model is
+set) with a short timeout, then turn, telling the client. "gemini" uses only Gemini. A backend that failed is skipped
+for AIW_OMNI_RT_SKIP seconds in auto mode.
 
-Settings (kv "models"): omni_model (empty = calls off), omni_voice (default Tina), omni_realtime_url, omni_realtime_model,
-omni_tts_model, omni_mode (auto | realtime | turn), omni_max_minutes (30). Secret omni_realtime_key (else the gateway key).
+Settings (kv "models"): omni_model (empty = no realtime/turn), omni_voice (default Tina), omni_realtime_url,
+omni_realtime_model, omni_tts_model, omni_mode (auto | realtime | turn | gemini), omni_max_minutes (30),
+omni_gemini_model (gemini-3.8-live), omni_gemini_voice (Puck), omni_gemini_url (relay / reverse proxy base, optional),
+omni_proxy (http://, https://, socks5:// for the Gemini connection; else HTTPS_PROXY / ALL_PROXY from the environment).
+Secrets omni_realtime_key (else the gateway key), omni_gemini_key (else env GEMINI_API_KEY / GOOGLE_API_KEY).
+Calls are on when omni_model is set, or when a Gemini key is set and the mode is auto or gemini.
 Tools from a call are deliberately few: create_aiw_task (a normal aiw task via Chat.start_task, whose own confirm cards
 still apply) and task_status. The call's transcript lands in the 小秘 chat as one message at hang-up.
 """
@@ -61,6 +75,15 @@ VOICES = ["Tina", "Cindy", "Liora Mira", "Raymond", "Zane", "Katerina", "Ryan", 
           "Maia", "Evan", "Qiao", "Momo", "Wil", "Angel", "Jennifer", "Aiden", "Sunny", "Dylan", "Eric", "Peter", "Rocky",
           "Kiki", "Ethan", "Cherry"]
 IN_RATE, OUT_RATE = 16000, 24000
+# v3.9.32 Gemini Live (ai.google.dev/api/live, aistudio.google.com/docs/live-api)
+GEMINI_HOST = "wss://generativelanguage.googleapis.com"
+GEMINI_PATH = "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-live"
+DEFAULT_GEMINI_VOICE = "Puck"
+GEMINI_VOICES = ["Puck", "Kore", "Zephyr", "Charon", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe", "Autonoe", "Enceladus",
+                 "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
+                 "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia",
+                 "Sadaltager", "Sulafat"]
 MAX_FRAME_B64 = 256 * 1024      # DashScope: one image ≤256 KB after base64
 MAX_MSG = 512 * 1024
 TRANSPORT: Optional[httpx.AsyncBaseTransport] = None   # tests: httpx.MockTransport
@@ -99,25 +122,99 @@ def with_model(url: str, model: str) -> str:
     return url + ("&" if "?" in url else "?") + "model=" + model
 
 
+MODES = ("auto", "realtime", "turn", "gemini")
+
+
+def gemini_url_for(base: str) -> str:
+    """The BidiGenerateContent endpoint. omni_gemini_url may be a bare host (a relay / reverse proxy in front of
+    generativelanguage.googleapis.com), which gets the standard path, or a full URL, which is used as given."""
+    b = (base or "").strip() or GEMINI_HOST
+    if b.startswith("http"):
+        b = "ws" + b[4:]
+    if "BidiGenerateContent" in b:
+        return b
+    return b.rstrip("/") + GEMINI_PATH
+
+
+def with_key(url: str, key: str) -> str:
+    if not key or re.search(r"[?&]key=", url):
+        return url
+    return url + ("&" if "?" in url else "?") + "key=" + key
+
+
+def gemini_on(cfg: dict) -> bool:
+    return bool(cfg.get("gemini_key")) and cfg.get("mode") in ("auto", "gemini")
+
+
+def enabled(cfg: dict) -> bool:
+    """Calls are possible: an omni model (realtime / turn), or a Gemini key in auto / gemini mode."""
+    if cfg.get("mode") == "gemini":
+        return bool(cfg.get("gemini_key"))
+    return bool(cfg.get("model")) or gemini_on(cfg)
+
+
+def disabled_message(cfg: dict) -> str:
+    if cfg.get("mode") == "gemini":
+        return "选了 Gemini Live 模式但还没有 Gemini API Key：设置 › 模型 › 视频通话 › Gemini Key"
+    return "还没有设置通话模型：设置 › 模型 › 通话模型（全模态），如 qwen3.8-omni-flash；或填 Gemini Live 的 Key"
+
+
+GEMINI_DEFAULTS = {"gemini_model": DEFAULT_GEMINI_MODEL, "gemini_voice": DEFAULT_GEMINI_VOICE, "gemini_url": "",
+                   "gemini_key": "", "proxy": "", "gemini_timeout": 8.0}
+
+
+def with_defaults(cfg: dict) -> dict:
+    """A config dict built before v3.9.32 (or by hand) gets the Gemini keys with their defaults."""
+    c = dict(cfg)
+    for k, v in GEMINI_DEFAULTS.items():
+        c.setdefault(k, v)
+    if not c["gemini_url"]:
+        c["gemini_url"] = gemini_url_for("")
+    return c
+
+
 def config(store, secrets) -> dict:
     m = store.kv_get("models", {}) or {}
     base = (m.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
     key = (secrets.get("openai_api_key") if secrets else None) or os.environ.get("OPENAI_API_KEY") or ""
+    tts_base, tts_key, gem_pkey, gem_pproxy = base, key, "", ""
+    if any(m.get(f) for f in ("omni_model_provider", "omni_tts_model_provider", "omni_gemini_provider")):
+        # v3.9.33: providers for the omni model (turn mode, and the realtime key / URL when they are empty), the TTS
+        # model, and Gemini Live (its key when omni_gemini_key is empty, its proxy when omni_proxy is empty)
+        from . import providers as _pv
+        if m.get("omni_model_provider"):
+            c = _pv.slot_conn(store, secrets, "omni_model", m)
+            base, key = c["base_url"], c["key"]
+        tts_base, tts_key = base, key
+        if m.get("omni_tts_model_provider"):
+            c = _pv.slot_conn(store, secrets, "omni_tts_model", m)
+            tts_base, tts_key = c["base_url"], c["key"]
+        if m.get("omni_gemini_provider"):
+            c = _pv.slot_conn(store, secrets, "omni_gemini", m)
+            if not c["default"]:
+                gem_pkey, gem_pproxy = c["key"], c.get("proxy") or ""
     model = str(m.get("omni_model") or "").strip()
     rt_url = str(m.get("omni_realtime_url") or "").strip() or realtime_url_for(base)
     if rt_url.startswith("http"):
         rt_url = "ws" + rt_url[4:]
     mode = str(m.get("omni_mode") or "auto").strip().lower()
+    gkey = ((secrets.get("omni_gemini_key") if secrets else None) or gem_pkey or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY") or "")
     try:
         minutes = float(m.get("omni_max_minutes") or 30)
     except (TypeError, ValueError):
         minutes = 30.0
     return {"model": model, "voice": str(m.get("omni_voice") or "").strip() or DEFAULT_VOICE,
-            "base_url": base, "key": key,
+            "base_url": base, "key": key, "tts_base_url": tts_base, "tts_key": tts_key,
             "rt_url": rt_url, "rt_model": str(m.get("omni_realtime_model") or "").strip() or realtime_model_for(model),
             "rt_key": (secrets.get("omni_realtime_key") if secrets else None) or key,
             "tts_model": str(m.get("omni_tts_model") or "").strip(),
-            "mode": mode if mode in ("auto", "realtime", "turn") else "auto",
+            "mode": mode if mode in MODES else "auto",
+            "gemini_model": str(m.get("omni_gemini_model") or "").strip() or DEFAULT_GEMINI_MODEL,
+            "gemini_voice": str(m.get("omni_gemini_voice") or "").strip() or DEFAULT_GEMINI_VOICE,
+            "gemini_url": gemini_url_for(str(m.get("omni_gemini_url") or "")), "gemini_key": gkey,
+            "proxy": str(m.get("omni_proxy") or "").strip() or gem_pproxy,
+            "gemini_timeout": _env_f("AIW_OMNI_GEMINI_TIMEOUT", 8.0),
             "max_seconds": max(60.0, min(minutes, 240.0) * 60),
             "rt_timeout": _env_f("AIW_OMNI_RT_TIMEOUT", 5.0), "max_fps": _env_f("AIW_OMNI_MAX_FPS", 1.0),
             "idle_s": _env_f("AIW_OMNI_IDLE", 30.0), "audio_format": os.environ.get("AIW_OMNI_AUDIO_FORMAT", "wav")}
@@ -125,11 +222,14 @@ def config(store, secrets) -> dict:
 
 def public(cfg: dict, store=None) -> dict:
     """What GET /api/omni/status shows (no keys)."""
-    out = {"enabled": bool(cfg["model"]), "model": cfg["model"], "voice": cfg["voice"], "voices": VOICES,
+    out = {"enabled": enabled(cfg), "model": cfg["model"], "voice": cfg["voice"], "voices": VOICES,
            "realtime_url": cfg["rt_url"], "realtime_model": cfg["rt_model"], "tts_model": cfg["tts_model"],
-           "mode": cfg["mode"], "max_minutes": int(cfg["max_seconds"] // 60), "has_realtime_key": bool(cfg["rt_key"])}
-    if not cfg["model"]:
-        out["message"] = "还没有设置通话模型：设置 › 模型 › 通话模型（全模态），如 qwen3.8-omni-flash"
+           "mode": cfg["mode"], "max_minutes": int(cfg["max_seconds"] // 60), "has_realtime_key": bool(cfg["rt_key"]),
+           "gemini": {"on": gemini_on(cfg), "model": cfg["gemini_model"], "voice": cfg["gemini_voice"],
+                      "voices": GEMINI_VOICES, "url": cfg["gemini_url"], "has_key": bool(cfg["gemini_key"]),
+                      "proxy": bool(cfg["proxy"])}}
+    if not out["enabled"]:
+        out["message"] = disabled_message(cfg)
     if store is not None:
         out["probe"] = (store.kv_get("omni_probe", {}) or {}).get(cfg["model"])
     return out
@@ -504,6 +604,375 @@ class RealtimeBackend:
                 pass
 
 
+# ---------------------------------------------------------------------------------------------------------- gemini
+def _connect_params() -> set:
+    try:
+        import inspect
+        from websockets.asyncio.client import connect
+        return set(inspect.signature(connect.__init__).parameters)
+    except Exception:  # noqa: BLE001  pragma: no cover
+        return set()
+
+
+WS_PROXY_ARG = "proxy" in _connect_params()   # websockets >= 15: proxy= (http, https, socks via python-socks)
+
+
+def env_proxy(url: str) -> str:
+    """HTTPS_PROXY / ALL_PROXY (or their lowercase forms) for a wss:// URL, honouring NO_PROXY; '' when none."""
+    import urllib.request
+    p = urlsplit(url)
+    host = p.hostname or ""
+    if urllib.request.proxy_bypass(f"{host}:{p.port or (443 if p.scheme == 'wss' else 80)}"):
+        return ""
+    px = urllib.request.getproxies()
+    for k in (("wss", "https", "socks", "all") if p.scheme == "wss" else ("ws", "http", "https", "socks", "all")):
+        if px.get(k):
+            return px[k]
+    return ""
+
+
+async def _http_tunnel(proxy: str, host: str, port: int, timeout: float):
+    """websockets < 15 has no proxy support: open a CONNECT tunnel through an http:// proxy ourselves and hand the
+    socket to connect(sock=...). https:// and socks proxies need websockets >= 15."""
+    import socket
+    p = urlsplit(proxy)
+    if p.scheme != "http":
+        raise RuntimeError(f"{p.scheme}:// 代理需要 websockets>=15（pip install -U 'websockets>=15'），或改用 http:// 代理")
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setblocking(False)
+    try:
+        await asyncio.wait_for(loop.sock_connect(sock, (p.hostname, p.port or 80)), timeout)
+        req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+        if p.username:
+            from urllib.parse import unquote
+            cred = b64e(f"{unquote(p.username)}:{unquote(p.password or '')}".encode())
+            req += f"Proxy-Authorization: Basic {cred}\r\n"
+        await loop.sock_sendall(sock, (req + "\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = await asyncio.wait_for(loop.sock_recv(sock, 4096), timeout)
+            if not chunk:
+                raise RuntimeError("代理断开了连接")
+            buf += chunk
+            if len(buf) > 16384:
+                raise RuntimeError("代理响应过长")
+        status = buf.split(b"\r\n", 1)[0].decode("latin-1", "ignore")
+        if " 200" not in status:
+            raise RuntimeError(f"代理拒绝 CONNECT：{status[:80]}")
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+async def ws_open(url: str, headers: dict, timeout: float, proxy: str = ""):
+    """A WebSocket for the Gemini connection, through omni_proxy (or the environment's proxy) when there is one."""
+    from websockets.asyncio.client import connect
+    kw: dict = {"additional_headers": headers, "open_timeout": timeout, "max_size": 16 * 1024 * 1024, "ping_interval": 20}
+    if WS_PROXY_ARG:
+        kw["proxy"] = proxy or True   # True: websockets reads HTTPS_PROXY / ALL_PROXY / NO_PROXY itself
+        try:
+            return await asyncio.wait_for(connect(url, **kw), timeout + 2)
+        except ImportError as e:   # socks:// without python-socks
+            raise RuntimeError("SOCKS 代理需要安装 python-socks：pip install 'python-socks[asyncio]'；或改用 http:// 代理") from e
+    px = proxy or env_proxy(url)
+    if px:
+        u = urlsplit(url)
+        port = u.port or (443 if u.scheme == "wss" else 80)
+        sock = await _http_tunnel(px, u.hostname or "", port, timeout)
+        kw["sock"] = sock
+        if u.scheme == "wss":
+            kw["server_hostname"] = u.hostname
+    return await asyncio.wait_for(connect(url, **kw), timeout + 2)
+
+
+def gemini_tools() -> list:
+    """TOOL_SPECS as Gemini functionDeclarations (OpenAPI schema with upper-case types)."""
+    def conv(sch):
+        if not isinstance(sch, dict):
+            return sch
+        out = {}
+        for k, v in sch.items():
+            if k == "type" and isinstance(v, str):
+                out[k] = v.upper()
+            elif k == "properties" and isinstance(v, dict):
+                out[k] = {n: conv(x) for n, x in v.items()}
+            elif k == "required" and not v:
+                continue
+            else:
+                out[k] = conv(v) if isinstance(v, dict) else v
+        return out
+    return [{"functionDeclarations": [{"name": t["function"]["name"], "description": t["function"]["description"],
+                                       "parameters": conv(t["function"]["parameters"])} for t in TOOL_SPECS]}]
+
+
+def _close_reason(e: BaseException) -> str:
+    """The reason Gemini gives in its close frame (a bad model, key or setup field), else the exception text."""
+    for attr in ("rcvd", "sent"):
+        fr = getattr(e, attr, None)
+        if fr is not None and getattr(fr, "reason", ""):
+            return f"{getattr(fr, 'code', '')} {fr.reason}".strip()
+    return f"{type(e).__name__}: {str(e)[:160]}"
+
+
+class GeminiBackend:
+    """Gemini Live API (BidiGenerateContent) behind the same client protocol. One logical session may span several
+    WebSocket connections: a goAway or a dropped connection reconnects with the latest resumption handle."""
+    mode = "gemini"
+    MAX_RECONNECTS = 30
+    PENDING_MAX = 100          # audio chunks kept while reconnecting (~2-4 s), oldest dropped first
+
+    def __init__(self, cfg: dict, emit: Emit, bridge: Optional[ToolBridge], instructions: str, video: bool):
+        self.cfg, self.emit, self.bridge = with_defaults(cfg), emit, bridge
+        self.instructions, self.video = instructions, video
+        self.ws = None
+        self.reader: Optional[asyncio.Task] = None
+        self.handle = ""           # latest resumable sessionResumptionUpdate.newHandle
+        self.closed = False
+        self.audio_out = True
+        self.said = ""
+        self.heard = ""
+        self.responding = False
+        self.jobs: dict = {}       # function call id -> task
+        self.side: set = set()
+        self.reconnecting: Optional[asyncio.Task] = None
+        self.reconnects = 0
+        self.pending: list[str] = []
+        self.log: list[str] = []   # what happened to the connection (tests / debugging)
+
+    # -- connection
+    def url(self) -> str:
+        return with_key(gemini_url_for(self.cfg["gemini_url"]), self.cfg["gemini_key"])
+
+    def setup(self, handle: str = "") -> dict:
+        model = self.cfg["gemini_model"]
+        s: dict = {
+            "model": model if model.startswith("models/") else "models/" + model,
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": self.cfg["gemini_voice"]}}}},
+            "systemInstruction": {"parts": [{"text": self.instructions}]},
+            "inputAudioTranscription": {}, "outputAudioTranscription": {},
+            "realtimeInputConfig": {"automaticActivityDetection": {
+                "disabled": False, "silenceDurationMs": int(_env_f("AIW_OMNI_GEMINI_SILENCE_MS", 800))}},
+            # without compression an audio+video session ends after ~2 minutes (audio only ~15)
+            "contextWindowCompression": {"slidingWindow": {}},
+            "sessionResumption": {"handle": handle} if handle else {},
+        }
+        if self.bridge is not None:
+            s["tools"] = gemini_tools()
+        return {"setup": s}
+
+    async def _open(self, handle: str = ""):
+        t = self.cfg["gemini_timeout"]
+        hdr = {"x-goog-api-key": self.cfg["gemini_key"]} if self.cfg["gemini_key"] else {}
+        ws = await ws_open(self.url(), hdr, t, self.cfg.get("proxy") or "")
+        try:
+            await ws.send(json.dumps(self.setup(handle), ensure_ascii=False))
+            end = time.time() + t
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), max(0.1, end - time.time()))
+                except asyncio.TimeoutError:
+                    raise RuntimeError("等 setupComplete 超时")
+                except Exception as e:  # noqa: BLE001  closed during setup: Gemini says why in the close frame
+                    raise RuntimeError("Gemini 拒绝了连接：" + _close_reason(e)) from e
+                try:
+                    ev = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if "setupComplete" in ev:
+                    return ws
+                if "error" in ev:
+                    raise RuntimeError(str(ev["error"])[:200])
+                await self._on(ev)   # e.g. a sessionResumptionUpdate before setupComplete
+        except BaseException:
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+    async def start(self):
+        self.ws = await self._open()
+        self.log.append("open")
+        self.reader = asyncio.create_task(self._read(self.ws))
+
+    async def _read(self, ws):
+        try:
+            async for raw in ws:
+                try:
+                    ev = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                await self._on(ev)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.info("omni gemini read: %s", _close_reason(e))
+        if ws is self.ws and not self.closed:   # the connection dropped under us (not a planned switch)
+            self._reconnect("closed")
+
+    def _reconnect(self, why: str):
+        if self.reconnecting is None or self.reconnecting.done():
+            self.reconnecting = asyncio.create_task(self._do_reconnect(why))
+
+    async def _do_reconnect(self, why: str):
+        old = self.ws
+        self.ws = None   # audio queues in self.pending meanwhile
+        self.log.append("reconnect:" + why)
+        while not self.closed:
+            if not self.handle or self.reconnects >= self.MAX_RECONNECTS:
+                break
+            self.reconnects += 1
+            try:
+                ws = await self._open(self.handle)
+            except Exception as e:  # noqa: BLE001
+                log.info("omni gemini resume: %s", e)
+                self.handle = ""     # a stale handle will not work a second time
+                try:
+                    ws = await self._open()   # a fresh session (the context restarts) beats a dead call
+                    await self.emit({"type": "error", "message": "Gemini 会话已重新开始（上下文未能接续）", "code": "resumed_fresh"})
+                except Exception as e2:  # noqa: BLE001
+                    log.info("omni gemini reopen: %s", e2)
+                    break
+            self.ws = ws
+            self.log.append("resumed")
+            self.reader = asyncio.create_task(self._read(ws))
+            if old is not None:
+                j = asyncio.create_task(self._close_ws(old))
+                self.side.add(j)
+                j.add_done_callback(self.side.discard)
+            pend, self.pending = self.pending, []
+            for a in pend:
+                await self._send({"realtimeInput": {"audio": {"data": a, "mimeType": f"audio/pcm;rate={IN_RATE}"}}})
+            return
+        if not self.closed:
+            self.closed = True
+            await self.emit({"type": "_closed"})
+
+    @staticmethod
+    async def _close_ws(ws):
+        try:
+            await asyncio.wait_for(ws.close(), 2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _send(self, msg: dict) -> bool:
+        ws = self.ws
+        if ws is None or self.closed:
+            return False
+        try:
+            await ws.send(json.dumps(msg, ensure_ascii=False))
+            return True
+        except Exception as e:  # noqa: BLE001  the reader notices the close and reconnects
+            log.info("omni gemini send: %s", e)
+            return False
+
+    # -- server messages
+    async def _on(self, ev: dict):
+        if "sessionResumptionUpdate" in ev:
+            u = ev["sessionResumptionUpdate"] or {}
+            if u.get("resumable") and u.get("newHandle"):
+                self.handle = str(u["newHandle"])
+        if "goAway" in ev:   # the server ends this connection soon: switch now, while the handle is fresh
+            self.log.append("goAway")
+            if self.ws is not None:
+                self._reconnect("goAway")
+        if "toolCall" in ev:
+            for fc in (ev["toolCall"] or {}).get("functionCalls") or []:
+                fid = str(fc.get("id") or "")
+                j = asyncio.create_task(self._tool(str(fc.get("name") or ""), fc.get("args") or {}, fid))
+                self.jobs[fid or id(j)] = j
+                j.add_done_callback(lambda _j, k=fid or id(j): self.jobs.pop(k, None))
+        if "toolCallCancellation" in ev:
+            for fid in (ev["toolCallCancellation"] or {}).get("ids") or []:
+                j = self.jobs.pop(str(fid), None)
+                if j is not None and not j.done():
+                    j.cancel()
+        sc = ev.get("serverContent")
+        if not isinstance(sc, dict):
+            return
+        it = sc.get("inputTranscription") or sc.get("interimInputTranscription")
+        if isinstance(it, dict) and it.get("text"):
+            self.heard += str(it["text"])
+            await self.emit({"type": "transcript", "role": "user", "text": self.heard.strip(), "final": False})
+        if sc.get("interrupted"):
+            self.responding = False
+            await self.emit({"type": "speech_started"})   # the user talks over the answer: stop playback now
+            await self._end_said(cut=True)
+        mt = sc.get("modelTurn")
+        if isinstance(mt, dict):
+            for part in mt.get("parts") or []:
+                d = part.get("inlineData") if isinstance(part, dict) else None
+                if isinstance(d, dict) and d.get("data") and str(d.get("mimeType") or "audio/pcm").startswith("audio"):
+                    if not self.responding:
+                        self.responding = True
+                        await self._end_heard()
+                    await self.emit({"type": "audio", "data": d["data"]})
+        ot = sc.get("outputTranscription")
+        if isinstance(ot, dict) and ot.get("text"):
+            await self._end_heard()
+            self.said += str(ot["text"])
+            await self.emit({"type": "transcript", "role": "assistant", "text": self.said.strip(), "final": False})
+        if sc.get("turnComplete"):
+            self.responding = False
+            await self._end_heard()
+            await self._end_said()
+
+    async def _end_heard(self):
+        txt, self.heard = self.heard.strip(), ""
+        if txt:
+            await self.emit({"type": "transcript", "role": "user", "text": txt, "final": True})
+
+    async def _end_said(self, cut: bool = False):
+        txt, self.said = self.said.strip(), ""
+        if txt:
+            await self.emit({"type": "transcript", "role": "assistant", "text": txt + ("…" if cut else ""), "final": True})
+
+    async def _tool(self, name: str, args: Any, fid: str):
+        await self.emit({"type": "tool", "name": name, "status": "running"})
+        try:
+            out = await self.bridge.run(name, args) if self.bridge else "工具不可用"
+        except asyncio.CancelledError:
+            await self.emit({"type": "tool", "name": name, "status": "error", "text": "已取消"})
+            raise
+        await self.emit({"type": "tool", "name": name, "status": "done", "text": out[:200]})
+        resp: dict = {"result": out}
+        if "3.1-flash-live" not in self.cfg["gemini_model"]:
+            resp["scheduling"] = "WHEN_IDLE"   # non-blocking calls (gemini-3.8-live default): speak it when free
+        fr = {"name": name, "response": resp}
+        if fid:
+            fr["id"] = fid
+        await self._send({"toolResponse": {"functionResponses": [fr]}})
+
+    # -- client input
+    async def audio(self, pcm_b64: str, pcm: bytes):
+        msg = {"realtimeInput": {"audio": {"data": pcm_b64, "mimeType": f"audio/pcm;rate={IN_RATE}"}}}
+        if self.ws is None and not self.closed:
+            self.pending = (self.pending + [pcm_b64])[-self.PENDING_MAX:]
+            return
+        await self._send(msg)
+
+    async def frame(self, jpeg_b64: str):
+        if self.ws is not None:   # frames during a reconnect are simply skipped (the next one comes in a second)
+            await self._send({"realtimeInput": {"video": {"data": jpeg_b64, "mimeType": "image/jpeg"}}})
+
+    async def interrupt(self):
+        return None   # Gemini's own VAD handles barge-in; the client already stopped its playback
+
+    async def close(self):
+        self.closed = True
+        for j in list(self.jobs.values()) + list(self.side):
+            j.cancel()
+        if self.reconnecting is not None and self.reconnecting is not asyncio.current_task():
+            self.reconnecting.cancel()
+        if self.reader and self.reader is not asyncio.current_task():
+            self.reader.cancel()
+        if self.ws is not None:
+            await self._close_ws(self.ws)
+
+
 # ---------------------------------------------------------------------------------------------------------- turn
 class HTTPFail(Exception):
     def __init__(self, status: int, text: str):
@@ -630,13 +1099,16 @@ class TurnBackend:
             b["enable_thinking"] = False
         return b
 
-    async def _stream(self, body: dict, on_text, on_audio) -> dict:
-        """One streamed chat/completions call: {"text", "audio": bool, "tool_calls": [...]}."""
-        url = self.cfg["base_url"] + "/chat/completions"
+    async def _stream(self, body: dict, on_text, on_audio, tts: bool = False) -> dict:
+        """One streamed chat/completions call: {"text", "audio": bool, "tool_calls": [...]}. tts: the 朗读模型's
+        own provider (v3.9.33 tts_base_url / tts_key, the omni provider when not set)."""
+        base = (self.cfg.get("tts_base_url") or self.cfg["base_url"]) if tts else self.cfg["base_url"]
+        key = (self.cfg.get("tts_key") or self.cfg["key"]) if tts else self.cfg["key"]
+        url = base + "/chat/completions"
         res = {"text": "", "audio": False, "tool_calls": []}
         content, tscript, calls = "", "", {}
         first = True
-        async with self.client.stream("POST", url, json=body, headers={"Authorization": f"Bearer {self.cfg['key']}"}) as r:
+        async with self.client.stream("POST", url, json=body, headers={"Authorization": f"Bearer {key}"}) as r:
             if r.status_code >= 400:
                 raise HTTPFail(r.status_code, (await r.aread()).decode("utf-8", "ignore"))
             async for line in r.aiter_lines():
@@ -757,7 +1229,7 @@ class TurnBackend:
             async def noop(_t):
                 return None
             try:
-                await self._stream(body, noop, self._audio_out)
+                await self._stream(body, noop, self._audio_out, tts=True)
             except Exception as e:  # noqa: BLE001
                 log.info("omni tts: %s", e)
                 await self.emit({"type": "transcript", "role": "assistant", "text": s, "final": True, "speak": True,
@@ -795,9 +1267,12 @@ class OmniCall:
 
     def __init__(self, cfg: dict, send: Callable[[dict], Awaitable[None]], chat=None, video: bool = True,
                  voice: Optional[str] = None):
-        self.cfg = dict(cfg)
+        self.cfg = with_defaults(cfg)
         if voice and isinstance(voice, str) and len(voice) <= 40:
-            self.cfg["voice"] = voice.strip() or self.cfg["voice"]
+            if voice.strip() in GEMINI_VOICES:
+                self.cfg["gemini_voice"] = voice.strip()
+            else:
+                self.cfg["voice"] = voice.strip() or self.cfg["voice"]
         self.send, self.chat, self.video = send, chat, video
         self.bridge = ToolBridge(chat)
         self.backend: Any = None
@@ -807,13 +1282,21 @@ class OmniCall:
         self.frames_dropped = 0
         self.notes: list[str] = []
         self.ended = False
+        self.dead = ""            # set when the upstream is gone for good: the call loop hangs up
         self.instructions = instructions_for(chat, video)
 
     async def _emit(self, ev: dict):
         t = ev.get("type")
-        if t == "_closed":   # the realtime upstream dropped mid-call: carry on in turn mode
-            if not self.ended and self.backend is not None and self.backend.mode == "realtime":
-                await self._fallback("实时连接断开")
+        if t == "_closed":   # the realtime / Gemini upstream dropped mid-call: carry on in turn mode when possible
+            if not self.ended and self.backend is not None and self.backend.mode in ("realtime", "gemini"):
+                if self.cfg["model"] and self.cfg["mode"] == "auto":
+                    await self._fallback("实时连接断开" if self.backend.mode == "realtime" else "Gemini 连接断开")
+                else:
+                    self.dead = "upstream_closed"
+                    try:
+                        await self.send({"type": "error", "message": "模型连接断开了，通话结束", "code": "upstream_closed"})
+                    except Exception:  # noqa: BLE001
+                        pass
             return
         if t == "transcript" and ev.get("final") and str(ev.get("text") or "").strip() and not ev.get("partial_speak"):
             self.lines.append((ev.get("role"), str(ev["text"]).strip()))
@@ -835,40 +1318,67 @@ class OmniCall:
                          "audio_out": self.backend.audio_out, "max_seconds": int(self.cfg["max_seconds"]),
                          "note": f"{why}，已切换到轮流对话"})
 
+    async def _try(self, kind: str) -> str:
+        """Open the realtime or Gemini backend; '' on success, else a note for the client."""
+        cfg = self.cfg
+        key = ("gemini", cfg["gemini_url"], cfg["gemini_model"]) if kind == "gemini" else (cfg["rt_url"], cfg["rt_model"])
+        label = "Gemini Live" if kind == "gemini" else "实时接口"
+        if cfg["mode"] == "auto" and time.time() - _RT_FAIL.get(key, 0) < _env_f("AIW_OMNI_RT_SKIP", 300):
+            return f"{label}刚才连不上"
+        if kind == "gemini":
+            b: Any = GeminiBackend(cfg, self._emit, self.bridge, self.instructions, self.video)
+            limit = cfg["gemini_timeout"] + 4
+        else:
+            b = RealtimeBackend(cfg, self._emit, self.bridge, self.instructions, self.video)
+            limit = cfg["rt_timeout"] + 2
+        try:
+            await asyncio.wait_for(b.start(), limit)
+            self.backend = b
+            _RT_FAIL.pop(key, None)
+            return ""
+        except Exception as e:  # noqa: BLE001
+            _RT_FAIL[key] = time.time()
+            log.info("omni %s %s: %s", kind, key, e)
+            try:
+                await b.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return f"{label}连不上（{type(e).__name__}: {str(e)[:120]}）"
+
+    def plan(self) -> list:
+        """Backends to try, in order. auto: Gemini first when its key is set, then realtime and turn when omni_model
+        is set. gemini / realtime / turn: only that one."""
+        cfg = self.cfg
+        if cfg["mode"] == "gemini":
+            return ["gemini"]
+        if cfg["mode"] in ("realtime", "turn"):
+            return [cfg["mode"]]
+        out = ["gemini"] if cfg["gemini_key"] else []
+        return out + (["realtime", "turn"] if cfg["model"] else [])
+
     async def start(self) -> dict:
         cfg = self.cfg
-        key = (cfg["rt_url"], cfg["rt_model"])
-        note = ""
-        if cfg["mode"] in ("auto", "realtime"):
-            skip = cfg["mode"] == "auto" and time.time() - _RT_FAIL.get(key, 0) < _env_f("AIW_OMNI_RT_SKIP", 300)
-            if not skip:
-                rt = RealtimeBackend(cfg, self._emit, self.bridge, self.instructions, self.video)
-                try:
-                    await asyncio.wait_for(rt.start(), cfg["rt_timeout"] + 2)
-                    self.backend = rt
-                    _RT_FAIL.pop(key, None)
-                except Exception as e:  # noqa: BLE001
-                    _RT_FAIL[key] = time.time()
-                    note = f"实时接口连不上（{type(e).__name__}: {str(e)[:80]}）"
-                    log.info("omni realtime %s: %s", key, e)
-                    try:
-                        await rt.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    if cfg["mode"] == "realtime":
-                        raise RuntimeError(note)
-            else:
-                note = "实时接口刚才连不上"
+        notes: list[str] = []
+        for kind in self.plan():
+            if kind == "turn":
+                self.backend = TurnBackend(cfg, self._emit, self.bridge, self.instructions, self.video)
+                await self.backend.start()
+                if notes:
+                    notes[-1] += "，已用轮流对话"
+                break
+            n = await self._try(kind)
+            if not n:
+                break
+            notes.append(n)
         if self.backend is None:
-            self.backend = TurnBackend(cfg, self._emit, self.bridge, self.instructions, self.video)
-            await self.backend.start()
-            if note:
-                note += "，已用轮流对话"
+            raise RuntimeError("；".join(notes) or disabled_message(cfg))
         b = self.backend
-        ready = {"type": "ready", "mode": b.mode, "voice": cfg["voice"], "audio_out": b.audio_out,
-                 "model": cfg["rt_model"] if b.mode == "realtime" else cfg["model"], "max_seconds": int(cfg["max_seconds"])}
-        if note:
-            ready["note"] = note
+        model = {"realtime": cfg["rt_model"], "gemini": cfg["gemini_model"]}.get(b.mode, cfg["model"])
+        voice = cfg["gemini_voice"] if b.mode == "gemini" else cfg["voice"]
+        ready = {"type": "ready", "mode": b.mode, "voice": voice, "audio_out": b.audio_out,
+                 "model": model, "max_seconds": int(cfg["max_seconds"])}
+        if notes:
+            ready["note"] = "；".join(notes)
         return ready
 
     async def on_audio(self, data: Any):
@@ -902,7 +1412,7 @@ class OmniCall:
             name = self.chat.agent_name() if self.chat is not None else name
         except Exception:  # noqa: BLE001
             pass
-        mode = {"realtime": "实时", "turn": "轮流"}.get(getattr(self.backend, "mode", ""), "")
+        mode = {"realtime": "实时", "turn": "轮流", "gemini": "Gemini"}.get(getattr(self.backend, "mode", ""), "")
         head = f"📞 {'视频' if self.video else '语音'}通话记录 · {secs // 60} 分 {secs % 60} 秒" + (f"（{mode}）" if mode else "")
         body, total = [], 0
         for role, text in self.lines:
@@ -927,7 +1437,8 @@ class OmniCall:
             return None
         try:
             return self.chat.add("assistant", "text", self.transcript_text(), {
-                "call": {"mode": getattr(self.backend, "mode", ""), "model": self.cfg["model"], "video": self.video,
+                "call": {"mode": getattr(self.backend, "mode", ""), "video": self.video,
+                         "model": self.cfg["gemini_model"] if getattr(self.backend, "mode", "") == "gemini" else self.cfg["model"],
                          "seconds": int(time.time() - self.started), "turns": len(self.lines), "reason": reason,
                          "tasks": list(self.bridge.tasks)}})
         except Exception as e:  # noqa: BLE001
@@ -936,11 +1447,44 @@ class OmniCall:
 
 
 # ---------------------------------------------------------------------------------------------------------- probe
+async def probe_gemini(cfg: dict) -> dict:
+    """Open a Gemini Live connection, send setup, wait for setupComplete (short timeout), close."""
+    t0 = time.time()
+    cfg = with_defaults(cfg)
+    out: dict = {"model": cfg["gemini_model"], "url": cfg["gemini_url"], "proxy": bool(cfg.get("proxy"))}
+    if not cfg["gemini_key"]:
+        return {**out, "ok": False, "error": "没有 Gemini API Key", "ms": 0}
+    g = GeminiBackend(cfg, _noop_emit, None, "probe", False)
+    try:
+        await asyncio.wait_for(g.start(), cfg["gemini_timeout"] + 4)
+        out["ok"] = True
+        _RT_FAIL.pop(("gemini", cfg["gemini_url"], cfg["gemini_model"]), None)
+    except Exception as e:  # noqa: BLE001
+        out.update(ok=False, error=f"{type(e).__name__}: {str(e)[:200]}")
+    finally:
+        await g.close()
+    out["ms"] = int((time.time() - t0) * 1000)
+    return out
+
+
 async def probe(cfg: dict) -> dict:
-    """设置 › 通话模型 › 探测: can the realtime endpoint be opened, and does a tiny turn-mode request return audio?"""
+    """设置 › 通话模型 › 探测: can Gemini Live / the realtime endpoint be opened, and does a tiny turn-mode request
+    return audio? Only the backends that are configured are tried."""
+    cfg = with_defaults(cfg)
     out: dict = {"model": cfg["model"], "ts": time.time(), "realtime": {}, "turn": {}, "mode": None, "notes": []}
+    if cfg.get("gemini_key"):
+        out["gemini"] = await probe_gemini(cfg)
+        if not out["gemini"].get("ok"):
+            err = out["gemini"].get("error") or ""
+            if not cfg.get("proxy") and not env_proxy(cfg["gemini_url"]) and "googleapis.com" in cfg["gemini_url"]:
+                out["notes"].append("国内直连 Google 通常不通：在「出站代理」填 http://… 或 socks5://… 代理，或填中转地址")
+            if "API key" in err or "PERMISSION" in err.upper() or "1008" in err:
+                out["notes"].append("Gemini 拒绝了 Key 或模型名：检查 Gemini Key 和模型（如 gemini-3.8-live）")
     if not cfg["model"]:
-        return {**out, "error": "没有设置通话模型"}
+        if "gemini" not in out:
+            return {**out, "error": "没有设置通话模型，也没有 Gemini Key"}
+        out["mode"] = "gemini" if out["gemini"].get("ok") else None
+        return out
     t0 = time.time()
     rt = RealtimeBackend(cfg, _noop_emit, None, "probe", False)
     try:
@@ -990,6 +1534,10 @@ async def probe(cfg: dict) -> dict:
         await tb.close()
     out["turn"]["ms"] = int((time.time() - t0) * 1000)
     out["mode"] = "realtime" if out["realtime"].get("ok") else ("turn" if out["turn"].get("ok") else None)
+    if (out.get("gemini") or {}).get("ok") and cfg["mode"] in ("auto", "gemini"):
+        out["mode"] = "gemini"
+    elif cfg["mode"] == "gemini":
+        out["mode"] = None
     if not out["realtime"].get("ok") and "qwen3.8" in cfg["rt_model"] and ".maas." not in cfg["rt_url"]:
         out["notes"].append("qwen3.8-omni-flash-realtime 必须用业务空间专属地址："
                             "wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime（填到「实时接口地址」）")
@@ -1010,7 +1558,7 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
     async def omni_probe():
         cfg = config(store, secrets)
         res = await probe(cfg)
-        if cfg["model"]:
+        if enabled(cfg) or cfg["model"]:   # keyed by omni_model ("" for a Gemini-only setup)
             ps = store.kv_get("omni_probe", {}) or {}
             ps[cfg["model"]] = res
             store.kv_set("omni_probe", ps)
@@ -1039,8 +1587,8 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
                 pass
 
         cfg = config(store, secrets)
-        if not cfg["model"]:
-            await bye("disabled", public(cfg)["message"], "disabled")
+        if not enabled(cfg):
+            await bye("disabled", disabled_message(cfg), "disabled")
             return
         if len(_ACTIVE) >= int(_env_f("AIW_OMNI_MAX_CALLS", 2)):
             await bye("busy", "已经有通话在进行，先挂断那一个", "busy")
@@ -1075,6 +1623,9 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
                 try:
                     raw = await asyncio.wait_for(ws.receive_text(), min(cfg["idle_s"], left))
                 except asyncio.TimeoutError:
+                    if call.dead:
+                        reason = call.dead
+                        break
                     if time.time() >= deadline:
                         continue   # the top of the loop says "上限" and hangs up
                     reason = "idle"
@@ -1105,6 +1656,9 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
                 elif t == "hangup":
                     reason = "hangup"
                     break
+                if call.dead:
+                    reason = call.dead
+                    break
         except WebSocketDisconnect:
             reason = "disconnect"
         except Exception as e:  # noqa: BLE001
@@ -1117,5 +1671,5 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
         await bye(reason)
 
 
-__all__ = ["OmniCall", "RealtimeBackend", "TurnBackend", "EnergyVAD", "ToolBridge", "config", "probe", "mount",
+__all__ = ["OmniCall", "RealtimeBackend", "TurnBackend", "GeminiBackend", "probe_gemini", "gemini_url_for", "ws_open", "EnergyVAD", "ToolBridge", "config", "probe", "mount",
            "realtime_url_for", "realtime_model_for", "TOOL_SPECS", "VOICES"]

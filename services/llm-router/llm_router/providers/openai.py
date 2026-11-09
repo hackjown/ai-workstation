@@ -53,10 +53,14 @@ class OpenAIProvider(LLMProvider):
     (set OPENAI_BASE_URL, e.g. a local vLLM / Qwen-VL / DeepSeek endpoint)."""
 
     name = "openai"
+    _px: dict = {}
 
     def __init__(self, model: str | None = None, api_key: str | None = None, base_url: str | None = None,
-                 tool_choice: str | None = None, thinking: str | None = None, effort: str | None = None):
+                 tool_choice: str | None = None, thinking: str | None = None, effort: str | None = None,
+                 proxy: str | None = None):
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-4.1")
+        # v3.9.33: a provider's own proxy (设置 › 模型 › 供应商); none = httpx's usual environment proxies
+        self._px = {"proxy": proxy} if proxy else {}
         # v3.9.24 auto routing: a reasoning effort (low / medium / high) sent as reasoning_effort; a gateway that
         # rejects it gets the plain request (the same 400 fallback as the thinking switches)
         self.effort = (effort or "").lower() if (effort or "").lower() in ("low", "medium", "high") else ""
@@ -98,7 +102,7 @@ class OpenAIProvider(LLMProvider):
         attempts, out_tokens = 0, 0
         # a thinking model writing a long reply needs minutes, not the 180 s that suits a quick decision
         wait = float(os.environ.get("AIW_LLM_TIMEOUT_S", "600" if self.thinking != "off" else "180"))
-        async with httpx.AsyncClient(timeout=wait) as c:
+        async with httpx.AsyncClient(timeout=wait, **self._px) as c:
             for attempt in range(3):
                 if attempt == 2:  # some gateways (e.g. GLM) only behave with tool_choice=auto
                     body["tool_choice"] = "auto"
@@ -262,13 +266,13 @@ class OpenAIProvider(LLMProvider):
                                          {"type": "image_url", "image_url": {"url": f"data:{_mime(image_b64)};base64,{image_b64}"}}]}]}
         # 3.8.8: at most 2 HTTP attempts for a picture (task-e63: 3 here x2 in the loop = ~24 s per failed read)
         from ..vision import attempts
-        async with httpx.AsyncClient(timeout=120) as c:
+        async with httpx.AsyncClient(timeout=120, **self._px) as c:
             return strip_think((await self._post(c, body, attempts()))["choices"][0]["message"].get("content") or "")
 
     async def complete(self, system: str, user: str, max_tokens: int = 800) -> str:
         body = {"model": self.model, "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-        async with httpx.AsyncClient(timeout=90) as c:
+        async with httpx.AsyncClient(timeout=90, **self._px) as c:
             return strip_think((await self._post(c, body))["choices"][0]["message"].get("content") or "")
 
 
@@ -281,7 +285,7 @@ class OpenAIProvider(LLMProvider):
             body["tools"] = [{"type": "function", "function": t} for t in tools]
             body["tool_choice"] = "auto"
         wait = float(os.environ.get("AIW_CHAT_TIMEOUT_S", "120"))
-        async with httpx.AsyncClient(timeout=wait) as c:
+        async with httpx.AsyncClient(timeout=wait, **self._px) as c:
             data = None
             if on_delta and self._stream_ok:
                 try:

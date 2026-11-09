@@ -255,6 +255,7 @@ pre.code{background:var(--bg);border:1px solid var(--line);border-radius:var(--r
 .mrow .btn{padding-left:0;padding-right:0}
 .mrow .probe{grid-column:1 / -1;display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px;min-height:0}
 .mrow .probe:empty{display:none}
+.mrow:has(.psel){grid-template-columns:minmax(72px,28%) minmax(0,1fr) 64px}   /* v3.9.33 供应商 select */
 .mrow .probe .muted{font-size:12px;color:var(--dim);line-height:18px}
 .mrow .probe .chip{font-size:12px;padding:1px 8px}
 .mrow .probe .chip::before{display:none}
@@ -297,6 +298,8 @@ details.more > summary .cnt{margin-left:auto;font:500 12px var(--mono);color:var
   .rw .t{grid-row:1;grid-column:2}
   .rw.sw .v{grid-column:auto}
   .mrow{grid-template-columns:minmax(0,1fr) 64px}
+  .mrow:has(.psel){grid-template-columns:minmax(0,1fr) 64px}
+  .mrow .psel{grid-column:1 / -1}
   .rw .v > input,.rw .v > select,.rw .v > textarea,.rw .v > .inl,.rw .v > .mrow{max-width:none}
   .grp-h .act .btn.ghost{display:none}
   .grp-h h2{font-size:17px}

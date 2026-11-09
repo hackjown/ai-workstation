@@ -145,7 +145,7 @@ function callConnect(st) {
 function callOn(m) {
   if (m.type === "ready") {
     CALL.mode = m.mode;
-    $("callBadge").textContent = (m.mode === "realtime" ? "实时" : "轮流") + " · " + (m.model || "");
+    $("callBadge").textContent = ({ realtime: "实时", gemini: "Gemini" }[m.mode] || "轮流") + " · " + (m.model || "");
     $("callBadge").title = m.note || "";
     $("capA").textContent = m.note ? m.note : "已接通，说话吧";
   } else if (m.type === "audio") {

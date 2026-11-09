@@ -205,6 +205,8 @@ pre.code { background:#fff; border:1px solid var(--line); border-radius:16px; pa
 .mrow { display:grid; grid-template-columns:1fr auto; gap:6px 8px; align-items:center; }
 .mrow select { width:100%; min-width:0; }
 .mrow .probe { grid-column:1 / -1; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+/* v3.9.33: provider select in front of the model select */
+.mrow .psel { width:100%; }
 .mrow .probe > div { flex-basis:100%; }
 .steplist .ms { font-style:normal; color:var(--muted); font-size:12px; margin-left:8px; white-space:nowrap; }
 

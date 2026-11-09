@@ -171,9 +171,12 @@ loadSettings = async function () {
   S.conns = connsR.connections || []; S.oauthCfg = oauthCfg;
   const roles = MODEL_ROLES.filter((r) => ["model", "vision_model", "video_model", "image_model", "omni_model"].includes(r.key));
   const omniSt = await api("GET", "/api/omni/status").catch(() => ({ voices: [] }));
-  S.omniProbes = S.omniProbes || {}; if (omniSt.model && omniSt.probe) S.omniProbes[omniSt.model] = omniSt.probe;
+  S.omniProbes = S.omniProbes || {}; if (omniSt.probe) S.omniProbes[omniSt.model || ""] = omniSt.probe;
+  const gem = omniSt.gemini || {};   // v3.9.32 Gemini Live
+  const provR = await api("GET", "/api/providers").catch(() => ({ providers: [], presets: [] }));   // v3.9.33 供应商
+  S.providers = provR.providers || []; S.provPresets = provR.presets || []; S.modelsCfg = models;
   const extra = MODEL_ROLES.filter((r) => !roles.includes(r));
-  const mrow = (r) => row(r.label, r.hint, `<div class="mrow"><select name="${r.key}" data-cur="${esc(models[r.key] || "")}" onchange="paintProbe(this)"></select>
+  const mrow = (r) => row(r.label, r.hint, `<div class="mrow">${provSelect(r.key + "_provider", models[r.key + "_provider"])}<select name="${r.key}" data-cur="${esc(models[r.key] || "")}" onchange="pickModelOption(this);paintProbe(this)"></select>
       <button type="button" class="btn sm" onclick="probeModel(this)">探测</button><div class="probe"></div></div>`, "", "top");
   const cloudRows = cloudRowsHTML(cloudList);
   const presets = MCP_PRESETS.map((p) => { const on = mcp.some((m) => m.name === p.name);
@@ -196,9 +199,11 @@ loadSettings = async function () {
       ${row("网关地址", "OpenAI 兼容接口", `<input name="base_url" value="${esc(models.base_url || "")}" placeholder="${esc(models.env_base_url || "https://api.openai.com/v1")}" />`)}
       ${row("API Key", "加密保存在服务器", `<input name="key" type="password" placeholder="${keyOk ? "已设置，留空不修改" : "sk-…"}" autocomplete="off" />`, keyOk ? '<span class="chip ok">已设置</span>' : '<span class="chip">未设置</span>')}
     </div>
+    <div class="rows" id="g-prov">${providersHTML()}</div>
     <div class="rows">
       ${roles.map(mrow).join("")}
-      <details class="more"><summary>${icon("chev")}更多角色<span class="cnt">${extra.map((r) => r.label).join("、")}</span></summary>${extra.map(mrow).join("")}</details>
+      <details class="more"><summary>${icon("chev")}更多角色<span class="cnt">${extra.map((r) => r.label).join("、")}</span></summary>${extra.map(mrow).join("")}
+        ${PROVIDER_ONLY_SLOTS.map(([k, label, hint]) => row(label, hint, provSelect(k + "_provider", models[k + "_provider"]) + (models[k] ? ` <span class="muted">${esc(models[k])}</span>` : ""))).join("")}</details>
     </div>
     <div class="rows">
       <div class="rw head"><div class="k">生图接口<small>第二个 OpenAI 兼容生图端点：生图 /images/generations，改图 /images/edits</small></div><div>${models.image2_model && models.has_image2_key && models.image2_base_url ? '<span class="chip ok">已配置</span>' : '<span class="chip">未配置</span>'}</div></div>
@@ -210,13 +215,18 @@ loadSettings = async function () {
       <div class="rw"><div class="k"></div><div class="v"><span class="small" id="imageTestOut"></span></div><div class="t"></div></div>
     </div>
     <div class="rows" id="g-call">
-      <div class="rw head"><div class="k">视频通话<small>聊天顶部的电话按钮：和球球语音/视频通话，能看摄像头画面，能把事交给 aiw</small></div><div>${models.omni_model ? '<span class="chip ok">已开启</span>' : '<span class="chip">未开启（先选通话模型）</span>'}</div></div>
+      <div class="rw head"><div class="k">视频通话<small>聊天顶部的电话按钮：和球球语音/视频通话，能看摄像头画面，能把事交给 aiw</small></div><div>${omniSt.enabled || models.omni_model ? '<span class="chip ok">已开启</span>' : '<span class="chip">未开启（先选通话模型或填 Gemini Key）</span>'}</div></div>
       ${row("音色", "Qwen3.5/3.8-Omni 默认 Tina；Cherry 只适用 Qwen3-Omni", `<select name="omni_voice">${[...new Set([models.omni_voice || "Tina", ...(omniSt.voices || ["Tina"])])].map((v) => `<option value="${esc(v)}" ${v === (models.omni_voice || "Tina") ? "selected" : ""}>${esc(v)}</option>`).join("")}</select>`)}
-      ${row("模式", "自动：先连实时接口，不通就用轮流对话", `<div class="segsw">${[["auto", "自动"], ["realtime", "只用实时"], ["turn", "只用轮流"]].map(([k, t]) => `<label><input type="radio" name="omni_mode" value="${k}" ${(models.omni_mode || "auto") === k ? "checked" : ""}>${t}</label>`).join("")}</div>`)}
+      ${row("模式", "自动：填了 Gemini Key 先连 Gemini Live，再连实时接口，不通就用轮流对话", `<div class="segsw">${[["auto", "自动"], ["realtime", "只用实时"], ["turn", "只用轮流"], ["gemini", "Gemini Live"]].map(([k, t]) => `<label><input type="radio" name="omni_mode" value="${k}" ${(models.omni_mode || "auto") === k ? "checked" : ""}>${t}</label>`).join("")}</div>`)}
       ${row("实时接口地址", "留空自动推算；qwen3.8-omni-flash-realtime 要填业务空间地址", `<input name="omni_realtime_url" value="${esc(models.omni_realtime_url || "")}" placeholder="${esc(omniSt.realtime_url || "wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime")}" />`)}
       ${row("实时接口 Key", "可选，留空用主网关 Key（如百炼 API Key）", `<input name="omni_key" type="password" placeholder="${models.has_omni_key ? "已设置，留空不修改" : "sk-…"}" autocomplete="off" />`, models.has_omni_key ? '<span class="chip ok">已设置</span>' : "")}
       ${row("实时模型", "留空 = 通话模型名加 -realtime", `<input name="omni_realtime_model" value="${esc(models.omni_realtime_model || "")}" placeholder="${esc(omniSt.realtime_model || "qwen3.8-omni-flash-realtime")}" />`)}
       ${row("朗读模型", "可选：通话模型只出文字时（如 qwen3.8-omni-flash）用它把回答读出来，如 qwen3.5-omni-flash；留空由手机/浏览器朗读", `<input name="omni_tts_model" value="${esc(models.omni_tts_model || "")}" placeholder="qwen3.5-omni-flash" />`)}
+      ${row("Gemini Key", "Gemini Live：免费层可用，国内需代理；免费层数据会被用于改进产品。在 aistudio.google.com/api-keys 创建", `<input name="omni_gemini_key" type="password" placeholder="${models.has_gemini_key ? "已设置，留空不修改" : "AIza…"}" autocomplete="off" />`, models.has_gemini_key ? '<span class="chip ok">已设置</span>' : '<span class="chip">未设置</span>')}
+      ${row("Gemini 模型", "留空 = gemini-3.8-live", `<input name="omni_gemini_model" value="${esc(models.omni_gemini_model || "")}" placeholder="gemini-3.8-live" />`)}
+      ${row("Gemini 音色", "预置音色，默认 Puck", `<select name="omni_gemini_voice">${[...new Set([models.omni_gemini_voice || "Puck", ...(gem.voices || ["Puck"])])].map((v) => `<option value="${esc(v)}" ${v === (models.omni_gemini_voice || "Puck") ? "selected" : ""}>${esc(v)}</option>`).join("")}</select>`)}
+      ${row("出站代理", "Gemini 连接走的代理，国内必填：http://192.168.1.2:7890 或 socks5://…（socks 需服务器装 python-socks）；留空用环境变量 HTTPS_PROXY", `<input name="omni_proxy" value="${esc(models.omni_proxy || "")}" placeholder="http://127.0.0.1:7890" />`)}
+      ${row("Gemini 中转地址", "可选：反向代理/中转的 wss:// 地址，留空直连 Google", `<input name="omni_gemini_url" value="${esc(models.omni_gemini_url || "")}" placeholder="wss://generativelanguage.googleapis.com" />`)}
       ${row("最长通话", "分钟，到点自动挂断", `<input name="omni_max_minutes" value="${esc(models.omni_max_minutes || "30")}" inputmode="numeric" style="max-width:120px" />`)}
     </div>
     <div class="rows">

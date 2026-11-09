@@ -1016,16 +1016,98 @@ const MODEL_ROLES = [
   { key: "image_model", label: "生图/改图模型", hint: "主网关上的 AI 生图和改图模型，如 gpt-image-1、gemini-2.5-flash-image", need: "image" },
   { key: "omni_model", label: "通话模型（全模态）", hint: "视频/语音通话用，如 qwen3.8-omni-flash", need: "omni" },
 ];
-S.modelIds = []; S.probes = {};
+S.modelIds = []; S.probes = {}; S.modelGroups = [];
+/* v3.9.33 供应商 (设置 › 模型): kv providers + the implicit 默认 (网关地址 + API Key). Each model slot has a
+   "<slot>_provider" select next to it; the model list is grouped by provider ("供应商 · model") and picking a model
+   from a group sets that slot's provider. Keys are write-only (PUT/POST body.key), GET shows has_key only. */
+const PROVIDER_ONLY_SLOTS = [["chat_model", "聊天模型的供应商", "chat_model（只能用 API 设置）"], ["small_model", "小模型的供应商", "分类/摘要用的 small_model"],
+  ["embed_model", "向量模型的供应商", "embed_model"], ["summary_model", "压缩模型的供应商", "summary_model"],
+  ["image2_model", "生图接口的供应商", "选了就用它的地址和 Key，代替下面「生图接口」的地址/Key"],
+  ["omni_tts_model", "朗读模型的供应商", "视频通话 › 朗读模型"], ["omni_gemini", "Gemini Live 的供应商", "Gemini Key 留空时用这个供应商的 Key（选 Gemini 供应商）"]];
+function provName(id) { const p = (S.providers || []).find((x) => x.id === (id || "default")); return p ? p.name : (id || "默认"); }
+function provSelect(name, cur) {
+  const ps = S.providers || [];
+  return `<select name="${name}" class="psel" title="供应商" onchange="fetchModels(false)">${ps.map((p) => `<option value="${p.id === "default" ? "" : esc(p.id)}" ${(cur || "") === (p.id === "default" ? "" : p.id) ? "selected" : ""}>${esc(p.name)}${p.enabled ? "" : "（已停用）"}</option>`).join("")}</select>`;
+}
+function providersHTML() {
+  const ps = S.providers || [];
+  return `<div class="rw head"><div class="k">供应商<small>多个 OpenAI 兼容接口；每个模型旁边选用哪个。「默认」= 上面的网关地址和 API Key</small></div>
+    <div><button type="button" class="btn sm" onclick="editProvider()">${icon("plus")}添加</button></div></div>`
+    + ps.map((p) => row(esc(p.name) + (p.default ? ' <span class="tag">默认</span>' : ""), esc(p.base_url) + (p.proxy ? " · 代理 " + esc(p.proxy) : ""),
+      `<span class="small" id="provT_${esc(p.id)}"></span>`,
+      `${p.has_key ? '<span class="chip ok">已设置</span>' : '<span class="chip">未设置 Key</span>'}${p.enabled ? "" : ' <span class="chip">已停用</span>'}
+       <button type="button" class="btn sm" onclick="testProvider('${esc(p.id)}')">测试连接</button>${p.default ? "" : `<button type="button" class="btn sm" onclick="editProvider('${esc(p.id)}')">编辑</button><button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="delProvider('${esc(p.id)}')">删除</button>`}`)).join("");
+}
+function editProvider(id) {
+  const p = (S.providers || []).find((x) => x.id === id) || { id: "", name: "", base_url: "", proxy: "", enabled: true, kind: "openai" };
+  const presets = id ? "" : `<div class="row gap">${(S.provPresets || []).map((x, i) => `<button type="button" class="btn sm" onclick="provPreset(${i})">${esc(x.name)}</button>`).join("")}</div><div class="muted" id="provHint"></div>`;
+  modal(`<form class="callnote" onsubmit="saveProvider(event, '${esc(id || "")}')"><h3>${id ? "编辑供应商" : "添加供应商"}</h3>${presets}
+    <label>名称<input name="name" value="${esc(p.name)}" required placeholder="百炼" /></label>
+    ${id ? "" : `<label>ID<input name="id" value="" placeholder="留空按名称生成，如 bailian" /></label>`}
+    <label>类型<select name="kind"><option value="openai">OpenAI 兼容</option></select></label>
+    <label>地址<input name="base_url" value="${esc(p.base_url)}" required placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" /></label>
+    <label>API Key<input name="key" type="password" autocomplete="off" placeholder="${p.has_key ? "已设置，留空不修改" : "sk-…"}" /></label>
+    <label>代理（可选）<input name="proxy" value="${esc(p.proxy || "")}" placeholder="http://127.0.0.1:7890" /></label>
+    <label><input type="checkbox" name="enabled" ${p.enabled ? "checked" : ""} /> 启用</label>
+    <div class="row gap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="testProviderForm(this, '${esc(id || "")}')">测试连接</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
+    <div class="small" id="provFormT"></div></form>`);
+}
+function provPreset(i) {
+  const x = S.provPresets[i]; const f = document.querySelector("#modal form"); if (!x || !f) return;
+  f.name.value = x.name; f.id.value = x.id; f.base_url.value = x.base_url; const h = $("provHint"); if (h) h.textContent = x.hint || "";
+}
+function provBody(f) { return { name: f.name.value.trim(), base_url: f.base_url.value.trim(), proxy: f.proxy.value.trim(), kind: f.kind.value, enabled: f.enabled.checked, ...(f.key.value ? { key: f.key.value.trim() } : {}), ...(f.id && f.id.value.trim() ? { id: f.id.value.trim() } : {}) }; }
+async function saveProvider(e, id) {
+  e.preventDefault();
+  try { await api(id ? "PUT" : "POST", id ? `/api/providers/${id}` : "/api/providers", provBody(e.target)); closeOverlays(); toast("供应商已保存"); loadSettings(); }
+  catch (err) { $("provFormT").textContent = "保存失败：" + err.message; }
+}
+async function testProviderForm(btn, id) {
+  const f = btn.closest("form"); const out = $("provFormT"); out.innerHTML = `<span class="spin"></span> 正在读取模型列表…`;
+  try { const r = await api("POST", `/api/providers/${id || "new"}/test`, provBody(f)); out.textContent = r.ok ? `连接正常：${r.count} 个模型，${(r.ms / 1000).toFixed(1)}s` : "连不上：" + (r.error || ""); }
+  catch (err) { out.textContent = "测试失败：" + err.message; }
+}
+async function testProvider(id) {
+  const out = $("provT_" + id); if (out) out.innerHTML = `<span class="spin"></span>`;
+  try { const r = await api("POST", `/api/providers/${id}/test`, {}); if (out) out.textContent = r.ok ? `✓ ${r.count} 个模型 · ${(r.ms / 1000).toFixed(1)}s` : "✕ " + (r.error || "").slice(0, 100); }
+  catch (err) { if (out) out.textContent = "✕ " + err.message; }
+}
+async function delProvider(id) {
+  if (!confirm(`删除供应商「${provName(id)}」？它的 Key 也会删除`)) return;
+  try { await api("DELETE", `/api/providers/${id}`); }
+  catch (err) {
+    if (!/还在用/.test(err.message) || !confirm(err.message + "\n\n强制删除？用到它的设置会回到「默认」")) return toast("没删：" + err.message);
+    await api("DELETE", `/api/providers/${id}?force=1`);
+  }
+  toast("已删除"); loadSettings();
+}
+function pickModelOption(sel) {   // a model picked from a provider's group also picks that provider for the slot
+  const o = sel.options[sel.selectedIndex]; if (!o || o.dataset.p === undefined) return;
+  const ps = sel.parentNode.querySelector(".psel"); if (ps && ps.value !== o.dataset.p) ps.value = o.dataset.p;
+}
 async function fetchModels(manual) {
   const note = $("modelListNote"); if (note) note.textContent = "正在读取…";
   const [r, probes] = await Promise.all([api("GET", "/api/models").catch((e) => ({ models: [], error: e.message })), api("GET", "/api/models/probes").catch(() => ({}))]);
-  S.modelIds = r.models || []; S.probes = probes || {};
-  if (note) note.textContent = r.error ? "读取失败：" + r.error.slice(0, 80) : `网关有 ${S.modelIds.length} 个模型`;
-  document.querySelectorAll("#sModel .mrow select").forEach((sel) => {
+  S.modelIds = r.models || []; S.probes = probes || {}; S.modelGroups = r.groups || [];
+  const nOther = S.modelGroups.slice(1).reduce((a, g) => a + (g.models || []).length, 0);
+  if (note) note.textContent = r.error ? "读取失败：" + r.error.slice(0, 80) : `网关有 ${S.modelIds.length} 个模型` + (nOther ? `，其他供应商 ${nOther} 个` : "");
+  document.querySelectorAll("#sModel .mrow select:not(.psel)").forEach((sel) => {
     const cur = sel.value || sel.dataset.cur || "";
-    const ids = [...new Set([...(cur ? [cur] : []), ...S.modelIds])];
+    const ps = sel.parentNode.querySelector(".psel"); const pid = ps ? ps.value : "";
     const role = MODEL_ROLES.find((x) => x.key === sel.name);
+    if (!role) return;
+    if (S.modelGroups.length > 1) {   // v3.9.33: grouped "供应商 · model", the slot's own provider first
+      const gs = [...S.modelGroups].sort((a, b) => ((b.provider === (pid || "default")) - (a.provider === (pid || "default"))));
+      const inAny = S.modelGroups.some((g) => (g.models || []).includes(cur));
+      sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "omni_model" ? "不用（关闭通话）" : "不用 / 同主模型"}</option>`
+        + (cur && !inAny ? `<option value="${esc(cur)}" selected>${esc(cur)}</option>` : "")
+        + gs.map((g) => `<optgroup label="${esc(g.name)}${g.error ? "（读取失败）" : ""}">${(g.models || []).map((m) => `<option value="${esc(m)}" data-p="${g.provider === "default" ? "" : esc(g.provider)}" ${m === cur && g.provider === (pid || "default") ? "selected" : ""}>${esc(g.name)} · ${esc(m)}${probeTag(m)}</option>`).join("")}</optgroup>`).join("")
+        + `<option value="__custom">手动输入…</option>`;
+      if (cur && sel.value !== cur) sel.value = cur;
+      paintProbe(sel);
+      return;
+    }
+    const ids = [...new Set([...(cur ? [cur] : []), ...S.modelIds])];
     sel.innerHTML = `<option value="">${role.key === "model" ? "默认（.env）" : role.key === "vision_model" ? "不用（主模型自己看图）" : role.key === "fallback" || role.key === "vision_fallback" ? "不用" : role.key === "image_model" ? "不用（只用生图接口）" : role.key === "omni_model" ? "不用（关闭通话）" : "同主模型"}</option>`
       + ids.map((m) => `<option value="${esc(m)}" ${m === cur ? "selected" : ""}>${esc(m)}${probeTag(m)}</option>`).join("")
       + `<option value="__custom">手动输入…</option>`;
@@ -1060,18 +1142,22 @@ function paintProbe(sel) {
 function omniProbeHTML(p) {
   if (!p) return `<span class="muted">未探测：点「探测」试实时接口和轮流模式</span>`;
   const ok = (b, t) => `<span class="chip ${b ? "ok" : "bad"}">${b ? "✓" : "✕"} ${t}</span>`;
-  const rt = p.realtime || {}, tn = p.turn || {};
-  return `${ok(rt.ok, "实时" + (rt.ms ? " " + (rt.ms / 1000).toFixed(1) + "s" : ""))} ${ok(tn.ok, "轮流" + (tn.ms ? " " + (tn.ms / 1000).toFixed(1) + "s" : ""))} ${tn.ok ? ok(tn.audio, "会说话") : ""}`
-    + `<div class="muted">${p.mode ? "通话会用：" + (p.mode === "realtime" ? "实时模式" : "轮流模式") : "两种都不通"}${rt.error ? "；实时：" + esc(rt.error.slice(0, 100)) : ""}${tn.error ? "；轮流：" + esc(tn.error.slice(0, 100)) : ""}</div>`
+  const rt = p.realtime || {}, tn = p.turn || {}, gm = p.gemini;
+  const gHTML = gm ? `${ok(gm.ok, "Gemini" + (gm.ms ? " " + (gm.ms / 1000).toFixed(1) + "s" : ""))} ` : "";
+  if (gm && !p.model) return gHTML + `<div class="muted">${gm.ok ? "通话会用：Gemini Live" : "Gemini 不通：" + esc((gm.error || "").slice(0, 120))}</div>`
+    + ((p.notes || []).length ? `<div class="muted">${esc(p.notes.join("；").slice(0, 240))}</div>` : "");
+  return gHTML + `${ok(rt.ok, "实时" + (rt.ms ? " " + (rt.ms / 1000).toFixed(1) + "s" : ""))} ${ok(tn.ok, "轮流" + (tn.ms ? " " + (tn.ms / 1000).toFixed(1) + "s" : ""))} ${tn.ok ? ok(tn.audio, "会说话") : ""}`
+    + `<div class="muted">${p.mode ? "通话会用：" + ({ realtime: "实时模式", gemini: "Gemini Live" }[p.mode] || "轮流模式") : "都不通"}${gm && gm.error ? "；Gemini：" + esc(gm.error.slice(0, 100)) : ""}${rt.error ? "；实时：" + esc(rt.error.slice(0, 100)) : ""}${tn.error ? "；轮流：" + esc(tn.error.slice(0, 100)) : ""}</div>`
     + ((p.notes || []).length ? `<div class="muted">${esc(p.notes.join("；").slice(0, 240))}</div>` : "");
 }
 async function probeOmni(sel, box, btn) {
-  box.innerHTML = `<span class="spin"></span> 正在试实时接口和轮流模式…`; btn.disabled = true;
+  box.innerHTML = `<span class="spin"></span> 正在试 Gemini / 实时接口 / 轮流模式…`; btn.disabled = true;
   try {
     const f = sel.closest("form"); const body = { omni_model: sel.value };
-    for (const k of ["omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model"]) if (f && f[k]) body[k] = f[k].value.trim();
+    for (const k of ["omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model", "omni_gemini_model", "omni_gemini_voice", "omni_gemini_url", "omni_proxy"]) if (f && f[k]) body[k] = f[k].value.trim();
     if (f && f.omni_mode) body.omni_mode = (f.querySelector("[name=omni_mode]:checked") || {}).value || "auto";
     if (f && f.omni_key && f.omni_key.value) await api("PUT", "/api/secrets/omni_realtime_key", { value: f.omni_key.value });
+    if (f && f.omni_gemini_key && f.omni_gemini_key.value) await api("PUT", "/api/secrets/omni_gemini_key", { value: f.omni_gemini_key.value });
     await api("PATCH", "/api/settings/models", body);
     const r = await api("POST", "/api/omni/probe", {});
     S.omniProbes = S.omniProbes || {}; S.omniProbes[sel.value] = r;
@@ -1079,15 +1165,21 @@ async function probeOmni(sel, box, btn) {
   } catch (e) { box.textContent = "探测失败：" + e.message; } finally { btn.disabled = false; }
 }
 async function probeModel(btn) {
-  const sel = btn.parentNode.querySelector("select"); if (!sel.value) return toast("先选一个模型");
-  if (sel.name === "omni_model") return probeOmni(sel, btn.parentNode.querySelector(".probe"), btn);
+  const sel = btn.parentNode.querySelector("select:not(.psel)");
+  if (sel.name === "omni_model") {   // v3.9.32: a Gemini-only setup (no omni model) can be probed too
+    const f = sel.closest("form"); const gk = f && ((f.omni_gemini_key && f.omni_gemini_key.value) || (f.omni_gemini_key && f.omni_gemini_key.placeholder.startsWith("已设置")));
+    if (!sel.value && !gk) return toast("先选通话模型或填 Gemini Key");
+    return probeOmni(sel, btn.parentNode.querySelector(".probe"), btn);
+  }
+  if (!sel.value) return toast("先选一个模型");
   const box = btn.parentNode.querySelector(".probe"); box.innerHTML = `<span class="spin"></span> 正在实测…`; btn.disabled = true;
   try {
     const base = document.querySelector("#sModel [name=base_url]").value.trim();
-    const r = await api("POST", "/api/models/probe", { model: sel.value, base_url: base || undefined });
+    const ps = sel.parentNode.querySelector(".psel");   // v3.9.33: probe through the slot's provider
+    const r = await api("POST", "/api/models/probe", { model: sel.value, provider: ps ? ps.value : undefined, base_url: (!ps || !ps.value) && base ? base : undefined });
     if (r.error) { box.textContent = r.error; return; }
     S.probes[sel.value] = r;
-    document.querySelectorAll("#sModel .mrow select").forEach((s2) => { [...s2.options].forEach((o) => { if (o.value && o.value !== "__custom") o.textContent = o.value + probeTag(o.value); }); paintProbe(s2); });
+    document.querySelectorAll("#sModel .mrow select:not(.psel)").forEach((s2) => { [...s2.options].forEach((o) => { if (o.value && o.value !== "__custom") o.textContent = (o.dataset.p !== undefined && S.modelGroups.length > 1 ? provName(o.dataset.p) + " · " : "") + o.value + probeTag(o.value); }); paintProbe(s2); });
   } catch (e) { box.textContent = "探测失败：" + e.message; } finally { btn.disabled = false; }
 }
 async function saveModels(e) {
@@ -1098,11 +1190,17 @@ async function saveModels(e) {
   const body = { model: v("model"), vision_model: v("vision_model"), vision_fallback: v("vision_fallback"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value };
   if (f.image2_base_url) { body.image2_base_url = f.image2_base_url.value.trim(); body.image2_model = f.image2_model.value.trim(); body.image_default = (f.image_default && f.image_default.value) || ""; }
   if (f.omni_model) body.omni_model = v("omni_model");
+  f.querySelectorAll("select.psel").forEach((s) => { body[s.name] = s.value; });   // v3.9.33 *_provider
   if (f.omni_voice) {   // v3.9.31 视频通话
     body.omni_voice = f.omni_voice.value; body.omni_realtime_url = f.omni_realtime_url.value.trim(); body.omni_realtime_model = f.omni_realtime_model.value.trim();
     body.omni_tts_model = f.omni_tts_model.value.trim(); body.omni_mode = (f.querySelector("[name=omni_mode]:checked") || {}).value || "auto";
     body.omni_max_minutes = f.omni_max_minutes.value.trim();
     if (f.omni_key && f.omni_key.value) await api("PUT", "/api/secrets/omni_realtime_key", { value: f.omni_key.value });
+    if (f.omni_gemini_model) {   // v3.9.32 Gemini Live
+      body.omni_gemini_model = f.omni_gemini_model.value.trim(); body.omni_gemini_voice = f.omni_gemini_voice.value;
+      body.omni_gemini_url = f.omni_gemini_url.value.trim(); body.omni_proxy = f.omni_proxy.value.trim();
+      if (f.omni_gemini_key && f.omni_gemini_key.value) await api("PUT", "/api/secrets/omni_gemini_key", { value: f.omni_gemini_key.value });
+    }
   }
   await api("PUT", "/api/settings/models", body);
   toast("已保存，下个任务生效"); loadSettings();

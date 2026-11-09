@@ -43,6 +43,14 @@ CODE_WORDS = re.compile(r"脚本|代码|源码|函数|接口|页面|网页|按�
 RUN_WORDS = re.compile(r"运行|跑一?下|跑一遍|执行|生成(一份|今天|今日|最新)?|抓取|爬取|采集|每天|定时|出一份|做一份|\brun\b|"
                        r"\bexecute\b|\bgenerate\b", re.I)
 
+# v3.9.30: a request to write a new program / site / tool is a coding task too (the dev loop runs, new-project mode)
+CODING_NEW = re.compile(r"(?:写|开发|实现|搭建|编写|做|造|撸)(?:一个|一套|一款|个|套|款)?[^，。；,;\n]{0,10}?"
+                        r"(?:程序|脚本|网站|网页应用|web\s*app|应用|App|app|小程序|插件|扩展|后端|前端|接口|API|服务端|命令行工具|"
+                        r"CLI|cli|机器人|bot|爬虫|游戏|库|SDK|sdk)|\b(?:build|write|implement|develop|code)\s+(?:me\s+)?"
+                        r"(?:an?\s+)?(?:\w+\s+){0,3}(?:app|application|website|web app|script|cli|tool|bot|api|server|"
+                        r"extension|plugin|game|library)\b", re.I)
+NEW_BUILD_REASON = "编码任务（新项目）"
+
 # paths / commands that mean the thread has code or script-made artifacts
 _CODE_FILE = re.compile(r"[\w./~-]+\.(?:py|js|mjs|ts|tsx|jsx|html?|css|vue|go|rs|java|sh)\b", re.I)
 _SCRIPT_RUN = re.compile(r"\b(?:python3?|node|bash|sh|deno|bun|npx|uv run)\s+[^\s;&|]*\.(?:py|js|mjs|ts|sh)\b", re.I)
@@ -101,6 +109,9 @@ def classify(text: str, signals: Optional[dict] = None, context: Optional[str] =
         if code_thread:
             reasons.append("对话里有代码/脚本产物")
         return {"intent": DEV_FIX, "forced": False, "reasons": reasons}
+    if CODING_NEW.search(plain):
+        return {"intent": DEV_FIX, "forced": False, "reasons": [NEW_BUILD_REASON if not code_thread else "编码任务",
+                                                                "写程序/网站/工具：" + CODING_NEW.search(plain).group(0)[:40]]}
     if RUN_WORDS.search(plain) or (sig.get("script_runs") and len(plain.strip()) <= 12 and re.search(r"再来|重新|再跑|再生成", plain)):
         return {"intent": RUN, "forced": False, "reasons": ["运行/生成类请求"]}
     return {"intent": OTHER, "forced": False, "reasons": []}

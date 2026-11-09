@@ -371,7 +371,33 @@ TOOLS: list[ToolSpec] = [
              "Put local files (paths on this computer, e.g. ~/workspace/uploads/a.jpg) on an <input type=file> by its ref.",
              {"page": {"type": "integer"}, "ref": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}}},
              ["page", "ref", "files"]),
-    ToolSpec("done", None, "Finish: the task is complete. Give a short summary.", {"summary": {"type": "string"}}, ["summary"]),
+    # v3.9.30 lean dev toolset (coding / fix tasks only; hidden otherwise)
+    ToolSpec("read_file", None, "Read a text file with line numbers (any path the task may read, not only ~/workspace). "
+             "Use offset (1-based first line) and limit (lines, default 400) to read just the region you need. In a "
+             "coding task an existing file must be read (or grepped) before files_patch may edit it.",
+             {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, ["path"]),
+    ToolSpec("grep", None, "Search file contents (extended regex, recursive) and get file:line:text hits. path defaults to "
+             "the source folder of the task contract. glob filters file names (e.g. *.py); files_only lists files.",
+             {"pattern": {"type": "string"}, "path": {"type": "string"}, "glob": {"type": "string"},
+              "ignore_case": {"type": "boolean"}, "context": {"type": "integer"}, "files_only": {"type": "boolean"},
+              "max_results": {"type": "integer"}}, ["pattern"]),
+    ToolSpec("glob", None, "Find files by name pattern (e.g. **/*.py, templates/*.html), newest first.",
+             {"pattern": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}}, ["pattern"]),
+    ToolSpec("todo_write", None, "Coding tasks: replace the TODO list (seeded from the task's acceptance items). Each item "
+             "{id, content, status: pending|in_progress|done, files: [related files]}. Exactly one item in_progress at a "
+             "time. An item can only be marked done after a verification (tests / the generator / verify_html / a diff "
+             "check) ran AFTER the last edit of its files; otherwise that update is rejected.",
+             {"todos": {"type": "array", "items": {"type": "object", "properties": {
+                 "id": {"type": "string"}, "content": {"type": "string"},
+                 "status": {"type": "string", "enum": ["pending", "in_progress", "done"]},
+                 "files": {"type": "array", "items": {"type": "string"}}}, "required": ["content", "status"]}}},
+             ["todos"]),
+    ToolSpec("done", None, "Finish: the task is complete. Give a short summary. Coding tasks: outcome is the receipt kind "
+             "- done (changed and verified), nothing (no change needed; cite file:line evidence), failed (could not; "
+             "say why), ask (need the user's decision; summary = the question, options = choices). Only claim TODO items "
+             "that are marked done with verification; the system appends the TODO receipt and flags unverified claims.",
+             {"summary": {"type": "string"}, "outcome": {"type": "string", "enum": ["done", "nothing", "failed", "ask"]},
+              "options": {"type": "array", "items": {"type": "string"}}}, ["summary"]),
     ToolSpec("fail", None, "Only when truly nothing more can be tried: explain in Chinese what was done, where it is stuck and "
              "what the user could do. The user is then asked whether to retry, take over or stop. For a captcha/login/"
              "SMS code use request_takeover instead; for missing information use ask_user.", {"reason": {"type": "string"}}, ["reason"]),
@@ -381,7 +407,7 @@ BY_NAME = {t.name: t for t in TOOLS}
 BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
-LOOP_TOOLS = {"verify_html", "done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
+LOOP_TOOLS = {"read_file", "grep", "glob", "todo_write", "verify_html", "done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_patch", "files_download", "done", "fail")
 
 

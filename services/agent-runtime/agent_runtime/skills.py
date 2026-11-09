@@ -71,7 +71,17 @@ CATALOG: list[dict] = [
               "tool is available, call it with upload=<project folder> and the install command (prefer Docker compose "
               "or an install.sh you wrote and tested here), then check the result (curl the page, docker ps) with "
               "another deploy_server call and report the address. If the tool is missing, tell the user to fill "
-              "设置 › 电脑 › 部署服务器.")},
+              "设置 › 电脑 › 部署服务器. "
+              # v3.9.30: the same rules the dev loop enforces (devloop.py), so prompt and framework agree
+              "Tools of the coding loop (the system enforces these): keep the TODO list with todo_write — it starts from "
+              "the task's acceptance items; one item in_progress at a time; an item may only be marked done after a "
+              "verification (tests / the generator / verify_html / a diff check) ran after your last edit of its files. "
+              "Before changing an EXISTING file read it (read_file with offset/limit, or grep/glob), then edit it with "
+              "files_patch (exact `old` that matches once); never write fix_*.py scripts that rewrite files. Creating new "
+              "files (PLAN.md, the prototype, new code and tests) is fine without reading. done needs the verification "
+              "evidence; claim only TODO items that are done, the system appends the TODO receipt. If you are stuck "
+              "(the same error repeats) re-read the code; if you need a decision or the step budget runs out, finish "
+              "with done(outcome=\"ask\", summary=<question>, options=[…]) instead of guessing.")},
     {"id": "signup", "title": "网站注册 填资料", "icon": "doc",
      "desc": "在网站注册账号、填写资料：每一步页面要填什么先发表单给你填，再由 Agent 填入",
      "path": "", "setup": "",

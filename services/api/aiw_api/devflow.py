@@ -147,6 +147,10 @@ def persister(store, task):
             store.kv_set(f"thread_dev:{tid}", cur)
         elif kind == "contract":
             store.kv_set(f"task_contract:{task.id}", value)
+        elif kind == "devmem":   # v3.9.30 the dev loop's working memory / todos, for a 继续 run
+            store.kv_set(f"task_devmem:{task.id}", value)
+            if root != task.id:
+                store.kv_set(f"task_devmem:{root}", value)
         elif kind == "git":
             store.kv_set(f"task_git:{task.id}", value)
             if root != task.id:
@@ -209,3 +213,21 @@ def dispatch_budget(store) -> tuple[int, float]:
     except ValueError:
         secs = 3600.0
     return max(0, steps), max(0.0, secs)
+
+
+def promote_on_route(store, task, route: Optional[dict]) -> bool:
+    """v3.9.30: the dev route (autoroute by="dev") turns the dev loop on even when the words alone did not: a long
+    继续/重试 in a thread that has code (sent code files, scripts it ran, repo paths). Persisted as the task's intent."""
+    if not route or route.get("by") != "dev" or getattr(task, "intent", None) == _in.DEV_FIX:
+        return False
+    meta = getattr(task, "meta", None) or {}
+    if not _in.has_code(meta.get("signals") or {}) and not meta.get("parent_contract"):
+        return False
+    task.intent = _in.DEV_FIX
+    reasons = list(meta.get("intent_reasons") or []) + ["模型路由判为开发任务（" + str(route.get("reason") or "dev") + "）"]
+    meta["intent_reasons"] = reasons
+    try:
+        store.kv_set(f"task_intent:{task.id}", {"intent": _in.DEV_FIX, "forced": False, "reasons": reasons})
+    except Exception as e:  # noqa: BLE001
+        log.warning("promote intent: %s", e)
+    return True

@@ -29,6 +29,10 @@ v3.9.29 devflow fixes from task-68b: dev/fix route prefers a strong model (autor
 models.fallback before a flash main model, thinking on, warning on flash), files_patch tool (files.patch), unexecuted-script
 detection, bare source names + parent contract, copy snapshots for untracked/platform-repo sources, concrete stuck
 messages, requirement-derived acceptance checks (verify_html req_checks + done gate), generator_cmd_fast.
+v3.9.30 Codex-style dev loop (agent_runtime/devloop.py): read_file/grep/glob/todo_write tools, explore-before-edit,
+todos from acceptance items with verification before done, receipt outcomes, fast generator first, compaction persisted
+as kv task_devmem:<task> for continuations, stuck -> explore, step budget -> ask, dev blocklist + no confirm pop-ups,
+flash only for compaction (models.summary_model). Auto-on for the dev skill, coding requests, fixes and dev-routed runs.
 """
 from __future__ import annotations
 

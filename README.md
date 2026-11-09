@@ -93,6 +93,19 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.30 编码任务的 Codex / Claude Code 式循环
+
+编码/开发/修复任务自动进入（不用手动选）：选了「开发 程序」技能（【技能：dev】）、请求是写程序/网站/工具、对已有代码的修复/修改（含「继续」），或模型路由判为开发任务（长任务继续且对话里有代码）。实现在 `services/agent-runtime/agent_runtime/devloop.py`。
+
+- **精简工具**：`read_file`（带行号，offset/limit）、`grep`、`glob`、`files_patch`（精确唯一替换，0 次/多次匹配会说明怎么改）、`shell`、`todo_write`、`done(outcome=done|nothing|failed|ask)` 完成回执。开发任务里写 `fix_*.py` 之类改文件的补丁脚本会被拒绝并指向 files_patch。
+- **先探索后修改**：修改已有文件前必须先 read_file/grep 读过它；没有源头的修复把第一个读过并修改的源文件定为源头；直接改生成产物会被拒绝并指出源头。全新项目（dev 技能的 PLAN.md → 原型截图 → ask_user → 实现流程）不受限制：新建文件、改本项目 ~/workspace 下的文件都不拦。
+- **TODO**：从任务契约的验收项（含需求检查）生成；同时只能有一项 in_progress；标 done 前必须在最后一次修改相关文件之后跑过验证（测试/生成器/verify_html/diff），否则拒绝；需求检查通过、改后重新生成会自动勾掉。done 时附「完成回执」，总结里声称完成但没验证的项会标 ⚠。
+- **生成器**：有 `generator_cmd_fast` 时，迭代必须先用快速命令并验证通过才允许完整运行；源头没改动不重复生成。
+- **上下文压缩**：滑出 25 行窗口的旧步骤并入「工作记忆」（读/改过的文件、决定、错误、未完成 TODO），可用便宜模型（flash）总结；保存到 kv `task_devmem:<任务>`，「继续」时恢复，不从头再来。
+- **卡住**：同一错误签名出现 3 次 → 回到探索阶段（重新读代码前不能改）；超过步数预算（`AIW_DEV_STEP_BUDGET` 默认 100，新项目 `AIW_DEV_STEP_BUDGET_NEW` 默认 250）→ 带回执询问用户继续还是停止。
+- **模型分工**：开发步骤用 `autoroute.dev.model`（强模型，未配置时照旧警告）；flash 只用于压缩总结（`models.summary_model` → flash 主模型 → 路由小模型）。
+- **安全**：危险命令黑名单（rm -rf ~ / /、git reset --hard、git clean、git push、sudo、curl|sh 等）直接拒绝；编码任务不弹确认框，本需确认的命令以工具错误拒绝（项目内 pip/npm 安装除外，直接执行）。`AIW_DEV_NO_CONFIRM=0` 恢复确认框，`AIW_DEV_BLOCK_FIX_SCRIPTS=0` 允许补丁脚本，`AIW_DEV_GEN_GATE=0` 关闭生成器门禁。
+
 ## v3.9.29 开发/修复流程修正（task-68b）
 - **模型路由**：修复代码（dev_fix）任务按顺序选模型：`autoroute.dev.model`（设置 › 模型路由 › 修复代码）→ `models.dev_model` →
   `models.strong_model` → `AIW_DEV_MODEL` → 困难档模型 → 主模型是 flash/lite/mini 类时先用 `models.fallback`（如 deveco-glm-5.3）→ 主模型；

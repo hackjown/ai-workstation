@@ -192,6 +192,24 @@ class SessionManager:
         return LLMRouter.from_settings(vm, m.get("model") or m.get("fallback"), key, m.get("base_url") or None,
                                        self._tool_choices(), m.get("thinking"), role="main"), vm
 
+    def _summary_llm(self, small=None) -> Optional[LLMRouter]:
+        """v3.9.30: the cheap model for context compaction / summaries (never the dev steps): models.summary_model,
+        else the main model when it is a flash-class model (thinking off), else the small routing model, else None
+        (the deterministic working memory is used alone)."""
+        if self._custom_llm:
+            return None
+        m = self.model_settings()
+        key = self.secrets.get("openai_api_key") if self.secrets else None
+        name = m.get("summary_model") or os.environ.get("AIW_SUMMARY_MODEL") or ""
+        if not name:
+            from . import autoroute as _ar
+            if _ar.is_flash(m.get("model") or ""):
+                name = m.get("model")
+        if name:
+            return LLMRouter.from_settings(name, None, key, m.get("base_url") or None, self._tool_choices(), "off",
+                                           role="subagent")
+        return small
+
     def _subagent_llm(self) -> Optional[LLMRouter]:
         if self._custom_llm:
             return None
@@ -499,6 +517,10 @@ class SessionManager:
                     meta["git"] = self.store.kv_get(f"task_git:{meta['parent_contract']['from_task']}") or {}
             except Exception as e:  # noqa: BLE001
                 log.warning("parent contract: %s", e)
+            try:   # v3.9.30: the previous run's dev working memory (todos, files, decisions) carries over
+                meta["parent_devmem"] = _cont.parent_devmem(self.store, row)
+            except Exception as e:  # noqa: BLE001
+                log.warning("parent devmem: %s", e)
         task = Task(id=row["id"], prompt=run_prompt, machine_id=row["machine_id"], thread_id=row.get("thread_id"),
                     source=row.get("source") or "chat", max_steps=steps, timeout_s=secs, continues=root_id,
                     intent=info.get("intent"), meta=meta)
@@ -1084,6 +1106,12 @@ class SessionManager:
                     except Exception as e:  # noqa: BLE001
                         log.warning("skill preflight: %s", e)
                     llm, route = await self._routed_llm(task, v24.small_llm() if v24 is not None else None)
+                    try:   # v3.9.30: the dev route switches the dev loop on (long 继续 in a code thread)
+                        from . import devflow as _dfa2
+                        if _dfa2.promote_on_route(self.store, task, route):
+                            log.info("task %s: dev loop on (route %s)", task.id, route.get("reason"))
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("promote dev: %s", e)
                     if route and route.get("by") == "video":
                         await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": f"视频任务，改用视频模型 {route['model']}"}))
                     elif route:   # v3.9.24 (2): which model / effort this run uses, on the timeline and the task
@@ -1099,6 +1127,10 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    try:   # v3.9.30: flash only for compaction / summaries; the dev steps run on the routed (strong) model
+                        loop.summary_llm = self._summary_llm(v24.small_llm() if v24 is not None else None)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("summary llm: %s", e)
                     try:   # v3.9.26: provenance / fingerprints per thread, contract / git per task
                         from . import devflow as _dfa
                         loop.persist = _dfa.persister(self.store, task)

@@ -611,7 +611,8 @@ async def test_task830_replay_regression_names_the_lost_github_section(vm, monke
     repo, art, gen_cmd, book, fps = _project(tmp)
     events = []
     gen = repo / "news" / "aiw_news.py"
-    script = [("shell", {"command": f"sed -i 's/^GH = True/GH = False/' {gen}"}),     # the restyle drops GitHub
+    script = [("grep", {"pattern": "GH", "path": str(gen)}),                          # v3.9.30: read before edit
+              ("shell", {"command": f"sed -i 's/^GH = True/GH = False/' {gen}"}),     # the restyle drops GitHub
               ("shell", {"command": gen_cmd}),
               ("shell", {"command": f"cd {repo} && python3 -m unittest discover -s tests -q"}),
               ("done", {"summary": "样式已改好。已知问题：无"}),
@@ -630,7 +631,8 @@ async def test_task830_replay_real_fix_passes_commits_and_rolls_back(vm):
     base = _git(repo, "rev-parse", "HEAD")
     events = []
     gen = repo / "news" / "aiw_news.py"
-    script = [("shell", {"command": f"sed -i 's/font:14px serif/font:15px sans-serif/' {gen}"}),
+    script = [("read_file", {"path": str(gen), "offset": 1, "limit": 5}),            # v3.9.30: read before edit
+              ("shell", {"command": f"sed -i 's/font:14px serif/font:15px sans-serif/' {gen}"}),
               ("shell", {"command": gen_cmd}),
               ("shell", {"command": f"cd {repo} && python3 -m unittest discover -s tests -q"}),
               ("done", {"summary": "新样式已在 aiw_news.py 里改好并重新生成，详情和 GitHub 都在。已知问题：无"})]

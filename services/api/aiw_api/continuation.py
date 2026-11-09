@@ -277,6 +277,24 @@ def parent_contract(store, row: dict) -> dict:
     return {}
 
 
+def parent_devmem(store, row: dict) -> dict:
+    """v3.9.30: the dev loop working memory (todos, files read/edited, decisions, compacted summary) of the newest
+    earlier run of this task, so a 继续 run resumes instead of restarting. {} if none."""
+    root = row.get("continues") or row.get("id")
+    if not root:
+        return {}
+    try:
+        runs = [r for r in (store.continuations(root) or []) if r.get("id") != row.get("id")]
+    except Exception:  # noqa: BLE001
+        runs = []
+    ids = [r.get("id") for r in reversed(runs) if r.get("id")] + ([root] if root != row.get("id") else [])
+    for rid in ids:
+        m = store.kv_get(f"task_devmem:{rid}")
+        if isinstance(m, dict) and (m.get("todos") or m.get("memory") or m.get("edits")):
+            return {**m, "from_task": rid}
+    return {}
+
+
 def contract_prompt(old_instructions: str, new: str, voided: list) -> str:
     """v3.9.26: the continuation prompt when the job changed kind (see run_prompt)."""
     parts = ["【任务契约】这次是一个新的目标（修复/修改代码），以下面的「目标」为准。",

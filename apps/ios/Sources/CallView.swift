@@ -42,6 +42,7 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     private let voice = AVSpeechSynthesizer()
     private var cameraReady = false
     private var isMuted = false       // read on the audio thread
+    private var lastErr = ""          // v3.9.35: the server's last error, kept on screen when it ends the call
 
     // MARK: start / stop
     func start(video: Bool) {
@@ -180,8 +181,13 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
             let name = o.s("name") == "create_aiw_task" ? "交给 aiw" : "查任务进度"
             note = o.s("status") == "running" ? "正在\(name)…" : (o.s("text").isEmpty ? "\(name)完成" : o.s("text"))
         case "error":
+            lastErr = o.s("message")
             if o.s("code") == "disabled" || mode.isEmpty { error = o.s("message") } else { note = o.s("message") }
         case "ended":
+            // v3.9.35: a call the server ended (model gone, quota, no response…) stays on screen with the reason
+            // instead of closing at once, so the user sees why; a normal hang-up still closes the view
+            let r = o.s("reason")
+            if error.isEmpty && !lastErr.isEmpty && r != "hangup" && r != "disconnect" { error = lastErr }
             finish()
         default:
             break

@@ -1156,11 +1156,12 @@ function omniFamily(sel) {
 }
 function omniProbeHTML(p, fam) {
   fam = p && p.family !== undefined ? p.family : (fam || "");
-  const hint = OMNI_HINTS[fam] ? `<div class="muted">${esc(OMNI_HINTS[fam])}</div>` : "";
+  let hint = OMNI_HINTS[fam] ? `<div class="muted">${esc(OMNI_HINTS[fam])}</div>` : "";
   if (!p) return `<span class="muted">未探测：点「探测」试${fam === "gemini" ? " Gemini Live" : "实时接口和轮流模式"}</span>` + hint;
   const ok = (b, t) => `<span class="chip ${b ? "ok" : "bad"}">${b ? "✓" : "✕"} ${t}</span>`;
   const rt = p.realtime || {}, tn = p.turn || {}, gm = p.gemini;
   const notes = (p.notes || []).length ? `<div class="muted">${esc(p.notes.join("；").slice(0, 240))}</div>` : "";
+  hint += ` <a href="#" onclick="omniCallsDiag();return false" class="small">通话诊断</a>`;   // v3.9.35
   if (p.route === "gemini" && gm) {   // v3.9.34: the call slot is routed to Gemini Live - only its badge
     return `${ok(gm.ok, "Gemini Live" + (gm.ms ? " " + (gm.ms / 1000).toFixed(1) + "s" : ""))} ${gm.ok ? ok(gm.audio !== false, "会说话") : ""}`
       + `<div class="muted">${gm.ok ? "通话会用：Gemini Live（" + esc(gm.model || "") + "）" : "Gemini Live 不通：" + esc((gm.error || "").slice(0, 120))}</div>` + notes + hint;
@@ -1172,12 +1173,27 @@ function omniProbeHTML(p, fam) {
     + `<div class="muted">${p.mode ? "通话会用：" + ({ realtime: "实时模式", gemini: "Gemini Live" }[p.mode] || "轮流模式") : "都不通"}${gm && gm.error ? "；Gemini：" + esc(gm.error.slice(0, 100)) : ""}${rt.error ? "；实时：" + esc(rt.error.slice(0, 100)) : ""}${tn.error ? "；轮流：" + esc(tn.error.slice(0, 100)) : ""}${rt.skipped ? "；实时接口未试（供应商不是百炼）" : ""}</div>`
     + notes + hint;
 }
+/* v3.9.35 设置 › 视频通话 › 通话诊断: the last 20 calls' connection timelines and counters (GET /api/omni/calls) */
+async function omniCallsDiag() {
+  let r;
+  try { r = await api("GET", "/api/omni/calls"); } catch (e) { return toast("读取通话诊断失败：" + e.message); }
+  const calls = r.calls || [];
+  const when = (t) => new Date(t * 1000).toLocaleString();
+  const one = (c, i) => { const n = c.counters || {};
+    return `<details ${i === 0 ? "open" : ""} style="margin-top:8px"><summary>${esc(when(c.started))} · ${esc(c.backend || "未接通")} ${esc(c.model || "")} · ${Math.round(c.seconds)} 秒 · ${c.active ? "进行中" : esc(c.reason || "")}${c.last_error ? ` · <b>${esc(c.last_error.slice(0, 90))}</b>` : ""}</summary>
+      <div class="small muted">麦克风 ${n.audio_in || 0} 段 → 发给模型 ${n.audio_up || 0}（重连时排队 ${n.audio_pending || 0}）· 画面 ${n.frames_in || 0}（丢 ${n.frames_dropped || 0}）· 模型消息 ${n.up_msgs || 0} · 回放声音 ${n.audio_out || 0} 段 · 重连 ${n.reconnects || 0} · 断开 ${n.upstream_closes || 0} · 看门狗 ${n.watchdog || 0}</div>
+      <pre style="white-space:pre-wrap;font-size:12px;max-height:40vh;overflow:auto">${(c.events || []).map((e) => `${String(e[0]).padStart(6)}s ${e[2] === "warn" ? "⚠ " : ""}${esc(e[1])}`).join("\n")}</pre></details>`; };
+  modal(`<div class="card"><div class="heading">通话诊断</div>
+    <div class="muted">最近 ${calls.length} 次通话（服务重启后清空）。服务器日志：<code>${esc(r.log_hint || "")}</code></div>
+    <div style="max-height:70vh;overflow:auto">${calls.length ? calls.map(one).join("") : '<div class="muted" style="margin-top:8px">还没有通话记录</div>'}</div>
+    <div class="row gap" style="justify-content:flex-end;margin-top:10px"><button class="btn sm" onclick="omniCallsDiag()">刷新</button><button class="btn sm" onclick="closeOverlays()">关闭</button></div></div>`);
+}
 async function probeOmni(sel, box, btn) {
   box.innerHTML = `<span class="spin"></span> 正在试 Gemini / 实时接口 / 轮流模式…`; btn.disabled = true;
   try {
     const f = sel.closest("form"); const body = { omni_model: sel.value };
     const ps = sel.parentNode.querySelector(".psel"); if (ps) body.omni_model_provider = ps.value;   // v3.9.34: probe the provider on screen
-    for (const k of ["omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model", "omni_gemini_model", "omni_gemini_voice", "omni_gemini_url", "omni_proxy"]) if (f && f[k]) body[k] = f[k].value.trim();
+    for (const k of ["omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model", "omni_gemini_model", "omni_gemini_voice", "omni_gemini_url", "omni_proxy", "omni_gemini_vad_start", "omni_gemini_vad_end", "omni_gemini_silence_ms"]) if (f && f[k]) body[k] = f[k].value.trim();
     if (f && f.omni_mode) body.omni_mode = (f.querySelector("[name=omni_mode]:checked") || {}).value || "auto";
     if (f && f.omni_key && f.omni_key.value) await api("PUT", "/api/secrets/omni_realtime_key", { value: f.omni_key.value });
     if (f && f.omni_gemini_key && f.omni_gemini_key.value) await api("PUT", "/api/secrets/omni_gemini_key", { value: f.omni_gemini_key.value });
@@ -1222,6 +1238,10 @@ async function saveModels(e) {
     if (f.omni_gemini_model) {   // v3.9.32 Gemini Live
       body.omni_gemini_model = f.omni_gemini_model.value.trim(); body.omni_gemini_voice = f.omni_gemini_voice.value;
       body.omni_gemini_url = f.omni_gemini_url.value.trim(); body.omni_proxy = f.omni_proxy.value.trim();
+      if (f.omni_gemini_vad_start) {   // v3.9.35 Gemini VAD
+        body.omni_gemini_vad_start = f.omni_gemini_vad_start.value; body.omni_gemini_vad_end = f.omni_gemini_vad_end.value;
+        body.omni_gemini_silence_ms = f.omni_gemini_silence_ms.value.trim();
+      }
       if (f.omni_gemini_key && f.omni_gemini_key.value) await api("PUT", "/api/secrets/omni_gemini_key", { value: f.omni_gemini_key.value });
     }
   }

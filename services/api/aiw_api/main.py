@@ -349,6 +349,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     ext24 = _v3924.mount(app, store, sessions, scheduler, notifier, secrets, settings, chat, auth)
     app.state.v3924 = ext24
     from . import omni_call as _omni   # v3.9.31: 视频通话 (/ws/omni-call, /api/omni/status, /api/omni/probe)
+    _omni.setup_logging()   # v3.9.35: the call's lifecycle (aiw.omni, INFO) shows in docker logs
     _omni.mount(app, store, secrets, chat, auth, lambda ws: _ok(ws_token(ws)))
     _pv.mount(app, store, secrets, auth)   # v3.9.33: 设置 › 模型 › 供应商 (/api/providers)
 
@@ -946,6 +947,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                   # v3.9.32 Gemini Live backend: model, prebuilt voice, relay base URL (optional), outbound proxy for the
                   # Gemini connection (http/https/socks; its key is the secret omni_gemini_key)
                   "omni_gemini_model", "omni_gemini_voice", "omni_gemini_url", "omni_proxy",
+                  # v3.9.35 Gemini automatic activity detection: start / end sensitivity (low | high; start also api =
+                  # the API default; empty start = low, empty end = API default) and silence ms (empty = API default)
+                  "omni_gemini_vad_start", "omni_gemini_vad_end", "omni_gemini_silence_ms",
                   # v3.9.33 model provider list: "<slot>_provider" = a provider id per model slot (empty = 默认)
                   *_pv.PROVIDER_FIELDS)
 
@@ -1012,6 +1016,19 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                     raise ValueError
             except ValueError:
                 raise HTTPException(400, "omni_max_minutes must be 1-240")
+        # v3.9.35 Gemini VAD
+        for k, ok in (("omni_gemini_vad_start", ("low", "high", "api")), ("omni_gemini_vad_end", ("low", "high", "api"))):
+            if m.get(k) is not None:
+                m[k] = str(m[k]).strip().lower() or None
+                if m[k] is not None and m[k] not in ok:
+                    raise HTTPException(400, f"{k} must be low, high or api (empty = default)")
+        if m.get("omni_gemini_silence_ms") is not None:
+            try:
+                if not 100 <= int(float(m["omni_gemini_silence_ms"])) <= 5000:
+                    raise ValueError
+                m["omni_gemini_silence_ms"] = str(int(float(m["omni_gemini_silence_ms"])))
+            except ValueError:
+                raise HTTPException(400, "omni_gemini_silence_ms must be 100-5000 (empty = API default)")
 
     @app.post("/api/models/probe", dependencies=[Depends(auth)])
     async def probe_model(body: dict):

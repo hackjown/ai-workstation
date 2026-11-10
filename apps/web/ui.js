@@ -228,6 +228,10 @@ loadSettings = async function () {
       ${row("出站代理", "Gemini 连接走的代理，国内必填：http://192.168.1.2:7890 或 socks5://…（socks 需服务器装 python-socks）；留空用环境变量 HTTPS_PROXY", `<input name="omni_proxy" value="${esc(models.omni_proxy || "")}" placeholder="http://127.0.0.1:7890" />`)}
       ${row("Gemini 中转地址", "可选：反向代理/中转的 wss:// 地址，留空直连 Google", `<input name="omni_gemini_url" value="${esc(models.omni_gemini_url || "")}" placeholder="wss://generativelanguage.googleapis.com" />`)}
       ${row("最长通话", "分钟，到点自动挂断", `<input name="omni_max_minutes" value="${esc(models.omni_max_minutes || "30")}" inputmode="numeric" style="max-width:120px" />`)}
+      ${row("Gemini 起说灵敏度", "免提时手机会听到自己的回声和环境噪音：默认「低」不容易被误当成说话；「高」= API 默认，更容易打断", `<select name="omni_gemini_vad_start">${[["", "默认（低）"], ["low", "低"], ["high", "高"], ["api", "API 默认（高）"]].map(([k, t]) => `<option value="${k}" ${(models.omni_gemini_vad_start || "") === k ? "selected" : ""}>${t}</option>`).join("")}</select>`)}
+      ${row("Gemini 断句灵敏度", "高 = 更快判定说完（API 默认）；低 = 允许更长的停顿", `<select name="omni_gemini_vad_end">${[["", "默认（API：高）"], ["high", "高"], ["low", "低"]].map(([k, t]) => `<option value="${k}" ${(models.omni_gemini_vad_end || "") === k ? "selected" : ""}>${t}</option>`).join("")}</select>`)}
+      ${row("Gemini 静音时长", "毫秒：说完停多久才算一句话结束（100-5000）；留空 = API 默认（约 800）", `<input name="omni_gemini_silence_ms" value="${esc(models.omni_gemini_silence_ms || "")}" inputmode="numeric" placeholder="800" style="max-width:120px" />`)}
+      ${row("通话诊断", "最近 20 次通话的连接时间线和计数：接通了却没回应时看这里；服务器日志 docker logs aiw-api 2&gt;&amp;1 | grep aiw.omni", `<button type="button" class="btn sm" onclick="omniCallsDiag()">通话诊断</button>`)}
     </div>
     <div class="rows">
       ${row("深度思考", "关掉可快很多", `<div class="segsw"><label><input type="radio" name="thinking" value="off" ${(models.thinking || "off") === "off" ? "checked" : ""}>关闭</label><label><input type="radio" name="thinking" value="on" ${models.thinking === "on" ? "checked" : ""}>模型默认</label></div>`)}

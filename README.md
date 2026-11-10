@@ -93,6 +93,18 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.35 Gemini Live 通话加固与诊断
+
+- 上游断开必报原因：每次关闭都记录代码和原因；超配额、Key 错误、参数错误（1007/1008/1011 等）会把原因发给客户端并结束通话；连续 3 次快速断开结束通话；重连异常也会结束通话，不再出现「已接通但不回话」。
+- 修复：重连过程中新连接再次断开时重连请求被忽略，导致通话永久静默。
+- 同一时刻只保留一条上游连接；挂断、客户端断线、取消时关闭上游连接。发送卡住 5 秒断开重连；工具调用 30 秒超时。
+- 看门狗：用户有效说话后 20 秒无任何模型回复，提示「模型没有响应，正在重连…」并续接，第二次开新会话，第三次报错挂断。
+- 客户端打断后丢弃该回答剩余音频；麦克风停顿 1.5 秒发送 audioStreamEnd。
+- 新设置：`omni_gemini_vad_start`（low/high/api，留空=low，减少外放回声误触）、`omni_gemini_vad_end`（留空=API 默认）、`omni_gemini_silence_ms`（100–5000）。
+- 诊断：`docker logs aiw-api 2>&1 | grep aiw.omni`（每 15 秒一行计数）；`GET /api/omni/calls` 保存最近 20 通的时间线；设置 › 视频通话 有「通话诊断」按钮。
+- iOS：通话中的错误会停留显示（未编译）。
+- 环境变量：AIW_OMNI_WATCHDOG_S、AIW_OMNI_SEND_TIMEOUT、AIW_OMNI_TOOL_TIMEOUT、AIW_OMNI_STATS_S、AIW_OMNI_LOG 等。
+
 ## v3.9.34 通话模型槽位按模型/供应商自动选后端
 
 「通话模型（全模态）」槽位（`omni_model` + `omni_model_provider`）里放的是 Gemini 时，通话直接走 Gemini Live，不再把 Gemini 的 Key 发给百炼实时接口（之前探测会出现「实时 ✗ HTTP 401」）。

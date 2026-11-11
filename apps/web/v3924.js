@@ -219,7 +219,7 @@ V24_RENDER.usage = async function (days) {
       ${u.per_day.map((d) => `<tr><td>${d.day}</td><td><div class="v24-barc" style="width:${(100 * d.total / max).toFixed(1)}%"></div></td><td>${n24(d.input)}</td><td>${n24(d.output)}</td>
         <td class="v24-note">${d.models.map((m) => `${q24(m.model)} ${n24(m.total)}`).join("<br>")}</td></tr>`).join("") || '<tr><td colspan="5" class="v24-note">这段时间没有记录</td></tr>'}</table></div>
     <div class="v24-g2"><div class="card v24-card"><h3>按模型</h3><table>${u.per_model.map((m) => `<tr><td class="v24-mono">${q24(m.model)}</td><td>${n24(m.input + m.output)}</td><td class="v24-note">${m.calls} 次</td></tr>`).join("")}</table></div>
-      <div class="card v24-card"><h3>按角色</h3><table>${u.per_role.map((m) => `<tr><td>${q24({ main: "任务主模型", chat: "聊天", small: "小模型", vision: "看图", subagent: "子代理", review: "审核", geometry: "定位" }[m.role] || m.role)}</td><td>${n24(m.input + m.output)}</td><td class="v24-note">${m.calls} 次</td></tr>`).join("")}</table></div></div>
+      <div class="card v24-card"><h3>按角色</h3><table>${u.per_role.map((m) => `<tr><td>${q24({ main: "任务主模型", chat: "聊天", small: "小模型", vision: "看图", subagent: "子代理", review: "审核", geometry: "定位", call: "通话" }[m.role] || m.role)}</td><td>${n24(m.input + m.output)}</td><td class="v24-note">${m.calls} 次</td></tr>`).join("")}</table></div></div>
     <div class="card v24-card"><h3>最耗 token 的任务</h3><table>${u.top_tasks.map((t) => `<tr><td>${q24(t.title || t.task_id)}</td><td>${n24(t.input + t.output)}</td></tr>`).join("") || '<tr><td class="v24-note">无</td></tr>'}</table></div>
     <div class="v24-note">数字来自网关返回的 usage；网关不返回 usage 的调用不计入。日期按北京时间。</div>`);
 };

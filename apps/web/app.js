@@ -1173,6 +1173,13 @@ function omniProbeHTML(p, fam) {
     + `<div class="muted">${p.mode ? "通话会用：" + ({ realtime: "实时模式", gemini: "Gemini Live" }[p.mode] || "轮流模式") : "都不通"}${gm && gm.error ? "；Gemini：" + esc(gm.error.slice(0, 100)) : ""}${rt.error ? "；实时：" + esc(rt.error.slice(0, 100)) : ""}${tn.error ? "；轮流：" + esc(tn.error.slice(0, 100)) : ""}${rt.skipped ? "；实时接口未试（供应商不是百炼）" : ""}</div>`
     + notes + hint;
 }
+/* v3.9.38 通话诊断: the call's tokens in / out with the per-modality split (audio / video / image / text) */
+function omniTokLine(t) {
+  if (!t || !(t.in || t.out)) return "";
+  const names = { audio: "音频", video: "视频", image: "图像", text: "文字", other: "其他" };
+  const by = (d) => { const p = Object.entries(d || {}).filter(([, v]) => v).map(([k, v]) => `${names[k] || esc(k)} ${v}`); return p.length ? `（${p.join(" / ")}）` : ""; };
+  return `<div class="small muted">tokens 输入 ${t.in || 0}${by(t.in_by)} · 输出 ${t.out || 0}${by(t.out_by)}${t.mode === "turn" ? " · 按轮计" : ""}</div>`;
+}
 /* v3.9.35 设置 › 视频通话 › 通话诊断: the last 20 calls' connection timelines and counters (GET /api/omni/calls) */
 async function omniCallsDiag() {
   let r;
@@ -1181,7 +1188,8 @@ async function omniCallsDiag() {
   const when = (t) => new Date(t * 1000).toLocaleString();
   const one = (c, i) => { const n = c.counters || {};
     return `<details ${i === 0 ? "open" : ""} style="margin-top:8px"><summary>${esc(when(c.started))} · ${esc(c.backend || "未接通")} ${esc(c.model || "")} · ${Math.round(c.seconds)} 秒 · ${c.active ? "进行中" : esc(c.reason || "")}${c.last_error ? ` · <b>${esc(c.last_error.slice(0, 90))}</b>` : ""}</summary>
-      <div class="small muted">麦克风 ${n.audio_in || 0} 段 → 发给模型 ${n.audio_up || 0}（重连时排队 ${n.audio_pending || 0}）· 画面 ${n.frames_in || 0}（丢 ${n.frames_dropped || 0}）· 模型消息 ${n.up_msgs || 0} · 回放声音 ${n.audio_out || 0} 段 · 被打断 ${n.interrupts || 0} 次${c.client_audio && c.client_audio.vp === false ? " · <b>回声消除关闭</b>" : ""} · 重连 ${n.reconnects || 0} · 断开 ${n.upstream_closes || 0} · 看门狗 ${n.watchdog || 0}</div>
+      <div class="small muted">麦克风 ${n.audio_in || 0} 段 → 发给模型 ${n.audio_up || 0}（重连时排队 ${n.audio_pending || 0}）· 画面 ${n.frames_in || 0}（丢 ${n.frames_dropped || 0}）· 模型消息 ${n.up_msgs || 0} · 回放声音 ${n.audio_out || 0} 段 · 被打断 ${n.interrupts || 0} 次${c.client_audio && c.client_audio.vp === false ? " · <b>回声消除关闭</b>" + (c.client_audio.vp_off_reason ? "（" + esc(c.client_audio.vp_off_reason) + "）" : "") : ""} · 重连 ${n.reconnects || 0} · 断开 ${n.upstream_closes || 0} · 看门狗 ${n.watchdog || 0}</div>
+      ${omniTokLine(c.tokens)}
       <pre style="white-space:pre-wrap;font-size:12px;max-height:40vh;overflow:auto">${(c.events || []).map((e) => `${String(e[0]).padStart(6)}s ${e[2] === "warn" ? "⚠ " : ""}${esc(e[1])}`).join("\n")}</pre></details>`; };
   modal(`<div class="card"><div class="heading">通话诊断</div>
     <div class="muted">最近 ${calls.length} 次通话（服务重启后清空）。服务器日志：<code>${esc(r.log_hint || "")}</code></div>

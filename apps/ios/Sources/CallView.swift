@@ -14,7 +14,7 @@ import CoreImage
 // AVAudioConverter that silently failed / gave 0 frames - each buffer is taken in whatever format it comes (Float32,
 // Int16 or Int32, interleaved or not, 1 or more channels: the first channel that has signal is used, like
 // channelMap [0]) and resampled to 16 kHz by hand with a fractional position kept across buffers. If no mic buffer
-// (or only digital silence) arrives for 3 s the note says 「麦克风没有声音，请检查权限/静音」 and the engine is
+// (or only digital silence) arrives for 3 s a note said so (removed in v3.9.38) and the engine is
 // restarted once without voice processing; the server's no_mic error does the same. AVAudioSession interruptions,
 // route changes and AVAudioEngine configuration changes restart the engine. start says client "ios"; mute is told to
 // the server so a muted mic is not reported as broken.
@@ -23,7 +23,7 @@ import CoreImage
 // cancellation off - now only happens when the mic tap delivers NO callbacks at all for 3 s (or the server says no_mic
 // and we really got no callbacks), never because the voice-processed signal is quiet (it is near-silent whenever
 // nobody talks); which mode is active (vp on/off, why, any setVoiceProcessingEnabled error, input rate/channels,
-// route) goes to the server as {"type":"client_audio"} so it shows in 通话诊断, and the screen says when AEC is off.
+// route) goes to the server as {"type":"client_audio"} so it shows in 通话诊断 (v3.9.37 also said it on screen).
 // Playback stays on the same engine (player -> mainMixerNode of the voice-processing engine, session .voiceChat), so
 // the AEC has its reference. (2) An echo gate (EchoGate, same rule as call.js callEchoGate): while the answer plays
 // and 300 ms after it drains, mic chunks go out as zeros unless the mic is clearly louder than the echo (RMS >
@@ -31,6 +31,21 @@ import CoreImage
 // (setting 防回声) or UserDefaults aiw.call.echoGate = "off" turns it off. (3) Playback: buffers complete on
 // .dataPlayedBack; an engine restart (route / config change) re-schedules the buffers not yet played instead of
 // dropping the tail of the answer; a stop by 打断 / interrupted bumps a generation so late completions are ignored.
+// v3.9.38 (field log: AEC on at start, then 2.5 s later "restart without voice processing, why=no mic callbacks", and the
+// whole call ran with AEC off although the mic then delivered a chunk every 40 ms): root cause - turning voice
+// processing on and routing to the speaker make iOS reconfigure the audio unit a moment after our engine.start(); that
+// posts AVAudioEngineConfigurationChange (and a route change), and AVAudioEngine STOPS itself on a configuration change.
+// scheduleRestart() threw away every notification that came within 1 s of our own start ("no restart loop"), so the
+// engine stayed stopped, the tap got nothing, and the 3 s check blamed voice processing. Now: a notification is decided
+// when the debounced restart runs - skipped only while the engine is still running (it was our own start's echo),
+// otherwise the engine is restarted with the SAME voice-processing mode (at most 4 such restarts in 10 s). Tap callbacks
+// are counted per engine start (a generation captured by the tap closure, counted first thing in the callback, before
+// the frames / mute / echo gate), measured from the moment engine.start() returned. The fallback is much more patient:
+// 6 s with no tap callback -> restart WITH voice processing; only if that start also gives none for 6 s is voice
+// processing dropped, and its reason is kept in its own field (vp_off_reason); each client_audio report carries its own
+// why (start / the restart's reason / turn). Engine notifications go to the server too (event "engine"), so the 通话诊断
+// timeline shows them. Nothing about the mic or the echo canceller is written on the call screen any more (the user
+// asked for no reminder texts): only an error that ends the call is shown; the rest is in 通话诊断.
 
 /// v3.9.37 echo gate on 40 ms chunks of 16 kHz pcm16 (see call.js callEchoGate for the same rule).
 struct EchoGate {
@@ -88,7 +103,6 @@ struct EchoGate {
 final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var mode = ""          // "realtime" | "turn" | "gemini" (v3.9.32) once the server is ready
     @Published var model = ""
-    @Published var note = ""
     @Published var userText = ""
     @Published var botText = "正在接通…"
     @Published var muted = false
@@ -107,13 +121,16 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     private var rsPos: Double = 0
     private var rsTail: [Float] = []
     private let micLock = NSLock()              // guards the three stamps below (audio thread writes, main reads)
-    private var lastBufAt: TimeInterval = 0     // last mic buffer of any kind
-    private var lastVoiceAt: TimeInterval = 0   // last mic buffer that was not digital silence
     private var audioStartAt: TimeInterval = 0  // when the engine (re)started
     private var micChecker: Timer?
-    private var micWarned = false
+    private var tapGen = 0                      // v3.9.38: bumped at every engine (re)start (micLock)
+    private var tapCount = 0                    // tap callbacks of the current start, counted before anything else (micLock)
+    private var lastTapAt: TimeInterval = 0     // last tap callback of the current start (micLock)
+    private let stallSeconds: TimeInterval = 6  // no tap callback this long after engine.start() -> mic restart ladder
+    private var micStage = 0                    // 0 normal, 1 restarted with voice processing, 2 voice processing dropped
+    private var vpOffReason = ""                // why voice processing (AEC) is off, if it is (kept apart from why)
+    private var autoRestarts: [TimeInterval] = []   // notification-driven restarts (loop guard)
     private var vpOn = true
-    private var vpFallbackTried = false
     private var vpErr = ""                       // v3.9.37: why setVoiceProcessingEnabled failed, if it did
     private var audioWhy = "start"               // why the engine last (re)started (main thread)
     private var inRate: Double = 0
@@ -127,6 +144,7 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     private var bufSeq = 0
     private var observers: [NSObjectProtocol] = []
     private var restartWork: DispatchWorkItem?
+    private var restartPending = false           // v3.9.38: a debounced restart is queued (main thread)
     private var task: URLSessionWebSocketTask?
     private let videoQueue = DispatchQueue(label: "aiw.call.video")
     private let ci = CIContext()
@@ -149,7 +167,7 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
                 if video {
                     AVCaptureDevice.requestAccess(for: .video) { granted in
                         DispatchQueue.main.async {
-                            if !granted { self.cameraOn = false; self.note = "没有摄像头权限，先用语音（设置 › Aiw › 相机）" }
+                            if !granted { self.cameraOn = false }   // v3.9.38: no note, the call goes on by voice
                             self.begin()
                         }
                     }
@@ -184,6 +202,11 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     private func startAudio(voiceProcessing: Bool, why: String = "start") throws {
         let input = engine.inputNode
         let carry = takeQueue()   // v3.9.37: the answer's buffers not yet played survive the restart
+        micLock.lock()            // v3.9.38: a new start - the stall check pauses until engine.start() succeeded
+        tapGen += 1
+        let gen = tapGen
+        tapCount = 0; lastTapAt = 0; audioStartAt = 0
+        micLock.unlock()
         if engine.isRunning { engine.stop() }
         input.removeTap(onBus: 0)
         vpErr = ""
@@ -200,7 +223,7 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
         guard inFmt.sampleRate > 0, inFmt.channelCount > 0 else {
             throw NSError(domain: "aiw.call", code: 1, userInfo: [NSLocalizedDescriptionKey: "没有可用的麦克风"])
         }
-        input.installTap(onBus: 0, bufferSize: 1024, format: inFmt) { [weak self] buf, _ in self?.onMic(buf) }
+        input.installTap(onBus: 0, bufferSize: 1024, format: inFmt) { [weak self] buf, _ in self?.onTap(buf, gen: gen) }
         if player.engine == nil { engine.attach(player) }
         // the answer plays through the SAME engine as the voice-processed mic (no separate output path), so the
         // system echo canceller hears what it has to remove
@@ -215,26 +238,28 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
         audioWhy = why; inRate = inFmt.sampleRate; inChans = Int(inFmt.channelCount)
         DispatchQueue.main.async { [weak self] in self?.pending = 0 }   // before the carried buffers count again
         for b in carry { schedule(b) }
+        if vpOn { vpOffReason = "" } else if vpOffReason.isEmpty {
+            vpOffReason = vpErr.isEmpty ? why : "\(why): \(vpErr)"
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            if !self.vpOn {
-                self.note = "回声消除没开（麦克风兼容模式），免提可能会自己打断自己，建议戴耳机"
-            } else if self.note.hasPrefix("回声消除没开") {
-                self.note = ""
-            }
-            if !self.mode.isEmpty { self.reportAudio("restart") }   // the first start is reported at ready
+            if !self.mode.isEmpty { self.reportAudio("restart", why: why) }   // the first start is reported at ready
         }
     }
 
     /// v3.9.37: what the audio path is (voice processing on/off and why, the echo gate's numbers) -> the server's
     /// 通话诊断 timeline.
-    private func reportAudio(_ event: String, why: String = "") {
+    /// v3.9.38: `why` is this report's own reason (start / the restart's reason / turn / the engine event), never a
+    /// leftover; why voice processing is off goes in vp_off_reason.
+    private func reportAudio(_ event: String, why: String) {
         micLock.lock()
         let g = gate
+        let taps = tapCount
         micLock.unlock()
         var o: JSON = ["type": "client_audio", "event": event, "vp": vpOn, "gate": g.on,
-                       "echo": Double(g.echo), "thr": Double(g.thr), "gated_s": Double(g.gatedMs) / 1000, "barges": g.barges]
-        o["why"] = why.isEmpty ? audioWhy : why
+                       "echo": Double(g.echo), "thr": Double(g.thr), "gated_s": Double(g.gatedMs) / 1000, "barges": g.barges,
+                       "why": why, "taps": taps, "mic_stage": micStage, "running": engine.isRunning]
+        if !vpOn && !vpOffReason.isEmpty { o["vp_off_reason"] = vpOffReason }
         if !vpErr.isEmpty { o["err"] = vpErr }
         if inRate > 0 { o["rate"] = inRate; o["chans"] = inChans }
         let outs = AVAudioSession.sharedInstance().currentRoute.outputs.map { $0.portType.rawValue }
@@ -243,21 +268,43 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     }
 
     /// Restart the engine a moment after an interruption / route change / config change (they come in bursts).
+    /// v3.9.38: voiceProcessing nil = a system notification (interruption / route / config). Those are decided when the
+    /// debounced restart runs: our own start often posts one, and while the engine still runs that is skipped - but a
+    /// configuration change STOPS AVAudioEngine, so a stopped engine is always restarted (same voice-processing mode),
+    /// at most 4 times in 10 s. (v3.9.37 dropped every notification within 1 s of our start, which left the engine
+    /// stopped after voice processing came up, and the silent tap then turned voice processing off.)
     private func scheduleRestart(_ why: String, voiceProcessing: Bool? = nil) {
-        if voiceProcessing == nil {   // our own engine start can post a config / route change: no restart loop
-            micLock.lock()
-            let started = audioStartAt
-            micLock.unlock()
-            if ProcessInfo.processInfo.systemUptime - started < 1.0 { return }
-        }
         restartWork?.cancel()
+        restartPending = true
         let w = DispatchWorkItem { [weak self] in
-            guard let self = self, !self.ended else { return }
+            guard let self = self else { return }
+            self.restartPending = false
+            guard !self.ended else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            if voiceProcessing == nil {
+                self.micLock.lock()
+                let started = self.audioStartAt
+                self.micLock.unlock()
+                let running = self.engine.isRunning
+                if running && started > 0 && now - started < 1.5 {
+                    self.reportAudio("engine", why: "\(why) ignored (engine running, just started)")
+                    return
+                }
+                self.autoRestarts = self.autoRestarts.filter { now - $0 < 10 }
+                if self.autoRestarts.count >= 4 && running {
+                    self.reportAudio("engine", why: "\(why) ignored (restart limit)")
+                    return
+                }
+                self.autoRestarts.append(now)
+            }
             do {
                 try? AVAudioSession.sharedInstance().setActive(true)
                 try self.startAudio(voiceProcessing: voiceProcessing ?? self.vpOn, why: why)
             } catch {
-                self.note = "麦克风重启失败（\(why)）：\(error.localizedDescription)"
+                self.micLock.lock()   // let the stall ladder try again later instead of pausing for good
+                self.audioStartAt = ProcessInfo.processInfo.systemUptime
+                self.micLock.unlock()
+                self.reportAudio("restart_failed", why: "\(why): \(error.localizedDescription)")   // log only, no note
             }
         }
         restartWork = w
@@ -272,9 +319,8 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
                   let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
             if type == .began {
-                self.note = "通话声音被系统打断了…"
+                self.reportAudio("engine", why: "interruption began")
             } else {
-                self.note = ""
                 self.scheduleRestart("interruption")
             }
         })
@@ -284,42 +330,40 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
                   let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
             switch reason {
             case .newDeviceAvailable, .oldDeviceUnavailable, .routeConfigurationChange:
-                self.scheduleRestart("route")
+                self.scheduleRestart("route (\(reason.rawValue))")
             default:
                 break   // .categoryChange / .override come from our own setup
             }
         })
         observers.append(nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             guard let self = self, !self.ended else { return }
-            self.scheduleRestart("config")
+            self.scheduleRestart(self.engine.isRunning ? "config" : "config (engine stopped)")
         })
     }
 
-    /// Every second: no mic buffer (or only digital silence) for 3 s since the engine started -> say so. v3.9.37: the
-    /// restart without voice processing (= without echo cancellation) happens ONLY when the tap gave no callbacks at
-    /// all for 3 s - a quiet or even all-zero voice-processed signal is normal when nobody talks, and turning AEC off
-    /// for it is what made the phone interrupt itself.
+    /// Every second (v3.9.38): the mic restart ladder, only on tap callbacks that really stopped - measured from the
+    /// moment engine.start() returned, per start. 6 s without a callback -> restart WITH voice processing; only when
+    /// that start also gives none for 6 s, voice processing (AEC) is dropped. A quiet or all-zero voice-processed signal
+    /// never counts (it is near-silent whenever nobody talks), mute does not stop callbacks, and nothing goes on screen.
     private func checkMic() {
-        guard !ended, !isMuted else { return }
+        guard !ended, !restartPending else { return }   // never escalate twice on one stall
         let now = ProcessInfo.processInfo.systemUptime
         micLock.lock()
-        let started = audioStartAt, buf = lastBufAt, voiced = lastVoiceAt
+        let started = audioStartAt, last = lastTapAt, taps = tapCount
         micLock.unlock()
-        guard started > 0, now - started >= 3 else { return }
-        let noCallbacks = now - max(buf, started) >= 3
-        let silent = noCallbacks || now - max(voiced, started) >= 3
-        if silent {
-            if !micWarned && (noCallbacks || now - max(voiced, started) >= 8) {   // all-zero: only note it after 8 s
-                micWarned = true
-                note = noCallbacks ? "麦克风没有声音，请检查权限/静音" : "麦克风只有静音，请检查权限/静音"
-            }
-            if noCallbacks && vpOn && !vpFallbackTried {
-                vpFallbackTried = true
-                scheduleRestart("no mic callbacks", voiceProcessing: false)
-            }
-        } else if micWarned {
-            micWarned = false
-            if note.hasPrefix("麦克风") { note = "" }
+        guard started > 0 else { return }   // a (re)start is under way
+        guard now - max(last, started) >= stallSeconds else {
+            if micStage == 1 && taps > 0 && now - started > 30 { micStage = 0 }   // the VP restart worked: start over
+            return
+        }
+        let what = taps == 0 ? "no mic callbacks" : "mic callbacks stopped"
+        if micStage == 0 {
+            micStage = 1
+            scheduleRestart("\(what) \(Int(stallSeconds))s, restart with voice processing", voiceProcessing: true)
+        } else if micStage == 1 && vpOn {
+            micStage = 2
+            vpOffReason = "\(what) \(Int(stallSeconds))s after the voice-processing restart"
+            scheduleRestart(vpOffReason, voiceProcessing: false)
         }
     }
 
@@ -402,15 +446,14 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     private func on(_ o: JSON) {
         switch o.s("type") {
         case "ready":
-            mode = o.s("mode"); model = o.s("model"); note = o.s("note")
+            mode = o.s("mode"); model = o.s("model")   // v3.9.38: a ready note is in 通话诊断, not on screen
             // v3.9.37 防回声: the server's echo_gate (absent = on), and a local override
             let off = (o["echo_gate"] as? Bool) == false || UserDefaults.standard.string(forKey: "aiw.call.echoGate") == "off"
             micLock.lock()
             gate.on = !off
             micLock.unlock()
-            reportAudio("start")   // vp on/off (and why), gate on/off, input format, route
-            botText = note.isEmpty ? "已接通，说话吧" : note
-            if !vpOn && note.isEmpty { note = "回声消除没开（麦克风兼容模式），免提可能会自己打断自己，建议戴耳机" }
+            reportAudio("start", why: audioWhy)   // vp on/off (+ vp_off_reason), gate on/off, input format, route
+            botText = "已接通，说话吧"
         case "speech_started":
             stopPlayback()
         case "transcript":
@@ -422,19 +465,19 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
                 if o.b("final") && o.b("speak") { say(o.s("text")) }
             }
         case "tool":
-            let name = o.s("name") == "create_aiw_task" ? "交给 aiw" : "查任务进度"
-            note = o.s("status") == "running" ? "正在\(name)…" : (o.s("text").isEmpty ? "\(name)完成" : o.s("text"))
+            break   // v3.9.38: no note on screen (the model says it; the server logs the tool call)
         case "error":
+            // v3.9.38: only an error that ends the call is shown (before ready, disabled, or at "ended" below); the
+            // rest - no_mic included - stays in 通话诊断. no_mic still nudges the restart ladder when the tap is silent.
             lastErr = o.s("message")
-            if o.s("code") == "disabled" || mode.isEmpty { error = o.s("message") } else { note = o.s("message") }
-            if o.s("code") == "no_mic" && !vpFallbackTried {   // v3.9.36: the server heard nothing from us
-                // v3.9.37: only drop voice processing when our tap really gives nothing; otherwise it is the network
+            if o.s("code") == "disabled" || mode.isEmpty { error = o.s("message") }
+            if o.s("code") == "no_mic" && micStage == 0 {
                 micLock.lock()
-                let noCallbacks = lastBufAt < audioStartAt || ProcessInfo.processInfo.systemUptime - lastBufAt >= 3
+                let started = audioStartAt, last = lastTapAt
                 micLock.unlock()
-                if noCallbacks && vpOn {
-                    vpFallbackTried = true
-                    scheduleRestart("server no_mic", voiceProcessing: false)
+                if started > 0 && ProcessInfo.processInfo.systemUptime - max(last, started) >= stallSeconds {
+                    micStage = 1
+                    scheduleRestart("server no_mic, restart with voice processing", voiceProcessing: true)
                 }
             }
         case "ended":
@@ -449,19 +492,21 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     }
 
     // MARK: audio
+    /// v3.9.38: every tap callback of the current engine start is counted first, whatever it holds.
+    private func onTap(_ buf: AVAudioPCMBuffer, gen: Int) {
+        micLock.lock()
+        let current = gen == tapGen
+        if current { tapCount += 1; lastTapAt = ProcessInfo.processInfo.systemUptime }
+        micLock.unlock()
+        if current { onMic(buf) }
+    }
+
     private func onMic(_ buf: AVAudioPCMBuffer) {
         let frames = Int(buf.frameLength)
         let chans = Int(buf.format.channelCount)
         let rate = buf.format.sampleRate
         guard frames > 0, chans > 0, rate > 0 else { return }
         let mono = monoSamples(buf, frames: frames, chans: chans)
-        var peak: Float = 0
-        for v in mono { let a = abs(v); if a > peak { peak = a } }
-        let now = ProcessInfo.processInfo.systemUptime
-        micLock.lock()
-        lastBufAt = now
-        if peak > 0.0001 { lastVoiceAt = now }
-        micLock.unlock()
         if rate != rsRate { rsRate = rate; rsPos = 0; rsTail = [] }   // the route changed the rate: start over
         let ratio = rate / 16000
         let raw = rsTail + mono
@@ -574,7 +619,7 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
                     s.micLock.lock()
                     s.playEndAt = min(s.playEndAt, ProcessInfo.processInfo.systemUptime)
                     s.micLock.unlock()
-                    s.reportAudio("turn")
+                    s.reportAudio("turn", why: "turn")
                 }
             }
         }
@@ -618,11 +663,6 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
         muted.toggle()
         isMuted = muted
         send(["type": "mute", "on": muted])
-        if !muted {   // a fresh 3 s before the no-mic note
-            micLock.lock()
-            audioStartAt = ProcessInfo.processInfo.systemUptime
-            micLock.unlock()
-        }
     }
 
     // MARK: camera
@@ -730,9 +770,6 @@ struct CallView: View {
                 VStack(spacing: 6) {
                     if !c.error.isEmpty {
                         Text(c.error).font(.body).multilineTextAlignment(.center).foregroundColor(.orange)
-                    }
-                    if !c.note.isEmpty && c.error.isEmpty {
-                        Text(c.note).font(.footnote).opacity(0.8).multilineTextAlignment(.center)
                     }
                     Text(c.userText).font(.subheadline).opacity(0.72).lineLimit(2)
                     Text(c.botText).font(.title3).lineLimit(4).multilineTextAlignment(.center)

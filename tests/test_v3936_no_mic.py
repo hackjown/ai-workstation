@@ -190,10 +190,10 @@ def test_web_client_unlocks_audio_in_the_tap():
     # the AudioContext is unlocked before the first await of the click handler
     assert body.index("callUnlockAudio();") < body.index("await ")
     for needle in ('client: "web"', 'type: "mute"', 'm.code === "no_mic"', "callAudioGate(true", "onstatechange",
-                   "没有收到麦克风声音", 'id="callMeter"', "callMicCheck", "callDownsampler(ctx.sampleRate"):
+                   "callMicCheck", "callDownsampler(ctx.sampleRate"):   # v3.9.38: warning text + meter removed
         assert needle in js, needle
     css = (ROOT / "apps" / "web" / "call.css").read_text(encoding="utf-8")
-    assert ".call-gate" in css and ".call-meter" in css and ".call-warn" in css
+    assert ".call-gate" in css
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -224,7 +224,7 @@ console.log(JSON.stringify(out));
 def test_ios_client_robust_mic():
     swift = (ROOT / "apps" / "ios" / "Sources" / "CallView.swift").read_text(encoding="utf-8")
     assert "AVAudioConverter(" not in swift   # the converter that silently produced nothing is gone
-    for needle in ('"client": "ios"', '"type": "mute"', 'o.s("code") == "no_mic"', "麦克风没有声音，请检查权限/静音",
+    for needle in ('"client": "ios"', '"type": "mute"', 'o.s("code") == "no_mic"',   # v3.9.38: no-mic note removed
                    "AVAudioSession.interruptionNotification", "AVAudioSession.routeChangeNotification",
                    ".AVAudioEngineConfigurationChange", "setVoiceProcessingEnabled(voiceProcessing)",
                    "voiceProcessing: false",

@@ -93,6 +93,17 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.38 iOS 回声消除不再被误关；通话界面去掉提醒文字；通话 token 计入用量
+
+现场日志（iOS 17，iPhone，免提，48 kHz 单声道）：0.9 s 开着语音处理（AEC）起声，3.4 s 以「no mic callbacks」为由**关掉 AEC 重启**，之后整通 143 s 都是 AEC 关；可麦克风其实一直有声音（in=3477 段，40 ms 一段不断），靠防回声闸门撑住（gated 73 s）。之后每条 turn 报告都还带着旧的 why=no mic callbacks。
+
+- 根因（iOS CallView.swift，未编译）：打开语音处理、切到扬声器会让系统在我们 `engine.start()` 之后马上重配音频单元，发出 `AVAudioEngineConfigurationChange`（和路由变化），而 AVAudioEngine 遇到配置变化会**自己停掉**。v3.9.37 的 `scheduleRestart` 把「自己启动后 1 秒内」的通知全部丢掉（防重启循环），引擎就停在那里，tap 没有回调，3 秒检查便误判成麦克风坏了并关掉 AEC。现在：通知在防抖后的重启时再判断——引擎还在跑才忽略（是自己启动的回声），停了就按**原来的语音处理模式**重启（10 秒内最多 4 次）。
+- 回调计数：每次启动一个代号（tap 闭包捕获），回调里第一件事就计数（在帧数、静音、防回声闸门之前），从 `engine.start()` 成功那一刻开始计时。
+- 回退更保守：6 秒一个回调都没有 → **带着语音处理**重启；只有这次重启后又 6 秒没有回调才关语音处理。服务器 no_mic 只会触发第一步（带语音处理重启），不会直接关 AEC。
+- 上报：每条 `client_audio` 的 `why` 是它自己的（start / 重启原因 / turn / engine 事件），AEC 关闭原因单独放 `vp_off_reason`；另有 `taps`（本次启动的回调数）、`mic_stage`、`running`，以及 `engine` / `restart_failed` 事件。服务器不再把上一条的 why/err 带到下一条。
+- 去掉通话界面的提醒文字（iOS + 网页）：回声消除没开、麦克风没声音/只有静音、音量条、系统打断、工具进度、ready 提示、非致命错误等都不再显示，只写进 通话诊断（网页另打 console）。保留：结束通话的真错误（模型断开、额度、Key、没权限等，在挂断时显示）和网页必要的「点一下开始声音」按钮（改成小按钮；麦克风 6 秒没样本时也用它重建）。服务器照旧记录并发送 no_mic（客户端不显示）。通话诊断保留「回声消除关闭」并附原因。
+- 通话 token 计入用量：通话不走 llm_router，以前没记。现在写进 `token_usage`（role=`call`，model=实际模型，task_id 空）。Gemini Live 读 `usageMetadata`（字段按 ai.google.dev/api/live 核对：promptTokenCount、responseTokenCount、toolUsePromptTokenCount、thoughtsTokenCount、totalTokenCount、promptTokensDetails/responseTokensDetails 按 modality）；不确定是累计还是每轮，开始按累计只记增量，一旦同一连接里数变小就判定为每轮并补齐差额（只可能少记，不会重复记）；重连时每个连接单独基线，续接会话的计数接着算或从零算都不会重复。DashScope 实时 `response.done` 的 usage、轮流模式的流式 usage（include_usage）也记。每个模型最多 30 秒写一行（`AIW_OMNI_USAGE_FLUSH_S`），挂断时写剩余。通话诊断显示 tokens 输入/输出及音频/视频/图像/文字拆分；用量页「按角色」显示「通话」（网页和 iOS）。
+
 ## v3.9.37 通话里球球总被自己的回声打断
 
 现场日志（iOS App，免提，Gemini Live，起说灵敏度低）：每句回答都在半句被截断，文字稿却完整；时间线里的「user」文字其实是球球自己的声音（「我看到你带」「请问还有」），被麦克风收回去 → Gemini VAD 当成用户说话 → `interrupted` → 客户端停播。

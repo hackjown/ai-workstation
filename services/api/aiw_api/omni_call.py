@@ -61,6 +61,11 @@ omni_echo_gate ("" / on, off) is told to the clients in ready.echo_gate (they mu
 the user is clearly louder than the echo). Every serverContent.interrupted is counted (interrupts=N in the stats line
 and the counters) and logged ("model interrupted by user speech"); the clients' {"type":"client_audio"} reports (iOS:
 voice processing on/off and why; both: echo level / gate threshold / gated time / barge-ins) go into the timeline.
+v3.9.38 token usage: calls bypass llm_router, so their tokens are counted here and written to token_usage (role "call",
+model = the model actually used, task_id empty) - Gemini Live usageMetadata (see LiveUsageMeter: cumulative or per-turn
+counts both handled, never counted twice across reconnects), DashScope realtime response.done usage, and the turn
+backend's stream usage (include_usage). Rows are batched (one per model at most every AIW_OMNI_USAGE_FLUSH_S = 30 s,
+plus the rest at hang-up); the per-modality split (audio / video / image / text, in and out) is in 通话诊断.
 Tools from a call are deliberately few: create_aiw_task (a normal aiw task via Chat.start_task, whose own confirm cards
 still apply) and task_status. The call's transcript lands in the 小秘 chat as one message at hang-up.
 """
@@ -133,6 +138,163 @@ def setup_logging() -> None:
 
 CALLS: deque = deque(maxlen=20)   # the last 20 calls' timelines (GET /api/omni/calls)
 _CALL_SEQ = itertools.count(1)
+
+
+# ------------------------------------------------------------------------------------------------- token usage (v3.9.38)
+USAGE_MODALITIES = ("audio", "video", "image", "text")
+
+
+def _mod(m: Any) -> str:
+    m = str(m or "").lower().replace("modality_", "").replace("_tokens", "")
+    return m if m in USAGE_MODALITIES else ("text" if m in ("document", "") else "other")
+
+
+def _int(v: Any) -> int:
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def usage_zero() -> dict:
+    return {"in": 0, "out": 0, "in_by": {}, "out_by": {}}
+
+
+def _by_list(items: Any, into: dict) -> None:
+    for d in items or []:
+        if isinstance(d, dict):
+            k = _mod(d.get("modality"))
+            into[k] = into.get(k, 0) + _int(d.get("tokenCount", d.get("token_count")))
+
+
+def gemini_usage(um: Any) -> Optional[dict]:
+    """Gemini Live usageMetadata (ai.google.dev/api/live UsageMetadata: promptTokenCount, responseTokenCount,
+    toolUsePromptTokenCount, thoughtsTokenCount, totalTokenCount, promptTokensDetails[] / responseTokensDetails[] /
+    toolUsePromptTokensDetails[] of {modality, tokenCount}; candidatesTokenCount / candidatesTokensDetails accepted as
+    the generateContent spelling) -> {"in", "out", "in_by", "out_by"}; None when it holds no counts."""
+    if not isinstance(um, dict):
+        return None
+    pin = _int(um.get("promptTokenCount")) + _int(um.get("toolUsePromptTokenCount"))
+    resp = um.get("responseTokenCount", um.get("candidatesTokenCount"))
+    out = _int(resp) + _int(um.get("thoughtsTokenCount"))
+    if resp is None and um.get("totalTokenCount") is not None:
+        out = max(0, _int(um.get("totalTokenCount")) - pin)
+    u = {"in": pin, "out": out, "in_by": {}, "out_by": {}}
+    _by_list(um.get("promptTokensDetails"), u["in_by"])
+    _by_list(um.get("toolUsePromptTokensDetails"), u["in_by"])
+    _by_list(um.get("responseTokensDetails", um.get("candidatesTokensDetails")), u["out_by"])
+    if _int(um.get("thoughtsTokenCount")):
+        u["out_by"]["text"] = u["out_by"].get("text", 0) + _int(um.get("thoughtsTokenCount"))
+    if not (pin or out or um.get("totalTokenCount")):
+        return None
+    return u
+
+
+def openai_usage(us: Any) -> Optional[dict]:
+    """An OpenAI-style usage block - DashScope realtime response.done usage (input_tokens / output_tokens /
+    input_token_details / output_token_details) or chat/completions stream usage (prompt_tokens / completion_tokens /
+    prompt_tokens_details / completion_tokens_details) - with *_tokens per modality in the details."""
+    if not isinstance(us, dict):
+        return None
+    pin = _int(us.get("input_tokens", us.get("prompt_tokens")))
+    out = _int(us.get("output_tokens", us.get("completion_tokens")))
+    if not pin and not out and us.get("total_tokens"):
+        pin = _int(us.get("total_tokens"))
+    if not pin and not out:
+        return None
+    u = {"in": pin, "out": out, "in_by": {}, "out_by": {}}
+    for key, side in (("input_token_details", "in_by"), ("prompt_tokens_details", "in_by"),
+                      ("output_token_details", "out_by"), ("completion_tokens_details", "out_by")):
+        det = us.get(key)
+        if isinstance(det, dict):
+            for k, v in det.items():
+                if k.endswith("_tokens") and k not in ("cached_tokens", "reasoning_tokens") and _int(v):
+                    m = _mod(k)
+                    u[side][m] = u[side].get(m, 0) + _int(v)
+    return u
+
+
+def usage_add(a: dict, b: dict, sign: int = 1) -> dict:
+    out = {"in": max(0, a["in"] + sign * b["in"]), "out": max(0, a["out"] + sign * b["out"]), "in_by": {}, "out_by": {}}
+    for side in ("in_by", "out_by"):
+        for k in set(a[side]) | set(b[side]):
+            v = max(0, a[side].get(k, 0) + sign * b[side].get(k, 0))
+            if v:
+                out[side][k] = v
+    return out
+
+
+def _ge(a: dict, b: dict) -> bool:
+    return a["in"] >= b["in"] and a["out"] >= b["out"]
+
+
+class LiveUsageMeter:
+    """v3.9.38: Gemini Live usageMetadata -> token deltas that are safe to add up, whichever way the server counts.
+
+    Within a turn the latest report wins while it keeps growing (a report that shrinks starts a new response). At
+    turnComplete (or when the connection ends) the turn's value is committed:
+      * mode "turn" (per-turn counts): recorded as it is.
+      * mode "unknown" (the start of every call): treated as possibly CUMULATIVE - only the growth over the last
+        committed value of this connection is recorded. As soon as a committed value is SMALLER than the previous one
+        on the same connection the counts cannot be cumulative: mode becomes "turn" and one correction is recorded so
+        the connection's total equals the sum of its per-turn values. (A call that ends before any value shrinks keeps
+        the cumulative reading: it may undercount, never double count.)
+    Connections: a fresh session starts from zero. A resumed session (resumption handle) may continue the counters:
+    its first value is measured from the previous connection's last value when it is not smaller, otherwise from zero.
+    A connection's value is never recorded twice (each connection keeps its own baseline)."""
+
+    def __init__(self):
+        self.mode = "unknown"
+        self.conns: dict = {}
+        self.tail: Optional[dict] = None   # the last committed value (the chain a resumed session may continue)
+
+    def open(self, key: Any, resumed: bool) -> None:
+        self.conns[key] = {"prev": None, "carry": self.tail if resumed else None, "hist": usage_zero(),
+                           "emitted": usage_zero(), "pending": None}
+
+    def _conn(self, key: Any) -> dict:
+        if key not in self.conns:
+            self.open(key, False)
+        return self.conns[key]
+
+    def observe(self, key: Any, u: dict) -> list:
+        c = self._conn(key)
+        out = []
+        if c["pending"] is not None and not _ge(u, c["pending"]):
+            d = self.commit(key)
+            if d:
+                out.append(d)
+        c["pending"] = u
+        return out
+
+    def commit(self, key: Any) -> Optional[dict]:
+        c = self.conns.get(key)
+        if c is None or c["pending"] is None:
+            return None
+        v, c["pending"] = c["pending"], None
+        if self.mode == "turn":
+            d = v
+        else:
+            base = c["prev"] if c["prev"] is not None else c["carry"]
+            if base is None:
+                d = v
+            elif _ge(v, base):
+                d = usage_add(v, base, -1)
+            elif c["prev"] is None:   # a resumed session whose counters restarted
+                d = v
+            else:                     # shrank on one connection: per-turn counts - correct this connection's total
+                self.mode = "turn"
+                d = usage_add(usage_add(c["hist"], v), c["emitted"], -1)
+        c["hist"] = usage_add(c["hist"], v)
+        c["emitted"] = usage_add(c["emitted"], d)
+        c["prev"] = v
+        self.tail = v
+        return d if (d["in"] or d["out"]) else None
+
+    def close(self, key: Any) -> Optional[dict]:
+        d = self.commit(key)
+        self.conns.pop(key, None)
+        return d
 COUNTERS = ("audio_in", "frames_in", "frames_dropped", "audio_up", "frames_up", "audio_pending", "pending_dropped",
             "up_msgs", "audio_out", "send_errors", "reconnects", "upstream_closes", "resumption_updates", "tool_calls",
             "watchdog", "interrupts", "client_reports")
@@ -156,6 +318,8 @@ class CallDiag:
         self.n: dict = {k: 0 for k in COUNTERS}
         self.last_user_tr = self.last_bot_tr = self.last_audio_out = 0.0
         self.client_audio: dict = {}   # v3.9.37: the client's last client_audio report (vp, gate, echo, …)
+        self.tokens: dict = usage_zero()   # v3.9.38: the call's tokens, in / out and per modality
+        self.usage_mode = ""               # v3.9.38: Gemini usageMetadata reading: unknown | turn
         if keep:
             CALLS.append(self)
 
@@ -177,7 +341,8 @@ class CallDiag:
                 f"(-{n['frames_dropped']}) up={n['audio_up']} pending={n['audio_pending']}(-{n['pending_dropped']})"
                 f" upstream_msgs={n['up_msgs']} out={n['audio_out']} reconnects={n['reconnects']}"
                 f" send_err={n['send_errors']} interrupts={n.get('interrupts', 0)} user_tr={self._ago(self.last_user_tr)}"
-                f" bot_tr={self._ago(self.last_bot_tr)}" + (f" ws={ws_state}" if ws_state else ""))
+                f" bot_tr={self._ago(self.last_bot_tr)} tokens_in={self.tokens['in']} tokens_out={self.tokens['out']}"
+                + (f" ws={ws_state}" if ws_state else ""))
 
     def public(self) -> dict:
         end = self.ended_at or time.time()
@@ -186,6 +351,8 @@ class CallDiag:
                 "video": self.video, "seconds": round(end - self.t0, 1), "active": self.ended_at is None,
                 "reason": self.reason, "last_error": self.last_error, "counters": dict(self.n),
                 "client_audio": dict(self.client_audio),
+                "tokens": {"in": self.tokens["in"], "out": self.tokens["out"], "in_by": dict(self.tokens["in_by"]),
+                           "out_by": dict(self.tokens["out_by"]), "mode": self.usage_mode},
                 "last_user_transcript_s": round(self.last_user_tr - self.t0, 1) if self.last_user_tr else None,
                 "last_bot_transcript_s": round(self.last_bot_tr - self.t0, 1) if self.last_bot_tr else None,
                 "events": [list(e) for e in self.events]}
@@ -703,6 +870,9 @@ class RealtimeBackend:
             self.said = ""
         elif t == "response.done":
             self.responding = False
+            u = openai_usage((ev.get("response") or {}).get("usage") if isinstance(ev.get("response"), dict) else None)
+            if u:   # v3.9.38: per response
+                await self.emit({"type": "_usage", "model": self.cfg["rt_model"], **u})
             if self.said.strip():   # cancelled before its transcript was done
                 await self.emit({"type": "transcript", "role": "assistant", "text": self.said + "…", "final": True})
                 self.said = ""
@@ -998,6 +1168,8 @@ class GeminiBackend:
         self.last_close = ""
         self.conn_t0 = 0.0
         self.conn_content = False  # this connection has sent serverContent / toolCall
+        self.meter = LiveUsageMeter()   # v3.9.38 usageMetadata -> token deltas (one baseline per connection)
+        self.open_resumed = False       # the last _open() resumed a session (its counters may continue)
         now = time.time()
         self.last_up = now         # last serverContent / toolCall from upstream (the watchdog's clock)
         self.voiced_s = 0.0        # seconds of loud client audio since then
@@ -1057,6 +1229,7 @@ class GeminiBackend:
                     continue
                 if "setupComplete" in ev:
                     self.diag.ev("setupComplete")
+                    self.open_resumed = bool(handle)
                     return ws
                 if "error" in ev:
                     raise RuntimeError(str(ev["error"])[:200])
@@ -1066,6 +1239,7 @@ class GeminiBackend:
             raise
 
     def _installed(self, ws):
+        self.meter.open(id(ws), self.open_resumed)
         self.ws = ws
         self.conn_t0 = time.time()
         self.conn_content = False
@@ -1090,6 +1264,7 @@ class GeminiBackend:
                     continue
                 try:
                     await self._on(ev)
+                    await self._usage(ws, ev)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001  one bad message never takes the connection down
@@ -1098,6 +1273,7 @@ class GeminiBackend:
             raise
         except Exception as e:  # noqa: BLE001
             err = e
+        await self._usage_emit(self.meter.close(id(ws)))   # v3.9.38: this connection's last turn
         code, reason = _close_info(ws, err)
         self.opened.discard(ws)
         if ws is not self.ws or self.closed:   # a connection we replaced or closed ourselves
@@ -1188,6 +1364,24 @@ class GeminiBackend:
                 fresh = False
                 continue
             return
+
+    async def _usage(self, ws, ev: dict):
+        """v3.9.38: usageMetadata (top level of any server message) into the meter; committed at turnComplete."""
+        u = gemini_usage(ev.get("usageMetadata"))
+        if u is not None:
+            for d in self.meter.observe(id(ws), u):
+                await self._usage_emit(d)
+        sc = ev.get("serverContent")
+        if isinstance(sc, dict) and sc.get("turnComplete"):
+            await self._usage_emit(self.meter.commit(id(ws)))
+
+    async def _usage_emit(self, d: Optional[dict]):
+        if self.meter.mode != getattr(self.diag, "usage_mode", None) and hasattr(self.diag, "usage_mode"):
+            if self.meter.mode == "turn":
+                self.diag.ev("usageMetadata is per turn (a count went down); recorded per turn from now on")
+            self.diag.usage_mode = self.meter.mode
+        if d:
+            await self.emit({"type": "_usage", "model": self.cfg["gemini_model"], **d})
 
     async def _flush(self):
         """Send the audio queued while there was no connection, in order (new chunks queue behind it meanwhile)."""
@@ -1413,6 +1607,11 @@ class GeminiBackend:
 
     async def close(self):
         self.closed = True
+        for key in list(self.meter.conns):   # v3.9.38: the turns not committed yet (readers are cancelled below)
+            try:
+                await self._usage_emit(self.meter.close(key))
+            except Exception:  # noqa: BLE001
+                pass
         for j in list(self.jobs.values()) + list(self.side):
             j.cancel()
         if self.reconnecting is not None and self.reconnecting is not asyncio.current_task():
@@ -1581,6 +1780,9 @@ class TurnBackend:
                     chunk = json.loads(data)
                 except ValueError:
                     continue
+                u = openai_usage(chunk.get("usage")) if isinstance(chunk, dict) else None
+                if u:   # v3.9.38: include_usage -> the last chunk carries this request's usage
+                    await self.emit({"type": "_usage", "model": str(body.get("model") or ""), **u})
                 for ch in chunk.get("choices") or []:
                     d = ch.get("delta") or {}
                     a = d.get("audio") or {}
@@ -1725,8 +1927,12 @@ class OmniCall:
     """One call: picks the backend, relays its events to the client, keeps the transcript, saves it at the end."""
 
     def __init__(self, cfg: dict, send: Callable[[dict], Awaitable[None]], chat=None, video: bool = True,
-                 voice: Optional[str] = None, diag: Optional[CallDiag] = None):
+                 voice: Optional[str] = None, diag: Optional[CallDiag] = None,
+                 usage_sink: Optional[Callable[[dict], None]] = None):
         self.cfg = with_defaults(cfg)
+        self.usage_sink = usage_sink         # v3.9.38: Usage.record (token_usage rows, role "call")
+        self.usage_batch: dict = {}          # model -> {"in", "out"} not written yet
+        self.usage_flushed = time.time()
         self.diag = diag if diag is not None else CallDiag()
         self.diag.video = video
         if voice and isinstance(voice, str) and len(voice) <= 40:
@@ -1779,8 +1985,36 @@ class OmniCall:
                     "reconnecting" if ws is None else str(getattr(getattr(ws, "state", None), "name", "open")).lower())
                 self.diag.ev(self.diag.stats_line(state))
 
+    def _usage_in(self, ev: dict):
+        """v3.9.38: one backend usage delta -> the call's totals (通话诊断) and the batch for token_usage."""
+        u = {"in": _int(ev.get("in")), "out": _int(ev.get("out")),
+             "in_by": {k: _int(v) for k, v in (ev.get("in_by") or {}).items()},
+             "out_by": {k: _int(v) for k, v in (ev.get("out_by") or {}).items()}}
+        self.diag.tokens = usage_add(self.diag.tokens, u)
+        m = str(ev.get("model") or self.diag.model or "")
+        b = self.usage_batch.setdefault(m, {"in": 0, "out": 0})
+        b["in"] += u["in"]
+        b["out"] += u["out"]
+        if time.time() - self.usage_flushed >= _env_f("AIW_OMNI_USAGE_FLUSH_S", 30.0):
+            self.flush_usage()
+
+    def flush_usage(self):
+        batch, self.usage_batch = self.usage_batch, {}
+        self.usage_flushed = time.time()
+        if self.usage_sink is None or os.environ.get("AIW_USAGE", "1") == "0":
+            return
+        for model, b in batch.items():
+            if b["in"] or b["out"]:
+                try:
+                    self.usage_sink({"model": model, "role": "call", "task_id": "", "input": b["in"], "output": b["out"]})
+                except Exception as e:  # noqa: BLE001
+                    log.warning("omni usage record: %s", e)
+
     async def _emit(self, ev: dict):
         t = ev.get("type")
+        if t == "_usage":
+            self._usage_in(ev)
+            return
         if t == "_closed":   # the realtime / Gemini upstream dropped mid-call: carry on in turn mode when possible
             why = str(ev.get("message") or "")
             self.diag.ev("upstream gone: " + (why or "closed"), warn=True)
@@ -1975,6 +2209,11 @@ class OmniCall:
                 except Exception as e:  # noqa: BLE001
                     self.diag.ev(f"backend close: {type(e).__name__}: {e}", warn=True)
         finally:
+            self.flush_usage()   # v3.9.38: the rest of the call's tokens
+            tk = self.diag.tokens
+            if tk["in"] or tk["out"]:
+                fmt = lambda d: ",".join(f"{k}={v}" for k, v in sorted(d.items())) or "-"  # noqa: E731
+                self.diag.ev(f"tokens in={tk['in']} ({fmt(tk['in_by'])}) out={tk['out']} ({fmt(tk['out_by'])})")
             self.diag.ended_at = time.time()
             self.diag.ev(f"ended ({reason or '-'}) after {self.diag.ended_at - self.started:.0f}s; " + self.diag.stats_line())
         if not self.lines or self.chat is None:
@@ -2109,14 +2348,20 @@ async def probe(cfg: dict) -> dict:
 
 
 CLIENT_AUDIO_KEYS = {"vp": bool, "gate": bool, "echo": float, "thr": float, "gated_s": float, "barges": int,
-                     "rate": float, "chans": int, "why": str, "err": str, "event": str, "route": str}
+                     "rate": float, "chans": int, "why": str, "err": str, "event": str, "route": str,
+                     "vp_off_reason": str, "taps": int, "mic_stage": int, "running": bool}   # v3.9.38: last four
+CLIENT_AUDIO_PER_REPORT = ("why", "err", "vp_off_reason")   # v3.9.38: never carried over from an earlier report
 
 
 def client_audio_report(diag, msg: dict) -> None:
     """v3.9.37 {"type":"client_audio", event: start|restart|turn|gate, vp: bool (iOS voice processing = AEC), gate,
     echo / thr (mic RMS 0..1 heard during playback / the barge-in threshold), gated_s, barges, why, err, route}:
     kept on the call (GET /api/omni/calls client_audio) and one timeline line - WARNING when voice processing is off,
-    since then the phone hears its own answer. At most 60 lines a call (a turn report comes after every answer)."""
+    since then the phone hears its own answer. At most 60 lines a call (a turn report comes after every answer).
+    v3.9.38: why / err / vp_off_reason belong to the report that carries them (a turn report says why=turn, and a
+    stale restart reason is not kept); vp_off_reason (iOS: why voice processing is off), taps (tap callbacks of the
+    current engine start), mic_stage (0 normal, 1 restarted with voice processing, 2 voice processing dropped) and
+    running (engine running) are logged too; events: start, restart, turn, engine, restart_failed, mic."""
     rep: dict = {}
     for k, typ in CLIENT_AUDIO_KEYS.items():
         if k not in msg or msg[k] is None:
@@ -2134,6 +2379,9 @@ def client_audio_report(diag, msg: dict) -> None:
     if not rep:
         return
     diag.bump("client_reports")
+    for k in CLIENT_AUDIO_PER_REPORT:
+        if k not in rep:
+            diag.client_audio.pop(k, None)
     diag.client_audio.update(rep)
     if diag.n.get("client_reports", 0) > 60:
         return
@@ -2142,7 +2390,8 @@ def client_audio_report(diag, msg: dict) -> None:
         parts.append(f"voice_processing(AEC)={'on' if rep['vp'] else 'OFF'}")
     if "gate" in rep:
         parts.append(f"echo_gate={'on' if rep['gate'] else 'off'}")
-    for k in ("echo", "thr", "gated_s", "barges", "rate", "chans", "route", "why", "err"):
+    for k in ("echo", "thr", "gated_s", "barges", "rate", "chans", "route", "why", "vp_off_reason", "taps",
+              "mic_stage", "running", "err"):
         if k in rep:
             parts.append(f"{k}={rep[k]}")
     diag.ev(f"client audio {rep.get('event') or '-'}: " + " ".join(parts), warn=rep.get("vp") is False)
@@ -2231,7 +2480,12 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
             diag.ev(f"call from {peer or '?'}: client={diag.client} video={bool(first.get('video', True))} mode={cfg['mode']}"
                     f" slot={cfg['model'] or '-'} gemini_route={bool(cfg.get('gemini_route'))}"
                     + (f" ua={diag.ua}" if diag.ua else ""))
-            call = OmniCall(cfg, send, chat, video=bool(first.get("video", True)), voice=first.get("voice"), diag=diag)
+            def _record(row: dict, _app=app):   # v3.9.38: token_usage via the app's Usage (set up by v3924)
+                u = getattr(_app.state, "usage", None)
+                if u is not None:
+                    u.record(row)
+            call = OmniCall(cfg, send, chat, video=bool(first.get("video", True)), voice=first.get("voice"), diag=diag,
+                            usage_sink=_record)
             _ACTIVE.add(id(call))
             try:
                 ready = await call.start()

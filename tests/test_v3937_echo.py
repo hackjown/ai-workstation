@@ -175,7 +175,7 @@ def test_web_client_echo_gate_wiring():
     js = (ROOT / "apps" / "web" / "call.js").read_text(encoding="utf-8")
     for needle in ("function callEchoGate(", "callDownsampler(ctx.sampleRate, callGateSend)", "function callPlaying(",
                    "CALL_ECHO_HOLD_MS = 300", "m.echo_gate === false", 'aiw_call_echo_gate', 'type: "client_audio"',
-                   "echoCancellation: true", 'callGateReport("turn")', "sustainMs: 200", "floor: 0.06", "factor: 3"):
+                   "echoCancellation: true", 'callGateReport("turn"', "sustainMs: 200", "floor: 0.06", "factor: 3"):
         assert needle in js, needle
     ui = (ROOT / "apps" / "web" / "ui.js").read_text(encoding="utf-8")
     assert 'name="omni_gemini_barge_in"' in ui and 'name="omni_echo_gate"' in ui
@@ -231,17 +231,14 @@ console.log(JSON.stringify(out));
 def test_ios_client_vp_fallback_gate_and_playback():
     swift = (ROOT / "apps" / "ios" / "Sources" / "CallView.swift").read_text(encoding="utf-8")
     assert swift.count("{") == swift.count("}")
-    # fallback to no voice processing only when the tap gives no callbacks at all
+    # v3.9.38 superseded the 3 s fallback (test_v3938_call_quiet.py checks the 6 s ladder); still no VP drop on quiet
     check = swift[swift.index("private func checkMic()"):]
     check = check[:check.index("\n    }\n")]
-    assert "noCallbacks && vpOn && !vpFallbackTried" in check
-    assert "now - max(buf, started) >= 3" in check
-    no_mic = swift[swift.index('o.s("code") == "no_mic"'):]
-    no_mic = no_mic[:no_mic.index('case "ended"')]
-    assert "noCallbacks && vpOn" in no_mic
-    # mode reported to the server and on screen
-    for needle in ('"type": "client_audio"', '"vp": vpOn', "reportAudio(\"start\")", "reportAudio(\"restart\")",
-                   "reportAudio(\"turn\")", "回声消除没开", "vpErr = error.localizedDescription",
+    assert "voiceProcessing: false" in check and "lastVoice" not in check
+    assert 'o.s("code") == "no_mic"' in swift
+    # mode reported to the server (v3.9.38: no longer on screen)
+    for needle in ('"type": "client_audio"', '"vp": vpOn', 'reportAudio("start"', 'reportAudio("restart"',
+                   'reportAudio("turn"', "vpErr = error.localizedDescription",
                    "isVoiceProcessingBypassed = false"):
         assert needle in swift, needle
     # playback on the same voice-processing engine, .voiceChat

@@ -67,7 +67,7 @@ struct UsageView: View {
     }
 
     func roleName(_ r: String) -> String {
-        ["main": "任务主模型", "chat": "聊天", "small": "小模型", "vision": "看图", "subagent": "子代理", "review": "审核", "geometry": "定位"][r] ?? r
+        ["main": "任务主模型", "chat": "聊天", "small": "小模型", "vision": "看图", "subagent": "子代理", "review": "审核", "geometry": "定位", "call": "通话"][r] ?? r
     }
 
     func load() async {

@@ -8,8 +8,8 @@
    v3.9.36 (no mic audio from iPhone Safari): the AudioContext is created and resume()d synchronously inside the tap
    that opens the call (before any await - iOS forgets the user gesture after one), and reused; a silent buffer unlocks
    playback. If it is still not "running" (or iOS interrupts it later), a 「点一下开始声音」 overlay resumes it on the
-   next tap; any tap in the call also resumes it. A mic level meter shows the microphone is heard, and 「没有收到麦克风
-   声音」 shows when no samples arrive for 3 s (a tap then rebuilds the audio graph). The downsampler keeps its
+   next tap; any tap in the call also resumes it. (v3.9.36 also had a mic level meter and a no-samples warning text;
+   v3.9.38 removed both.) The downsampler keeps its
    fractional position across 128-sample worklet blocks so 48 kHz / 44.1 kHz both give exact 16 kHz. start says
    client "web"; mute / unmute is told to the server so a muted mic is not reported as broken.
    v3.9.37 (every answer cut off mid-sentence on a phone on speaker: its own playback reached the mic, Gemini's VAD
@@ -19,11 +19,18 @@
    real barge-in: then the held chunks and what follows go out as they are. echoCancellation is still asked for. The
    server's ready.echo_gate (setting 防回声 / omni_echo_gate) or localStorage aiw_call_echo_gate = "off" turns it off.
    After each answer a {"type":"client_audio","event":"turn"} report (echo level, threshold, gated seconds,
-   barge-ins) goes to the server's 通话诊断 timeline. */
+   barge-ins) goes to the server's 通话诊断 timeline.
+   v3.9.38 (the user asked for no reminder texts on the call screen): no mic level meter, no mic warnings, no tool /
+   ready / non-fatal error notes. Only an error that ends the call is shown (as the call closes), plus the minimal
+   「点一下开始声音」 button, which a real tap needs (audio unlock, or rebuilding a mic that stopped delivering samples for
+   6 s). The server's no_mic and the client's own mic checks are logged (console + client_audio to 通话诊断) only. Each
+   client_audio report carries its own why (= its event). */
 const CALL = { ws: null, ctx: null, mic: null, cam: null, node: null, src: null, sink: null, sources: new Set(), next: 0,
   muted: false, video: true, facing: "user", frameT: null, pingT: null, clockT: null, micT: null, t0: 0, ended: false,
   lastThumb: null, lastSent: 0, caps: { user: "", assistant: "" }, mode: "", wake: null, opening: false,
-  samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, level: 0, meterAt: 0, micWarn: false, gate: null, gateOn: true };
+  samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, micStall: false, lastErr: "", gate: null, gateOn: true };
+
+const CALL_MIC_STALL_MS = 6000;   // v3.9.38: no mic samples this long -> offer the tap (logged, no text)
 
 const CALL_ECHO_HOLD_MS = 300;   // v3.9.37: the gate stays shut this long after the answer queue drains (room echo)
 
@@ -69,7 +76,7 @@ function callCtxState() {   // iOS: "interrupted" (a phone call, Siri, another a
 }
 
 /* the tap-to-start-audio overlay: a real tap is what iOS needs to resume the context */
-function callAudioGate(on, text) {
+function callAudioGate(on) {   // v3.9.38: one minimal button, always the same words
   const v = $("callView"); if (!v) return;
   let g = $("callGate");
   if (!on) { if (g) g.remove(); return; }
@@ -78,14 +85,15 @@ function callAudioGate(on, text) {
     g.onclick = (e) => { e.stopPropagation(); callGateTap(); };
     v.appendChild(g);
   }
-  g.innerHTML = `${icon("mic")}<span>${esc(text || "点一下开始声音")}</span>`;
+  g.innerHTML = `${icon("mic")}<span>点一下开始声音</span>`;
 }
 
 function callGateTap() {
   const ctx = callUnlockAudio();   // synchronous, inside the tap
   if (!ctx) return;
-  const stale = CALL.audioAt && Date.now() - Math.max(CALL.lastSample, CALL.audioAt) > 3000;
-  if (CALL.mic && (stale || !CALL.node)) {
+  const stale = CALL.audioAt && Date.now() - Math.max(CALL.lastSample, CALL.audioAt) > CALL_MIC_STALL_MS;
+  const dead = CALL.mic && CALL.mic.getAudioTracks().some((t) => t.readyState === "ended");
+  if (CALL.mic && (stale || dead || !CALL.node)) {
     // the context runs but the mic delivers nothing: rebuild the graph on a fresh context made in this tap
     try { CALL.node && CALL.node.disconnect(); CALL.src && CALL.src.disconnect(); } catch (e) { /* gone */ }
     if (CALL.samples === 0 || stale) {
@@ -93,7 +101,9 @@ function callGateTap() {
       CALL.ctx = null; callUnlockAudio();
     }
     CALL.sources.clear(); CALL.next = 0;   // the answer queue was timed on the old context
-    callAudio().catch((e) => toast("麦克风打不开：" + e.message));
+    const reopen = dead ? navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } })
+      .then((m) => { CALL.mic = m; }) : Promise.resolve();
+    reopen.then(() => callAudio()).catch((e) => callEnd("麦克风打不开：" + e.message));
   }
   setTimeout(() => { if (CALL.ctx && CALL.ctx.state === "running") callAudioGate(false); }, 250);
 }
@@ -116,7 +126,7 @@ async function openCall(video = true) {
   }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { callDropCtx(); return toast("这个浏览器不能用麦克风（需要 HTTPS 或 localhost）"); }
   CALL.video = video; CALL.ended = false; CALL.muted = false; CALL.gateOn = true; CALL.playEndAt = 0; CALL.facing = "user"; CALL.caps = { user: "", assistant: "" };
-  Object.assign(CALL, { samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, level: 0, micWarn: false });
+  Object.assign(CALL, { samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, micStall: false, lastErr: "" });
   callView(st);
   try {
     CALL.mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
@@ -124,7 +134,7 @@ async function openCall(video = true) {
   if (video) await callCamera(true);
   try { await callAudio(); } catch (e) { callEnd("麦克风打不开：" + e.message); return; }
   if (CALL.ended) return;
-  CALL.mic.getAudioTracks().forEach((t) => { t.onended = () => { if (!CALL.ended) callMicWarn(true, "麦克风被系统停掉了，挂断后重拨"); }; });
+  CALL.mic.getAudioTracks().forEach((t) => { t.onended = () => { if (!CALL.ended) { callLog("mic track ended"); callAudioGate(true); } }; });
   CALL.micT = setInterval(callMicCheck, 1000);
   callConnect(st);
   try { CALL.wake = await navigator.wakeLock.request("screen"); } catch (e) { /* not supported */ }
@@ -139,8 +149,7 @@ function callView(st) {
   if (!el) { el = document.createElement("div"); el.id = "callView"; document.body.appendChild(el); }
   el.innerHTML = `<video id="callVideo" playsinline muted autoplay></video>
     <div class="call-orb" id="callOrb"><span class="mate" id="callMate" role="img" aria-label="球球"></span></div>
-    <div class="call-top"><span class="call-badge" id="callBadge">连接中…</span><span class="call-meter" id="callMeter" title="麦克风音量"><i></i></span><span class="call-clock" id="callClock">00:00</span></div>
-    <div class="call-warn" id="callWarn" hidden></div>
+    <div class="call-top"><span class="call-badge" id="callBadge">连接中…</span><span class="call-clock" id="callClock">00:00</span></div>
     <div class="call-caps" id="callCaps" onclick="callInterrupt()" title="点一下打断"><div class="cap-u" id="capU"></div><div class="cap-a" id="capA">正在接通…</div></div>
     <div class="call-bar">
       <button class="cbtn" id="callMute" onclick="callMute()" aria-label="静音">${icon("mic")}</button>
@@ -164,7 +173,11 @@ async function callCamera(on) {
   if (!on) { if (v) v.srcObject = null; $("callView").classList.remove("cam"); return; }
   try {
     CALL.cam = await navigator.mediaDevices.getUserMedia({ video: { facingMode: CALL.facing, width: { ideal: 1280 }, height: { ideal: 720 } } });
-  } catch (e) { toast("摄像头打不开，先用语音：" + (e.message || e.name)); CALL.video = false; return; }
+  } catch (e) {   // v3.9.38: no note - the call goes on by voice, the button shows the camera is off
+    callLog("camera failed: " + (e.message || e.name)); CALL.video = false;
+    const b = $("callCam"); if (b) { b.innerHTML = icon("camoff"); b.classList.add("off"); }
+    return;
+  }
   v.srcObject = CALL.cam; v.classList.toggle("mirror", CALL.facing === "user");
   $("callView").classList.add("cam");
   CALL.lastThumb = null; CALL.lastSent = 0;
@@ -267,10 +280,10 @@ function callGateSend(f32) {   // downsampler -> echo gate -> socket
   for (const c of CALL.gate(f32, callPlaying())) callSendPcm(c);
 }
 
-function callGateReport(event) {
+function callGateReport(event, why) {   // v3.9.38: why is this report's own reason
   const g = CALL.gate && CALL.gate.stats;
   if (!CALL.ws || CALL.ws.readyState !== 1) return;
-  const r = { type: "client_audio", event, gate: !!(g && g.on), rate: CALL.ctx ? CALL.ctx.sampleRate : 0 };
+  const r = { type: "client_audio", event, why: why || event, gate: !!(g && g.on), rate: CALL.ctx ? CALL.ctx.sampleRate : 0 };
   if (g) Object.assign(r, { echo: +g.echo.toFixed(4), thr: +g.thr.toFixed(4), gated_s: +(g.gatedMs / 1000).toFixed(1), barges: g.barges });
   try { CALL.ws.send(JSON.stringify(r)); } catch (e) { /* closed */ }
 }
@@ -285,12 +298,10 @@ async function callAudio() {
   const push = callDownsampler(ctx.sampleRate, callGateSend);
   let gateOff = false; try { gateOff = localStorage.getItem("aiw_call_echo_gate") === "off"; } catch (e) { /* private mode */ }
   CALL.gate = callEchoGate({ on: CALL.gateOn && !gateOff });
-  const feed = (f32) => {   // level meter + "are samples arriving at all"
+  const feed = (f32) => {   // "are samples arriving at all" (v3.9.38: no level meter)
     const now = Date.now(); CALL.samples += f32.length; CALL.lastSample = now;
-    let pk = 0, sq = 0; for (let i = 0; i < f32.length; i++) { const v = f32[i]; sq += v * v; if (v > pk) pk = v; else if (-v > pk) pk = -v; }
+    let pk = 0; for (let i = 0; i < f32.length; i++) { const v = f32[i]; if (v > pk) pk = v; else if (-v > pk) pk = -v; }
     if (pk > 1e-4) CALL.lastVoice = now;
-    CALL.level = Math.max(Math.sqrt(sq / Math.max(1, f32.length)), CALL.level * 0.85);
-    if (now - CALL.meterAt > 100) { CALL.meterAt = now; const m = $("callMeter"); if (m && m.firstChild) m.firstChild.style.width = Math.min(100, Math.round(CALL.level * 400)) + "%"; }
     push(f32);
   };
   if (ctx.audioWorklet && window.AudioWorkletNode) {
@@ -308,25 +319,19 @@ async function callAudio() {
   if (ctx.state !== "running") callAudioGate(true);
 }
 
-function callMicWarn(on, text) {
-  CALL.micWarn = on;
-  const w = $("callWarn"); if (!w) return;
-  w.hidden = !on; if (on) w.textContent = text || "没有收到麦克风声音";
+function callLog(msg) {   // v3.9.38: what used to be a note on screen - console only (the server keeps its own diag)
+  try { console.info("[aiw call] " + msg); } catch (e) { /* no console */ }
 }
 
-function callMicCheck() {   // every second: samples stopped (or never came) for 3 s -> say so and offer the tap
-  if (CALL.ended || !CALL.audioAt) return;
-  const now = Date.now();
-  if (CALL.muted) { if (CALL.micWarn) callMicWarn(false); return; }
-  const noSamples = now - Math.max(CALL.lastSample, CALL.audioAt) > 3000;
-  const allZero = !noSamples && CALL.samples > 0 && now - Math.max(CALL.lastVoice, CALL.audioAt) > 3000;
-  if (noSamples) {
-    callMicWarn(true, "没有收到麦克风声音，点一下屏幕试试");
-    callAudioGate(true, CALL.ctx && CALL.ctx.state !== "running" ? "点一下开始声音" : "点一下重新打开麦克风");
-  } else if (allZero) {
-    callMicWarn(true, "麦克风只有静音：检查静音键 / 系统麦克风权限");
-  } else if (CALL.micWarn) {
-    callMicWarn(false); callAudioGate(false);
+function callMicCheck() {   // every second: samples stopped (or never came) for 6 s -> log it and offer the tap, no text
+  if (CALL.ended || !CALL.audioAt || CALL.muted) return;
+  const stall = Date.now() - Math.max(CALL.lastSample, CALL.audioAt) > CALL_MIC_STALL_MS;
+  if (stall && !CALL.micStall) {
+    CALL.micStall = true; callLog("no mic samples for 6 s"); callGateReport("mic", "no mic samples 6s");
+    callAudioGate(true);   // a real tap is what rebuilds the graph on iOS
+  } else if (!stall && CALL.micStall) {
+    CALL.micStall = false; callGateReport("mic", "mic samples back");
+    if (CALL.ctx && CALL.ctx.state === "running") callAudioGate(false);
   }
 }
 
@@ -354,10 +359,10 @@ function callOn(m) {
   if (m.type === "ready") {
     CALL.mode = m.mode;
     if (m.echo_gate === false) { CALL.gateOn = false; if (CALL.gate) CALL.gate.stats.on = false; }   // v3.9.37 防回声 off
-    callGateReport("start");
+    callGateReport("start", "start");
     $("callBadge").textContent = ({ realtime: "实时", gemini: "Gemini" }[m.mode] || "轮流") + " · " + (m.model || "");
-    $("callBadge").title = m.note || "";
-    $("capA").textContent = m.note ? m.note : "已接通，说话吧";
+    if (m.note) callLog("ready note: " + m.note);   // v3.9.38: not on screen (it is in 通话诊断)
+    $("capA").textContent = "已接通，说话吧";
   } else if (m.type === "audio") {
     callPlay(m.data);
   } else if (m.type === "speech_started") {
@@ -366,15 +371,18 @@ function callOn(m) {
     if (m.role === "user") { CALL.caps.user = m.text; $("capU").textContent = m.text; if (m.final) $("capA").textContent = ""; }
     else { CALL.caps.assistant = m.text; $("capA").textContent = m.text; if (m.final && m.speak) callSpeak(m.text); }
   } else if (m.type === "tool") {
-    const t = { create_aiw_task: "交给 aiw", task_status: "查任务进度" }[m.name] || m.name;
-    toast(m.status === "running" ? `正在${t}…` : m.status === "done" ? (m.text || `${t}完成`) : `${t}没成功`);
+    callLog(`tool ${m.name} ${m.status}${m.text ? ": " + m.text : ""}`);   // v3.9.38: no toast during the call
   } else if (m.type === "error") {
-    if (m.code === "no_mic") {   // v3.9.36: the server heard nothing from us
-      callMicWarn(true, m.message || "服务器没有收到麦克风声音");
-      callAudioGate(true, CALL.ctx && CALL.ctx.state !== "running" ? "点一下开始声音" : "点一下重新打开麦克风");
-    } else toast(m.message || "出错了");
+    // v3.9.38: only an error that ends the call is shown - before ready / disabled at once, otherwise when "ended"
+    // arrives; no_mic and the rest are logged (the server keeps them in 通话诊断)
+    callLog(`error ${m.code || ""} ${m.message || ""}`);
+    if (m.code === "no_mic") {   // the server heard nothing from us: only the audio unlock may need a tap
+      if (CALL.ctx && CALL.ctx.state !== "running") callAudioGate(true);
+    } else if (!CALL.mode || m.code === "disabled") callEnd(m.message || "通话没接通");
+    else CALL.lastErr = m.message || "";
   } else if (m.type === "ended") {
-    callEnd();
+    const r = m.reason || "";
+    callEnd(r !== "hangup" && r !== "disconnect" ? CALL.lastErr : "");
   }
 }
 
@@ -389,7 +397,7 @@ function callPlay(b64) {
   CALL.sources.add(s);
   s.onended = () => {
     CALL.sources.delete(s);
-    if (!CALL.sources.size) { CALL.playEndAt = Date.now(); $("callView")?.classList.remove("talking"); callGateReport("turn"); }
+    if (!CALL.sources.size) { CALL.playEndAt = Date.now(); $("callView")?.classList.remove("talking"); callGateReport("turn", "turn"); }
   };
   $("callView").classList.add("talking");
 }
@@ -418,7 +426,7 @@ function callMute() {
   CALL.muted = !CALL.muted;
   const b = $("callMute"); b.innerHTML = icon(CALL.muted ? "micoff" : "mic"); b.classList.toggle("off", CALL.muted);
   if (CALL.ws && CALL.ws.readyState === 1) CALL.ws.send(JSON.stringify({ type: "mute", on: CALL.muted }));
-  if (!CALL.muted) CALL.audioAt = Date.now();   // fresh 3 s before the no-mic note
+  if (!CALL.muted) CALL.audioAt = Date.now();   // fresh 6 s before the mic stall check
 }
 
 async function callCamToggle() {

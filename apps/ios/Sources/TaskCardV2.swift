@@ -297,6 +297,7 @@ struct CardResultView: View {
             ForEach(files.indices, id: \.self) { i in
                 if files[i].s("kind") != "image" { fileRow(files[i]) }
             }
+            if !result.a("cards").isEmpty { TravelCardsView(cards: result.a("cards")) }   // v3.9.40 订餐厅 / 机票比价
         }
         .padding(.leading, 10).padding(.vertical, 4)
         .overlay(alignment: .leading) { Rectangle().fill(ok ? okGreen : cardRed).frame(width: 3) }

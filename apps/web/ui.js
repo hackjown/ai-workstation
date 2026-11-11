@@ -111,7 +111,7 @@ MODEL_ROLES.forEach((r) => { if (HINTS[r.key]) r.hint = HINTS[r.key]; });
 loadThreads();
 
 /* ---------- settings: grouped page (模型 / 电脑 / 集成 / 通知 / 你 / 关于), same handlers */
-const SECTIONS = [["g-model", "模型"], ["g-pc", "电脑"], ["g-conn", "连接器"], ["g-int", "集成"], ["g-skill", "技能"], ["g-notify", "通知"], ["g-me", "你和记忆"], ["g-upd", "更新"], ["g-about", "关于"]];
+const SECTIONS = [["g-model", "模型"], ["g-pc", "电脑"], ["g-conn", "连接器"], ["g-int", "集成"], ["g-skill", "技能"], ["g-travel", "出行"], ["g-notify", "通知"], ["g-me", "你和记忆"], ["g-upd", "更新"], ["g-about", "关于"]];
 const secNo = (id) => { const i = SECTIONS.findIndex((x) => x[0] === id); return `<span class="no">// ${String(i + 1).padStart(2, "0")}</span>`; };
 const pill = (ok, on, off) => `<span class="chip ${ok === true ? "ok" : ok === false ? "" : "bad"}">${ok ? on : off}</span>`;
 function row(k, hint, v, t = "", cls = "") { return `<div class="rw ${cls}"><div class="k">${k}${hint ? `<small>${hint}</small>` : ""}</div><div class="v">${v}</div><div class="t">${t}</div></div>`; }
@@ -160,6 +160,7 @@ loadSettings = async function () {
   const bos = await api("GET", "/api/browseros").catch(() => ({ machines: [] }));
   const [skillList, upd, skJob] = await Promise.all([api("GET", "/api/skills").catch(() => []), api("GET", "/api/update").catch(() => null),
     api("GET", "/api/skills/install").catch(() => null)]);
+  const travelCfg = await api("GET", "/api/travel/settings").catch(() => null);   // v3.9.40 出行
   S.skillList = skillList; S.skillJob = skJob && Date.now() / 1000 - (skJob.finished || skJob.started || 0) < 1800 ? skJob : null;
   const localM = machines.find((m) => m.provider !== "instabox");
   let localUp = null;
@@ -314,6 +315,8 @@ loadSettings = async function () {
   </section>
 
   ${skillSection(skillList)}
+
+  ${typeof travelSettingsHTML === "function" ? travelSettingsHTML(travelCfg, secNo("g-travel")) : ""}
 
   <form class="grp" id="g-notify" onsubmit="saveNotify(event)"><span id="sNotify" hidden></span>
     <div class="grp-h"><h2>${secNo("g-notify")}通知</h2>${pill(!!(notify.bark_url || notify.ntfy_url || notify.webhook_url), "已配置", "未配置")}

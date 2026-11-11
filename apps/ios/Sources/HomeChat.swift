@@ -737,6 +737,7 @@ struct HomeChatView: View {
                         }.padding(8).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 12))
                     }.buttonStyle(.plain)
                 }
+                if !d.a("cards").isEmpty { TravelCardsView(cards: d.a("cards")) }   // v3.9.40
                 HStack(spacing: 6) {
                     Text(when(msg.d("created_at"))).font(.caption2).foregroundColor(.secondary)
                     if !d.s("thread_id").isEmpty {

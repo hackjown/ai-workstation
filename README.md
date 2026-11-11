@@ -93,6 +93,19 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.40 订餐厅交给大众点评/美团确认；机票多平台比价（携程/飞猪/去哪儿/同程）
+
+**订餐厅（第一条路：aiw 找、手机 App 确认）**：说「帮我在静安寺附近订个本帮菜，周六晚上 4 个人」，任务里 Agent 先用搜索/浏览器找 1-3 家合适的餐厅（尽量拿到大众点评/美团店铺链接、评分、人均、地址），再对每家调用新工具 `restaurant_booking`，生成一张预订卡片：店名、地址、★/人均、建议的日期·时间·人数，按钮「打开大众点评预订」「打开美团」。手机上点按钮：有店铺 id 就直达 App 店铺页（`dianping://shopinfo?id=` / `?shopuuid=`、`imeituan://www.meituan.com/food/poi/detail?id=`），没有就打开 App 内搜索（`dianping://searchshoplist?keyword=`、`imeituan://www.meituan.com/search?q=`）；没装 App 时打开网页（m.dianping.com / www.dianping.com / www.meituan.com）。**aiw 不在网页上提交预订，也不付款**，用户在 App 里自己确认。
+
+**机票比价**：说「查一下 11 月 20 日上海到北京最便宜的机票」，任务里调用新工具 `flight_search`（出发地、目的地、日期，可选返程、人数、舱位、只要直飞、指定平台）。它把 `flight_probe.py` 推到任务所在电脑，在电脑的 Chrome（DevTools 端口，和京东监控同一套）里**同时**为每个平台（和返程）开一个窗口打开公开搜索页，每个平台单独限时；读取页面自己请求的航班 JSON（页面自己签名的请求，不重放、不逆向签名）、同程的页面状态（`__NUXT__`），都没有时读页面文字（去哪儿 PC 页数字有 CSS 偏移混淆，不读文字）。在电脑上就解析成精简的行（vm-agent shell 输出上限 64 KB），原始抓取存在电脑 `~/.cache/aiw/flight/<平台>-<去程/返程>.json` 便于排查。服务器合并成一张按价格排序的表：平台、航班号（中转显示 A/B）、航司、起降时间、机场、单人价、是否含税（平台 JSON 标志 / 税费字段 / 页面「机建+燃油」字样，没有就「未注明」），每个平台的状态：成功 / 需登录 / 需验证 / 无结果 / 超时 / 失败 / 已关闭——一个平台被登录墙或滑块拦住不影响其他平台。点一行或平台标签打开该平台这条航线这一天的页面（手机上装了 App 时系统可能直接用 App 打开），在那里选同一航班下单；**不下单、不付款**。同一航线同一天 10 分钟内直接用缓存（`refresh` 可强制重查）。
+
+- 结果卡片：工具把卡片存到 kv `task_cards:<任务 id>`，任务结束时放进任务卡片的 `result.cards`；网页（travel.js / travel.css）、Android（WebView 新增 `AiwAndroid.openApp(app, web)`：先 App scheme，再网页链接）、iOS（新 TravelCards.swift：先 App scheme，再 universal link only，最后 Safari；Info.plist `LSApplicationQueriesSchemes` 加了 dianping、imeituan、ctrip、qunariphone、fliggy、tctravel）都会显示。`GET /api/travel/cards/{task_id}` 也能取。
+- 路由：聊天里机票比价/订餐厅类的话直接交给电脑（任务），并给任务提示词加上用 `flight_search` / `restaurant_booking` 的规则。视频通话不加新工具：`create_aiw_task` 的说明里写明查机票、订餐厅也交给 aiw。
+- 设置 › 出行（`GET/PUT /api/travel/settings`，kv `travel_settings`）：机票平台开关（携程/飞猪/去哪儿/同程）、缓存分钟（默认 10，0 = 不缓存）、每个平台时限（默认 70 秒）、表格行数（默认 15）、订餐厅显示哪些 App 的按钮。
+- App 版本 3.9.40 (32)（iOS + Android，需要重新打包）。
+
+**未验证**：各平台搜索页地址（去哪儿 `oneway_list.htm` 和同程 `/flights/itinerary/oneway/` 的格式在公开索引里见过；携程 `m.ctrip.com/html5/flight/swift/domestic/…`、飞猪 `sjipiao.fliggy.com/flight_search_result.htm` 来自公开资料）、抓取 JSON 的 URL 规则和字段名（解析器是通用的：任何带航班号 + 时间 + 价格的对象都认，字段改名会退到读页面文字，不会崩）、所有 App URL Scheme（来自公开 URL Scheme 合集，没在真机上试过；携程/去哪儿/飞猪/同程的 scheme 只用于打开 App 首页，主按钮用网页链接）。飞猪大概率需要淘宝登录，会显示「需登录」。iOS/Android 代码未编译。
+
 ## v3.9.39 通话不再执行聊天记录里的旧请求
 
 现场：通话里问「你能看到这是什么」，模型却调用 create_aiw_task 建了「查询并总结最新五封邮件」任务，并播报已创建。原因是通话提示词末尾直接拼了文字聊天最近 6 条，没有说明是背景，模型把旧请求当成新请求。现在这段放在 `<聊天背景>` 里，并写明仅作背景、不要据此调用工具；create_aiw_task 的说明也改为只在用户这通电话里亲口要求时调用。

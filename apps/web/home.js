@@ -136,6 +136,7 @@ function htcResult(r) {
   if (pics.length) h += `<a class="htc-thumb" href="${artUrl(pics[0].path)}" target="_blank" rel="noopener"><img src="${artUrl(pics[0].path)}" alt="${esc(pics[0].name)}" loading="lazy" />${pics.length > 1 ? `<span>+${pics.length - 1}</span>` : ""}</a>`;
   for (const f of files) if (f.kind !== "image")
     h += `<a class="filecard" href="${artUrl(f.path, true)}" download="${esc(f.name)}"><span class="iconbox">${icon("file")}</span><span class="grow"><b>${esc(f.name)}</b><div class="small">点击下载</div></span></a>`;
+  if (r.cards && typeof hTravelCards === "function") h += hTravelCards(r.cards);   // v3.9.40 订餐厅 / 机票比价
   return h + `</div>`;
 }
 function hTaskCard(m) {
@@ -225,7 +226,7 @@ function hMsg(m) {
   if (m.kind === "confirm") return hConfirm(m);
   if (m.kind === "task_result") {
     const ok = d.status === "succeeded";
-    return hA(m, `<div class="hres ${ok ? "ok" : "bad"}"><div class="bubble hmd">${hMd(m.text)}</div>${hFiles(d.files)}
+    return hA(m, `<div class="hres ${ok ? "ok" : "bad"}"><div class="bubble hmd">${hMd(m.text)}</div>${hFiles(d.files)}${d.cards && typeof hTravelCards === "function" ? hTravelCards(d.cards) : ""}
       <div class="meta">${hTime(m.created_at)}${d.thread_id ? ` · <button class="link small" onclick="hOpenTask('${m.id}')">${d.has_more ? "查看完整结果" : "查看任务"} ›</button>` : ""}</div></div>`);
   }
   // assistant text (the one being written: 球球 thinks until the first token)

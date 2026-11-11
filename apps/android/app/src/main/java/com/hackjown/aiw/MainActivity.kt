@@ -280,6 +280,21 @@ class MainActivity : AppCompatActivity() {
         catch (_: ActivityNotFoundException) { toast("没有能打开这个链接的应用") }
     }
 
+    /** v3.9.40 出行 cards (travel.js -> AiwAndroid.openApp): the app's own scheme first (大众点评 / 美团 shop page),
+     *  else the web link (Android App Links may still hand it to the installed app, otherwise the browser). */
+    private fun openAppOrWeb(app: String, web: String) {
+        if (app.isNotBlank()) {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(app)).addCategory(Intent.CATEGORY_BROWSABLE)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                return
+            } catch (_: ActivityNotFoundException) {
+            } catch (_: SecurityException) {
+            }
+        }
+        if (web.isNotBlank()) external(Uri.parse(web)) else toast("没有安装对应的 App")
+    }
+
     private fun askExit() {
         AlertDialog.Builder(this).setTitle("退出 Aiw？")
             .setPositiveButton("退出") { _, _ -> finish() }
@@ -401,6 +416,8 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface fun openSettings() { runOnUiThread { this@MainActivity.openSettings() } }
         @JavascriptInterface fun toast(s: String) { this@MainActivity.toast(s) }
         @JavascriptInterface fun version(): String = BuildConfig.VERSION_NAME
+        /** v3.9.40: open a restaurant / flight card's link: app scheme first, then the web page */
+        @JavascriptInterface fun openApp(app: String, web: String) { runOnUiThread { this@MainActivity.openAppOrWeb(app, web) } }
         /** v3.9.28 手机快通道: true = the phone answers this message itself (FastPath.kt), the page must not send it */
         @JavascriptInterface fun fastTry(text: String): Boolean = try { fast.tryHandle(text) } catch (e: Exception) { false }
         @JavascriptInterface fun saveBase64(name: String, mime: String, b64: String) {

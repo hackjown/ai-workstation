@@ -320,6 +320,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     _share.mount(app, settings, auth)
     from . import browseros   # BrowserOS neo per computer (/api/browseros*)
     browseros.mount(app, store, sessions, auth)
+    from . import travel as _travel   # v3.9.40 出行: /api/travel/settings (机票平台开关, 缓存), /api/travel/cards/{task}
+    _travel.mount(app, store, auth)
     from . import chat as _chat   # the persistent 小秘 chat (/api/chat*): routing, task cards, escalations in the chat
     chat = _chat.Chat(store, sessions, notifier, settings, secrets)
     app.state.chat = chat

@@ -61,6 +61,15 @@ ATT_TASK_RE = re.compile(r"转换|转成|转为|导出|导入|生成|画|描|绘
 ATT_CHAT_RE = re.compile(r"^(这|那|它)?(是什么|写了什么|讲了什么|说了什么|什么意思)|总结|概括|翻译|解释|读一下|看看(内容|写)", re.I)
 
 
+def wants_travel(text: str) -> bool:
+    """v3.9.40: a 机票比价 or 订餐厅 request (travel.py) runs as a task: flight_search / restaurant_booking live there."""
+    try:
+        from .travel import wants_travel as _wt
+        return _wt(text)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def attachments_want_task(text: str, attachments: list) -> bool:
     """Attachments + an action on them (not only 'what does it say') = a task for the computer."""
     if not attachments:
@@ -803,6 +812,8 @@ class Chat:
             elif (wants_image_gen(text, attachments) or wants_image_edit(text, attachments)) and self._image_cfg():
                 route = {"route": "chat", "title": "", "image": True}   # v3.9.15: the image model, right in the chat
             elif attachments_want_task(text, attachments):   # v3.9.3: shared files + "帮我转成…" go straight to the computer
+                route = {"route": "task", "title": ""}
+            elif not attachments and wants_travel(text):   # v3.9.40: 机票比价 / 订餐厅 need the computer's browser
                 route = {"route": "task", "title": ""}
             elif mode == "auto" and self.phone_fast(text, attachments):   # v3.9.28 手机快通道: no LLM router
                 route = {"route": "task", "title": "", "fast": "device"}
@@ -1566,13 +1577,20 @@ class Chat:
                 if not text.startswith(("任务没", "没", "抱歉")):
                     text = "任务没有完成：" + text
             thumb = next((f["path"] for f in files if f["kind"] == "image"), None)
+            cards = []
+            try:   # v3.9.40: restaurant / flight cards the task's tools made (travel.py), with their app buttons
+                from . import travel as _travel
+                cards = _travel.cards_for(self.store, task.id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("travel cards: %s", e)
             acts = [{**a, "stale": True} if not a.get("resolved") and not a.get("stale") else a
                     for a in (self.get(card["id"]) or card)["data"].get("actions") or []]
             # 3.8.8: the result is ON the card (no separate 球球 message); the push notification is sessions' own
             self.update(card["id"], data={**base, "status": st, "status_line": STATUS_CN.get(st, st), "ended_at": time.time(),
                                           "actions": acts, "stuck": None,
                                           "result": {"text": text, "status": st, "files": files, "thumb": thumb,
-                                                     "has_more": len(res.strip()) > len(line) + 2, "at": time.time()}},
+                                                     "has_more": len(res.strip()) > len(line) + 2, "at": time.time(),
+                                                     **({"cards": cards} if cards else {})}},
                         task_id=task.id)
 
     def _line(self, cd: dict, status: str) -> str:

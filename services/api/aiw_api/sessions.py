@@ -1084,6 +1084,12 @@ class SessionManager:
                     extra.update(shopwatch.task_tools(self.store, self.notifier, task, computer, confirm))
                 except Exception as e:  # noqa: BLE001
                     log.warning("price watch tools unavailable: %s", e)
+                try:  # v3.9.40 出行: restaurant_booking (大众点评/美团 hand-off card) + flight_search (机票比价)
+                    from . import travel
+                    extra.update(travel.task_tools(self.store, task, computer))
+                    sx += travel.prompt_extra(task.prompt)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("travel tools unavailable: %s", e)
                 xhs_task = False
                 try:  # 小红书运营: caps, the approval queue and the warning pause live in xhs.py
                     from . import xhs

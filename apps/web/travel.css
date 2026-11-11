@@ -1,0 +1,25 @@
+/* v3.9.40 出行 cards (travel.js) */
+.trv-cards { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+.trv-card { border: 1px solid var(--line, rgba(127,127,127,.25)); border-radius: 14px; padding: 10px 12px; background: var(--card, rgba(127,127,127,.06)); }
+.trv-h { display: flex; gap: 8px; align-items: flex-start; }
+.trv-h .grow { flex: 1; min-width: 0; }
+.trv-ic { font-size: 18px; line-height: 1.3; }
+.trv-facts, .trv-sug { margin-top: 6px; font-size: 14px; }
+.trv-sug { font-weight: 600; }
+.trv-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.trv-note { margin-top: 8px; }
+.trv-leg { margin-top: 10px; }
+.trv-legh { font-weight: 600; margin-bottom: 4px; }
+.trv-row { display: grid; grid-template-columns: 70px 1fr auto; gap: 8px; align-items: center; width: 100%; text-align: left; padding: 7px 4px; border: 0; border-top: 1px solid var(--line, rgba(127,127,127,.18)); background: transparent; color: inherit; cursor: pointer; font: inherit; }
+.trv-row:hover { background: rgba(127,127,127,.08); }
+.trv-p { font-weight: 700; color: var(--amber, #e8a33d); font-variant-numeric: tabular-nums; }
+.trv-f { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.trv-src { display: flex; flex-direction: column; align-items: flex-end; font-size: 13px; white-space: nowrap; }
+.trv-plats { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.trv-st { cursor: pointer; border: 0; }
+.trv-st.st-ok { background: rgba(60,170,90,.15); }
+.trv-st.st-login, .trv-st.st-captcha { background: rgba(232,163,61,.18); }
+.trv-st.st-error, .trv-st.st-timeout { background: rgba(220,70,70,.14); }
+.trv-sws { display: flex; flex-wrap: wrap; gap: 12px; }
+.trv-sw { display: inline-flex; align-items: center; gap: 4px; }
+@media (max-width: 520px) { .trv-row { grid-template-columns: 58px 1fr; } .trv-src { grid-column: 2; align-items: flex-start; flex-direction: row; gap: 6px; } }

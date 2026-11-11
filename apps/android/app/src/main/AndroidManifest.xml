@@ -33,6 +33,14 @@
         <intent><action android:name="android.intent.action.DIAL" /><data android:scheme="tel" /></intent>
         <intent><action android:name="android.intent.action.CALL" /><data android:scheme="tel" /></intent>
         <intent><action android:name="android.intent.action.SENDTO" /><data android:scheme="smsto" /></intent>
+        <!-- v3.9.40 出行 cards: 大众点评 / 美团 / 携程 / 去哪儿 / 飞猪 / 同程 (startActivity works without these; listed
+             so a future resolveActivity check sees the apps on Android 11+) -->
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="dianping" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="imeituan" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="ctrip" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="qunariphone" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="fliggy" /></intent>
+        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="tctravel" /></intent>
     </queries>
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />

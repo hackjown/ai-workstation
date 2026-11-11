@@ -93,6 +93,11 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.43 连接器工具列表取不到时说清原因
+
+- 任务开头那行和「测试」都会写出工具列表失败的真实原因（超时几秒 / 代理拒绝 / 空列表等），「测试」每次重新向服务器要列表，只算这个连接自己的工具。
+- Adobe 这类预置连接器拉工具列表的时限从 20 秒放宽到 45 秒；刷新失败时沿用 24 小时内上次成功的列表，一次慢请求不会让任务丢掉 Adobe 工具。
+
 ## v3.9.42 用了「Photoshop」却没走 Adobe
 
 - 规划规则：工具列表里有 `mcp_adobe_*` 且请求点名 Photoshop / Adobe / Firefly / Lightroom / Illustrator / Express 时，先用 Adobe 工具；没有合适的工具或调用失败才用 Photopea，并说明一句。没连接 Adobe 时，「Photoshop」仍指 Photopea。

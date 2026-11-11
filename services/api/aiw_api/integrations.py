@@ -545,12 +545,32 @@ _MCP_CACHE: dict[str, tuple[float, list]] = {}
 _MCP_TTL = 300.0
 
 
+_MCP_STALE = 86400.0
+CONN_ERRORS: dict[str, str] = {}   # v3.9.43: cid -> why its tool list failed last time (shown on the task + 测试)
+
+
+def _err_text(e: BaseException, timeout: float | None = None) -> str:
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return f"超时（{int(timeout or 0)} 秒内没拿到工具列表，多半是代理慢或没走代理）"
+    t = f"{type(e).__name__}: {str(e)}".strip()
+    return t[:300]
+
+
 async def _mcp_tools(client: "MCPClient", key: str, timeout: float = 8) -> list[dict]:
+    """Tool lists are cached 5 min; v3.9.43: when a refresh fails, the last good list (up to 24 h) is used, so
+    one slow proxy round trip never strips a connector from a task. Raises only with no list at all."""
     import time
     hit = _MCP_CACHE.get(key)
     if hit and time.time() - hit[0] < _MCP_TTL:
         return hit[1]
-    tools = await asyncio.wait_for(client.list_tools(), timeout)
+    try:
+        tools = await asyncio.wait_for(client.list_tools(), timeout)
+    except Exception as e:  # noqa: BLE001
+        if hit and hit[1] and time.time() - hit[0] < _MCP_STALE:
+            log.warning("mcp tools %s: %s - using the list from %d s ago", key[:60], _err_text(e, timeout),
+                        int(time.time() - hit[0]))
+            return hit[1]
+        raise
     _MCP_CACHE[key] = (time.time(), tools)
     return tools
 
@@ -599,7 +619,8 @@ def adobe_route_note(tools: dict, prompt: str, store=None, secrets=None) -> str:
     elif status != "ok":
         why = "Adobe 创意工具需要重新授权"
     else:
-        why = "Adobe 工具列表没取到（多半是代理或网络超时）"
+        err = CONN_ERRORS.get("adobe") or next((v for k, v in CONN_ERRORS.items() if k.startswith("adobe")), "")
+        why = "Adobe 工具列表没取到：" + (err or "原因未知，看 docker logs aiw-api | grep 'connection adobe'")
     return f"{why}，这次改用 Photopea。"
 
 
@@ -683,7 +704,16 @@ async def connection_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
                                    retry_403=bool(pre.get("retry_403")), fetch_links=bool(pre.get("fetch_links")))
                 allow = [a.lower() for a in (rec.get("allow_tools") or [])]
                 gate = pre.get("gate") if pre and rec.get("expose", "auto") != "always" else None
-                for t in await _mcp_tools(client, "conn:" + cid + rec["mcp_url"], 20 if pre else 8):
+                _to = 45 if pre else 8   # v3.9.43: Adobe's 50+ tools over a proxy from China can take >20 s
+                try:
+                    _tl = await _mcp_tools(client, "conn:" + cid + rec["mcp_url"], _to)
+                except Exception as e:  # noqa: BLE001
+                    CONN_ERRORS[cid] = _err_text(e, _to)
+                    raise
+                CONN_ERRORS.pop(cid, None)
+                if not _tl:
+                    CONN_ERRORS[cid] = "服务器返回了空的工具列表（账号或地区可能没有开通）"
+                for t in _tl:
                     if allow and not any(_glob(t["name"].lower(), a) for a in allow):
                         continue
                     name = safe_name("mcp_", cid, t["name"])

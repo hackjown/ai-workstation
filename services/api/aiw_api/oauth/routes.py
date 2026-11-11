@@ -140,10 +140,17 @@ def mount(app, store, secrets, notifier, auth) -> None:
             raise HTTPException(404, "没有这个连接")
         if rec.get("status") != "ok":
             return {"ok": False, "status": rec.get("status"), "message": rec.get("status_msg"), "tools": []}
+        from ..integrations import CONN_ERRORS, forget_tools
+        forget_tools("conn:" + cid)   # v3.9.43: 测试 always asks the server again
         tools = await connection_tools(store, secrets)
-        mine = [n for n in tools if n != "connector_status"]
+        from ..integrations import safe_name
+        pre = safe_name("mcp_", cid, "")
+        mine = [n for n in tools if n != "connector_status" and (n.startswith(pre) or not rec.get("mcp_url"))]
         rec = conns.get(cid) or rec
-        return {"ok": rec.get("status") == "ok", "status": rec.get("status"), "tools": mine[:60]}
+        err = CONN_ERRORS.get(cid, "")
+        ok = rec.get("status") == "ok" and not err
+        return {"ok": ok, "status": rec.get("status"), "tools": mine[:60], "count": len(mine),
+                "message": err or rec.get("status_msg") or ""}
 
     @app.delete("/api/connections/{cid}", dependencies=[Depends(auth)])
     async def delete_connection(cid: str, service: str = ""):

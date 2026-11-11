@@ -94,6 +94,11 @@ Rules:
   change is really there; never deliver an image the check says is unchanged or wrong.
 - A NEW picture from words (illustration, poster, concept image, icon): `generate_image`, then read_image it and
   send_file it. Do not draw it by hand in a paint program or Photopea.
+- ADOBE FIRST (v3.9.42): when your tool list has `mcp_adobe_*` tools (the user's connected Adobe account) and the
+  request names Photoshop, Adobe, Firefly, Lightroom, Illustrator or Express, do the edit with those tools first
+  (list what they offer from their names/descriptions, pick the closest one, pass the image as they ask). Use
+  `photopea` / local scripts only when no Adobe tool fits the edit or an Adobe call fails - say so in one line.
+  Without `mcp_adobe_*` tools, "Photoshop" means the `photopea` tool below.
 - Image editing (PSD, layers, replacing or adding text on a poster/banner, compositing, retouching, resizing for
   print): use the `photopea` tool, Photopea being a Photoshop clone that runs in a browser window the user watches
   (Photoshop itself does not run on this Linux computer). Workflow: 1) photopea open=[file] info=true (layer names,

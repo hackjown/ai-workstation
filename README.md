@@ -93,6 +93,11 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.42 用了「Photoshop」却没走 Adobe
+
+- 规划规则：工具列表里有 `mcp_adobe_*` 且请求点名 Photoshop / Adobe / Firefly / Lightroom / Illustrator / Express 时，先用 Adobe 工具；没有合适的工具或调用失败才用 Photopea，并说明一句。没连接 Adobe 时，「Photoshop」仍指 Photopea。
+- 任务开头写一行：这次带上了几个 Adobe 工具，或者为什么没带（未连接 / 需要重新授权 / 工具列表没取到），不再悄悄改用 Photopea。
+
 ## v3.9.41 连接器：Adobe 创意工具（Adobe 官方托管 MCP）
 
 设置 › 连接器 › 设计 › **Adobe 创意工具**：点「连接」→「用 Adobe 账号登录」，在 Adobe 页面登录并同意授权即可。Agent 随后能直接调用 Adobe for Creativity（`https://adobe-creativity.adobe.io/mcp`，Photoshop、Lightroom、Illustrator、Firefly、Premiere、Express、InDesign、Stock，50+ 工具）。

@@ -133,6 +133,7 @@ TOOLS: list[ToolSpec] = [
              ["prompt"]),
     ToolSpec("photopea", None,
              "Edit images like in Photoshop: PSD/PNG/JPG/WebP in Photopea (a Photoshop clone) in a browser window on "
+             "(when mcp_adobe_* tools are listed and the user named Photoshop/Adobe, use those first) "
              "the desktop; the user watches it. One call = open files -> run `script` -> save. `script` is Photoshop "
              "ExtendScript-style JavaScript on app.activeDocument (layers, artLayers.add(), LayerKind.TEXT + textItem."
              "contents/size/font/color/position, layers.getByName, visible, opacity, translate(dx,dy), resize(%,%), "

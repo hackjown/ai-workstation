@@ -1029,6 +1029,13 @@ class SessionManager:
                     extra = await load_tools(self.store, self.secrets) if self.secrets else {}
                     from .integrations import gate_tools   # v3.9.41: Adobe tools only for creative requests
                     extra = gate_tools(extra, task.prompt or "")
+                    try:   # v3.9.42: say on the task which connector tools rode along (or why Adobe did not)
+                        from .integrations import adobe_route_note
+                        _an = adobe_route_note(extra, task.prompt or "", self.store, self.secrets)
+                        if _an:
+                            await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE, data={"text": _an, "connector": "adobe"}))
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("adobe route note: %s", e)
                 except Exception as e:  # noqa: BLE001
                     log.warning("integrations unavailable: %s", e)
                     extra = {}

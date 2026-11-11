@@ -573,6 +573,36 @@ def gate_tools(tools: dict, prompt: str) -> dict:
     return out
 
 
+_ADOBE_ASK = r"(?i)adobe|photoshop|lightroom|illustrator|firefly|indesign|adobe\s*express|(?<![a-z])ps(?![a-z])"
+
+
+def adobe_route_note(tools: dict, prompt: str, store=None, secrets=None) -> str:
+    """v3.9.42: the user named Photoshop / Adobe / Firefly. Returns one line for the task: how many Adobe tools
+    this task got, or why it got none (not connected / needs re-auth / tool list failed), so a Photopea run is
+    never silent about it. Empty when the request does not name Adobe."""
+    if not re.search(_ADOBE_ASK, prompt or ""):
+        return ""
+    n = sum(1 for k in (tools or {}) if k.startswith("mcp_adobe_"))
+    if n:
+        return f"已带上 Adobe 创意工具（{n} 个），优先用 Adobe 处理。"
+    status = ""
+    try:
+        from .oauth import manager
+        for rec in manager(store, secrets).all():
+            if rec.get("connector") == "adobe" or rec.get("preset") == "adobe" or rec.get("provider") == "adobe" or str(rec.get("id", "")).startswith("adobe"):
+                status = rec.get("status") or "?"
+                break
+    except Exception:  # noqa: BLE001
+        status = ""
+    if not status:
+        why = "Adobe 创意工具还没连接（设置 › 连接器 › 设计）"
+    elif status != "ok":
+        why = "Adobe 创意工具需要重新授权"
+    else:
+        why = "Adobe 工具列表没取到（多半是代理或网络超时）"
+    return f"{why}，这次改用 Photopea。"
+
+
 async def load_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
     """name -> (schema, async call(args)). Broken integrations are skipped, not fatal.
     MCP tool lists are cached for 5 minutes and each server gets 8 s, so a slow server never stalls a task start."""

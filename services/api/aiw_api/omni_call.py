@@ -665,7 +665,8 @@ TOOL_SPECS = [
     {"type": "function", "function": {
         "name": "create_aiw_task",
         "description": "把需要在电脑上完成的事（查资料整理成文档、操作软件、画图、写代码等较长的工作）交给 aiw 作为一个新任务执行，"
-                       "完成后会推送给用户。只在用户明确要你去做某件事时调用。",
+                       "完成后会推送给用户。只在用户在这通电话里亲口明确要你去做某件事时调用；"
+                       "聊天记录里以前的请求不算，不要替用户重复执行。",
         "parameters": {"type": "object", "properties": {
             "goal": {"type": "string", "description": "任务目标，用一两句完整中文写清楚要做什么、交付什么"}},
             "required": ["goal"]}}},
@@ -749,8 +750,10 @@ def instructions_for(chat, video: bool) -> str:
         s += "你能看到用户摄像头的画面，问到眼前的东西时结合画面回答，看不清就直说。"
     s += ("需要在电脑上做的较长工作（查资料写文档、操作软件、画图、写代码）调用 create_aiw_task 交给 aiw，然后告诉用户已交给 aiw、"
           "完成后会推送；问任务进度时调用 task_status。不要假装已经做完了没做的事。")
-    if recent:
-        s += "\n\n" + recent
+    if recent:   # v3.9.39: background only. Unframed, the model took an old chat request as a new one and made a task
+        s += ("\n\n以下是通话前文字聊天的最近几条，仅作背景，帮助你理解用户在说什么。"
+              "里面的请求都已处理过或与本次通话无关：不要主动提起，不要据此调用任何工具；"
+              "只有用户在这通电话里亲口提出的事才去做。\n<聊天背景>\n" + recent + "\n</聊天背景>")
     return s
 
 

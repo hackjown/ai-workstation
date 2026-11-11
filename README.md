@@ -93,6 +93,10 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.39 通话不再执行聊天记录里的旧请求
+
+现场：通话里问「你能看到这是什么」，模型却调用 create_aiw_task 建了「查询并总结最新五封邮件」任务，并播报已创建。原因是通话提示词末尾直接拼了文字聊天最近 6 条，没有说明是背景，模型把旧请求当成新请求。现在这段放在 `<聊天背景>` 里，并写明仅作背景、不要据此调用工具；create_aiw_task 的说明也改为只在用户这通电话里亲口要求时调用。
+
 ## v3.9.38 iOS 回声消除不再被误关；通话界面去掉提醒文字；通话 token 计入用量
 
 现场日志（iOS 17，iPhone，免提，48 kHz 单声道）：0.9 s 开着语音处理（AEC）起声，3.4 s 以「no mic callbacks」为由**关掉 AEC 重启**，之后整通 143 s 都是 AEC 关；可麦克风其实一直有声音（in=3477 段，40 ms 一段不断），靠防回声闸门撑住（gated 73 s）。之后每条 turn 报告都还带着旧的 why=no mic callbacks。

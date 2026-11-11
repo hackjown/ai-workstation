@@ -377,6 +377,32 @@ class AgentLoop:
         await self.emit(EventType.FILE, name=name, size=res.get("size"), artifact=str(p),
                         truncated=bool(res.get("size") and res["size"] > p.stat().st_size))
 
+    async def _ext_files(self, res: dict, save_dir: str) -> None:
+        """v3.9.41: files a connector tool returned (Adobe images, PSDs, videos as base64 or downloaded result links):
+        each becomes a task file (shown on the task card) and is written to the computer under ~/workspace/<save_dir>/,
+        so later steps can open, edit or send it. The base64 never reaches the model; res["text"] gets the paths."""
+        lines = []
+        for f in res.pop("files", None) or []:
+            b64 = f.get("content_b64")
+            if not b64:
+                continue
+            name = Path(str(f.get("name") or "file")).name
+            vm_path = f"{save_dir.strip('/')}/{name}"
+            try:
+                await self._deliver_file({"path": name, "content_b64": b64, "size": f.get("size")})
+            except Exception as e:  # noqa: BLE001
+                __import__("logging").getLogger("aiw.loop").warning("connector file %s: %s", name, e)
+            where = ""
+            try:
+                up = await self.computer.execute("files.upload", {"path": vm_path, "content_b64": b64},
+                                                 observe=False, timeout=120)
+                where = f"~/workspace/{vm_path}" if up.success else f"(没能放到电脑上：{str(up.error)[:80]})"
+            except Exception as e:  # noqa: BLE001
+                where = f"(没能放到电脑上：{type(e).__name__})"
+            lines.append(f"- {name} -> 任务文件 + {where}")
+        if lines:
+            res["text"] = (res.get("text") or "") + "\n已保存：\n" + "\n".join(lines)
+
     async def _video_qa(self, path: str) -> Optional[str]:
         """Loudness, channels, and for a document explainer page coverage and length (task-8bd: 8 of 16 pages, -25.7 LUFS mono)."""
         try:
@@ -814,7 +840,13 @@ class AgentLoop:
                     self._page_note = None
 
             _xi = getattr(self, "_ext_image", None)   # an MCP cloud computer's screenshot from the last tool call
-            if _xi:
+            if _xi and getattr(self, "_ext_image_note", None):   # v3.9.41: a connector's result image, not a screen
+                self._ext_image, self._ext_image_note = None, None
+                before = _xi
+                note = ((note + "\n") if note else "") + (
+                    "The image is the result image your last connector tool returned (e.g. Adobe), NOT the screen. "
+                    "It is saved as a task file and on the computer; check it against the request.")
+            elif _xi:
                 self._ext_image = None
                 before = _xi
                 note = ((note + "\n") if note else "") + (
@@ -1517,10 +1549,14 @@ class AgentLoop:
                 ok, err = True, None
             except Exception as e:  # noqa: BLE001
                 res, ok, err = {}, False, f"{type(e).__name__}: {e}"
+            if isinstance(res, dict) and res.get("files"):   # v3.9.41: connector result files -> task card + computer
+                await self._ext_files(res, getattr(fn, "save_dir", "") or "connectors/" + t[:40])
             if isinstance(res, dict) and res.get("image_b64"):   # MCP screenshot: shown to the model next step
                 self._ext_image = res.pop("image_b64")
                 res.pop("image_mime", None)
-                res["text"] = (res.get("text") or "") + "\n[screenshot attached to the next step]"
+                self._ext_image_note = res.pop("image_note", None)
+                res["text"] = (res.get("text") or "") + ("\n[the first result image is attached to the next step]"
+                                                         if self._ext_image_note else "\n[screenshot attached to the next step]")
             self._acted = self._acted or ok
             if self._secrets:
                 res, err = _rd.mask_obj(res, self._secrets.values()), _rd.mask(err, self._secrets.values())

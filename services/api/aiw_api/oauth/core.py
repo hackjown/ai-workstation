@@ -31,16 +31,38 @@ TRANSPORT: Optional[httpx.AsyncBaseTransport] = None   # tests: httpx.MockTransp
 
 
 class OAuthError(RuntimeError):
-    pass
+    def __init__(self, msg: str = "", code: str = ""):
+        super().__init__(msg)
+        self.code = code   # v3.9.41: the OAuth `error` value from a token endpoint (invalid_target, invalid_scope, ...)
 
 
 class ReauthRequired(OAuthError):
     """The grant is gone (invalid_grant / revoked / no refresh token): the user must connect again."""
 
 
-def http(timeout: float = 20) -> httpx.AsyncClient:
+def http(timeout: float = 20, proxy: str = "") -> httpx.AsyncClient:
+    """v3.9.41: `proxy` (http://, https://, socks5://) for providers that are slow or blocked from the server's network
+    (adobe.io from mainland China). Empty = httpx's own environment handling (HTTPS_PROXY / ALL_PROXY / NO_PROXY)."""
+    kw: dict = {}
+    if proxy and TRANSPORT is None:
+        kw["proxy"] = proxy
     return httpx.AsyncClient(timeout=timeout, follow_redirects=True, transport=TRANSPORT,
-                             headers={"User-Agent": "ai-workstation/3.9.27"})
+                             headers={"User-Agent": "ai-workstation/3.9.41"}, **kw)
+
+
+def proxy_for(store, rec: Optional[dict] = None) -> str:
+    """The connection's own proxy, else 设置 › 连接器 › 高级 › 代理 (kv oauth_settings.proxy)."""
+    p = str((rec or {}).get("proxy") or "").strip()
+    if p:
+        return p
+    try:
+        return str((store.kv_get("oauth_settings", {}) or {}).get("proxy") or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def valid_proxy(p: str) -> bool:
+    return not p or bool(re.match(r"^(https?|socks5h?|socks4)://[^\s/]+", p.strip()))
 
 
 # ------------------------------------------------------------------ PKCE + state
@@ -71,6 +93,17 @@ class StateStore:
         allv[st] = {**data, "exp": time.time() + self.ttl}
         self.store.kv_set(self.KEY, allv)
         return st
+
+    def pop_latest(self, **match) -> Optional[dict]:
+        """v3.9.41: Adobe IMS redirects an invalid_scope error WITHOUT the state: take the newest pending record that
+        matches (aiw has one user, so the newest pending authorization is the one that just bounced)."""
+        allv = self.store.kv_get(self.KEY, {}) or {}
+        now = time.time()
+        hits = [(v.get("exp", 0), k) for k, v in allv.items()
+                if v.get("exp", 0) > now and all(v.get(mk) == mv for mk, mv in match.items())]
+        if not hits:
+            return None
+        return self.pop(max(hits)[1])
 
     def pop(self, state: str) -> Optional[dict]:
         allv = self.store.kv_get(self.KEY, {}) or {}
@@ -127,23 +160,23 @@ def _wk(base: str, name: str) -> list[str]:
     return out
 
 
-async def probe(url: str, headers: Optional[dict] = None) -> dict:
+async def probe(url: str, headers: Optional[dict] = None, proxy: str = "") -> dict:
     """POST an MCP initialize without a token. Returns {needs_auth, www_authenticate} or {needs_auth: False}."""
     body = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                       "clientInfo": {"name": "ai-workstation", "version": "3.9.27"}}}
-    async with http() as c:
+                       "clientInfo": {"name": "ai-workstation", "version": "3.9.41"}}}
+    async with http(proxy=proxy) as c:
         r = await c.post(url, json=body, headers={"Accept": "application/json, text/event-stream", **(headers or {})})
     if r.status_code in (401, 403):
         return {"needs_auth": True, "www_authenticate": r.headers.get("www-authenticate", ""), "status": r.status_code}
     return {"needs_auth": False, "status": r.status_code}
 
 
-async def discover(mcp_url: str, www_authenticate: str = "") -> dict:
+async def discover(mcp_url: str, www_authenticate: str = "", proxy: str = "") -> dict:
     """-> {resource, prm, issuer, as_meta, scopes}. Raises OAuthError when no authorization server is found."""
     wa = parse_www_authenticate(www_authenticate)
     prm: dict = {}
-    async with http() as c:
+    async with http(proxy=proxy) as c:
         cands = ([wa["resource_metadata"]] if wa.get("resource_metadata") else []) + _wk(mcp_url, "oauth-protected-resource")
         for u in cands:
             try:
@@ -179,24 +212,37 @@ async def discover(mcp_url: str, www_authenticate: str = "") -> dict:
     return {"resource": res, "prm": prm, "issuer": issuer, "as_meta": meta, "scopes": scopes}
 
 
-async def register_client(as_meta: dict, redirect: str, name: str = "AI Workstation") -> dict:
-    """RFC 7591 dynamic registration as a public client (token_endpoint_auth_method none + PKCE)."""
+async def register_client(as_meta: dict, redirect: str, name: str = "AI Workstation", auth_method: str = "none",
+                          scope: Optional[list[str]] = None, proxy: str = "") -> dict:
+    """RFC 7591 dynamic registration. Default: a public client (token_endpoint_auth_method none + PKCE).
+    v3.9.41: `auth_method` client_secret_post / client_secret_basic for servers that want a confidential client
+    (Adobe IMS lists only those two), `scope` for servers that grant a client only what it registered with."""
     ep = as_meta.get("registration_endpoint")
     if not ep:
         raise OAuthError("该服务不支持动态注册，请填写你自己注册的 client_id / client_secret")
     loop = (urlparse(redirect).hostname or "") in ("127.0.0.1", "localhost")
     body = {"client_name": name, "redirect_uris": [redirect], "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"], "token_endpoint_auth_method": "none",
+            "response_types": ["code"], "token_endpoint_auth_method": auth_method or "none",
             "application_type": "native" if loop else "web"}
-    async with http() as c:
+    if scope:
+        body["scope"] = " ".join(scope)
+    async with http(proxy=proxy) as c:
         r = await c.post(ep, json=body)
     if r.status_code >= 300:
         raise OAuthError(f"动态注册失败：HTTP {r.status_code} {r.text[:200]}")
     d = r.json()
     if not d.get("client_id"):
         raise OAuthError("动态注册没有返回 client_id")
-    return {"client_id": d["client_id"], "client_secret": d.get("client_secret") or "",
-            "registered_redirect": redirect, "dcr": True}
+    out = {"client_id": d["client_id"], "client_secret": d.get("client_secret") or "",
+           "registered_redirect": redirect, "dcr": True, "registered_at": time.time()}
+    am = d.get("token_endpoint_auth_method") or auth_method
+    if am in ("client_secret_basic", "client_secret_post"):
+        out["auth_method"] = am
+    if d.get("scope"):
+        out["scope"] = d["scope"]
+    if d.get("client_secret_expires_at"):
+        out["secret_expires_at"] = float(d["client_secret_expires_at"])
+    return out
 
 
 # ------------------------------------------------------------------ authorize / token / revoke
@@ -235,7 +281,7 @@ def _norm_tokens(d: dict, old: Optional[dict] = None) -> dict:
     return tok
 
 
-async def _token_post(endpoint: str, form: dict, client: dict) -> dict:
+async def _token_post(endpoint: str, form: dict, client: dict, proxy: str = "") -> dict:
     form = {k: v for k, v in form.items() if v not in (None, "")}
     auth = None
     if client.get("client_secret") and client.get("auth_method", "client_secret_post") == "client_secret_basic":
@@ -244,7 +290,7 @@ async def _token_post(endpoint: str, form: dict, client: dict) -> dict:
         form["client_id"] = client["client_id"]
         if client.get("client_secret"):
             form["client_secret"] = client["client_secret"]
-    async with http() as c:
+    async with http(proxy=proxy) as c:
         r = await c.post(endpoint, data=form, auth=auth, headers={"Accept": "application/json"})
     try:
         d = r.json()
@@ -253,28 +299,63 @@ async def _token_post(endpoint: str, form: dict, client: dict) -> dict:
         d = dict(parse_qsl(r.text))
     if r.status_code >= 400 or d.get("error") or d.get("ok") is False:
         err = d.get("error") or f"HTTP {r.status_code}"
-        if err in ("invalid_grant", "invalid_token", "unauthorized_client", "invalid_client"):
-            raise ReauthRequired(f"{err}: {d.get('error_description') or ''}"[:300])
-        raise OAuthError(f"{err}: {d.get('error_description') or r.text[:200]}")
+        if err in ("invalid_grant", "invalid_token", "unauthorized_client", "invalid_client") or \
+                (err == "access_denied" and form.get("grant_type") == "refresh_token"):   # Adobe IMS: access_denied
+            raise ReauthRequired(f"{err}: {d.get('error_description') or ''}"[:300], code=str(err))
+        raise OAuthError(f"{err}: {d.get('error_description') or r.text[:200]}", code=str(err))
     return d
 
 
+RESOURCE_ERRORS = ("invalid_target", "invalid_request", "invalid_resource")
+
+
+def _resource_refused(e: Exception) -> bool:
+    """A token endpoint that does not take RFC 8707 `resource` says so with one of these (not invalid_grant)."""
+    return isinstance(e, OAuthError) and not isinstance(e, ReauthRequired) and (
+        getattr(e, "code", "") in RESOURCE_ERRORS or "resource" in str(e).lower())
+
+
 async def exchange_code(endpoint: str, client: dict, code: str, verifier: str, redirect: str,
-                        resource: str = "") -> dict:
-    d = await _token_post(endpoint, {"grant_type": "authorization_code", "code": code, "redirect_uri": redirect,
-                                     "code_verifier": verifier, "resource": resource}, client)
-    return _norm_tokens(d)
+                        resource: str = "", proxy: str = "", resource_fallback: bool = False) -> dict:
+    """v3.9.41 resource_fallback: when the token endpoint refuses `resource`, ask again without it (the code is not
+    spent by a request the server rejected as malformed). tok["resource_sent"] says which way it went."""
+    form = {"grant_type": "authorization_code", "code": code, "redirect_uri": redirect, "code_verifier": verifier,
+            "resource": resource}
+    try:
+        d = await _token_post(endpoint, form, client, proxy)
+        sent = bool(resource)
+    except OAuthError as e:
+        if not (resource and resource_fallback and _resource_refused(e)):
+            raise
+        d = await _token_post(endpoint, {**form, "resource": ""}, client, proxy)
+        sent = False
+    tok = _norm_tokens(d)
+    tok["resource_sent"] = sent
+    return tok
 
 
-async def refresh(endpoint: str, client: dict, tokens: dict, resource: str = "") -> dict:
+async def refresh(endpoint: str, client: dict, tokens: dict, resource: str = "", proxy: str = "",
+                  resource_fallback: bool = False) -> dict:
     if not tokens.get("refresh_token"):
         raise ReauthRequired("没有 refresh token")
-    d = await _token_post(endpoint, {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
-                                     "resource": resource}, client)
-    return _norm_tokens(d, tokens)
+    if tokens.get("resource_sent") is False:
+        resource = ""   # the code exchange already learned this server does not take it
+    form = {"grant_type": "refresh_token", "refresh_token": tokens["refresh_token"], "resource": resource}
+    try:
+        d = await _token_post(endpoint, form, client, proxy)
+        sent = bool(resource)
+    except OAuthError as e:
+        if not (resource and resource_fallback and _resource_refused(e)):
+            raise
+        d = await _token_post(endpoint, {**form, "resource": ""}, client, proxy)
+        sent = False
+    tok = _norm_tokens(d, tokens)
+    if "resource_sent" in tokens or resource_fallback:
+        tok["resource_sent"] = sent
+    return tok
 
 
-async def revoke(endpoint: str, client: dict, tokens: dict) -> bool:
+async def revoke(endpoint: str, client: dict, tokens: dict, proxy: str = "") -> bool:
     """RFC 7009 best effort: refresh token first (revokes the whole grant at most servers)."""
     if not endpoint:
         return False
@@ -287,7 +368,7 @@ async def revoke(endpoint: str, client: dict, tokens: dict) -> bool:
             form = {"token": t, "token_type_hint": hint, "client_id": client.get("client_id")}
             if client.get("client_secret"):
                 form["client_secret"] = client["client_secret"]
-            async with http(10) as c:
+            async with http(10, proxy) as c:
                 r = await c.post(endpoint, data=form)
             ok = ok or r.status_code < 400
         except httpx.HTTPError:
@@ -306,4 +387,4 @@ def mask_url(u: str) -> str:
 
 __all__ = ["OAuthError", "ReauthRequired", "StateStore", "pkce_pair", "pkce_challenge", "redirect_uri", "public_url",
            "parse_www_authenticate", "canonical_resource", "probe", "discover", "register_client", "authorize_url",
-           "exchange_code", "refresh", "revoke", "expired", "http", "TOKEN_SKEW", "Any"]
+           "exchange_code", "refresh", "revoke", "expired", "http", "proxy_for", "valid_proxy", "TOKEN_SKEW", "Any"]

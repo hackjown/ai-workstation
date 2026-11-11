@@ -7,6 +7,8 @@
   GET    /api/connections/{id}/start            restart authorization (re-auth) -> same shape
   POST   /api/connections/{id}/test             list the connection's tools
   DELETE /api/connections/{id}?service=         revoke at the provider (when it has a revocation endpoint) + delete
+  PATCH  /api/connections/{id}                  v3.9.41 preset options without re-authorizing: {proxy, expose, allow_tools,
+                                                resource_mode, scopes} (scopes / resource_mode apply at the next 授权)
   GET    /api/oauth/callback                    the redirect URI (no API token: the single-use state is the proof)
   GET    /api/oauth/settings                    {public_url, redirect_uri, providers:{id:{configured, client_id, help}}}
   PUT    /api/oauth/settings                    {public_url?, providers?:{id:{client_id, client_secret}}}
@@ -17,11 +19,13 @@ import html
 import re
 
 from fastapi import Body, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from . import core
 from .connections import manager
-from .providers import CATALOG, METHOD_LABEL, PROVIDERS
+from .providers import CATALOG, MCP_PRESETS, METHOD_LABEL, PROVIDERS
+
+PRESET_OPTS = ("proxy", "scopes", "resource_mode", "guest", "expose", "allow_tools")
 
 
 def _page(ok: bool, title: str, msg: str) -> HTMLResponse:
@@ -43,7 +47,9 @@ def mount(app, store, secrets, notifier, auth) -> None:
     async def list_connections():
         return {"connections": [conns.public(c) for c in conns.all()], "redirect_uri": core.redirect_uri(store),
                 "catalog": {k: {"name": v["name"], "method": v["method"], "label": METHOD_LABEL.get(v["method"], ""),
-                                "provider": v.get("provider") or "", "mcp_url": v.get("mcp_url") or ""}
+                                "provider": v.get("provider") or "", "mcp_url": v.get("mcp_url") or "",
+                                **({"preset": v["preset"], "scopes": MCP_PRESETS[v["preset"]]["scopes"],
+                                    "help": MCP_PRESETS[v["preset"]].get("help", "")} if v.get("preset") in MCP_PRESETS else {})}
                             for k, v in CATALOG.items()}}
 
     async def _start(**kw) -> dict:
@@ -80,8 +86,36 @@ def mount(app, store, secrets, notifier, auth) -> None:
                 raise HTTPException(400, "先填服务地址（https://…）")
             rec = conns.save_token(connector, str(body["token"]), str(body.get("base_url") or ""), str(body.get("key") or ""))
             return {"id": rec["id"], "status": "ok"}
+        opts = {k: body[k] for k in PRESET_OPTS if k in body}
         return await _start(connector=connector, send_mail=bool(body.get("send_mail")),
-                            client_id=str(body.get("client_id") or ""), client_secret=str(body.get("client_secret") or ""))
+                            client_id=str(body.get("client_id") or ""), client_secret=str(body.get("client_secret") or ""),
+                            options=opts)
+
+    @app.patch("/api/connections/{cid}", dependencies=[Depends(auth)])
+    async def patch_connection(cid: str, body: dict = Body(...)):
+        rec = conns.get(cid)
+        if not rec:
+            raise HTTPException(404, "没有这个连接")
+        if "proxy" in body:
+            p = str(body.get("proxy") or "").strip()
+            if not core.valid_proxy(p):
+                raise HTTPException(400, "代理地址要以 http:// https:// 或 socks5:// 开头")
+            rec["proxy"] = p
+        if body.get("expose") in ("auto", "always"):
+            rec["expose"] = body["expose"]
+        if "allow_tools" in body:
+            al = body.get("allow_tools") or []
+            rec["allow_tools"] = [x.strip() for x in (al if isinstance(al, list) else str(al).split(",")) if x.strip()][:200]
+        if body.get("resource_mode") in ("auto", "on", "off"):
+            rec["resource_mode"] = body["resource_mode"]
+        if "scopes" in body:
+            sc = body.get("scopes") or []
+            rec["scopes"] = [x for x in (sc if isinstance(sc, list) else str(sc).replace(",", " ").split()) if x][:20]
+            rec.pop("scope_note", None)
+        conns.save(rec)
+        from .. import integrations as _ig
+        _ig.forget_tools("conn:" + cid)
+        return conns.public(rec)
 
     @app.get("/api/connections/{cid}/start", dependencies=[Depends(auth)])
     async def restart(cid: str):
@@ -124,6 +158,8 @@ def mount(app, store, secrets, notifier, auth) -> None:
     async def oauth_callback(state: str = "", code: str = "", error: str = "", error_description: str = ""):
         try:
             rec = await conns.callback(state, code, error, error_description)
+            if rec.get("retry_url"):   # v3.9.41: invalid_scope -> straight back to the login with the base scopes
+                return RedirectResponse(rec["retry_url"], status_code=302)
         except core.OAuthError as e:
             return _page(False, "连接失败", str(e))
         except Exception as e:  # noqa: BLE001
@@ -143,7 +179,7 @@ def mount(app, store, secrets, notifier, auth) -> None:
             prov[pid] = {"name": p["name"], "configured": bool(c), "client_id": (c or {}).get("client_id", ""),
                          "has_secret": bool((c or {}).get("client_secret")), "help": p.get("help", ""),
                          "console": p.get("console", "")}
-        return {"public_url": cfg.get("public_url") or "", "env_public_url": core.public_url(store) if not cfg.get("public_url") else "",
+        return {"public_url": cfg.get("public_url") or "", "proxy": cfg.get("proxy") or "", "env_public_url": core.public_url(store) if not cfg.get("public_url") else "",
                 "redirect_uri": core.redirect_uri(store), "providers": prov}
 
     @app.put("/api/oauth/settings", dependencies=[Depends(auth)])
@@ -154,6 +190,13 @@ def mount(app, store, secrets, notifier, auth) -> None:
                 raise HTTPException(400, "公网地址要以 https:// 开头")
             cfg = store.kv_get("oauth_settings", {}) or {}
             cfg["public_url"] = u
+            store.kv_set("oauth_settings", cfg)
+        if "proxy" in body:   # v3.9.41: proxy for every connector's OAuth + MCP traffic (a connection's own wins)
+            p = str(body.get("proxy") or "").strip()
+            if not core.valid_proxy(p):
+                raise HTTPException(400, "代理地址要以 http:// https:// 或 socks5:// 开头")
+            cfg = store.kv_get("oauth_settings", {}) or {}
+            cfg["proxy"] = p
             store.kv_set("oauth_settings", cfg)
         for pid, v in (body.get("providers") or {}).items():
             if pid not in PROVIDERS or not isinstance(v, dict):

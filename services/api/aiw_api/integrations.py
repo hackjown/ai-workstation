@@ -198,6 +198,11 @@ class MCPAuthError(RuntimeError):
     """v3.9.27: the server keeps answering 401 after a refresh -> the connection needs re-authorization."""
 
 
+class MCPForbidden(RuntimeError):
+    """v3.9.41: 403 after a refreshed token (Adobe answers 403, not 401): the account / plan / region is not allowed.
+    Not a re-authorization: logging in again would give the same answer."""
+
+
 class MCPClient:
     """Streamable HTTP MCP client (protocol 2025-06-18, falls back to the 2024-11-05 HTTP+SSE transport when the
     URL does not take a POST). v3.9.27: `token` is a TokenProvider (oauth/connections.py): every request carries
@@ -205,9 +210,11 @@ class MCPClient:
     needs_reauth."""
     PROTOCOL = "2025-06-18"
 
-    def __init__(self, url: str, headers: dict | None = None, token=None):
+    def __init__(self, url: str, headers: dict | None = None, token=None, proxy: str = "", retry_403: bool = False,
+                 fetch_links: bool = False):
         self.url, self.headers = url, {"Accept": "application/json, text/event-stream", **(headers or {})}
         self.token = token
+        self.proxy, self.retry_403, self.fetch_links = proxy or "", retry_403, fetch_links
         self.session_id: str | None = None
         self.protocol: str | None = None
         self._id = 0
@@ -215,7 +222,8 @@ class MCPClient:
 
     def _client(self, timeout: float) -> httpx.AsyncClient:
         from .oauth import core as _oc
-        return httpx.AsyncClient(timeout=timeout, transport=_oc.TRANSPORT, follow_redirects=True)
+        kw = {"proxy": self.proxy} if self.proxy and _oc.TRANSPORT is None else {}
+        return httpx.AsyncClient(timeout=timeout, transport=_oc.TRANSPORT, follow_redirects=True, **kw)
 
     async def _headers(self, stale: str | None = None) -> dict:
         h = dict(self.headers)
@@ -237,6 +245,18 @@ class MCPClient:
             if r.status_code == 401:
                 self.token.reauth()
                 raise MCPAuthError("授权已失效，需要在 设置 › 连接器 重新授权")
+        if r.status_code == 403 and self.token is not None and self.retry_403:
+            # v3.9.41 Adobe: an expired/insufficient token is a bare 403 - refresh once, retry once
+            body = r.text[:300]
+            await r.aclose()
+            stale = h.get("Authorization", "")[7:]
+            try:
+                r = await c.post(self.url, json=msg, headers=await self._headers(stale))
+            except Exception as e:  # noqa: BLE001 - ReauthRequired from the refresh
+                raise MCPAuthError(f"授权已失效，需要在 设置 › 连接器 重新授权（{e}）") from e
+            if r.status_code == 403:
+                raise MCPForbidden("服务拒绝访问（HTTP 403）：账号没有这个功能的权限、套餐或地区不支持，或者需要代理。"
+                                   + (f" 服务返回：{body}" if body.strip() else ""))
         return r
 
     async def _rpc(self, c: httpx.AsyncClient, method: str, params: dict | None = None, notify: bool = False) -> Any:
@@ -362,13 +382,137 @@ class MCPClient:
                 res = await self._rpc(c, "tools/call", {"name": name, "arguments": args})
             finally:
                 await self._close()
-        content = (res or {}).get("content", []) or []
-        texts = [b.get("text", "") for b in content if b.get("type") == "text"]
-        out = {"text": "\n".join(texts)[:6000], "is_error": bool((res or {}).get("isError"))}
-        img = next((b for b in content if b.get("type") == "image" and b.get("data")), None)
-        if img:   # screenshots (Simular box sends webp): re-encode to PNG so every vision model can read them
-            out["image_b64"], out["image_mime"] = to_png_b64(img["data"], img.get("mimeType") or "")
-        return out
+        if not self.fetch_links:
+            content = (res or {}).get("content", []) or []
+            texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+            out = {"text": "\n".join(texts)[:6000], "is_error": bool((res or {}).get("isError"))}
+            img = next((b for b in content if b.get("type") == "image" and b.get("data")), None)
+            if img:   # screenshots (Simular box sends webp): re-encode to PNG so every vision model can read them
+                out["image_b64"], out["image_mime"] = to_png_b64(img["data"], img.get("mimeType") or "")
+            return out
+        return await rich_result(res or {}, self.proxy, name)
+
+
+# ------------------------------------------------------------------ v3.9.41 rich MCP results (Adobe 创意工具)
+MAX_FILE = int(__import__("os").environ.get("AIW_MCP_MAX_FILE", str(40 * 1024 * 1024)))
+MAX_FILES = 8
+MEDIA_EXT = re.compile(r"\.(png|jpe?g|webp|gif|tiff?|psd|svg|ai|pdf|indd|mp4|mov|webm|mp3|wav|m4a|zip)(?:[?#]|$)", re.I)
+URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+")
+
+
+def _fname(name: str, mime: str, i: int, tool: str) -> str:
+    import mimetypes
+    import os as _os
+    base = re.sub(r"[^\w.\-]+", "_", _os.path.basename((name or "").split("?")[0]))[:80].strip("._")
+    if not base:
+        base = f"{NAME_RE.sub('_', tool)[:30]}-{int(__import__('time').time())}-{i + 1}"
+    if "." not in base:
+        base += mimetypes.guess_extension((mime or "").split(";")[0].strip()) or ".bin"
+    return base
+
+
+def _seeable(mime: str) -> bool:
+    return (mime or "").split(";")[0].strip().lower() in ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif")
+
+
+async def _fetch(url: str, proxy: str) -> tuple[bytes, str] | None:
+    """A result link (Adobe returns presigned storage URLs that expire): download it now, capped."""
+    from .oauth import core as _oc
+    try:
+        kw = {"proxy": proxy} if proxy and _oc.TRANSPORT is None else {}
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True, transport=_oc.TRANSPORT, **kw) as c:
+            async with c.stream("GET", url) as r:
+                if r.status_code >= 400:
+                    return None
+                if int(r.headers.get("content-length") or 0) > MAX_FILE:
+                    return None
+                buf = bytearray()
+                async for chunk in r.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > MAX_FILE:
+                        return None
+                return bytes(buf), r.headers.get("content-type", "").split(";")[0]
+    except Exception as e:  # noqa: BLE001
+        log.warning("mcp result link %s: %s", url[:80], e)
+        return None
+
+
+async def rich_result(res: dict, proxy: str = "", tool: str = "") -> dict:
+    """tools/call result -> {text, is_error, files[{name, mime, size, content_b64 | url}], links, image_b64?}.
+    Every binary output (image blocks, embedded resource blobs, resource_link / media URLs in the text) becomes a file:
+    the agent loop puts it on the task card (artifact) and on the computer (~/workspace/<save_dir>/); the model only
+    reads the short text plus the first image. Big base64 never reaches the model's context."""
+    import base64 as _b64
+    content = res.get("content") or []
+    texts, files, links = [], [], []
+    first_img = None
+    for i, b in enumerate(content):
+        t = b.get("type")
+        if t == "text":
+            texts.append(b.get("text") or "")
+        elif t in ("image", "audio") and b.get("data"):
+            mime = b.get("mimeType") or ("image/png" if t == "image" else "audio/mpeg")
+            raw = _b64.b64decode(b["data"])
+            files.append({"name": _fname("", mime, i, tool), "mime": mime, "size": len(raw), "content_b64": b["data"]})
+            if t == "image" and first_img is None and _seeable(mime):
+                first_img = (b["data"], mime)
+        elif t == "resource":
+            r = b.get("resource") or {}
+            mime = r.get("mimeType") or ""
+            if r.get("blob"):
+                raw = _b64.b64decode(r["blob"])
+                files.append({"name": _fname(r.get("uri") or "", mime, i, tool), "mime": mime, "size": len(raw),
+                              "content_b64": r["blob"], "uri": r.get("uri") or ""})
+                if _seeable(mime) and first_img is None:
+                    first_img = (r["blob"], mime)
+            elif r.get("text") is not None:
+                texts.append(f"[{r.get('uri') or 'resource'}]\n{r['text']}")
+        elif t == "resource_link":
+            links.append({"url": b.get("uri") or "", "name": b.get("name") or b.get("title") or "",
+                          "mime": b.get("mimeType") or "", "size": b.get("size")})
+    if not texts and res.get("structuredContent") is not None:
+        texts.append(json.dumps(res["structuredContent"], ensure_ascii=False)[:6000])
+    text = "\n".join(texts)
+    for u in URL_RE.findall(text):   # media URLs inside the text (presigned asset links)
+        u = u.rstrip(".,;")
+        if MEDIA_EXT.search(u.split("?")[0].split("#")[0]) and not any(x["url"] == u for x in links):
+            links.append({"url": u, "name": "", "mime": "", "size": None})
+    for j, ln in enumerate(links[:MAX_FILES]):
+        if not ln["url"].startswith(("https://", "http://")):
+            continue
+        got = await _fetch(ln["url"], proxy)
+        if not got:
+            ln["fetched"] = False
+            continue
+        data, ctype = got
+        mime = ln["mime"] or ctype or ""
+        files.append({"name": _fname(ln["name"] or ln["url"], mime, len(files) + j, tool), "mime": mime, "size": len(data),
+                      "content_b64": _b64.b64encode(data).decode(), "url": ln["url"]})
+        ln["fetched"] = True
+        if _seeable(mime) and first_img is None and len(data) <= 8 * 1024 * 1024:
+            first_img = (_b64.b64encode(data).decode(), mime)
+    seen, uniq = set(), []
+    for f in files[:MAX_FILES]:
+        n, k = f["name"], 2
+        while n in seen:
+            stem, dot, ext = f["name"].rpartition(".")
+            n = f"{stem}-{k}.{ext}" if dot else f"{f['name']}-{k}"
+            k += 1
+        seen.add(n)
+        uniq.append({**f, "name": n})
+    out = {"text": text[:6000], "is_error": bool(res.get("isError"))}
+    if uniq:
+        out["files"] = uniq
+        lines = [f"- {f['name']}（{f['mime'] or '文件'}，{round(f['size'] / 1024)} KB）" for f in uniq]
+        out["text"] = (out["text"] + "\n\n" if out["text"] else "") + "生成/返回的文件：\n" + "\n".join(lines)
+    miss = [ln["url"] for ln in links if ln.get("fetched") is False]
+    if miss:
+        out["links"] = miss
+        out["text"] += "\n没能下载的链接（可能已过期或需要代理）：\n" + "\n".join(miss[:5])
+    if first_img:
+        out["image_b64"], out["image_mime"] = to_png_b64(*first_img) if len(first_img[0]) < 12_000_000 else first_img
+        out["image_note"] = "result"
+    return out
 
 
 def _sse_pick(text: str, mid) -> dict | None:
@@ -401,14 +545,32 @@ _MCP_CACHE: dict[str, tuple[float, list]] = {}
 _MCP_TTL = 300.0
 
 
-async def _mcp_tools(client: "MCPClient", key: str) -> list[dict]:
+async def _mcp_tools(client: "MCPClient", key: str, timeout: float = 8) -> list[dict]:
     import time
     hit = _MCP_CACHE.get(key)
     if hit and time.time() - hit[0] < _MCP_TTL:
         return hit[1]
-    tools = await asyncio.wait_for(client.list_tools(), 8)
+    tools = await asyncio.wait_for(client.list_tools(), timeout)
     _MCP_CACHE[key] = (time.time(), tools)
     return tools
+
+
+def forget_tools(prefix: str) -> None:
+    """v3.9.41: drop cached tool lists (after a connection's settings change)."""
+    for k in [k for k in _MCP_CACHE if k.startswith(prefix)]:
+        _MCP_CACHE.pop(k, None)
+
+
+def gate_tools(tools: dict, prompt: str) -> dict:
+    """v3.9.41: tools whose fn carries `gate` (a regex) are only offered to tasks whose request matches it - 50+ Adobe
+    tools would otherwise ride along in every step of every task. expose=always on the connection sets no gate."""
+    out = {}
+    for k, v in (tools or {}).items():
+        g = getattr(v[1], "gate", None)
+        if g and not re.search(g, prompt or ""):
+            continue
+        out[k] = v
+    return out
 
 
 async def load_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
@@ -451,6 +613,11 @@ async def load_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
     return tools
 
 
+def _glob(name: str, pat: str) -> bool:
+    import fnmatch
+    return fnmatch.fnmatchcase(name, pat) or name == pat
+
+
 async def connection_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
     """v3.9.27: tools from 设置 › 连接器 connections. A connection that needs re-authorization contributes one
     tool, connector_status, so the agent tells the user instead of failing silently."""
@@ -478,11 +645,22 @@ async def connection_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
             elif method == "rest_token":
                 out.update(rest_preset_tools(cid, CATALOG.get(cid) or {}, secrets, base_url=rec.get("base_url") or ""))
             elif method == "mcp_oauth" and rec.get("mcp_url"):
+                from .oauth import core as _oc
+                from .oauth.providers import MCP_PRESETS
+                pre = MCP_PRESETS.get(rec.get("preset") or "") or {}
                 tp = None if rec.get("auth") == "none" else conns.token_provider(cid)
-                client = MCPClient(rec["mcp_url"], token=tp)
-                for t in await _mcp_tools(client, "conn:" + cid + rec["mcp_url"]):
+                client = MCPClient(rec["mcp_url"], token=tp, proxy=_oc.proxy_for(store, rec),
+                                   retry_403=bool(pre.get("retry_403")), fetch_links=bool(pre.get("fetch_links")))
+                allow = [a.lower() for a in (rec.get("allow_tools") or [])]
+                gate = pre.get("gate") if pre and rec.get("expose", "auto") != "always" else None
+                for t in await _mcp_tools(client, "conn:" + cid + rec["mcp_url"], 20 if pre else 8):
+                    if allow and not any(_glob(t["name"].lower(), a) for a in allow):
+                        continue
                     name = safe_name("mcp_", cid, t["name"])
-                    schema = {"name": name, "description": (t.get("description") or t["name"])[:900],
+                    desc = (t.get("description") or t["name"])
+                    if pre:
+                        desc = f"[{rec.get('name') or cid}] " + desc
+                    schema = {"name": name, "description": desc[:900],
                               "parameters": t.get("inputSchema") or {"type": "object", "properties": {}}}
 
                     async def fn(args, _c=client, _n=t["name"]):
@@ -490,6 +668,19 @@ async def connection_tools(store, secrets) -> dict[str, tuple[dict, Any]]:
                             return await _c.call(_n, args)
                         except MCPAuthError as e:
                             return {"text": str(e), "is_error": True, "needs_reauth": True}
+                        except MCPForbidden as e:
+                            return {"text": str(e), "is_error": True, "forbidden": True}
+                    if pre:
+                        ann = t.get("annotations") or {}
+                        if ann.get("destructiveHint") is True:
+                            fn.needs_confirm = lambda a: True   # type: ignore[attr-defined]
+                            fn.confirm_reason = f"{rec.get('name')}：会删除或覆盖你账号里的内容"   # type: ignore[attr-defined]
+                        elif ann.get("readOnlyHint") is True:
+                            fn.needs_confirm = lambda a: False   # type: ignore[attr-defined]
+                        fn.max_result = 3000   # type: ignore[attr-defined]
+                        fn.save_dir = pre.get("save_dir") or f"connectors/{cid}"   # type: ignore[attr-defined]
+                        if gate:
+                            fn.gate = gate   # type: ignore[attr-defined]
                     out[name] = (schema, fn)
         except Exception as e:  # noqa: BLE001 - one broken connection never hides the others
             log.warning("connection %s: %s", cid, e)

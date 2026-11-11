@@ -206,8 +206,44 @@ CATALOG: dict[str, dict] = {
          "url": "{base}/v1/vaults/{vault_id}/items/{item_id}",
          "params": {"vault_id": {"type": "string", "description": "保险库 id", "required": True},
                     "item_id": {"type": "string", "description": "条目 id", "required": True}}}]},
+    # v3.9.41: Adobe's official hosted MCP (Photoshop, Lightroom, Illustrator, Firefly, Premiere, Express, InDesign, Stock)
+    "adobe": {"name": "Adobe 创意工具", "method": "mcp_oauth", "mcp_url": "https://adobe-creativity.adobe.io/mcp",
+              "preset": "adobe"},
     "feishu": {"name": "飞书", "method": "mcp_url"},
     "dingtalk": {"name": "钉钉", "method": "mcp_url"},
+}
+
+# v3.9.41: remote MCP presets whose server does not follow the discovery dance exactly. Keys used by
+# connections._start_preset / integrations.connection_tools:
+#   skip_probe      do not probe first (Adobe answers an unauthenticated initialize with 403 and no WWW-Authenticate)
+#   as_meta         authorization server metadata to use when discovery is unreachable (checked 2026-11-11)
+#   scopes          requested by default (registration AND authorize); base_scopes = fallback after invalid_scope
+#   dcr_auth        token_endpoint_auth_method to register with (IMS lists only client_secret_basic/post)
+#   dcr_scope       send `scope` in the registration (IMS only grants llm.* to a client registered with them)
+#   resource        auto: send RFC 8707 `resource` on authorize + token, drop it on the token call when refused
+#   retry_403       a 403 on a call with a token = refresh once and retry (no WWW-Authenticate challenge)
+#   save_dir        where result files go on the computer (relative to ~/workspace)
+#   gate            tools only offered to tasks that look like this (setting expose=always turns the gate off)
+MCP_PRESETS: dict[str, dict] = {
+    "adobe": {
+        "skip_probe": True,
+        "issuer": "https://ims-na1.adobelogin.com",
+        "as_meta": {"issuer": "https://ims-na1.adobelogin.com",
+                    "authorization_endpoint": "https://ims-na1.adobelogin.com/ims/authorize/v2",
+                    "token_endpoint": "https://ims-na1.adobelogin.com/ims/token/v3",
+                    "registration_endpoint": "https://ims-na1.adobelogin.com/ims/register",
+                    "revocation_endpoint": "https://ims-na1.adobelogin.com/ims/revoke",
+                    "scopes_supported": ["openid", "AdobeID", "offline_access", "llm.assets.manage", "llm.assets.upload"]},
+        "scopes": ["openid", "AdobeID", "offline_access", "llm.assets.manage", "llm.assets.upload"],
+        "base_scopes": ["openid", "AdobeID", "offline_access"],
+        "dcr_auth": "client_secret_post", "dcr_scope": True, "client_name": "AI Workstation",
+        "resource": "auto", "retry_403": True, "fetch_links": True, "save_dir": "connectors/adobe",
+        "gate": r"(?i)adobe|photoshop|(?<![a-z])(?:ps|lr|pr)(?![a-z])|lightroom|illustrator|firefly|premiere|express|indesign|"
+                r"stock|acrobat|修图|抠图|去背景|换背景|调色|滤镜|海报|配图|插画|矢量|logo|标志|设计|排版|画册|生图|生成图|"
+                r"图片|照片|相片|图像|头像|封面|banner|视频|剪辑|字幕|素材|图库|创意|美化|扩图|p图",
+        "help": "Adobe 官方托管 MCP（adobe-creativity.adobe.io）。点「用 Adobe 账号登录」，在 Adobe 页面登录并同意授权即可，"
+                "aiw 会自动注册客户端（不用去 Adobe 开发者控制台）。从国内访问 adobe.io 可能不稳定，可以在下面填代理。",
+    },
 }
 
 # old relay connectors, only read by the one-time migration (connections.migrate_relays)

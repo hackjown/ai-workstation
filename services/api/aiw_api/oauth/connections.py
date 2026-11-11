@@ -5,6 +5,8 @@ Records live in kv "connections" (no secrets in them). Secrets, all in the Secre
   oauth_tok_<cid>        token set {access_token, refresh_token, expires_at, scope, ...}
   oauth_client_<cid>     a client registration for this connection (DCR result or a client the user typed for a
                          custom MCP server), bound to the issuer it was registered at
+  oauth_dcr_<cid>        v3.9.41 presets: {redirect URI: client} - one dynamic registration per redirect URI (SSH tunnel
+                         127.0.0.1 vs LAN IP vs public URL); the one that issued the token is copied to oauth_client_<cid>
   oauth_cfg_<provider>   the user's own OAuth client for google / microsoft / github / slack / ... (设置 › 高级)
   conn_<connector>       API keys / tokens (same name the pre-3.9.27 UI used, so existing connections keep working)
 
@@ -21,7 +23,7 @@ import uuid
 from typing import Any, Optional
 
 from . import core
-from .providers import CATALOG, PROVIDERS, RELAY_HOST_RE, RELAY_IDS, scopes_for
+from .providers import CATALOG, MCP_PRESETS, PROVIDERS, RELAY_HOST_RE, RELAY_IDS, scopes_for
 
 log = logging.getLogger("aiw.oauth")
 KEY = "connections"
@@ -72,6 +74,9 @@ class Connections:
         out["has_token"] = bool(tok.get("access_token"))
         out["expires_at"] = tok.get("expires_at")
         out["scope"] = tok.get("scope") or rec.get("scope") or ""
+        if rec.get("proxy"):
+            out["proxy"] = core.mask_url(rec["proxy"])
+            out["proxy"] = re.sub(r"//[^/@]*@", "//***@", out["proxy"])   # user:pass in a proxy URL
         return out
 
     def provider_client(self, provider: str) -> Optional[dict]:
@@ -137,7 +142,10 @@ class Connections:
                 raise core.ReauthRequired("缺少 OAuth 客户端配置")
             try:
                 self.refresh_count += 1
-                new = await core.refresh(ep["token"], client, tok, rec.get("resource") or "")
+                pre = MCP_PRESETS.get(rec.get("preset") or "") or {}
+                res = "" if rec.get("resource_mode") == "off" else (rec.get("resource") or "")
+                new = await core.refresh(ep["token"], client, tok, res, proxy=core.proxy_for(self.store, rec),
+                                         resource_fallback=(rec.get("resource_mode") or pre.get("resource")) == "auto")
             except core.ReauthRequired as e:
                 self.set_status(cid, "needs_reauth", REAUTH_MSG)
                 raise core.ReauthRequired(f"{rec.get('name') or cid} {REAUTH_MSG}：{e}") from e
@@ -151,12 +159,15 @@ class Connections:
 
     # ------------------------------------------------------------- authorize
     async def start(self, connector: str = "", *, mcp_url: str = "", name: str = "", client_id: str = "",
-                    client_secret: str = "", send_mail: bool = False) -> dict:
-        """-> {id, status, authorize_url?, provider?, message?}. status "authorize": open authorize_url."""
+                    client_secret: str = "", send_mail: bool = False, options: Optional[dict] = None) -> dict:
+        """-> {id, status, authorize_url?, provider?, message?}. status "authorize": open authorize_url.
+        v3.9.41 options (presets): proxy, scopes (list or space separated), resource_mode auto|on|off, guest, expose."""
         redirect = core.redirect_uri(self.store)
         cat = CATALOG.get(connector) or {}
         if connector and not cat:
             raise core.OAuthError(f"未知连接器 {connector}")
+        if cat.get("preset") in MCP_PRESETS:
+            return await self._start_preset(connector, cat, redirect, options or {}, client_id, client_secret)
         method = cat.get("method") or ("mcp_oauth" if mcp_url else "")
         if method in ("native", "rest_oauth"):
             provider = cat["provider"]
@@ -244,31 +255,145 @@ class Connections:
                                    disc["resource"], {}, redirect, offline_ok=offline)
         raise core.OAuthError(f"{cat.get('name') or connector} 不走 OAuth（{method}）")
 
-    def _authorize(self, rec, client, auth_ep, token_ep, scopes, resource, extra, redirect, offline_ok=False) -> dict:
+    async def _start_preset(self, connector: str, cat: dict, redirect: str, opts: dict, client_id: str = "",
+                            client_secret: str = "") -> dict:
+        """v3.9.41: a remote MCP preset (Adobe 创意工具). Goes straight to OAuth: no probe (403 without a challenge),
+        discovery with the preset's metadata as the fallback when adobe.io cannot be read, a confidential DCR client per
+        redirect URI (registered with the scopes), PKCE S256, `resource` with an automatic fallback."""
+        pre = MCP_PRESETS[cat["preset"]]
+        cid = connector
+        url = cat["mcp_url"]
+        rec = self.get(cid) or {"id": cid, "connector": connector, "name": cat["name"], "method": "mcp_oauth",
+                                "preset": cat["preset"], "created_at": time.time()}
+        rec.update(mcp_url=url, preset=cat["preset"], method="mcp_oauth", provider="")
+        if "proxy" in opts:
+            p = str(opts.get("proxy") or "").strip()
+            if not core.valid_proxy(p):
+                raise core.OAuthError("代理地址要以 http:// https:// 或 socks5:// 开头")
+            rec["proxy"] = p
+        if opts.get("scopes"):
+            sc = opts["scopes"] if isinstance(opts["scopes"], list) else str(opts["scopes"]).replace(",", " ").split()
+            rec["scopes"] = [x for x in sc if x][:20]
+            rec.pop("scope_note", None)
+        if opts.get("resource_mode") in ("auto", "on", "off"):
+            rec["resource_mode"] = opts["resource_mode"]
+        if opts.get("expose") in ("auto", "always"):
+            rec["expose"] = opts["expose"]
+        if opts.get("allow_tools") is not None:
+            al = opts["allow_tools"]
+            rec["allow_tools"] = [x.strip() for x in (al if isinstance(al, list) else str(al).split(",")) if x.strip()][:200]
+        proxy = core.proxy_for(self.store, rec)
+        if opts.get("guest"):
+            # reported "guest" tier without login: only if the server really answers an unauthenticated initialize
+            pr = await core.probe(url, proxy=proxy)
+            if pr["needs_auth"]:
+                rec.update(status=rec.get("status") if rec.get("status") == "ok" else "error",
+                           status_msg=f"免登录模式不可用（HTTP {pr.get('status')}），请用 Adobe 账号登录")
+                self.save(rec)
+                return {"id": cid, "status": "error", "message": rec["status_msg"]}
+            rec.update(status="ok", status_msg="免登录模式（功能受限）", auth="none")
+            self.save(rec)
+            return {"id": cid, "status": "ok"}
+        disc_note = ""
+        try:
+            disc = await core.discover(url, "", proxy=proxy)
+            meta, issuer, resource = disc["as_meta"], disc["issuer"], disc["resource"]
+        except Exception as e:  # noqa: BLE001 - unreachable from here (China) or metadata changed: use the preset's
+            log.warning("preset %s discovery: %s", cid, e)
+            meta, issuer, resource = dict(pre["as_meta"]), pre["issuer"], core.canonical_resource(url)
+            disc_note = f"（自动发现失败，用内置的 Adobe IMS 地址：{type(e).__name__}）"
+        if not meta.get("registration_endpoint") and pre["as_meta"].get("registration_endpoint") and \
+                issuer.rstrip("/") == pre["issuer"].rstrip("/"):
+            meta["registration_endpoint"] = pre["as_meta"]["registration_endpoint"]
+        if not meta.get("revocation_endpoint") and issuer.rstrip("/") == pre["issuer"].rstrip("/"):
+            meta["revocation_endpoint"] = pre["as_meta"].get("revocation_endpoint")
+        scopes = list(rec.get("scopes") or pre["scopes"])
+        rec.update(via_provider=False, resource=resource, issuer=issuer,
+                   as_meta={k: meta.get(k) for k in ("issuer", "authorization_endpoint", "token_endpoint",
+                                                     "registration_endpoint", "revocation_endpoint", "scopes_supported")})
+        regs = self.secrets.get_json(f"oauth_dcr_{cid}") or {}
+        if client_id:   # a client the user registered in the Adobe Developer Console (optional)
+            client = {"client_id": client_id, "client_secret": client_secret, "issuer": issuer, "dcr": False,
+                      "auth_method": pre.get("dcr_auth") or "client_secret_post"}
+            regs[redirect] = client
+        else:
+            client = regs.get(redirect)
+            if client and (client.get("issuer") != issuer or
+                           (client.get("dcr") and pre.get("dcr_scope") and set(scopes) - set((client.get("req_scopes") or [])))):
+                client = None   # another server, or registered with fewer scopes than we now ask for
+            if client and client.get("secret_expires_at") and client["secret_expires_at"] < time.time() + 60:
+                client = None
+            if not client:
+                if not meta.get("registration_endpoint"):
+                    rec.update(status="needs_client", status_msg="Adobe 没有提供动态注册，请填你自己的 client_id / client_secret")
+                    self.save(rec)
+                    return {"id": cid, "status": "needs_client", "redirect_uri": redirect, "message": rec["status_msg"]}
+                client = await core.register_client(meta, redirect, pre.get("client_name") or "AI Workstation",
+                                                    auth_method=pre.get("dcr_auth") or "none",
+                                                    scope=scopes if pre.get("dcr_scope") else None, proxy=proxy)
+                client.update(issuer=issuer, req_scopes=scopes)
+            regs[redirect] = client
+        self.secrets.put_json(f"oauth_dcr_{cid}", regs)
+        if not self.secrets.get_json(f"oauth_client_{cid}"):
+            self.secrets.put_json(f"oauth_client_{cid}", client)   # nothing connected yet: this is the client
+        if rec.get("status") != "ok":
+            rec["status"], rec["status_msg"] = "pending", "等待授权" + disc_note
+        self.save(rec)
+        mode = rec.get("resource_mode") or pre.get("resource") or "auto"
+        res = "" if mode == "off" else resource
+        base = list(pre.get("base_scopes") or [])
+        return self._authorize(rec, client, meta["authorization_endpoint"], meta["token_endpoint"], scopes, res, {},
+                               redirect, offline_ok="offline_access" in scopes, preset=cat["preset"], req_scopes=scopes,
+                               scope_retry=bool(base) and set(scopes) != set(base) and not opts.get("_scope_fallback"),
+                               resource_fallback=(mode == "auto"))
+
+    def _authorize(self, rec, client, auth_ep, token_ep, scopes, resource, extra, redirect, offline_ok=False,
+                   **st_extra) -> dict:
         verifier, challenge = core.pkce_pair()
         # the client (and its secret) is NOT put in the state record: the callback looks it up again in the vault
-        state = self.states.create(cid=rec["id"], verifier=verifier, redirect=redirect, token=token_ep, resource=resource)
+        state = self.states.create(cid=rec["id"], verifier=verifier, redirect=redirect, token=token_ep, resource=resource,
+                                   **st_extra)
         url = core.authorize_url(auth_ep, client["client_id"], redirect, state, challenge, scopes, resource, extra,
                                  offline_ok=offline_ok)
         return {"id": rec["id"], "status": "authorize", "authorize_url": url, "redirect_uri": redirect}
 
     async def callback(self, state: str, code: str = "", error: str = "", error_description: str = "") -> dict:
         st = self.states.pop(state)
+        if not st and not state and error:   # v3.9.41: IMS sends ?error=invalid_scope with no state
+            st = self.states.pop_latest(scope_retry=True)
         if not st:
             raise core.OAuthError("授权已过期或链接无效（state 不匹配），请回到连接器页面重新连接")
         rec = self.get(st["cid"])
         if not rec:
             raise core.OAuthError("连接已被删除")
+        pre = MCP_PRESETS.get(st.get("preset") or "") or {}
+        if error == "invalid_scope" and pre and st.get("scope_retry"):
+            # v3.9.41: the server refused the extra scopes (Adobe llm.*): authorize again with the base set
+            rec["scopes"] = list(pre.get("base_scopes") or [])
+            rec["scope_note"] = "已退回基础权限（服务拒绝了 " + " ".join(st.get("req_scopes") or []) + "）"
+            self.save(rec)
+            out = await self.start(rec.get("connector") or rec["id"], options={"_scope_fallback": True})
+            if out.get("status") == "authorize":
+                return {**rec, "retry_url": out["authorize_url"]}
         if error or not code:
             self.set_status(rec["id"], "error", f"授权被拒绝：{error or '没有返回 code'} {error_description}"[:200])
-            raise core.OAuthError(f"授权被拒绝：{error or 'no code'}")
+            raise core.OAuthError(f"授权被拒绝：{error or 'no code'}", code=error or "")
+        if pre:   # the registration made for THIS redirect URI issued the code; it becomes the connection's client
+            reg = (self.secrets.get_json(f"oauth_dcr_{rec['id']}") or {}).get(st["redirect"])
+            if reg and reg.get("client_id"):
+                self.secrets.put_json(f"oauth_client_{rec['id']}", reg)
         client = self.client_for(rec)
         if not client:
             raise core.OAuthError("OAuth 客户端配置已被删除，请重新连接")
-        tok = await core.exchange_code(st["token"], client, code, st["verifier"], st["redirect"], st.get("resource") or "")
+        proxy = core.proxy_for(self.store, rec)
+        tok = await core.exchange_code(st["token"], client, code, st["verifier"], st["redirect"], st.get("resource") or "",
+                                       proxy=proxy, resource_fallback=bool(st.get("resource_fallback")))
         self.secrets.put_json(f"oauth_tok_{rec['id']}", tok)
         rec = self.get(rec["id"]) or rec
         rec.update(status="ok", status_msg="", scope=tok.get("scope", ""), connected_at=time.time())
+        if pre:
+            rec["resource_token"] = tok.get("resource_sent", bool(st.get("resource")))
+            rec["auth"] = "oauth"
         self.save(rec)
         return rec
 
@@ -286,10 +411,10 @@ class Connections:
         ep = self.endpoints(rec) if rec.get("method") in ("native", "rest_oauth", "mcp_oauth") else {}
         if tok and ep.get("revoke") and client:
             try:
-                await core.revoke(ep["revoke"], client, tok)
+                await core.revoke(ep["revoke"], client, tok, proxy=core.proxy_for(self.store, rec))
             except Exception as e:  # noqa: BLE001
                 log.warning("revoke %s: %s", cid, e)
-        for n in (f"oauth_tok_{cid}", f"oauth_client_{cid}"):
+        for n in (f"oauth_tok_{cid}", f"oauth_client_{cid}", f"oauth_dcr_{cid}"):
             self.secrets.delete(n)
         self.store.kv_set(KEY, [c for c in self.all() if c["id"] != cid])
         return True

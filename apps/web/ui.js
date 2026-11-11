@@ -169,7 +169,7 @@ loadSettings = async function () {
   // v3.9.27: direct connectors (OAuth / API key / official MCP) and their redirect URI + client settings
   const [connsR, oauthCfg] = await Promise.all([api("GET", "/api/connections").catch(() => ({ connections: [] })),
     api("GET", "/api/oauth/settings").catch(() => ({ providers: {} }))]);
-  S.conns = connsR.connections || []; S.oauthCfg = oauthCfg;
+  S.conns = connsR.connections || []; S.oauthCfg = oauthCfg; S.connCatalog = connsR.catalog || {};
   const roles = MODEL_ROLES.filter((r) => ["model", "vision_model", "video_model", "image_model", "omni_model"].includes(r.key));
   const omniSt = await api("GET", "/api/omni/status").catch(() => ({ voices: [] }));
   S.omniProbes = S.omniProbes || {}; if (omniSt.probe) S.omniProbes[omniSt.model || ""] = omniSt.probe;
@@ -541,6 +541,7 @@ const CONNECTORS = [
   { id: "calendly", name: "Calendly", cat: "办公", logo: "calendly", kind: "rest_token", keyName: "Personal Access Token", keyUrl: "https://calendly.com/integrations/api_webhooks", desc: "预约链接和日程" },
   { id: "canva", name: "Canva", cat: "设计", logo: "canva", kind: "rest_oauth", provider: "canva", desc: "列出、导出设计（Canva Connect API）" },
   { id: "dropbox", name: "Dropbox", cat: "文件", logo: "dropbox", kind: "rest_oauth", provider: "dropbox", desc: "文件搜索、读取、分享链接" },
+  { id: "adobe", name: "Adobe 创意工具", cat: "设计", logo: "", letter: "A", color: "#eb1000", kind: "oauth", preset: "adobe", loginName: "Adobe", desc: "Photoshop、Lightroom、Illustrator、Firefly、Premiere、Express、InDesign、Stock（Adobe 官方 MCP，50+ 工具；结果图片自动存成任务文件并放到电脑上）" },
   { id: "figma", name: "Figma", cat: "设计", logo: "figma", kind: "rest_token", keyName: "Personal access token（figd_…）", keyUrl: "https://www.figma.com/developers/api#access-tokens", desc: "读取设计稿、导出切图" },
   { id: "linear", name: "Linear", cat: "项目", logo: "linear", kind: "oauth", alt: { url: "https://mcp.linear.app/mcp", header: "Bearer", keyName: "Linear API Key（lin_api_…）", keyUrl: "https://linear.app/settings/account/security" }, desc: "Issue、项目、周期（官方 MCP）" },
   { id: "jira", name: "Jira / Confluence", cat: "项目", logo: "jira", kind: "oauth", desc: "工单和文档（Atlassian 官方 MCP）" },
@@ -590,9 +591,9 @@ function connSection(mcp) {
     else {
       const prov = c.provider && (S.oauthCfg.providers || {})[c.provider];
       const needClient = ["native", "rest_oauth"].includes(c.kind) && prov && !prov.configured;
-      form = `<div class="inl">${c.id === "gmail" ? `<label class="small"><input type="checkbox" id="csend_gmail" /> 允许直接发送（多申请 gmail.send）</label>` : ""}<button type="button" class="btn sm primary" onclick="connOAuth('${c.id}')">${needClient ? "先填 OAuth 客户端" : `用 ${esc(c.provider ? (prov && prov.name) || c.name : c.name)} 账号登录`}</button></div>
+      form = `<div class="inl">${c.id === "gmail" ? `<label class="small"><input type="checkbox" id="csend_gmail" /> 允许直接发送（多申请 gmail.send）</label>` : ""}<button type="button" class="btn sm primary" onclick="connOAuth('${c.id}')">${needClient ? "先填 OAuth 客户端" : `用 ${esc(c.provider ? (prov && prov.name) || c.name : c.loginName || c.name)} 账号登录`}</button></div>
          <span class="small">${c.kind === "oauth" ? "官方远程 MCP，浏览器里登录授权，token 加密保存、自动刷新。" : `用你自己的 ${esc((prov && prov.name) || "")} OAuth 客户端直连官方 API（在下面「高级」里填）。`}${s.msg ? " · " + esc(s.msg) : ""}</span>
-         ${c.alt ? `<details class="more"><summary>${icon("chev")}或者用 API Key</summary>${keyForm(c, c.alt)}</details>` : ""}`;
+         ${c.alt ? `<details class="more"><summary>${icon("chev")}或者用 API Key</summary>${keyForm(c, c.alt)}</details>` : ""}${c.preset ? connPresetForm(c, s.rec) : ""}`;
     }
     const chip = s.st && s.st !== "ok" ? `<span class="chip ${CONN_ST[s.st] ? CONN_ST[s.st][0] : ""}">${esc(s.msg && s.st === "needs_reauth" ? s.msg : (CONN_ST[s.st] || ["", s.st])[1])}</span>` : connected ? '<span class="chip ok">已连接</span>' : "";
     const act = connected ? `<button type="button" class="btn sm" onclick="connTest('${c.id}')">测试</button><button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="connRemove('${c.id}')">断开</button>`
@@ -637,10 +638,32 @@ function connSection(mcp) {
       <details class="more" ${(S.conns || []).some((r) => r.status === "needs_client") ? "open" : ""}><summary>${icon("chev")}高级 · OAuth 回调地址和客户端<span class="cnt">Google、Microsoft 等需要你自己的 OAuth 客户端</span></summary>
         ${row("公网地址", "aiw 有公网 https 域名时填（Cloudflare Tunnel / Tailscale Funnel / 自有域名）；留空用本机回环地址", `<input name="public_url" placeholder="https://aiw.example.com" value="${esc(cfg.public_url || "")}" />`)}
         ${row("要登记的重定向 URI", "在各家开发者控制台创建 OAuth 客户端时，把这个地址填进「重定向 URI / Callback URL」", `<span class="mono" id="connRedirect">${esc(cfg.redirect_uri || "")}</span>`)}
+        ${row("连接器代理", "连接器的授权和调用走这个代理（http:// / socks5://），比如从国内访问 Adobe；单个连接器里填的优先", `<input name="conn_proxy" autocomplete="off" placeholder="留空 = 不用代理（或环境变量 HTTPS_PROXY）" value="${esc(cfg.proxy || "")}" />`)}
         ${provRows}
         <div class="savebar"><span class="note">client_secret 加密保存；用回环地址时只能在 aiw 服务器本机的浏览器里完成登录</span><button class="btn sm primary">保存</button></div>
       </details>
     </form></section>`;
+}
+// v3.9.41: Adobe 创意工具 (official hosted MCP): proxy, scopes, when the tools are offered, and a guest try
+function connPresetForm(c, rec) {
+  const cat = (S.connCatalog || {})[c.id] || {}; rec = rec || {};
+  const scopes = (rec.scopes && rec.scopes.length ? rec.scopes : cat.scopes || []).join(" ");
+  return `<details class="more"><summary>${icon("chev")}代理和高级</summary>
+    <span class="small">${esc(cat.help || "")}${rec.scope_note ? " · " + esc(rec.scope_note) : ""}</span>
+    <input autocomplete="off" id="cpx_${c.id}" placeholder="代理（可选）：http://192.168.50.1:7890 或 socks5://…；留空用「高级」里的连接器代理" value="${esc(rec.proxy || "")}" />
+    <input autocomplete="off" id="csc_${c.id}" placeholder="权限范围（scope）" value="${esc(scopes)}" />
+    <label class="small"><input type="checkbox" id="cexp_${c.id}" ${rec.expose === "always" ? "checked" : ""} /> 每个任务都带上这些工具（默认只在修图、海报、视频这类任务里出现，省 token）</label>
+    <div class="inl">${rec.id ? `<button type="button" class="btn sm" onclick="connPresetSave('${c.id}')">保存设置</button>` : ""}<button type="button" class="btn sm ghost" onclick="connOAuth('${c.id}', {guest: true})">试试免登录模式</button></div></details>`;
+}
+function connPresetOpts(id) {
+  const o = {}; const px = $("cpx_" + id), sc = $("csc_" + id), ex = $("cexp_" + id);
+  if (px) o.proxy = px.value.trim(); if (sc && sc.value.trim()) o.scopes = sc.value.trim(); if (ex) o.expose = ex.checked ? "always" : "auto";
+  return o;
+}
+async function connPresetSave(id) {
+  const st = $("cs_" + id);
+  try { await api("PATCH", `/api/connections/${id}`, connPresetOpts(id)); toast("已保存"); loadSettings(); }
+  catch (err) { st.textContent = "保存失败：" + err.message; st.style.color = "var(--bad)"; }
 }
 function connFilter(cat, q) {
   S.connCat = cat; q = (q == null ? (document.querySelector(".connfilter input") || {}).value || "" : q).trim().toLowerCase();
@@ -702,9 +725,9 @@ async function connOAuthResult(r, label, st) {
   };
   setTimeout(poll, 2000);
 }
-async function connOAuth(id) {
+async function connOAuth(id, extra) {
   const c = CONNECTORS.find((x) => x.id === id); const st = $("cs_" + id); st.style.color = "";
-  const body = { connector: id }; const send = $("csend_gmail"); if (id === "gmail" && send && send.checked) body.send_mail = true;
+  const body = { connector: id, ...(c.preset ? connPresetOpts(id) : {}), ...(extra || {}) }; const send = $("csend_gmail"); if (id === "gmail" && send && send.checked) body.send_mail = true;
   try { await connOAuthResult(await api("POST", "/api/connections", body), c.name, st); } catch (err) { st.textContent = "连接失败：" + err.message; st.style.color = "var(--bad)"; }
 }
 async function connReauth(cid) { try { await connOAuthResult(await api("GET", `/api/connections/${cid}/start`), cid, $("mcpAddNote")); } catch (err) { toast(err.message); } }
@@ -727,7 +750,7 @@ async function connSaveAdv(e) {
     const old = S.oauthCfg.providers[pid];
     if (id !== (old.client_id || "") || sec) providers[pid] = { client_id: id, client_secret: sec };
   });
-  try { S.oauthCfg = await api("PUT", "/api/oauth/settings", { public_url: f.public_url.value.trim(), providers }); toast("已保存 · 重定向 URI " + S.oauthCfg.redirect_uri); loadSettings(); }
+  try { S.oauthCfg = await api("PUT", "/api/oauth/settings", { public_url: f.public_url.value.trim(), proxy: f.conn_proxy.value.trim(), providers }); toast("已保存 · 重定向 URI " + S.oauthCfg.redirect_uri); loadSettings(); }
   catch (err) { toast("保存失败：" + err.message); }
 }
 async function connTest(id) {

@@ -1027,6 +1027,8 @@ class SessionManager:
                 from .integrations import load_tools
                 try:
                     extra = await load_tools(self.store, self.secrets) if self.secrets else {}
+                    from .integrations import gate_tools   # v3.9.41: Adobe tools only for creative requests
+                    extra = gate_tools(extra, task.prompt or "")
                 except Exception as e:  # noqa: BLE001
                     log.warning("integrations unavailable: %s", e)
                     extra = {}

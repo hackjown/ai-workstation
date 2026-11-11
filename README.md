@@ -93,6 +93,23 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.41 连接器：Adobe 创意工具（Adobe 官方托管 MCP）
+
+设置 › 连接器 › 设计 › **Adobe 创意工具**：点「连接」→「用 Adobe 账号登录」，在 Adobe 页面登录并同意授权即可。Agent 随后能直接调用 Adobe for Creativity（`https://adobe-creativity.adobe.io/mcp`，Photoshop、Lightroom、Illustrator、Firefly、Premiere、Express、InDesign、Stock，50+ 工具）。
+
+- **直接走 OAuth**：Adobe 对未登录的 initialize 回 403（不是 401，也没有 WWW-Authenticate），所以预设不先探测。发现顺序：受保护资源元数据（`/.well-known/oauth-protected-resource/mcp` → `ims-na1.adobelogin.com`）→ IMS 授权服务器元数据；adobe.io 读不到时用内置的 IMS 地址（`/ims/authorize/v2`、`/ims/token/v3`、`/ims/register`、`/ims/revoke`）。
+- **动态注册（不用去 Adobe 开发者控制台）**：运行时向 `/ims/register` 注册机密客户端（`client_secret_post`，IMS 只支持 basic/post），注册时带上 scope——IMS 只把 `llm.assets.manage`、`llm.assets.upload` 给注册时申请了它们的客户端（2026-11-11 实测）。**每个回调地址一份注册**（SSH 隧道 127.0.0.1:8000、局域网 IP、公网地址互不覆盖，存 vault `oauth_dcr_adobe`），登录完成时用哪个回调地址，哪份注册就成为这个连接的客户端。client_secret 只在 vault（AES-256-GCM）里，代码里没有写死任何客户端。
+- **授权**：PKCE S256；scope 默认 `openid AdobeID offline_access llm.assets.manage llm.assets.upload`（可在「代理和高级」里改）。IMS 拒绝 scope 时会重定向 `?error=invalid_scope` 且**不带 state**：aiw 认出这次刚发出的授权，自动退回基础权限 `openid AdobeID offline_access` 重新跳转登录。RFC 8707 `resource`：默认 auto——授权和换 token 都带；token 端点拒绝（invalid_target / invalid_request）就不带再换一次，并记住以后刷新也不带；也可设 on / off。
+- **刷新**：token 过期前 60 秒刷新（每个连接一把锁）；IMS 对失效 refresh token 回 `access_denied`，现在也算「需要重新授权」。调用时遇到 403：先刷新一次重试；刷新后仍 403 则告诉 Agent「服务拒绝访问（账号/套餐/地区/代理）」，不把连接标成需要重新授权。
+- **工具**：名字 `mcp_adobe_<工具名>`，说明前缀「[Adobe 创意工具]」；按 MCP annotations：readOnlyHint 不弹确认，destructiveHint 必弹，其余按原来的写操作规则。为省 token，**默认只在像修图/抠图/海报/封面/图片/视频/设计/PS/Firefly… 这类任务里提供**（「每个任务都带上」可关掉这个限制）；可设工具白名单（`allow_tools`，支持 `photoshop_*`）。
+- **结果文件**：图片块、内嵌资源（blob）、resource_link 和文字里的媒体链接（Adobe 返回的预签名地址会过期，立即下载，单个上限 40 MB，最多 8 个）都变成文件：**放在任务卡片的结果文件里**（第一张图做缩略图），同时写到电脑 `~/workspace/connectors/adobe/`；第一张图给模型下一步看（注明是结果图不是屏幕）。base64 不进模型上下文。
+- **代理**：连接器层新增代理（http:// / https:// / socks5://）。设置 › 连接器 › 高级 › 连接器代理（所有连接器），或 Adobe 自己的「代理和高级」（优先）。授权服务器元数据、注册、换 token、刷新、撤销、MCP 调用、结果下载都走它。依赖加了 `socksio`。
+- 「试试免登录模式」：只有服务器真的接受未登录 initialize 时才启用（今天实测是 403，所以会提示不可用）。
+- API：`POST /api/connections {connector:"adobe", proxy?, scopes?, resource_mode?, expose?, allow_tools?, guest?}`；`PATCH /api/connections/{id}`（改代理/白名单/暴露方式，不用重新授权）；`GET/PUT /api/oauth/settings` 多了 `proxy`。
+- iOS / Android 的连接器在网页设置里，App 未改动，版本不变。
+
+**未验证**：真实登录和 token 交换（只做到 Adobe 登录页）、真实 tools/list 和 tools/call（工具名、参数、结果格式按 MCP 规范处理）、免登录档、IMS token 端点对 `resource` 的态度（假 code 时有无 resource 都回 access_denied）、从国内访问 adobe.io / adobelogin.com / auth.services.adobe.com 的情况。
+
 ## v3.9.40 订餐厅交给大众点评/美团确认；机票多平台比价（携程/飞猪/去哪儿/同程）
 
 **订餐厅（第一条路：aiw 找、手机 App 确认）**：说「帮我在静安寺附近订个本帮菜，周六晚上 4 个人」，任务里 Agent 先用搜索/浏览器找 1-3 家合适的餐厅（尽量拿到大众点评/美团店铺链接、评分、人均、地址），再对每家调用新工具 `restaurant_booking`，生成一张预订卡片：店名、地址、★/人均、建议的日期·时间·人数，按钮「打开大众点评预订」「打开美团」。手机上点按钮：有店铺 id 就直达 App 店铺页（`dianping://shopinfo?id=` / `?shopuuid=`、`imeituan://www.meituan.com/food/poi/detail?id=`），没有就打开 App 内搜索（`dianping://searchshoplist?keyword=`、`imeituan://www.meituan.com/search?q=`）；没装 App 时打开网页（m.dianping.com / www.dianping.com / www.meituan.com）。**aiw 不在网页上提交预订，也不付款**，用户在 App 里自己确认。

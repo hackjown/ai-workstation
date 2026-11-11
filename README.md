@@ -93,6 +93,16 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.36 通话收不到麦克风声音（手机网页 / iOS App）
+
+现场诊断：Gemini 已接通（0.9 s），但 21 秒里客户端只发了摄像头画面，没有一条麦克风音频（`in=0 frames=15 … user_tr=never`）。
+
+- 网页（call.js）：点「视频通话」的那一下就同步创建并 `resume()` AudioContext（在任何 await 之前，iOS Safari 只认这一下点击），全程复用；播放一个静音样本解锁外放。若仍不是 running（或被系统打断成 interrupted），屏幕中间出现「点一下开始声音」；通话里点任意位置也会恢复。顶部有麦克风音量条；3 秒没有采样显示「没有收到麦克风声音」，点一下会在新的 AudioContext 上重建麦克风链路；只有数字静音时提示检查静音键/权限。降采样保留小数位置，48 kHz / 44.1 kHz 都精确输出 16 kHz。
+- iOS App（CallView.swift，未编译）：去掉会静默失败的 AVAudioConverter，麦克风缓冲按实际格式（Float32/Int16/Int32、交错与否、多声道取第一个有信号的声道）手工转成 16 kHz 单声道；3 秒无声提示「麦克风没有声音，请检查权限/静音」，并自动关掉语音处理（voice processing）重启一次引擎；处理 AVAudioSession 打断、路由变化和 AVAudioEngine 配置变化（重启引擎）。
+- 服务器：接通后 5 秒（`AIW_OMNI_NO_MIC_S`，0 = 关）仍没收到任何音频，在通话时间线记 WARNING「no audio from client」，并给客户端发一次 `{"type":"error","code":"no_mic"}`（「服务器没有收到麦克风声音（摄像头画面正常）…」）。客户端静音时发 `{"type":"mute","on":true}`，不会误报；取消静音后重新计时。
+- start 消息新增 `client`（`ios` / `web`）和 `ua`；「call from …」日志行和 `GET /api/omni/calls` 显示 client / ua（老客户端用请求头 User-Agent）。
+- 提示：手机网页通话必须用 HTTPS（反向代理/远程访问也要 https://），否则浏览器不给麦克风。
+
 ## v3.9.35 Gemini Live 通话加固与诊断
 
 - 上游断开必报原因：每次关闭都记录代码和原因；超配额、Key 错误、参数错误（1007/1008/1011 等）会把原因发给客户端并结束通话；连续 3 次快速断开结束通话；重连异常也会结束通话，不再出现「已接通但不回话」。

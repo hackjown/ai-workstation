@@ -10,6 +10,14 @@ import CoreImage
 // tap on the captions (打断). The camera (front/back, can be turned off) gives a JPEG (≤720 px long edge, quality 0.6)
 // at most once a second. A transcript with speak=true (a text-only model and no 朗读模型 on the server) is read out
 // with AVSpeechSynthesizer. The server saves the call's transcript to the 小秘 chat at hang-up.
+// v3.9.36 (a call where the server got camera frames but no microphone audio): the mic tap no longer goes through an
+// AVAudioConverter that silently failed / gave 0 frames - each buffer is taken in whatever format it comes (Float32,
+// Int16 or Int32, interleaved or not, 1 or more channels: the first channel that has signal is used, like
+// channelMap [0]) and resampled to 16 kHz by hand with a fractional position kept across buffers. If no mic buffer
+// (or only digital silence) arrives for 3 s the note says 「麦克风没有声音，请检查权限/静音」 and the engine is
+// restarted once without voice processing; the server's no_mic error does the same. AVAudioSession interruptions,
+// route changes and AVAudioEngine configuration changes restart the engine. start says client "ios"; mute is told to
+// the server so a muted mic is not reported as broken.
 
 final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     @Published var mode = ""          // "realtime" | "turn" | "gemini" (v3.9.32) once the server is ready
@@ -29,8 +37,19 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let outFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 24000, channels: 1, interleaved: false)!
-    private let micFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true)!
-    private var converter: AVAudioConverter?
+    private var rsRate: Double = 0              // v3.9.36 resampler state (audio thread only)
+    private var rsPos: Double = 0
+    private var rsTail: [Float] = []
+    private let micLock = NSLock()              // guards the three stamps below (audio thread writes, main reads)
+    private var lastBufAt: TimeInterval = 0     // last mic buffer of any kind
+    private var lastVoiceAt: TimeInterval = 0   // last mic buffer that was not digital silence
+    private var audioStartAt: TimeInterval = 0  // when the engine (re)started
+    private var micChecker: Timer?
+    private var micWarned = false
+    private var vpOn = true
+    private var vpFallbackTried = false
+    private var observers: [NSObjectProtocol] = []
+    private var restartWork: DispatchWorkItem?
     private var task: URLSessionWebSocketTask?
     private let videoQueue = DispatchQueue(label: "aiw.call.video")
     private let ci = CIContext()
@@ -69,27 +88,121 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
             let s = AVAudioSession.sharedInstance()
             try s.setCategory(.playAndRecord, mode: .voiceChat, options: [.defaultToSpeaker, .allowBluetooth])
             try s.setActive(true)
-            let input = engine.inputNode
-            try? input.setVoiceProcessingEnabled(true)   // system AEC / noise suppression on the engine
-            let inFmt = input.outputFormat(forBus: 0)
-            guard inFmt.sampleRate > 0, inFmt.channelCount > 0 else { fail("没有可用的麦克风"); return }
-            converter = AVAudioConverter(from: inFmt, to: micFormat)
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 1024, format: inFmt) { [weak self] buf, _ in self?.onMic(buf) }
-            engine.attach(player)
-            engine.connect(player, to: engine.mainMixerNode, format: outFormat)
-            engine.prepare()
-            try engine.start()
-            player.play()
+            try startAudio(voiceProcessing: true)
         } catch {
             fail("麦克风打不开：\(error.localizedDescription)")
             return
         }
+        observeAudio()
         if cameraOn { startCamera() }
         connect()
         clock = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.seconds += 1 }
         pinger = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.send(["type": "ping"]) }
+        micChecker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.checkMic() }
         UIApplication.shared.isIdleTimerDisabled = true
+    }
+
+    /// v3.9.36: (re)builds the input tap and starts the engine. The input format is read after voice processing is
+    /// switched (it can change the channel count and rate); the tap takes that format and onMic copes with any.
+    private func startAudio(voiceProcessing: Bool) throws {
+        let input = engine.inputNode
+        if engine.isRunning { engine.stop() }
+        input.removeTap(onBus: 0)
+        if input.isVoiceProcessingEnabled != voiceProcessing {
+            try? input.setVoiceProcessingEnabled(voiceProcessing)   // system AEC / noise suppression on the engine
+        }
+        vpOn = input.isVoiceProcessingEnabled
+        let inFmt = input.outputFormat(forBus: 0)
+        guard inFmt.sampleRate > 0, inFmt.channelCount > 0 else {
+            throw NSError(domain: "aiw.call", code: 1, userInfo: [NSLocalizedDescriptionKey: "没有可用的麦克风"])
+        }
+        input.installTap(onBus: 0, bufferSize: 1024, format: inFmt) { [weak self] buf, _ in self?.onMic(buf) }
+        if player.engine == nil { engine.attach(player) }
+        engine.connect(player, to: engine.mainMixerNode, format: outFormat)
+        engine.prepare()
+        try engine.start()
+        player.play()
+        micLock.lock()
+        audioStartAt = ProcessInfo.processInfo.systemUptime
+        micLock.unlock()
+    }
+
+    /// Restart the engine a moment after an interruption / route change / config change (they come in bursts).
+    private func scheduleRestart(_ why: String, voiceProcessing: Bool? = nil) {
+        if voiceProcessing == nil {   // our own engine start can post a config / route change: no restart loop
+            micLock.lock()
+            let started = audioStartAt
+            micLock.unlock()
+            if ProcessInfo.processInfo.systemUptime - started < 1.0 { return }
+        }
+        restartWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self, !self.ended else { return }
+            do {
+                try? AVAudioSession.sharedInstance().setActive(true)
+                try self.startAudio(voiceProcessing: voiceProcessing ?? self.vpOn)
+            } catch {
+                self.note = "麦克风重启失败（\(why)）：\(error.localizedDescription)"
+            }
+        }
+        restartWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: w)
+    }
+
+    private func observeAudio() {
+        let nc = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+        observers.append(nc.addObserver(forName: AVAudioSession.interruptionNotification, object: session, queue: .main) { [weak self] n in
+            guard let self = self, !self.ended,
+                  let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            if type == .began {
+                self.note = "通话声音被系统打断了…"
+            } else {
+                self.note = ""
+                self.scheduleRestart("interruption")
+            }
+        })
+        observers.append(nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: session, queue: .main) { [weak self] n in
+            guard let self = self, !self.ended,
+                  let raw = n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+            switch reason {
+            case .newDeviceAvailable, .oldDeviceUnavailable, .routeConfigurationChange:
+                self.scheduleRestart("route")
+            default:
+                break   // .categoryChange / .override come from our own setup
+            }
+        })
+        observers.append(nc.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            guard let self = self, !self.ended else { return }
+            self.scheduleRestart("config")
+        })
+    }
+
+    /// Every second: no mic buffer (or only digital silence) for 3 s since the engine started -> say so, and the
+    /// first time restart without voice processing (some routes give nothing through the voice-processing unit).
+    private func checkMic() {
+        guard !ended, !isMuted else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        micLock.lock()
+        let started = audioStartAt, buf = lastBufAt, voiced = lastVoiceAt
+        micLock.unlock()
+        guard started > 0, now - started >= 3 else { return }
+        let silent = now - max(voiced, started) >= 3
+        if silent {
+            if !micWarned {
+                micWarned = true
+                note = buf < started ? "麦克风没有声音，请检查权限/静音" : "麦克风只有静音，请检查权限/静音"
+            }
+            if vpOn && !vpFallbackTried {
+                vpFallbackTried = true
+                scheduleRestart("no mic", voiceProcessing: false)
+            }
+        } else if micWarned {
+            micWarned = false
+            if note.hasPrefix("麦克风") { note = "" }
+        }
     }
 
     func hangup() {
@@ -104,7 +217,10 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
         guard !ended else { return }
         ended = true
         stopPlayback()
-        clock?.invalidate(); pinger?.invalidate()
+        clock?.invalidate(); pinger?.invalidate(); micChecker?.invalidate()
+        restartWork?.cancel()
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         videoQueue.async { if self.capture.isRunning { self.capture.stopRunning() } }
@@ -126,7 +242,10 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
         t.maximumMessageSize = 4 * 1024 * 1024
         task = t
         t.resume()
-        send(["type": "start", "video": cameraOn])
+        let ver = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "?"
+        let ua = "aiw-ios/\(ver) iOS \(UIDevice.current.systemVersion) \(UIDevice.current.model)"
+        send(["type": "start", "video": cameraOn, "client": "ios", "ua": ua])
+        if isMuted { send(["type": "mute", "on": true]) }
         receive(t)
     }
 
@@ -183,6 +302,10 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
         case "error":
             lastErr = o.s("message")
             if o.s("code") == "disabled" || mode.isEmpty { error = o.s("message") } else { note = o.s("message") }
+            if o.s("code") == "no_mic" && !vpFallbackTried {   // v3.9.36: the server heard nothing from us
+                vpFallbackTried = true
+                scheduleRestart("server no_mic", voiceProcessing: false)
+            }
         case "ended":
             // v3.9.35: a call the server ended (model gone, quota, no response…) stays on screen with the reason
             // instead of closing at once, so the user sees why; a normal hang-up still closes the view
@@ -196,24 +319,70 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
 
     // MARK: audio
     private func onMic(_ buf: AVAudioPCMBuffer) {
-        guard let conv = converter else { return }
-        let cap = AVAudioFrameCount(Double(buf.frameLength) * micFormat.sampleRate / buf.format.sampleRate + 64)
-        guard let out = AVAudioPCMBuffer(pcmFormat: micFormat, frameCapacity: cap) else { return }
-        var fed = false
-        var err: NSError?
-        conv.convert(to: out, error: &err) { _, status in
-            if fed { status.pointee = .noDataNow; return nil }
-            fed = true
-            status.pointee = .haveData
-            return buf
+        let frames = Int(buf.frameLength)
+        let chans = Int(buf.format.channelCount)
+        let rate = buf.format.sampleRate
+        guard frames > 0, chans > 0, rate > 0 else { return }
+        let mono = monoSamples(buf, frames: frames, chans: chans)
+        var peak: Float = 0
+        for v in mono { let a = abs(v); if a > peak { peak = a } }
+        let now = ProcessInfo.processInfo.systemUptime
+        micLock.lock()
+        lastBufAt = now
+        if peak > 0.0001 { lastVoiceAt = now }
+        micLock.unlock()
+        if rate != rsRate { rsRate = rate; rsPos = 0; rsTail = [] }   // the route changed the rate: start over
+        let ratio = rate / 16000
+        let raw = rsTail + mono
+        var pos = rsPos
+        var out = [Int16]()
+        out.reserveCapacity(Int(Double(raw.count) / ratio) + 1)
+        while pos + ratio <= Double(raw.count) {   // average each 1/16000 s window (a box filter) to 16 kHz
+            let a = Int(pos)
+            let b = max(a + 1, Int(pos + ratio))
+            var sum: Float = 0
+            for j in a..<b { sum += raw[j] }
+            var v = sum / Float(b - a)
+            if v.isNaN { v = 0 }
+            v = max(-1, min(1, v))
+            out.append(Int16(v < 0 ? v * 32768 : v * 32767))
+            pos += ratio
         }
-        guard err == nil, out.frameLength > 0, let ch = out.int16ChannelData else { return }
-        acc.append(Data(bytes: ch[0], count: Int(out.frameLength) * 2))
+        let used = min(Int(pos), raw.count)
+        rsTail = Array(raw[used...])
+        rsPos = pos - Double(used)
+        out.withUnsafeBufferPointer { acc.append(Data(buffer: $0)) }
         while acc.count >= 1280 {   // 40 ms of 16 kHz pcm16
             let chunk = Data(acc.prefix(1280))
             acc.removeFirst(1280)
             if !isMuted { send(["type": "audio", "data": chunk.base64EncodedString()]) }
         }
+    }
+
+    /// One channel of the tap buffer as Float in -1...1, whatever its sample format and layout: the first channel
+    /// with signal (voice processing can hand over several channels with the voice in the first).
+    private func monoSamples(_ buf: AVAudioPCMBuffer, frames: Int, chans: Int) -> [Float] {
+        let inter = buf.format.isInterleaved
+        let stride = inter ? chans : 1
+        var best = [Float](repeating: 0, count: frames)
+        for c in 0..<chans {
+            var ch = [Float](repeating: 0, count: frames)
+            if let f = buf.floatChannelData {
+                let p = inter ? f[0] + c : f[c]
+                for i in 0..<frames { ch[i] = p[i * stride] }
+            } else if let q = buf.int16ChannelData {
+                let p = inter ? q[0] + c : q[c]
+                for i in 0..<frames { ch[i] = Float(p[i * stride]) / 32768 }
+            } else if let q = buf.int32ChannelData {
+                let p = inter ? q[0] + c : q[c]
+                for i in 0..<frames { ch[i] = Float(p[i * stride]) / 2147483648 }
+            } else {
+                return best
+            }
+            if ch.contains(where: { $0 != 0 }) { return ch }
+            if c == 0 { best = ch }
+        }
+        return best
     }
 
     private func play(_ b64: String) {
@@ -261,6 +430,12 @@ final class CallEngine: NSObject, ObservableObject, AVCaptureVideoDataOutputSamp
     func toggleMute() {
         muted.toggle()
         isMuted = muted
+        send(["type": "mute", "on": muted])
+        if !muted {   // a fresh 3 s before the no-mic note
+            micLock.lock()
+            audioStartAt = ProcessInfo.processInfo.systemUptime
+            micLock.unlock()
+        }
     }
 
     // MARK: camera

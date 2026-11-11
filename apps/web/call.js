@@ -4,10 +4,18 @@
    the model's 24 kHz pcm16 plays through a scheduled AudioBuffer queue, cut at once on speech_started / 打断.
    echoCancellation is asked for in getUserMedia so the model does not hear itself. Server messages: ready (mode
    badge 实时 / 轮流), audio, transcript (live captions; speak=true -> read out with speechSynthesis), speech_started,
-   tool, error, ended. The transcript is saved to the 小秘 chat by the server at hang-up. */
-const CALL = { ws: null, ctx: null, mic: null, cam: null, node: null, src: null, sources: new Set(), next: 0,
-  muted: false, video: true, facing: "user", frameT: null, pingT: null, clockT: null, t0: 0, ended: false,
-  lastThumb: null, lastSent: 0, caps: { user: "", assistant: "" }, mode: "", wake: null };
+   tool, error, ended. The transcript is saved to the 小秘 chat by the server at hang-up.
+   v3.9.36 (no mic audio from iPhone Safari): the AudioContext is created and resume()d synchronously inside the tap
+   that opens the call (before any await - iOS forgets the user gesture after one), and reused; a silent buffer unlocks
+   playback. If it is still not "running" (or iOS interrupts it later), a 「点一下开始声音」 overlay resumes it on the
+   next tap; any tap in the call also resumes it. A mic level meter shows the microphone is heard, and 「没有收到麦克风
+   声音」 shows when no samples arrive for 3 s (a tap then rebuilds the audio graph). The downsampler keeps its
+   fractional position across 128-sample worklet blocks so 48 kHz / 44.1 kHz both give exact 16 kHz. start says
+   client "web"; mute / unmute is told to the server so a muted mic is not reported as broken. */
+const CALL = { ws: null, ctx: null, mic: null, cam: null, node: null, src: null, sink: null, sources: new Set(), next: 0,
+  muted: false, video: true, facing: "user", frameT: null, pingT: null, clockT: null, micT: null, t0: 0, ended: false,
+  lastThumb: null, lastSent: 0, caps: { user: "", assistant: "" }, mode: "", wake: null, opening: false,
+  samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, level: 0, meterAt: 0, micWarn: false };
 
 Object.assign(IC, {
   phone: "M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z",
@@ -20,24 +28,100 @@ document.querySelectorAll("#hsheet [data-hi], #callBtn [data-hi]").forEach((el) 
 
 const CALL_WORKLET = `class P extends AudioWorkletProcessor{process(i){const c=i[0]&&i[0][0];if(c)this.port.postMessage(c.slice(0));return true}}registerProcessor("aiw-mic",P);`;
 
+/* v3.9.36: must run synchronously inside a user tap (no await before it): creates / resumes the one AudioContext of
+   the call and plays one silent sample, which is what lets iOS Safari run the mic worklet and play the answer. */
+function callUnlockAudio() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  if (!CALL.ctx || CALL.ctx.state === "closed") {
+    try { CALL.ctx = new AC({ latencyHint: "interactive" }); } catch (e) { CALL.ctx = new AC(); }
+    CALL.ctx.onstatechange = callCtxState;
+  }
+  const ctx = CALL.ctx;
+  try { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); } catch (e) { /* old Safari */ }
+  try {
+    const b = ctx.createBuffer(1, 1, ctx.sampleRate); const s = ctx.createBufferSource();
+    s.buffer = b; s.connect(ctx.destination); s.start(0);
+  } catch (e) { /* nothing to unlock */ }
+  return ctx;
+}
+
+function callCtxState() {   // iOS: "interrupted" (a phone call, Siri, another app's audio), "suspended" (no gesture)
+  const ctx = CALL.ctx;
+  if (!ctx || CALL.ended || ctx.onstatechange !== callCtxState) return;
+  if (ctx.state === "running") { callAudioGate(false); return; }
+  if (ctx.state === "closed") return;
+  setTimeout(() => {   // try once on our own; iOS often lets an interrupted context resume after the interruption
+    if (!CALL.ctx || CALL.ended || CALL.ctx.state === "running") return;
+    try { CALL.ctx.resume().catch(() => {}); } catch (e) { /* no */ }
+    setTimeout(() => { if (CALL.ctx && !CALL.ended && CALL.ctx.state !== "running") callAudioGate(true); }, 400);
+  }, 300);
+}
+
+/* the tap-to-start-audio overlay: a real tap is what iOS needs to resume the context */
+function callAudioGate(on, text) {
+  const v = $("callView"); if (!v) return;
+  let g = $("callGate");
+  if (!on) { if (g) g.remove(); return; }
+  if (!g) {
+    g = document.createElement("button"); g.id = "callGate"; g.className = "call-gate"; g.type = "button";
+    g.onclick = (e) => { e.stopPropagation(); callGateTap(); };
+    v.appendChild(g);
+  }
+  g.innerHTML = `${icon("mic")}<span>${esc(text || "点一下开始声音")}</span>`;
+}
+
+function callGateTap() {
+  const ctx = callUnlockAudio();   // synchronous, inside the tap
+  if (!ctx) return;
+  const stale = CALL.audioAt && Date.now() - Math.max(CALL.lastSample, CALL.audioAt) > 3000;
+  if (CALL.mic && (stale || !CALL.node)) {
+    // the context runs but the mic delivers nothing: rebuild the graph on a fresh context made in this tap
+    try { CALL.node && CALL.node.disconnect(); CALL.src && CALL.src.disconnect(); } catch (e) { /* gone */ }
+    if (CALL.samples === 0 || stale) {
+      try { ctx.onstatechange = null; ctx.close().catch(() => {}); } catch (e) { /* closed */ }
+      CALL.ctx = null; callUnlockAudio();
+    }
+    CALL.sources.clear(); CALL.next = 0;   // the answer queue was timed on the old context
+    callAudio().catch((e) => toast("麦克风打不开：" + e.message));
+  }
+  setTimeout(() => { if (CALL.ctx && CALL.ctx.state === "running") callAudioGate(false); }, 250);
+}
+
+function callTapResume() {   // any tap in the call: resume a suspended / interrupted context
+  if (CALL.ctx && CALL.ctx.state !== "running" && CALL.ctx.state !== "closed") callUnlockAudio();
+}
+
 async function openCall(video = true) {
-  if (CALL.ws) return;
+  if (CALL.ws || CALL.opening) return;
+  callUnlockAudio();   // v3.9.36: before the first await, while the tap still counts
+  CALL.opening = true;
   let st;
-  try { st = await api("GET", "/api/omni/status"); } catch (e) { return toast("读不到通话设置：" + e.message); }
+  try { st = await api("GET", "/api/omni/status"); } catch (e) { CALL.opening = false; callDropCtx(); return toast("读不到通话设置：" + e.message); }
+  CALL.opening = false;
   if (!st.enabled) {
+    callDropCtx();
     return modal(`<div class="callnote"><h3>${icon("phone")} 视频通话还没开</h3><div class="muted">${esc(st.message || "先设置通话模型")}</div>
       <div class="row gap"><button class="btn primary" onclick="closeOverlays();go('settings');setTimeout(()=>{const el=document.getElementById('g-call');if(el)el.scrollIntoView({behavior:'smooth'})},400)">去设置</button><button class="btn" onclick="closeOverlays()">取消</button></div></div>`);
   }
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return toast("这个浏览器不能用麦克风（需要 HTTPS 或 localhost）");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { callDropCtx(); return toast("这个浏览器不能用麦克风（需要 HTTPS 或 localhost）"); }
   CALL.video = video; CALL.ended = false; CALL.muted = false; CALL.facing = "user"; CALL.caps = { user: "", assistant: "" };
+  Object.assign(CALL, { samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, level: 0, micWarn: false });
   callView(st);
   try {
     CALL.mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
   } catch (e) { callEnd("没有麦克风权限：" + (e.message || e.name)); return; }
   if (video) await callCamera(true);
   try { await callAudio(); } catch (e) { callEnd("麦克风打不开：" + e.message); return; }
+  if (CALL.ended) return;
+  CALL.mic.getAudioTracks().forEach((t) => { t.onended = () => { if (!CALL.ended) callMicWarn(true, "麦克风被系统停掉了，挂断后重拨"); }; });
+  CALL.micT = setInterval(callMicCheck, 1000);
   callConnect(st);
   try { CALL.wake = await navigator.wakeLock.request("screen"); } catch (e) { /* not supported */ }
+}
+
+function callDropCtx() {
+  if (CALL.ctx && !CALL.ws) { try { CALL.ctx.onstatechange = null; CALL.ctx.close().catch(() => {}); } catch (e) { /* closed */ } CALL.ctx = null; }
 }
 
 function callView(st) {
@@ -45,7 +129,8 @@ function callView(st) {
   if (!el) { el = document.createElement("div"); el.id = "callView"; document.body.appendChild(el); }
   el.innerHTML = `<video id="callVideo" playsinline muted autoplay></video>
     <div class="call-orb" id="callOrb"><span class="mate" id="callMate" role="img" aria-label="球球"></span></div>
-    <div class="call-top"><span class="call-badge" id="callBadge">连接中…</span><span class="call-clock" id="callClock">00:00</span></div>
+    <div class="call-top"><span class="call-badge" id="callBadge">连接中…</span><span class="call-meter" id="callMeter" title="麦克风音量"><i></i></span><span class="call-clock" id="callClock">00:00</span></div>
+    <div class="call-warn" id="callWarn" hidden></div>
     <div class="call-caps" id="callCaps" onclick="callInterrupt()" title="点一下打断"><div class="cap-u" id="capU"></div><div class="cap-a" id="capA">正在接通…</div></div>
     <div class="call-bar">
       <button class="cbtn" id="callMute" onclick="callMute()" aria-label="静音">${icon("mic")}</button>
@@ -54,6 +139,7 @@ function callView(st) {
       <button class="cbtn end" onclick="callHangup()" aria-label="挂断">${icon("hangup")}</button>
     </div>`;
   el.classList.add("on");
+  el.onpointerdown = callTapResume;   // v3.9.36
   document.body.classList.add("in-call");
   try { if (window.AiwMate && AiwMate.create) { CALL.mate = AiwMate.create($("callMate"), { eyeScale: 1.7 }); CALL.mate.set("02"); } } catch (e) { CALL.mate = null; }
   CALL.t0 = Date.now();
@@ -97,30 +183,74 @@ function callFrame() {
   }, "image/jpeg", 0.6);
 }
 
-async function callAudio() {
-  const AC = window.AudioContext || window.webkitAudioContext;
-  CALL.ctx = new AC();
-  if (CALL.ctx.state === "suspended") await CALL.ctx.resume();
-  CALL.src = CALL.ctx.createMediaStreamSource(CALL.mic);
-  const rate = CALL.ctx.sampleRate; const ratio = rate / 16000;
-  let acc = new Float32Array(0);
-  const push = (f32) => {   // downsample by averaging to 16 kHz, send 40 ms (640 samples) at a time
-    const n = Math.floor(f32.length / ratio); const out = new Float32Array(n);
-    for (let i = 0; i < n; i++) { const a = Math.floor(i * ratio), b = Math.min(f32.length, Math.floor((i + 1) * ratio)); let s = 0; for (let j = a; j < b; j++) s += f32[j]; out[i] = s / Math.max(1, b - a); }
-    const m = new Float32Array(acc.length + n); m.set(acc); m.set(out, acc.length); acc = m;
-    while (acc.length >= 640) { callSendPcm(acc.subarray(0, 640)); acc = acc.slice(640); }
+/* v3.9.36: a downsampler to 16 kHz that keeps its fractional read position between calls, so 128-sample worklet
+   blocks at 48 kHz (ratio 3) and 44.1 kHz (ratio 2.75625) lose nothing; chunks of 640 samples (40 ms) go to onChunk. */
+function callDownsampler(rate, onChunk, size = 640) {
+  const ratio = rate / 16000;
+  let raw = new Float32Array(0), pos = 0, out = new Float32Array(size), k = 0;
+  return (f32) => {
+    const m = new Float32Array(raw.length + f32.length); m.set(raw); m.set(f32, raw.length); raw = m;
+    while (pos + ratio <= raw.length) {
+      const a = Math.floor(pos), b = Math.max(a + 1, Math.floor(pos + ratio)); let s = 0;
+      for (let j = a; j < b; j++) s += raw[j];
+      out[k++] = s / (b - a); pos += ratio;
+      if (k === size) { onChunk(out); out = new Float32Array(size); k = 0; }
+    }
+    const used = Math.floor(pos); raw = raw.slice(used); pos -= used;
   };
-  if (CALL.ctx.audioWorklet) {
+}
+
+async function callAudio() {
+  const ctx = CALL.ctx && CALL.ctx.state !== "closed" ? CALL.ctx : callUnlockAudio();
+  if (!ctx) throw new Error("这个浏览器没有 Web Audio");
+  CALL.ctx = ctx;
+  // resume() can stay pending forever on iOS without a gesture: never wait on it for long
+  if (ctx.state !== "running") await Promise.race([ctx.resume().catch(() => {}), new Promise((r) => setTimeout(r, 600))]);
+  CALL.src = ctx.createMediaStreamSource(CALL.mic);
+  const push = callDownsampler(ctx.sampleRate, callSendPcm);
+  const feed = (f32) => {   // level meter + "are samples arriving at all"
+    const now = Date.now(); CALL.samples += f32.length; CALL.lastSample = now;
+    let pk = 0, sq = 0; for (let i = 0; i < f32.length; i++) { const v = f32[i]; sq += v * v; if (v > pk) pk = v; else if (-v > pk) pk = -v; }
+    if (pk > 1e-4) CALL.lastVoice = now;
+    CALL.level = Math.max(Math.sqrt(sq / Math.max(1, f32.length)), CALL.level * 0.85);
+    if (now - CALL.meterAt > 100) { CALL.meterAt = now; const m = $("callMeter"); if (m && m.firstChild) m.firstChild.style.width = Math.min(100, Math.round(CALL.level * 400)) + "%"; }
+    push(f32);
+  };
+  if (ctx.audioWorklet && window.AudioWorkletNode) {
     const url = URL.createObjectURL(new Blob([CALL_WORKLET], { type: "application/javascript" }));
-    await CALL.ctx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
-    CALL.node = new AudioWorkletNode(CALL.ctx, "aiw-mic");
-    CALL.node.port.onmessage = (e) => push(e.data);
+    try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+    CALL.node = new AudioWorkletNode(ctx, "aiw-mic", { numberOfInputs: 1, numberOfOutputs: 1, channelCount: 1, channelCountMode: "explicit" });
+    CALL.node.port.onmessage = (e) => feed(e.data);
   } else {
-    CALL.node = CALL.ctx.createScriptProcessor(2048, 1, 1);
-    CALL.node.onaudioprocess = (e) => push(e.inputBuffer.getChannelData(0));
+    CALL.node = ctx.createScriptProcessor(2048, 1, 1);
+    CALL.node.onaudioprocess = (e) => feed(e.inputBuffer.getChannelData(0));
   }
-  const sink = CALL.ctx.createGain(); sink.gain.value = 0;   // keep the graph pulling without playing the mic back
-  CALL.src.connect(CALL.node); CALL.node.connect(sink); sink.connect(CALL.ctx.destination);
+  CALL.sink = ctx.createGain(); CALL.sink.gain.value = 0;   // keep the graph pulling without playing the mic back
+  CALL.src.connect(CALL.node); CALL.node.connect(CALL.sink); CALL.sink.connect(ctx.destination);
+  CALL.audioAt = Date.now();
+  if (ctx.state !== "running") callAudioGate(true);
+}
+
+function callMicWarn(on, text) {
+  CALL.micWarn = on;
+  const w = $("callWarn"); if (!w) return;
+  w.hidden = !on; if (on) w.textContent = text || "没有收到麦克风声音";
+}
+
+function callMicCheck() {   // every second: samples stopped (or never came) for 3 s -> say so and offer the tap
+  if (CALL.ended || !CALL.audioAt) return;
+  const now = Date.now();
+  if (CALL.muted) { if (CALL.micWarn) callMicWarn(false); return; }
+  const noSamples = now - Math.max(CALL.lastSample, CALL.audioAt) > 3000;
+  const allZero = !noSamples && CALL.samples > 0 && now - Math.max(CALL.lastVoice, CALL.audioAt) > 3000;
+  if (noSamples) {
+    callMicWarn(true, "没有收到麦克风声音，点一下屏幕试试");
+    callAudioGate(true, CALL.ctx && CALL.ctx.state !== "running" ? "点一下开始声音" : "点一下重新打开麦克风");
+  } else if (allZero) {
+    callMicWarn(true, "麦克风只有静音：检查静音键 / 系统麦克风权限");
+  } else if (CALL.micWarn) {
+    callMicWarn(false); callAudioGate(false);
+  }
 }
 
 function callSendPcm(f32) {
@@ -135,7 +265,8 @@ function callConnect(st) {
   const ws = new WebSocket(wsUrl("/ws/omni-call"));
   CALL.ws = ws;
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: "start", video: CALL.video }));
+    ws.send(JSON.stringify({ type: "start", video: CALL.video, client: "web", ua: String(navigator.userAgent || "").slice(0, 160) }));
+    if (CALL.muted) ws.send(JSON.stringify({ type: "mute", on: true }));
     CALL.pingT = setInterval(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 10000);
   };
   ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; } callOn(m); };
@@ -159,7 +290,10 @@ function callOn(m) {
     const t = { create_aiw_task: "交给 aiw", task_status: "查任务进度" }[m.name] || m.name;
     toast(m.status === "running" ? `正在${t}…` : m.status === "done" ? (m.text || `${t}完成`) : `${t}没成功`);
   } else if (m.type === "error") {
-    toast(m.message || "出错了");
+    if (m.code === "no_mic") {   // v3.9.36: the server heard nothing from us
+      callMicWarn(true, m.message || "服务器没有收到麦克风声音");
+      callAudioGate(true, CALL.ctx && CALL.ctx.state !== "running" ? "点一下开始声音" : "点一下重新打开麦克风");
+    } else toast(m.message || "出错了");
   } else if (m.type === "ended") {
     callEnd();
   }
@@ -198,6 +332,8 @@ function callInterrupt() {
 function callMute() {
   CALL.muted = !CALL.muted;
   const b = $("callMute"); b.innerHTML = icon(CALL.muted ? "micoff" : "mic"); b.classList.toggle("off", CALL.muted);
+  if (CALL.ws && CALL.ws.readyState === 1) CALL.ws.send(JSON.stringify({ type: "mute", on: CALL.muted }));
+  if (!CALL.muted) CALL.audioAt = Date.now();   // fresh 3 s before the no-mic note
 }
 
 async function callCamToggle() {
@@ -222,16 +358,16 @@ function callEnd(msg) {
   if (CALL.ended) return;
   CALL.ended = true;
   callStopPlayback();
-  [CALL.frameT, CALL.pingT, CALL.clockT].forEach((t) => clearInterval(t));
+  [CALL.frameT, CALL.pingT, CALL.clockT, CALL.micT].forEach((t) => clearInterval(t));
   [CALL.mic, CALL.cam].forEach((s) => s && s.getTracks().forEach((t) => t.stop()));
   try { CALL.node && CALL.node.disconnect(); CALL.src && CALL.src.disconnect(); } catch (e) { /* gone */ }
-  if (CALL.ctx) CALL.ctx.close().catch(() => {});
+  if (CALL.ctx) { CALL.ctx.onstatechange = null; CALL.ctx.close().catch(() => {}); }
   if (CALL.ws && CALL.ws.readyState <= 1) CALL.ws.close();
   if (CALL.wake) CALL.wake.release().catch(() => {});
   try { CALL.mate && CALL.mate.destroy(); } catch (e) { /* gone */ }
   CALL.mate = null;
-  Object.assign(CALL, { ws: null, ctx: null, mic: null, cam: null, node: null, src: null, wake: null, mode: "" });
-  const el = $("callView"); if (el) { el.classList.remove("on", "cam", "talking"); el.innerHTML = ""; }
+  Object.assign(CALL, { ws: null, ctx: null, mic: null, cam: null, node: null, src: null, sink: null, wake: null, mode: "", micT: null, audioAt: 0 });
+  const el = $("callView"); if (el) { el.classList.remove("on", "cam", "talking"); el.innerHTML = ""; el.onpointerdown = null; }
   document.body.classList.remove("in-call");
   if (msg) toast(msg);
 }

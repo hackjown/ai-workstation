@@ -25,3 +25,10 @@ body.in-call { overflow:hidden; }
 #callView .cbtn[hidden] { display:none; }
 .callnote { display:flex; flex-direction:column; gap:12px; padding:6px; }
 .callnote h3 { margin:0; display:flex; gap:8px; align-items:center; }
+/* v3.9.36: mic level meter, 「没有收到麦克风声音」, and the tap-to-start-audio overlay (iOS Safari keeps audio off until a tap) */
+#callView .call-meter { width:46px; height:8px; border-radius:4px; background:rgba(0,0,0,.42); overflow:hidden; display:inline-block; }
+#callView .call-meter i { display:block; height:100%; width:0; background:#4cc38a; transition:width .1s linear; }
+#callView .call-warn { position:absolute; top:calc(52px + var(--safe-t)); left:16px; right:16px; max-width:560px; margin:0 auto; text-align:center; background:rgba(229,72,77,.88); border-radius:12px; padding:8px 12px; font-size:14px; line-height:1.45; z-index:2; }
+#callView .call-warn[hidden] { display:none; }
+#callView .call-gate { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:3; display:flex; flex-direction:column; align-items:center; gap:10px; padding:22px 28px; border:0; border-radius:20px; background:rgba(0,0,0,.72); color:#fff; font-size:17px; cursor:pointer; backdrop-filter:blur(8px); }
+#callView .call-gate svg.i { width:34px; height:34px; }

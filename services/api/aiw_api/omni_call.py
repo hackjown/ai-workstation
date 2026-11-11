@@ -141,6 +141,7 @@ class CallDiag:
         self.t0 = time.time()
         self.peer = peer
         self.backend = self.model = ""
+        self.client = self.ua = ""   # v3.9.36: "ios" | "web" from the start message, and the User-Agent
         self.video: Optional[bool] = None
         self.ended_at: Optional[float] = None
         self.reason = ""
@@ -173,7 +174,8 @@ class CallDiag:
 
     def public(self) -> dict:
         end = self.ended_at or time.time()
-        return {"id": self.id, "started": self.t0, "peer": self.peer, "backend": self.backend, "model": self.model,
+        return {"id": self.id, "started": self.t0, "peer": self.peer, "client": self.client, "ua": self.ua,
+                "backend": self.backend, "model": self.model,
                 "video": self.video, "seconds": round(end - self.t0, 1), "active": self.ended_at is None,
                 "reason": self.reason, "last_error": self.last_error, "counters": dict(self.n),
                 "last_user_transcript_s": round(self.last_user_tr - self.t0, 1) if self.last_user_tr else None,
@@ -210,6 +212,7 @@ def with_model(url: str, model: str) -> str:
 
 
 MODES = ("auto", "realtime", "turn", "gemini")
+NO_MIC_MSG = "服务器没有收到麦克风声音（摄像头画面正常），请检查麦克风权限、静音键，网页需 HTTPS 并点一下屏幕"   # v3.9.36
 RT_OFF_NOTE = ("实时接口只用于百炼 / DashScope：通话模型的供应商不是百炼，也没有填「实时接口地址」，"
                "不会把这个供应商的 Key 发给 DashScope")
 
@@ -2135,8 +2138,17 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
             if first.get("type") != "start":
                 await bye("no_start", "第一条消息必须是 start")
                 return
-            diag.ev(f"call from {peer or '?'}: video={bool(first.get('video', True))} mode={cfg['mode']}"
-                    f" slot={cfg['model'] or '-'} gemini_route={bool(cfg.get('gemini_route'))}")
+            # v3.9.36: which client (ios | web, from the start message) and its User-Agent, so a silent-mic call
+            # can be traced to the app or the browser
+            diag.client = re.sub(r"[^a-z0-9_.-]", "", str(first.get("client") or "").lower())[:16] or "?"
+            try:
+                ua_h = ws.headers.get("user-agent", "") if getattr(ws, "headers", None) is not None else ""
+            except Exception:  # noqa: BLE001
+                ua_h = ""
+            diag.ua = re.sub(r"\s+", " ", str(first.get("ua") or ua_h or ""))[:160]
+            diag.ev(f"call from {peer or '?'}: client={diag.client} video={bool(first.get('video', True))} mode={cfg['mode']}"
+                    f" slot={cfg['model'] or '-'} gemini_route={bool(cfg.get('gemini_route'))}"
+                    + (f" ua={diag.ua}" if diag.ua else ""))
             call = OmniCall(cfg, send, chat, video=bool(first.get("video", True)), voice=first.get("voice"), diag=diag)
             _ACTIVE.add(id(call))
             try:
@@ -2151,7 +2163,17 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
             deadline = call.started + cfg["max_seconds"]
             dead_wait = asyncio.ensure_future(call.dead_evt.wait())
             last_msg = time.time()
+            # v3.9.36: a client that sends camera frames (or nothing) but no microphone audio - an iOS Safari
+            # AudioContext left suspended, a dead AVAudioEngine tap - gets told once, and the timeline says so
+            no_mic_s = _env_f("AIW_OMNI_NO_MIC_S", 5.0)
+            no_mic_warned, client_muted, mic_t0 = no_mic_s <= 0, False, time.time()
             while True:
+                if not no_mic_warned and not client_muted and time.time() - mic_t0 >= no_mic_s:
+                    no_mic_warned = True
+                    if diag.n.get("audio_in", 0) == 0:
+                        diag.ev(f"no audio from client {time.time() - mic_t0:.0f}s after ready"
+                                f" (frames={diag.n.get('frames_in', 0)} client={diag.client})", warn=True)
+                        await send({"type": "error", "code": "no_mic", "message": NO_MIC_MSG})
                 left = deadline - time.time()
                 if left <= 0:
                     reason = "max_length"
@@ -2164,6 +2186,8 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
                 if recv is None:
                     recv = asyncio.ensure_future(ws.receive_text())
                 wait = min(cfg["idle_s"] - (time.time() - last_msg), left)
+                if not no_mic_warned and not client_muted:   # wake up for the no-mic check
+                    wait = min(wait, max(0.05, mic_t0 + no_mic_s - time.time()))
                 done, _ = await asyncio.wait({recv, dead_wait}, timeout=max(0.0, wait),
                                              return_when=asyncio.FIRST_COMPLETED)
                 if recv not in done:
@@ -2202,6 +2226,10 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
                     await call.on_frame(msg.get("data"))
                 elif t == "interrupt":
                     await call.interrupt()
+                elif t == "mute":   # v3.9.36: a muted client sends no audio on purpose - no no_mic warning then
+                    client_muted = bool(msg.get("on"))
+                    if not client_muted:
+                        mic_t0 = time.time()   # give the unmuted mic its own few seconds
                 elif t == "hangup":
                     reason = "hangup"
                     break

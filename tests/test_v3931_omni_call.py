@@ -682,7 +682,7 @@ def test_web_and_ios_clients_are_wired():
             assert r.returncode == 0, r.stderr
     sw = (ios / "Sources" / "CallView.swift").read_text(encoding="utf-8")
     for needle in (".playAndRecord", ".voiceChat", "setVoiceProcessingEnabled", "AVAudioPlayerNode", "AVCaptureSession",
-                   "URLSessionWebSocketTask", "/ws/omni-call", "sampleRate: 16000", "sampleRate: 24000", "jpegData(compressionQuality: 0.6)"):
+                   "URLSessionWebSocketTask", "/ws/omni-call", "rate / 16000", "sampleRate: 24000", "jpegData(compressionQuality: 0.6)"):
         assert needle in sw, needle
     assert "CallView(video: true)" in (ios / "Sources" / "HomeChat.swift").read_text(encoding="utf-8")
     import plistlib

@@ -950,6 +950,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                   # v3.9.35 Gemini automatic activity detection: start / end sensitivity (low | high; start also api =
                   # the API default; empty start = low, empty end = API default) and silence ms (empty = API default)
                   "omni_gemini_vad_start", "omni_gemini_vad_end", "omni_gemini_silence_ms",
+                  # v3.9.37 echo: Gemini barge-in (auto | on | off = activityHandling NO_INTERRUPTION) and the
+                  # clients' echo gate (on | off; empty = on)
+                  "omni_gemini_barge_in", "omni_echo_gate",
                   # v3.9.33 model provider list: "<slot>_provider" = a provider id per model slot (empty = 默认)
                   *_pv.PROVIDER_FIELDS)
 
@@ -1022,6 +1025,11 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                 m[k] = str(m[k]).strip().lower() or None
                 if m[k] is not None and m[k] not in ok:
                     raise HTTPException(400, f"{k} must be low, high or api (empty = default)")
+        for k, ok in (("omni_gemini_barge_in", ("auto", "on", "off")), ("omni_echo_gate", ("on", "off"))):   # v3.9.37
+            if m.get(k) is not None:
+                m[k] = str(m[k]).strip().lower() or None
+                if m[k] is not None and m[k] not in ok:
+                    raise HTTPException(400, f"{k} must be {', '.join(ok)} (empty = default)")
         if m.get("omni_gemini_silence_ms") is not None:
             try:
                 if not 100 <= int(float(m["omni_gemini_silence_ms"])) <= 5000:

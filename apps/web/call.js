@@ -11,11 +11,21 @@
    next tap; any tap in the call also resumes it. A mic level meter shows the microphone is heard, and 「没有收到麦克风
    声音」 shows when no samples arrive for 3 s (a tap then rebuilds the audio graph). The downsampler keeps its
    fractional position across 128-sample worklet blocks so 48 kHz / 44.1 kHz both give exact 16 kHz. start says
-   client "web"; mute / unmute is told to the server so a muted mic is not reported as broken. */
+   client "web"; mute / unmute is told to the server so a muted mic is not reported as broken.
+   v3.9.37 (every answer cut off mid-sentence on a phone on speaker: its own playback reached the mic, Gemini's VAD
+   took it for the user and sent interrupted): an echo gate (callEchoGate) sits between the downsampler and the socket.
+   While the answer plays (and 300 ms after the queue drains) each 40 ms chunk goes out as zeros, unless the mic is
+   clearly louder than the echo - RMS > max(0.06, 3 x the echo level measured during playback) for >= 200 ms - which is a
+   real barge-in: then the held chunks and what follows go out as they are. echoCancellation is still asked for. The
+   server's ready.echo_gate (setting 防回声 / omni_echo_gate) or localStorage aiw_call_echo_gate = "off" turns it off.
+   After each answer a {"type":"client_audio","event":"turn"} report (echo level, threshold, gated seconds,
+   barge-ins) goes to the server's 通话诊断 timeline. */
 const CALL = { ws: null, ctx: null, mic: null, cam: null, node: null, src: null, sink: null, sources: new Set(), next: 0,
   muted: false, video: true, facing: "user", frameT: null, pingT: null, clockT: null, micT: null, t0: 0, ended: false,
   lastThumb: null, lastSent: 0, caps: { user: "", assistant: "" }, mode: "", wake: null, opening: false,
-  samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, level: 0, meterAt: 0, micWarn: false };
+  samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, level: 0, meterAt: 0, micWarn: false, gate: null, gateOn: true };
+
+const CALL_ECHO_HOLD_MS = 300;   // v3.9.37: the gate stays shut this long after the answer queue drains (room echo)
 
 Object.assign(IC, {
   phone: "M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z",
@@ -105,7 +115,7 @@ async function openCall(video = true) {
       <div class="row gap"><button class="btn primary" onclick="closeOverlays();go('settings');setTimeout(()=>{const el=document.getElementById('g-call');if(el)el.scrollIntoView({behavior:'smooth'})},400)">去设置</button><button class="btn" onclick="closeOverlays()">取消</button></div></div>`);
   }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { callDropCtx(); return toast("这个浏览器不能用麦克风（需要 HTTPS 或 localhost）"); }
-  CALL.video = video; CALL.ended = false; CALL.muted = false; CALL.facing = "user"; CALL.caps = { user: "", assistant: "" };
+  CALL.video = video; CALL.ended = false; CALL.muted = false; CALL.gateOn = true; CALL.playEndAt = 0; CALL.facing = "user"; CALL.caps = { user: "", assistant: "" };
   Object.assign(CALL, { samples: 0, lastSample: 0, lastVoice: 0, audioAt: 0, level: 0, micWarn: false });
   callView(st);
   try {
@@ -200,6 +210,71 @@ function callDownsampler(rate, onChunk, size = 640) {
   };
 }
 
+/* v3.9.37 echo gate. feed(chunk, playing) -> the chunks to send now (Float32Array[]; [] = hold).
+   Not playing (or gate off): the chunk as it is (plus any held chunks). Playing: the echo level is learned from the
+   quiet chunks (fast during the first 300 ms of each answer); a chunk above thr = min(cap, max(floor, factor x echo))
+   is held; once held chunks reach sustainMs it is a real barge-in: the held chunks and everything after go out as they
+   are until it is quiet (below thr/2) for releaseMs or the answer stops. A loud run shorter than sustainMs, and every
+   quiet chunk, goes out as zeros of the same length, so the stream keeps its timing. */
+function callEchoGate(opt) {
+  const o = Object.assign({ on: true, floor: 0.06, factor: 3, cap: 0.5, sustainMs: 200, warmMs: 300, releaseMs: 600, chunkMs: 40 }, opt || {});
+  const st = { on: o.on !== false, echo: 0, thr: o.floor, gatedMs: 0, barges: 0, open: false, loudMs: 0, quietMs: 0, playMs: 0, held: [] };
+  const zeros = (a) => a.map((c) => new Float32Array(c.length));
+  const feed = (f32, playing) => {
+    let sq = 0; for (let i = 0; i < f32.length; i++) sq += f32[i] * f32[i];
+    const rms = Math.sqrt(sq / Math.max(1, f32.length));
+    if (!st.on || !playing) {   // the answer is over: let everything through, a held start of speech included
+      const out = st.held.concat([f32]);
+      st.held = []; st.open = false; st.loudMs = 0; st.quietMs = 0; st.playMs = 0;
+      return out;
+    }
+    st.playMs += o.chunkMs;
+    st.thr = Math.min(o.cap, Math.max(o.floor, o.factor * st.echo));
+    if (st.open) {   // barge-in in progress
+      if (rms > st.thr * 0.5) st.quietMs = 0; else st.quietMs += o.chunkMs;
+      if (st.quietMs < o.releaseMs) return [f32];
+      st.open = false; st.loudMs = 0; st.quietMs = 0;
+    }
+    const warm = st.playMs <= o.warmMs;
+    if (!warm && rms > st.thr) {
+      st.held.push(f32); st.loudMs += o.chunkMs;
+      if (st.loudMs >= o.sustainMs) {
+        st.open = true; st.barges++; st.quietMs = 0;
+        const out = st.held; st.held = []; st.loudMs = 0;
+        return out;
+      }
+      return [];
+    }
+    st.echo += (rms - st.echo) * (warm ? 0.3 : 0.1);
+    const out = zeros(st.held.concat([f32]));
+    st.gatedMs += o.chunkMs * out.length; st.held = []; st.loudMs = 0;
+    return out;
+  };
+  feed.stats = st;
+  return feed;
+}
+
+function callPlaying() {   // v3.9.37: the model's answer is (or was a moment ago) coming out of the speaker
+  const ctx = CALL.ctx;
+  const q = ctx && CALL.sources.size ? (CALL.next - ctx.currentTime) * 1000 : -1e9;
+  if (q > -CALL_ECHO_HOLD_MS) return true;
+  if (window.speechSynthesis && speechSynthesis.speaking) return true;
+  return Date.now() - (CALL.playEndAt || 0) < CALL_ECHO_HOLD_MS;
+}
+
+function callGateSend(f32) {   // downsampler -> echo gate -> socket
+  if (!CALL.gate) { callSendPcm(f32); return; }
+  for (const c of CALL.gate(f32, callPlaying())) callSendPcm(c);
+}
+
+function callGateReport(event) {
+  const g = CALL.gate && CALL.gate.stats;
+  if (!CALL.ws || CALL.ws.readyState !== 1) return;
+  const r = { type: "client_audio", event, gate: !!(g && g.on), rate: CALL.ctx ? CALL.ctx.sampleRate : 0 };
+  if (g) Object.assign(r, { echo: +g.echo.toFixed(4), thr: +g.thr.toFixed(4), gated_s: +(g.gatedMs / 1000).toFixed(1), barges: g.barges });
+  try { CALL.ws.send(JSON.stringify(r)); } catch (e) { /* closed */ }
+}
+
 async function callAudio() {
   const ctx = CALL.ctx && CALL.ctx.state !== "closed" ? CALL.ctx : callUnlockAudio();
   if (!ctx) throw new Error("这个浏览器没有 Web Audio");
@@ -207,7 +282,9 @@ async function callAudio() {
   // resume() can stay pending forever on iOS without a gesture: never wait on it for long
   if (ctx.state !== "running") await Promise.race([ctx.resume().catch(() => {}), new Promise((r) => setTimeout(r, 600))]);
   CALL.src = ctx.createMediaStreamSource(CALL.mic);
-  const push = callDownsampler(ctx.sampleRate, callSendPcm);
+  const push = callDownsampler(ctx.sampleRate, callGateSend);
+  let gateOff = false; try { gateOff = localStorage.getItem("aiw_call_echo_gate") === "off"; } catch (e) { /* private mode */ }
+  CALL.gate = callEchoGate({ on: CALL.gateOn && !gateOff });
   const feed = (f32) => {   // level meter + "are samples arriving at all"
     const now = Date.now(); CALL.samples += f32.length; CALL.lastSample = now;
     let pk = 0, sq = 0; for (let i = 0; i < f32.length; i++) { const v = f32[i]; sq += v * v; if (v > pk) pk = v; else if (-v > pk) pk = -v; }
@@ -276,6 +353,8 @@ function callConnect(st) {
 function callOn(m) {
   if (m.type === "ready") {
     CALL.mode = m.mode;
+    if (m.echo_gate === false) { CALL.gateOn = false; if (CALL.gate) CALL.gate.stats.on = false; }   // v3.9.37 防回声 off
+    callGateReport("start");
     $("callBadge").textContent = ({ realtime: "实时", gemini: "Gemini" }[m.mode] || "轮流") + " · " + (m.model || "");
     $("callBadge").title = m.note || "";
     $("capA").textContent = m.note ? m.note : "已接通，说话吧";
@@ -307,13 +386,19 @@ function callPlay(b64) {
   const s = ctx.createBufferSource(); s.buffer = buf; s.connect(ctx.destination);
   const at = Math.max(ctx.currentTime + 0.04, CALL.next);
   s.start(at); CALL.next = at + buf.duration;
-  CALL.sources.add(s); s.onended = () => { CALL.sources.delete(s); if (!CALL.sources.size) $("callView")?.classList.remove("talking"); };
+  CALL.sources.add(s);
+  s.onended = () => {
+    CALL.sources.delete(s);
+    if (!CALL.sources.size) { CALL.playEndAt = Date.now(); $("callView")?.classList.remove("talking"); callGateReport("turn"); }
+  };
   $("callView").classList.add("talking");
 }
 
 function callStopPlayback() {
   CALL.sources.forEach((s) => { try { s.stop(); } catch (e) { /* already stopped */ } });
+  const was = CALL.sources.size > 0;
   CALL.sources.clear(); CALL.next = 0;
+  if (was) CALL.playEndAt = Date.now();   // v3.9.37: the room still rings for a moment - the gate holds 300 ms more
   if (window.speechSynthesis) speechSynthesis.cancel();
   $("callView")?.classList.remove("talking");
 }

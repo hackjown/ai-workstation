@@ -231,6 +231,8 @@ loadSettings = async function () {
       ${row("Gemini 起说灵敏度", "免提时手机会听到自己的回声和环境噪音：默认「低」不容易被误当成说话；「高」= API 默认，更容易打断", `<select name="omni_gemini_vad_start">${[["", "默认（低）"], ["low", "低"], ["high", "高"], ["api", "API 默认（高）"]].map(([k, t]) => `<option value="${k}" ${(models.omni_gemini_vad_start || "") === k ? "selected" : ""}>${t}</option>`).join("")}</select>`)}
       ${row("Gemini 断句灵敏度", "高 = 更快判定说完（API 默认）；低 = 允许更长的停顿", `<select name="omni_gemini_vad_end">${[["", "默认（API：高）"], ["high", "高"], ["low", "低"]].map(([k, t]) => `<option value="${k}" ${(models.omni_gemini_vad_end || "") === k ? "selected" : ""}>${t}</option>`).join("")}</select>`)}
       ${row("Gemini 静音时长", "毫秒：说完停多久才算一句话结束（100-5000）；留空 = API 默认（约 800）", `<input name="omni_gemini_silence_ms" value="${esc(models.omni_gemini_silence_ms || "")}" inputmode="numeric" placeholder="800" style="max-width:120px" />`)}
+      ${row("Gemini 打断（barge-in）", "开 = 你一说话就打断球球（API 默认）；关 = 球球把话说完，免提时回声不会把它打断（v3.9.37）", `<select name="omni_gemini_barge_in">${[["", "自动（开）"], ["on", "开"], ["off", "关（不打断）"]].map(([k, t]) => `<option value="${k}" ${(models.omni_gemini_barge_in || "") === k ? "selected" : ""}>${t}</option>`).join("")}</select>`)}
+      ${row("防回声", "球球说话时手机/浏览器先压住麦克风（只放过明显比回声大的声音），防止免提时自己打断自己；关 = 一直原样发送麦克风", `<select name="omni_echo_gate">${[["", "默认（开）"], ["on", "开"], ["off", "关"]].map(([k, t]) => `<option value="${k}" ${(models.omni_echo_gate || "") === k ? "selected" : ""}>${t}</option>`).join("")}</select>`)}
       ${row("通话诊断", "最近 20 次通话的连接时间线和计数：接通了却没回应时看这里；服务器日志 docker logs aiw-api 2&gt;&amp;1 | grep aiw.omni", `<button type="button" class="btn sm" onclick="omniCallsDiag()">通话诊断</button>`)}
     </div>
     <div class="rows">

@@ -93,6 +93,16 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.37 通话里球球总被自己的回声打断
+
+现场日志（iOS App，免提，Gemini Live，起说灵敏度低）：每句回答都在半句被截断，文字稿却完整；时间线里的「user」文字其实是球球自己的声音（「我看到你带」「请问还有」），被麦克风收回去 → Gemini VAD 当成用户说话 → `interrupted` → 客户端停播。
+
+- iOS App（CallView.swift，未编译）：v3.9.36 的「3 秒无声就关掉语音处理重启」会在开头没人说话时触发（语音处理后的信号本来就几乎是静音），于是系统回声消除（AEC）被关掉。现在只有麦克风回调**完全没有**来 3 秒（或服务器报 no_mic 且本地确实没有回调）才回退；安静/全零信号只提示，不回退。语音处理开/关、原因、setVoiceProcessingEnabled 的错误、输入采样率/声道、输出路由通过 `{"type":"client_audio"}` 发给服务器，进「通话诊断」时间线（AEC 关闭记 WARNING），屏幕上也会提示「回声消除没开…建议戴耳机」。播放仍走同一个开了语音处理的引擎（player → mainMixerNode，会话 .voiceChat），AEC 有参考信号。
+- 防回声闸门（iOS + 网页）：球球说话时（以及播放队列放完后 300 ms 内），麦克风每 40 ms 一段改发全零；只有明显比回声大（RMS > max(0.06, 3×播放时测到的回声电平) 持续 ≥ 200 ms）才算真打断，那时把攒下的语音和后续原样发出。设置 › 视频通话 ›「防回声」（`omni_echo_gate`，默认开）可关；网页也可 `localStorage.aiw_call_echo_gate = "off"`，iOS `UserDefaults aiw.call.echoGate = "off"`。每句回答放完客户端上报一次回声电平/阈值/被压住的秒数/打断次数。
+- Gemini 打断开关：设置 ›「Gemini 打断（barge-in）」（`omni_gemini_barge_in`：空/auto/on = API 默认 START_OF_ACTIVITY_INTERRUPTS；off = `realtimeInputConfig.activityHandling: "NO_INTERRUPTION"`，球球总把话说完）。字段名按 ai.google.dev/api/live 核对。
+- 诊断：每次 `serverContent.interrupted` 计数（stats 行 `interrupts=N`，计数器 `interrupts`），时间线记「model interrupted by user speech (#N; said so far …; heard …)」；ready 消息带 `echo_gate` / `barge_in`；backend 行显示 `barge_in=… echo_gate=…`。
+- 播放尾巴：iOS 缓冲按 `.dataPlayedBack` 完成；路由/配置变化重启引擎时把还没播的缓冲重新排上，不再丢掉回答的后半截；打断后迟到的完成回调按代号忽略。服务器转发全部音频块（out 计数在发出前累计），网页播放队列不变。
+
 ## v3.9.36 通话收不到麦克风声音（手机网页 / iOS App）
 
 现场诊断：Gemini 已接通（0.9 s），但 21 秒里客户端只发了摄像头画面，没有一条麦克风音频（`in=0 frames=15 … user_tr=never`）。

@@ -1181,7 +1181,7 @@ async function omniCallsDiag() {
   const when = (t) => new Date(t * 1000).toLocaleString();
   const one = (c, i) => { const n = c.counters || {};
     return `<details ${i === 0 ? "open" : ""} style="margin-top:8px"><summary>${esc(when(c.started))} · ${esc(c.backend || "未接通")} ${esc(c.model || "")} · ${Math.round(c.seconds)} 秒 · ${c.active ? "进行中" : esc(c.reason || "")}${c.last_error ? ` · <b>${esc(c.last_error.slice(0, 90))}</b>` : ""}</summary>
-      <div class="small muted">麦克风 ${n.audio_in || 0} 段 → 发给模型 ${n.audio_up || 0}（重连时排队 ${n.audio_pending || 0}）· 画面 ${n.frames_in || 0}（丢 ${n.frames_dropped || 0}）· 模型消息 ${n.up_msgs || 0} · 回放声音 ${n.audio_out || 0} 段 · 重连 ${n.reconnects || 0} · 断开 ${n.upstream_closes || 0} · 看门狗 ${n.watchdog || 0}</div>
+      <div class="small muted">麦克风 ${n.audio_in || 0} 段 → 发给模型 ${n.audio_up || 0}（重连时排队 ${n.audio_pending || 0}）· 画面 ${n.frames_in || 0}（丢 ${n.frames_dropped || 0}）· 模型消息 ${n.up_msgs || 0} · 回放声音 ${n.audio_out || 0} 段 · 被打断 ${n.interrupts || 0} 次${c.client_audio && c.client_audio.vp === false ? " · <b>回声消除关闭</b>" : ""} · 重连 ${n.reconnects || 0} · 断开 ${n.upstream_closes || 0} · 看门狗 ${n.watchdog || 0}</div>
       <pre style="white-space:pre-wrap;font-size:12px;max-height:40vh;overflow:auto">${(c.events || []).map((e) => `${String(e[0]).padStart(6)}s ${e[2] === "warn" ? "⚠ " : ""}${esc(e[1])}`).join("\n")}</pre></details>`; };
   modal(`<div class="card"><div class="heading">通话诊断</div>
     <div class="muted">最近 ${calls.length} 次通话（服务重启后清空）。服务器日志：<code>${esc(r.log_hint || "")}</code></div>
@@ -1193,7 +1193,7 @@ async function probeOmni(sel, box, btn) {
   try {
     const f = sel.closest("form"); const body = { omni_model: sel.value };
     const ps = sel.parentNode.querySelector(".psel"); if (ps) body.omni_model_provider = ps.value;   // v3.9.34: probe the provider on screen
-    for (const k of ["omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model", "omni_gemini_model", "omni_gemini_voice", "omni_gemini_url", "omni_proxy", "omni_gemini_vad_start", "omni_gemini_vad_end", "omni_gemini_silence_ms"]) if (f && f[k]) body[k] = f[k].value.trim();
+    for (const k of ["omni_voice", "omni_realtime_url", "omni_realtime_model", "omni_tts_model", "omni_gemini_model", "omni_gemini_voice", "omni_gemini_url", "omni_proxy", "omni_gemini_vad_start", "omni_gemini_vad_end", "omni_gemini_silence_ms", "omni_gemini_barge_in", "omni_echo_gate"]) if (f && f[k]) body[k] = f[k].value.trim();
     if (f && f.omni_mode) body.omni_mode = (f.querySelector("[name=omni_mode]:checked") || {}).value || "auto";
     if (f && f.omni_key && f.omni_key.value) await api("PUT", "/api/secrets/omni_realtime_key", { value: f.omni_key.value });
     if (f && f.omni_gemini_key && f.omni_gemini_key.value) await api("PUT", "/api/secrets/omni_gemini_key", { value: f.omni_gemini_key.value });
@@ -1242,6 +1242,8 @@ async function saveModels(e) {
         body.omni_gemini_vad_start = f.omni_gemini_vad_start.value; body.omni_gemini_vad_end = f.omni_gemini_vad_end.value;
         body.omni_gemini_silence_ms = f.omni_gemini_silence_ms.value.trim();
       }
+      if (f.omni_gemini_barge_in) body.omni_gemini_barge_in = f.omni_gemini_barge_in.value;   // v3.9.37
+      if (f.omni_echo_gate) body.omni_echo_gate = f.omni_echo_gate.value;
       if (f.omni_gemini_key && f.omni_gemini_key.value) await api("PUT", "/api/secrets/omni_gemini_key", { value: f.omni_gemini_key.value });
     }
   }

@@ -55,6 +55,12 @@ v3.9.34 routing of the call slot (omni_model + omni_model_provider):
   * realtime (DashScope protocol) is only tried when omni_realtime_url is set, or the slot provider is DashScope /
     Bailian (dashscope*.aliyuncs.com, *.maas.aliyuncs.com), or the slot is the default gateway (as before). Otherwise
     auto = [Gemini if its key is set] + turn, and a third-party provider's key never goes to dashscope.aliyuncs.com.
+v3.9.37 echo / self-interruption: omni_gemini_barge_in ("" / auto / on = the API default START_OF_ACTIVITY_INTERRUPTS,
+off = realtimeInputConfig.activityHandling NO_INTERRUPTION: the user's speech never cuts the model's answer);
+omni_echo_gate ("" / on, off) is told to the clients in ready.echo_gate (they mute the mic while the answer plays unless
+the user is clearly louder than the echo). Every serverContent.interrupted is counted (interrupts=N in the stats line
+and the counters) and logged ("model interrupted by user speech"); the clients' {"type":"client_audio"} reports (iOS:
+voice processing on/off and why; both: echo level / gate threshold / gated time / barge-ins) go into the timeline.
 Tools from a call are deliberately few: create_aiw_task (a normal aiw task via Chat.start_task, whose own confirm cards
 still apply) and task_status. The call's transcript lands in the 小秘 chat as one message at hang-up.
 """
@@ -129,7 +135,7 @@ CALLS: deque = deque(maxlen=20)   # the last 20 calls' timelines (GET /api/omni/
 _CALL_SEQ = itertools.count(1)
 COUNTERS = ("audio_in", "frames_in", "frames_dropped", "audio_up", "frames_up", "audio_pending", "pending_dropped",
             "up_msgs", "audio_out", "send_errors", "reconnects", "upstream_closes", "resumption_updates", "tool_calls",
-            "watchdog")
+            "watchdog", "interrupts", "client_reports")
 
 
 class CallDiag:
@@ -149,6 +155,7 @@ class CallDiag:
         self.events: list = []
         self.n: dict = {k: 0 for k in COUNTERS}
         self.last_user_tr = self.last_bot_tr = self.last_audio_out = 0.0
+        self.client_audio: dict = {}   # v3.9.37: the client's last client_audio report (vp, gate, echo, …)
         if keep:
             CALLS.append(self)
 
@@ -169,7 +176,7 @@ class CallDiag:
         return (f"stats t={time.time() - self.t0:.0f}s in={n['audio_in']} frames={n['frames_in']}"
                 f"(-{n['frames_dropped']}) up={n['audio_up']} pending={n['audio_pending']}(-{n['pending_dropped']})"
                 f" upstream_msgs={n['up_msgs']} out={n['audio_out']} reconnects={n['reconnects']}"
-                f" send_err={n['send_errors']} user_tr={self._ago(self.last_user_tr)}"
+                f" send_err={n['send_errors']} interrupts={n.get('interrupts', 0)} user_tr={self._ago(self.last_user_tr)}"
                 f" bot_tr={self._ago(self.last_bot_tr)}" + (f" ws={ws_state}" if ws_state else ""))
 
     def public(self) -> dict:
@@ -178,6 +185,7 @@ class CallDiag:
                 "backend": self.backend, "model": self.model,
                 "video": self.video, "seconds": round(end - self.t0, 1), "active": self.ended_at is None,
                 "reason": self.reason, "last_error": self.last_error, "counters": dict(self.n),
+                "client_audio": dict(self.client_audio),
                 "last_user_transcript_s": round(self.last_user_tr - self.t0, 1) if self.last_user_tr else None,
                 "last_bot_transcript_s": round(self.last_bot_tr - self.t0, 1) if self.last_bot_tr else None,
                 "events": [list(e) for e in self.events]}
@@ -256,7 +264,8 @@ def disabled_message(cfg: dict) -> str:
 
 GEMINI_DEFAULTS = {"gemini_model": DEFAULT_GEMINI_MODEL, "gemini_voice": DEFAULT_GEMINI_VOICE, "gemini_url": "",
                    "gemini_key": "", "proxy": "", "gemini_timeout": 8.0,
-                   "gemini_vad_start": "", "gemini_vad_end": "", "gemini_silence_ms": ""}
+                   "gemini_vad_start": "", "gemini_vad_end": "", "gemini_silence_ms": "",
+                   "gemini_barge_in": "", "echo_gate": ""}
 
 
 def with_defaults(cfg: dict) -> dict:
@@ -362,6 +371,10 @@ def config(store, secrets) -> dict:
             "gemini_vad_start": str(m.get("omni_gemini_vad_start") or "").strip().lower(),
             "gemini_vad_end": str(m.get("omni_gemini_vad_end") or "").strip().lower(),
             "gemini_silence_ms": str(m.get("omni_gemini_silence_ms") or "").strip(),
+            # v3.9.37: barge-in ("" = auto = on | on | off -> activityHandling NO_INTERRUPTION) and the clients' echo
+            # gate ("" = on | off)
+            "gemini_barge_in": str(m.get("omni_gemini_barge_in") or "").strip().lower(),
+            "echo_gate": str(m.get("omni_echo_gate") or "").strip().lower(),
             "max_seconds": max(60.0, min(minutes, 240.0) * 60),
             "rt_timeout": _env_f("AIW_OMNI_RT_TIMEOUT", 5.0), "max_fps": _env_f("AIW_OMNI_MAX_FPS", 1.0),
             "idle_s": _env_f("AIW_OMNI_IDLE", 30.0), "audio_format": os.environ.get("AIW_OMNI_AUDIO_FORMAT", "wav")}
@@ -375,7 +388,9 @@ def public(cfg: dict, store=None) -> dict:
            "gemini": {"on": gemini_on(cfg), "model": cfg["gemini_model"], "voice": cfg["gemini_voice"],
                       "voices": GEMINI_VOICES, "url": cfg["gemini_url"], "has_key": bool(cfg["gemini_key"]),
                       "proxy": bool(cfg["proxy"]), "route": bool(cfg.get("gemini_route")),
-                      "vad": vad_config(with_defaults(cfg))},
+                      "vad": vad_config(with_defaults(cfg)),
+                      "barge_in": barge_in_on(with_defaults(cfg))},
+           "echo_gate": echo_gate_on(with_defaults(cfg)),
            "realtime_on": bool(cfg.get("rt_on", True)), "family": family(cfg), "hint": hint_for(cfg)}
     if not out["enabled"]:
         out["message"] = disabled_message(cfg)
@@ -911,6 +926,25 @@ def vad_config(cfg: dict) -> dict:
     return aad
 
 
+def barge_in_on(cfg: dict) -> bool:
+    """v3.9.37 omni_gemini_barge_in: "" / auto / on = the user's speech interrupts the answer (API default), off = not."""
+    return str(cfg.get("gemini_barge_in") or "auto").strip().lower() not in ("off", "no", "false", "0")
+
+
+def echo_gate_on(cfg: dict) -> bool:
+    """v3.9.37 omni_echo_gate: "" / on = the clients mute their mic while the answer plays (unless clearly louder)."""
+    return str(cfg.get("echo_gate") or "on").strip().lower() not in ("off", "no", "false", "0")
+
+
+def realtime_input_config(cfg: dict) -> dict:
+    """BidiGenerateContentSetup.realtimeInputConfig: automaticActivityDetection (v3.9.35) + activityHandling (v3.9.37:
+    NO_INTERRUPTION when barge-in is off; otherwise left out = START_OF_ACTIVITY_INTERRUPTS, the API default)."""
+    out: dict = {"automaticActivityDetection": vad_config(cfg)}
+    if not barge_in_on(cfg):
+        out["activityHandling"] = "NO_INTERRUPTION"
+    return out
+
+
 class _NoDiag:
     """Stand-in when a backend runs outside a call (the probe, unit tests)."""
     def __init__(self):
@@ -990,7 +1024,7 @@ class GeminiBackend:
                                  "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": self.cfg["gemini_voice"]}}}},
             "systemInstruction": {"parts": [{"text": self.instructions}]},
             "inputAudioTranscription": {}, "outputAudioTranscription": {},
-            "realtimeInputConfig": {"automaticActivityDetection": vad_config(self.cfg)},
+            "realtimeInputConfig": realtime_input_config(self.cfg),
             # without compression an audio+video session ends after ~2 minutes (audio only ~15)
             "contextWindowCompression": {"slidingWindow": {}},
             "sessionResumption": {"handle": handle} if handle else {},
@@ -1257,6 +1291,11 @@ class GeminiBackend:
             self.heard += str(it["text"])
             await self.emit({"type": "transcript", "role": "user", "text": self.heard.strip(), "final": False})
         if sc.get("interrupted"):
+            # v3.9.37: count and log every barge-in, so a call that keeps cutting itself off (the phone's own playback
+            # echoed into the mic) shows it in the timeline / stats
+            self.diag.bump("interrupts")
+            self.diag.ev(f"model interrupted by user speech (#{self.diag.n.get('interrupts', 0)};"
+                         f" said so far: {self.said.strip()[-40:] or '-'}; heard: {self.heard.strip()[-40:] or '-'})")
             self.responding = False
             self.drop_audio_until = 0.0
             await self.emit({"type": "speech_started"})   # the user talks over the answer: stop playback now
@@ -1793,6 +1832,7 @@ class OmniCall:
                 pass
         await self.send({"type": "ready", "mode": "turn", "model": self.cfg["model"], "voice": self.cfg["voice"],
                          "audio_out": self.backend.audio_out, "max_seconds": int(self.cfg["max_seconds"]),
+                         "echo_gate": echo_gate_on(self.cfg),
                          "note": f"{why}，已切换到轮流对话"})
 
     async def _try(self, kind: str) -> str:
@@ -1807,7 +1847,8 @@ class OmniCall:
             limit = cfg["gemini_timeout"] + 4
             self.diag.ev(f"backend gemini: model {cfg['gemini_model']} url {cfg['gemini_url'].split('?')[0]}"
                          f" proxy={'yes' if cfg.get('proxy') else ('env' if env_proxy(cfg['gemini_url']) else 'no')}"
-                         f" vad={json.dumps(vad_config(cfg), ensure_ascii=False)}")
+                         f" vad={json.dumps(vad_config(cfg), ensure_ascii=False)}"
+                         f" barge_in={'on' if barge_in_on(cfg) else 'off'} echo_gate={'on' if echo_gate_on(cfg) else 'off'}")
         else:
             b = RealtimeBackend(cfg, self._emit, self.bridge, self.instructions, self.video)
             limit = cfg["rt_timeout"] + 2
@@ -1868,7 +1909,8 @@ class OmniCall:
         self.diag.ev(f"ready: {b.mode} {model}" + (f" (note: {'；'.join(notes)[:160]})" if notes else ""))
         voice = cfg["gemini_voice"] if b.mode == "gemini" else cfg["voice"]
         ready = {"type": "ready", "mode": b.mode, "voice": voice, "audio_out": b.audio_out,
-                 "model": model, "max_seconds": int(cfg["max_seconds"])}
+                 "model": model, "max_seconds": int(cfg["max_seconds"]),
+                 "echo_gate": echo_gate_on(cfg), "barge_in": barge_in_on(cfg) if b.mode == "gemini" else True}
         if notes:
             ready["note"] = "；".join(notes)
         return ready
@@ -2066,6 +2108,46 @@ async def probe(cfg: dict) -> dict:
     return out
 
 
+CLIENT_AUDIO_KEYS = {"vp": bool, "gate": bool, "echo": float, "thr": float, "gated_s": float, "barges": int,
+                     "rate": float, "chans": int, "why": str, "err": str, "event": str, "route": str}
+
+
+def client_audio_report(diag, msg: dict) -> None:
+    """v3.9.37 {"type":"client_audio", event: start|restart|turn|gate, vp: bool (iOS voice processing = AEC), gate,
+    echo / thr (mic RMS 0..1 heard during playback / the barge-in threshold), gated_s, barges, why, err, route}:
+    kept on the call (GET /api/omni/calls client_audio) and one timeline line - WARNING when voice processing is off,
+    since then the phone hears its own answer. At most 60 lines a call (a turn report comes after every answer)."""
+    rep: dict = {}
+    for k, typ in CLIENT_AUDIO_KEYS.items():
+        if k not in msg or msg[k] is None:
+            continue
+        try:
+            v = msg[k]
+            if typ is bool:
+                rep[k] = bool(v)
+            elif typ is str:
+                rep[k] = re.sub(r"\s+", " ", str(v))[:120]
+            else:
+                rep[k] = round(typ(v), 4) if typ is float else typ(v)
+        except (TypeError, ValueError):
+            continue
+    if not rep:
+        return
+    diag.bump("client_reports")
+    diag.client_audio.update(rep)
+    if diag.n.get("client_reports", 0) > 60:
+        return
+    parts = []
+    if "vp" in rep:
+        parts.append(f"voice_processing(AEC)={'on' if rep['vp'] else 'OFF'}")
+    if "gate" in rep:
+        parts.append(f"echo_gate={'on' if rep['gate'] else 'off'}")
+    for k in ("echo", "thr", "gated_s", "barges", "rate", "chans", "route", "why", "err"):
+        if k in rep:
+            parts.append(f"{k}={rep[k]}")
+    diag.ev(f"client audio {rep.get('event') or '-'}: " + " ".join(parts), warn=rep.get("vp") is False)
+
+
 async def _noop_emit(_ev: dict):
     return None
 
@@ -2230,6 +2312,8 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
                     client_muted = bool(msg.get("on"))
                     if not client_muted:
                         mic_t0 = time.time()   # give the unmuted mic its own few seconds
+                elif t == "client_audio":   # v3.9.37: the client's audio path (vp on/off, echo gate) into the timeline
+                    client_audio_report(diag, msg)
                 elif t == "hangup":
                     reason = "hangup"
                     break
@@ -2253,5 +2337,5 @@ def mount(app, store, secrets, chat, auth, ws_ok) -> None:
         await bye(reason)
 
 
-__all__ = ["CallDiag", "CALLS", "setup_logging", "vad_config", "OmniCall", "RealtimeBackend", "TurnBackend", "GeminiBackend", "probe_gemini", "gemini_url_for", "ws_open", "EnergyVAD", "ToolBridge", "config", "probe", "mount",
+__all__ = ["client_audio_report", "realtime_input_config", "barge_in_on", "echo_gate_on", "CallDiag", "CALLS", "setup_logging", "vad_config", "OmniCall", "RealtimeBackend", "TurnBackend", "GeminiBackend", "probe_gemini", "gemini_url_for", "ws_open", "EnergyVAD", "ToolBridge", "config", "probe", "mount",
            "realtime_url_for", "realtime_model_for", "TOOL_SPECS", "VOICES"]

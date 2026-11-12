@@ -741,7 +741,7 @@ class AgentLoop:
             is_dev = self._intent == _in.DEV_FIX
             rab = _es.dev_rabbit_steps() if is_dev else _es.rabbit_steps()
             if rab and ((self.plan_steps and len(self.plan_done) < len(self.plan_steps)) or (is_dev and not self.plan_steps)):
-                since = self.step - max(self._plan_tick_at, getattr(self, "_answered_at", 0),
+                since = self.step - max(self._plan_tick_at, getattr(self, "_answered_at", 0), getattr(self, "_sent_at", 0),
                                         *((self.dev.last_source_step, *self.dev.gen_runs[-1:]) if is_dev else ()))
                 cur = next((i for i in range(len(self.plan_steps)) if i not in self.plan_done), 0)
                 item = (self.plan_steps[cur] if self.plan_steps else
@@ -1269,6 +1269,7 @@ class AgentLoop:
                 outcome.result = {k: v for k, v in outcome.result.items() if k != "content_b64"}
                 outcome.result["sent_to_user"] = True
                 self._sent_file = Path(outcome.result.get("path") or "file").name
+                self._sent_at = self.step   # v3.9.44 (task-b09): a delivered file is progress for the stuck check
                 self._mark_progress()
                 note = ("The file was delivered to the user's chat. If nothing else was asked, call done NOW "
                         "with a short Chinese summary.")
@@ -1827,7 +1828,11 @@ class AgentLoop:
     async def _dev_tool(self, t: str, a: dict) -> str:
         """read_file / grep / glob run on the computer (read-only, sensitive paths refused); todo_write is local."""
         if t == "todo_write":
+            before = {t["id"] for t in self.lp.todos if t.get("status") == "done"}
             ok, msg = self.lp.todo_write(self.step, a.get("todos") or a.get("items") or [])
+            if {t["id"] for t in self.lp.todos if t.get("status") == "done"} - before:
+                self._plan_tick_at = self.step   # v3.9.44: a todo ticked is a plan tick (the dev loop plans in todos)
+                self._mark_progress()
             await self.emit(EventType.PLAN_UPDATE, todos=self.lp.todos, note=msg[:200])
             await self.emit(EventType.ACTION_RESULT, tool=t, success=ok, error=None if ok else msg[:300], result={})
             if not ok:

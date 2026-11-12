@@ -1241,6 +1241,14 @@ class Chat:
                 return {"route": "answer", "messages": [m]}
         if not _cont.is_followup(text, bool(attachments)):
             return None
+        # v3.9.44 (task-b09): only tasks the message is about (a 姓名牌 .docx is not a run of the 道闸图集 task)
+        about = [c for c in cands if _cont.about_task(self.store, c["root"], text, attachments)]
+        if len(about) < len(cands):
+            log.info("followup: %d of %d recent tasks are not about %r (+%d files)", len(cands) - len(about), len(cands),
+                     text[:40], len(attachments or []))
+        cands = about
+        if not cands:
+            return None
         open_ = [c for c in cands if c["run"]["status"] not in ("succeeded",)]
         if len(open_) == 1:
             target = open_[0]

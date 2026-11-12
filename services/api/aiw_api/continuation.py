@@ -55,6 +55,106 @@ def is_followup(text: str, has_attachments: bool = False) -> bool:
     return has_attachments and len(t) <= 24
 
 
+# v3.9.44 (task-b09): "把名字改成庹芯语" + 姓名牌 .docx, sent in the chat home, matched FOLLOWUP_RE (改成) and the only
+# recent task was the 道闸图集 one, so the name card became a run of the barrier-gate album: same thread, the album's
+# instructions as the goal, its build_album.py as the dev contract's source. A follow-up now has to be ABOUT the task:
+# an attachment of a kind the task never touched, or a skill marker the task never used, starts a new task instead.
+_FAMILY = {
+    "doc": ("docx", "doc", "rtf", "odt", "pages", "wps"), "sheet": ("xlsx", "xls", "csv", "ods", "numbers", "et"),
+    "slides": ("pptx", "ppt", "key", "odp", "dps"), "pdf": ("pdf",),
+    "image": ("png", "jpg", "jpeg", "webp", "gif", "bmp", "heic", "tif", "tiff", "svg"), "cad": ("dxf", "dwg"),
+    "video": ("mp4", "mov", "avi", "mkv", "webm"), "audio": ("mp3", "wav", "m4a", "aac", "flac"),
+    "archive": ("zip", "rar", "7z", "tar", "gz"),
+    "code": ("py", "js", "ts", "html", "htm", "css", "json", "sh", "md", "txt"),
+}
+_FAMILY_WORDS = {"doc": r"word|docx?\b|文档|姓名牌|名牌|桌牌|简历|合同|试卷", "sheet": r"excel|xlsx?\b|表格|csv",
+                 "slides": r"ppt|pptx|幻灯片|演示文稿|课件", "pdf": r"pdf", "image": r"图片|照片|图像|截图|png|jpe?g|海报",
+                 "cad": r"cad|dxf|dwg|图纸|户型", "video": r"视频|mp4|动画", "audio": r"音频|配音|mp3"}
+_UPLOADED = re.compile(r"(已经|刚刚?|刚才)?(上传|传|发|放)(了|好了|上去了|过来了|给你了)|(附件|文件)(已经)?(在|发|传)(这|了|好)")
+_SKILL_MARK = re.compile(r"【技能[:：]\s*([^】]+)】")
+
+
+def _family(name: str) -> Optional[str]:
+    ext = (name or "").rsplit(".", 1)[-1].lower() if "." in (name or "") else ""
+    for fam, exts in _FAMILY.items():
+        if ext in exts:
+            return fam
+    return None
+
+
+def _words(text: str) -> set:
+    t = re.sub(r"\.[A-Za-z0-9]{1,5}\b", " ", text or "")
+    out = set()
+    for seg in re.findall(r"[\u4e00-\u9fff]{2,}", t):
+        out.update(seg[i:i + 2] for i in range(len(seg) - 1))
+    out.update(w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", t))
+    return out - {"uploads", "workspace", "task", "file", "image", "photo", "img"}
+
+
+def _skills(text: str) -> set:
+    out = set()
+    for m in _SKILL_MARK.finditer(text or ""):
+        out.update(n.strip().lower() for n in re.split(r"[、,，\s]+", m.group(1)) if n.strip())
+    return out
+
+
+def task_text(store, root: str) -> tuple[str, set]:
+    """Everything a task is about (its instructions, every run's words, the files it made or got) and its file kinds."""
+    runs = store.continuations(root) or ([store.task(root)] if store.task(root) else [])
+    parts = [instructions(store, store.task(root) or {"prompt": ""})] if store.task(root) else []
+    parts += [str(r.get("prompt") or "") for r in runs]
+    names = []
+    try:
+        names += [f["name"] for f in files_made(store, runs)]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from . import uploads as _up
+        ids = [r["id"] for r in runs if r.get("id")]
+        names += [str(u.get("name") or "") for u in _up.for_task(store, ids, None) if u.get("name")]
+    except Exception:  # noqa: BLE001
+        pass
+    text = "\n".join(parts + names)
+    fams = {f for f in (_family(n) for n in names) if f}
+    fams |= {f for f in (_family(m.group(0)) for m in re.finditer(r"[\w\u4e00-\u9fff .-]+\.[A-Za-z0-9]{2,5}\b", text)) if f}
+    for fam, rx in _FAMILY_WORDS.items():
+        if re.search(rx, text, re.I):
+            fams.add(fam)
+    return text, fams
+
+
+def about_task(store, root: str, text: str, attachments: Optional[list] = None) -> bool:
+    """Is this chat message about task `root`? False only on clear evidence it is something else:
+    * every attachment is a kind of file the task never made, got or mentioned, and shares no name word with it;
+    * the message picks a skill (【技能：x】) and the task used other skills, none of these."""
+    t = (text or "").strip()
+    if is_bare_continue(t) or _UPLOADED.search(t):   # "我已经上传了" answers the task that asked for the file
+        return True
+    try:
+        ttext, fams = task_text(store, root)
+        if fams & {"doc", "slides", "sheet"}:   # a PDF is how a Word / PPT / Excel file often arrives
+            fams = fams | {"pdf"}
+        if "pdf" in fams:
+            fams = fams | {"doc", "slides"}
+    except Exception:  # noqa: BLE001  never block a follow-up on a lookup error
+        return True
+    names = [str(a.get("name") or "") for a in (attachments or []) if isinstance(a, dict) and a.get("name")]
+    if names:
+        tw = _words(ttext)
+        related = False
+        for n in names:
+            fam = _family(n)
+            if (fam and fam in fams) or (_words(n) & tw) or fam is None:
+                related = True
+                break
+        if not related:
+            return False
+    mine, theirs = _skills(t), _skills(ttext)
+    if mine and theirs and not (mine & theirs):
+        return False
+    return True
+
+
 def root_id(store, task_id: str) -> str:
     t = store.task(task_id) or {}
     return t.get("continues") or task_id

@@ -25,6 +25,24 @@ INTENTS = (DEV_FIX, RUN, OTHER)
 
 FORCED_DEV = re.compile(r"【技能[:：][^】]*\bdev\b", re.I)
 
+# v3.9.44 (task-b09): "【技能：officecli】你用这个技能来修改啊" (rename a person on a .docx name card) was classified
+# dev_fix because the thread had script-made files ("修改" + code thread). A picked non-dev skill, or a request about an
+# office document / picture with no code words of its own, is that skill's job, never a source-code fix.
+SKILL_TAG = re.compile(r"【技能[:：]\s*([^】]+)】")
+DOC_WORK = re.compile(r"\.(?:docx?|xlsx?|pptx?|pdf|odt|ods|odp|rtf)\b|\bword\b|\bexcel\b|\bppt\b|"
+                      r"文档|幻灯片|演示文稿|简历|合同|试卷|姓名牌|名牌|桌牌|台卡|证书", re.I)
+
+
+def non_dev_skill(text: str) -> list[str]:
+    """Skills named in a 【技能：…】 marker other than dev."""
+    out = []
+    for m in SKILL_TAG.finditer(text or ""):
+        for n in re.split(r"[、,，\s]+", m.group(1)):
+            n = n.strip()
+            if n and n.lower() != "dev":
+                out.append(n)
+    return out
+
 # a negated clause: from the negation word to the end of the clause
 NEGATED = re.compile(r"(不要|不用|不必|不准|不许|不能|不可以|禁止|严禁|别|勿|无需|千万别|\bdon'?t\b|\bdo not\b|\bnever\b|"
                      r"\bwithout\b|\bno need to\b)[^，。；！？,;.!?\n]{0,40}", re.I)
@@ -94,6 +112,12 @@ def classify(text: str, signals: Optional[dict] = None, context: Optional[str] =
         return {"intent": DEV_FIX, "forced": True, "reasons": ["显式标签【技能：dev】"]}
     sig = signals if signals is not None else signals_from_text(context or "")
     plain = strip_negated(t)
+    own_code = bool(re.search(r"脚本|代码|源码|函数|接口|\.py\b|\.js\b|\.ts\b|css|html|网页|页面|前端|后端|程序|仓库|repo", plain, re.I))
+    skills = non_dev_skill(t)
+    if skills and not own_code:   # v3.9.44: the picked skill does the job (officecli edits the .docx itself)
+        return {"intent": OTHER, "forced": False, "reasons": ["选了技能：" + "、".join(skills)[:40] + "（不是改代码）"]}
+    if DOC_WORK.search(SKILL_TAG.sub(" ", plain)) and not own_code and not STRONG.search(plain):
+        return {"intent": OTHER, "forced": False, "reasons": ["改文档，不是改代码"]}
     strong = [m.group(0) for m in STRONG.finditer(plain)]
     weak = [m.group(0) for m in WEAK.finditer(plain)]
     code_words = [m.group(0) for m in CODE_WORDS.finditer(plain)]

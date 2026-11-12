@@ -146,7 +146,10 @@ _GREP_PATH = re.compile(r"^((?:~|/|\.{0,2}/)?[\w./@+-]+\.[A-Za-z0-9]{1,6}):\d+[:
 _VERIFY_CMD = re.compile(r"\b(pytest|py\.test|python3? -m (pytest|unittest)|npm (run )?(test|build|lint)|pnpm (test|build)|"
                          r"yarn (test|build)|node --test|go (test|vet|build)|cargo (test|check|build)|make (test|check)|"
                          r"vitest|jest|tsc\b|eslint|ruff|flake8|mypy|py_compile|python3? -m compileall|git diff\b|"
-                         r"\bdiff\s+-[a-zA-Z]*u|\bcmp\b|node -c|bash -n)\b")
+                         r"\bdiff\s+-[a-zA-Z]*u|\bcmp\b|node -c|bash -n)\b"
+                         # v3.9.44 (task-b09): checking a document is verification too
+                         r"|\bofficecli\s+(?:query|view|get|validate|check)\b|\bpdftoppm\b|\bpdftotext\b|"
+                         r"\bsoffice\b[^\n]*--convert-to|\bunzip\s+-p\b|zipfile\.ZipFile")
 
 
 def _kw(text: str) -> list[str]:
@@ -185,6 +188,7 @@ class DevLoop:
         self.budget_extra = 0
         self.flagged: list = []                # receipt flags (unverified claims, open todos)
         self.last_kind = ""                    # what the last pre() refusal was (for the timeline label)
+        self.todo_refusals = 0                 # v3.9.44: todo_write refusals in a row (3 -> let it through, flagged)
 
     # ------------------------------------------------------------------ todos
     def seed_todos(self, contract: Optional[dict]) -> None:
@@ -251,8 +255,16 @@ class DevLoop:
                  "files": [norm(x) for x in (it.get("files") or old.get("files") or []) if x][:10],
                  "auto": old.get("auto"), "evidence": old.get("evidence") or ""}
             if st == "done" and old.get("status") != "done":
-                ev = self.evidence_after(self.last_edit(t["files"] or None))
-                if not ev:
+                le = self.last_edit(t["files"] or None)
+                ev = self.evidence_after(le)
+                if not ev and le <= 0:
+                    # v3.9.44 (task-b09): no tracked source edit in this run -> nothing the gate protects; the item
+                    # was refused 8 times ("last edit at step 0") while the file was already made, checked and sent
+                    t["evidence"] = "本次没有改动受控源文件"
+                elif not ev and self.todo_refusals >= 2:
+                    t["evidence"] = "未验证（连续被拒 3 次后放行）"
+                    self.flagged.append(f"todo {tid} 标完成时没有验证证据")
+                elif not ev:
                     t["status"] = "in_progress" if old.get("status") == "in_progress" else (old.get("status") or "pending")
                     rejected.append(t)
                 else:
@@ -260,8 +272,20 @@ class DevLoop:
             new.append(t)
         prog = [t for t in new if t["status"] == "in_progress"]
         if len(prog) > 1:
+            # v3.9.44 (task-b09): a refused item fell back to in_progress while the model moved on to the next one,
+            # and the whole list bounced on "only ONE in_progress" every time. The model's own in_progress wins;
+            # refused items go back to pending instead.
+            mine = [t for t in prog if t not in rejected]
+            if mine:
+                for t in prog:
+                    if t in rejected:
+                        t["status"] = "pending"
+                prog = [t for t in new if t["status"] == "in_progress"]
+        if len(prog) > 1:
+            self.todo_refusals += 1
             return False, ("REJECTED: only ONE todo may be in_progress at a time (got "
                            + ", ".join(t["id"] for t in prog) + "). Finish or reset the others to pending.")
+        self.todo_refusals = self.todo_refusals + 1 if rejected else 0
         self.todos = new
         msg = "todos updated: " + ", ".join(f"{t['id']}={t['status']}" for t in new)
         if rejected:
@@ -487,6 +511,8 @@ class DevLoop:
                     self.record_edit(step, t)
         elif tool == "files_read" and ok:
             self.record_read(step, [_pv._ws(str(a.get("path") or ""))])
+        elif tool == "read_image" and ok:   # v3.9.44: looking at the rendered result is a check
+            self.record_verify(step, "look", str(a.get("path") or ""))
         elif tool in ("files_patch", "files_write") and ok and a.get("path"):
             wp = _pv._ws(str(a["path"]))
             self.record_edit(step, wp)

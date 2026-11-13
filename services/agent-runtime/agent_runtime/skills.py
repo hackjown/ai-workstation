@@ -17,6 +17,8 @@ DESIGNER_AUTO = (r"house-?plan-?designer|装修设计器|户型设计器|设计�
 
 
 def is_designer_task(prompt: str) -> bool:
+    if re.search(SCAN3D_AUTO, prompt or "", re.I):   # v3.9.45: a LiDAR room scan goes to scan-3d, not the designer
+        return False
     return bool(re.search(DESIGNER_AUTO, prompt or "", re.I))
 
 # v3.9.14 auto triggers for the vendored anthropics skills
@@ -25,6 +27,15 @@ WEBAPP_TEST_AUTO = (r"webapp-?testing|playwright|(测试|自测|测一下|测一
                     r"(网页|页面|前端|网站)[^。\n]{0,10}(测试|自测|有没有\s*bug|报错)")
 FRONTEND_AUTO = (r"frontend-?design|(做|写|设计|生成|搭|改)[^。\n]{0,10}(落地页|着陆页|官网|主页|landing ?page|仪表盘|dashboard|"
                  r"报告页|展示页|宣传页|个人网站|网页设计|前端页面|ui ?界面)")
+
+# v3.9.45: a room scan from the iPhone app 3D Model Anything (house-capture zip, shared to Aiw) -> GLB + offline 3D page
+SCAN3D_AUTO = (r"3d ?model ?anything|house-?capture|scan-?3d|扫描建模|lidar ?扫描|"
+               r"(?=[\s\S]*\.zip(?![a-z0-9]))[\s\S]*?(建模|三维|3d|模型|扫描|lidar|glb|three\.?js|房间|户型)")
+
+
+def is_scan3d_task(prompt: str) -> bool:
+    return bool(re.search(SCAN3D_AUTO, prompt or "", re.I))
+
 
 MARK = re.compile(r"【技能[:：]\s*([^】]+)】")
 
@@ -194,6 +205,18 @@ CATALOG: list[dict] = [
               "template.md, run `remake.py check 复刻_<name>.md --duration <s>` until OK, `remake.py json … --analysis "
               "analysis.json > 复刻_<name>.json`, send_file both, done with the slot table and the check result. "
               "Reference images only when the user asks for them.")},
+    {"id": "scan-3d", "title": "扫描建模", "icon": "cube",
+     "desc": "iPhone「3D Model Anything」扫描的房间 zip → GLB 模型 + 手机能打开的 3D 网页 + 尺寸摘要；可瘦身，可精修成可编辑场景",
+     "path": "~/.claude/skills/scan-3d", "auto": SCAN3D_AUTO,
+     "check": "test -f ~/.claude/skills/scan-3d/scan3d.py && grep -q 'def cmd_slim' ~/.claude/skills/scan-3d/scan3d.py && python3 -c 'import numpy'",
+     "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/aiw-skill-setup.sh "
+               "-o /tmp/aiwss.sh && bash /tmp/aiwss.sh scan-3d"),
+     "note": ("First step is always `python3 ~/.claude/skills/scan-3d/scan3d.py build <the .zip from ATTACHMENTS>` "
+              "(seconds, no model needed); send_file every path on its SEND: line, the -3d.html first, and put the room "
+              "size / walls / doors / windows / objects from the summary in done. Never write your own PLY/Open3D/Blender "
+              "code for this and do not read the photos first. `scan3d.py slim <unpacked folder>` only when the user "
+              "mentions size or archiving. The editable Three.js rebuild (wesbos/3d-model-anything scan-to-threejs) only "
+              "when the user asks for it.")},
     # v3.9.14: three Apache-2.0 skills from anthropics/skills, vendored in skills/<id> (NOTICE.md), set up by aiw-skill-setup.sh
     {"id": "skill-creator", "title": "技能制作", "icon": "spark",
      "desc": "把一次做成的流程、或用户描述的做法写成新技能（SKILL.md + 脚本），以后的任务自动用上",
@@ -285,6 +308,8 @@ def auto(prompt: str) -> list[str]:
     """Skills a task needs whether or not it was picked (a sign-up must ask for the data, never invent it)."""
     text = strip(prompt or "")
     out = [s["id"] for s in CATALOG if s.get("auto") and re.search(s["auto"], text, re.I)]
+    if "scan-3d" in out:                  # a LiDAR room scan is not a floor-plan drawing
+        out = [n for n in out if n not in ("house-plan-designer", "cad-drawing", "librecad", "frontend-design")]
     if "house-plan-designer" in out:      # the designer reads the plan itself; the CAD redraw phases would fight it
         out = [n for n in out if n not in ("cad-drawing", "librecad", "frontend-design")]
     return out

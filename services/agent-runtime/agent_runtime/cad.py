@@ -1218,8 +1218,8 @@ def cad_mode(prompt: str, context: str | None = None, history: bool | None = Non
     never a revision; negated verbs ("不要修改") do not count."""
     p = prompt or ""
     try:                                   # 3.9.8: 户型图 → 装修设计器 is its own skill, not a CAD redraw
-        from .skills import is_designer_task
-        if is_designer_task(p):
+        from .skills import is_designer_task, is_scan3d_task
+        if is_designer_task(p) or is_scan3d_task(p):   # v3.9.45: a LiDAR room scan is not a drawing either
             return None
     except Exception:  # noqa: BLE001
         pass

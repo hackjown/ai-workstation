@@ -93,6 +93,15 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.45 扫描建模：iPhone 扫的房间分享给 Aiw，直接出 3D 模型
+
+- 新技能「扫描建模」（scan-3d）：在「3D Model Anything」里 Share room → 分享给 Aiw → 说「建模」。附件是 zip，且话里有建模/3D/模型/扫描/房间这类词，就自动用这个技能（不会再被当成户型设计器或 CAD 画图）。任务派给「设计制图」电脑。
+- 第一步固定跑 `scan3d.py build`，几十秒，不用模型：读 LiDAR 网格和 App 缓存的照片颜色，只留本房间，简化到 ≤ 30 万面，交付 `<名>-3d.html`（离线 WebGL 页面，手机直接开：拖动旋转、双指缩放平移、俯视、剖切滑块去掉天花板）、`<名>.glb`（Blender / Three.js 可用）和尺寸摘要（长宽、层高、墙门窗、识别到的家具）。
+- 瘦身 `scan3d.py slim`（用户提到太大或要存档时）：照片原尺寸按质量 82 重存（保留 EXIF，位姿和内参不变），删掉深度帧和 arworldmap，另存 scan-slim.zip。
+- 精修成可编辑 Three.js 场景（wesbos/3d-model-anything 的 scan-to-threejs 流程）只在用户明确要求时做，需要强模型。
+- 上传上限：分享 → App 上传走 /api/uploads/raw，服务器上限 500 MB（`AIW_UPLOAD_MAX_MB`），手机端同样 500 MB；任务开始时按 16 MB 分段推到电脑。中间如果有 Cloudflare 等代理，它自己的请求体上限（免费版 100 MB）会先拦。
+- 安装：`aiw-skill-setup.sh scan-3d`（任务开始前自动检查并安装，装 numpy / Pillow）。
+
 ## v3.9.44 聊天框的新任务不再并进旧任务；改文档不再当成修代码（task-b09）
 
 - 跟进判断：聊天框里「改成…」「修改」这类话以前会并进最近的任务。现在要先看是不是同一件事：附件是这个任务从没碰过的文件类型（比如道闸图集任务收到一个姓名牌 .docx），或者选的技能和任务用过的技能不同，就开新任务。「我已经上传了」「继续」照旧接着原任务。

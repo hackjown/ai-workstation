@@ -339,9 +339,355 @@ def roomplan(path: str) -> dict:
     return out
 
 
+PART_ZH = {"Wall": "墙段组", "Door": "门", "Window": "窗", "WindowFrame": "窗框"}
 OBJ_ZH = {"storage": "柜子", "refrigerator": "冰箱", "stove": "灶台", "bed": "床", "sink": "水槽", "washerDryer": "洗衣机",
           "toilet": "马桶", "bathtub": "浴缸", "oven": "烤箱", "dishwasher": "洗碗机", "table": "桌子", "sofa": "沙发",
           "chair": "椅子", "fireplace": "壁炉", "television": "电视", "stairs": "楼梯"}
+
+
+# ------------------------------------------------------------------------------------------------- RoomPlan model
+# v3.9.47: the clean model the 3D Model Anything app previews: walls (with door / window / opening holes), doors,
+# windows, floor and furniture rebuilt from rooms/room-N.json (RoomPlan CapturedRoom), one named part per element so
+# Blender / three.js editor / Reality Composer can move, hide or recolour each. Written as GLB, USDZ (iPhone Quick
+# Look and AR, needs usd-core) and a view in the offline page.
+MAT = {"wall": ((0.93, 0.92, 0.89), 1.0), "floor": ((0.78, 0.68, 0.55), 1.0), "door": ((0.55, 0.38, 0.24), 1.0),
+       "window": ((0.62, 0.80, 0.92), 0.35), "frame": ((0.85, 0.85, 0.85), 1.0),
+       "sofa": ((0.45, 0.52, 0.62), 1.0), "chair": ((0.62, 0.45, 0.30), 1.0), "table": ((0.70, 0.52, 0.34), 1.0),
+       "bed": ((0.85, 0.83, 0.80), 1.0), "storage": ((0.80, 0.74, 0.64), 1.0), "television": ((0.12, 0.12, 0.13), 1.0),
+       "refrigerator": ((0.86, 0.87, 0.88), 1.0), "appliance": ((0.82, 0.83, 0.84), 1.0),
+       "bath": ((0.96, 0.96, 0.97), 1.0), "stairs": ((0.66, 0.58, 0.48), 1.0), "fireplace": ((0.50, 0.42, 0.38), 1.0),
+       "object": ((0.72, 0.70, 0.66), 1.0)}
+_CAT_MAT = {"stove": "appliance", "oven": "appliance", "dishwasher": "appliance", "washerDryer": "appliance",
+            "sink": "bath", "toilet": "bath", "bathtub": "bath"}
+WALL_T = 0.10
+
+
+def _cat(o) -> str:
+    c = o.get("category")
+    if isinstance(c, dict):
+        return next(iter(c), "object")
+    return str(c or "object")
+
+
+def _m4(t) -> "np.ndarray":
+    return np.array(t, dtype=float).reshape(4, 4).T   # RoomPlan / simd: column-major
+
+
+def _box(M, c, s):
+    """8 corners of a box (centre c, size s, in the frame M) -> (24 verts, 24 normals, 12 tris), flat faces."""
+    c, s = np.asarray(c, float), np.asarray(s, float) / 2
+    V, N, F = [], [], []
+    for ax in range(3):
+        for sg in (-1, 1):
+            u, v = [a for a in range(3) if a != ax]
+            n = np.zeros(3); n[ax] = sg
+            q = []
+            for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+                p = np.zeros(3); p[ax] = sg; p[u] = a; p[v] = b
+                q.append(c + p * s)
+            if np.dot(np.cross(q[1] - q[0], q[2] - q[0]), n) < 0:
+                q = q[::-1]
+            base = len(V)
+            V += q; N += [n] * 4
+            F += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
+    V = np.array(V); N = np.array(N)
+    V = (M[:3, :3] @ V.T).T + M[:3, 3]
+    N = (M[:3, :3] @ N.T).T
+    N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9)
+    return V, N, np.array(F)
+
+
+class Parts:
+    def __init__(self):
+        self.items = []   # (name, mat, V, N, F)
+        self.count = {}
+
+    def add(self, kind, mat, boxes):
+        if not boxes:
+            return
+        V, N, F = [], [], []
+        for M, c, s in boxes:
+            if min(s) <= 0:
+                continue
+            v, n, f = _box(M, c, s)
+            F.append(f + sum(len(x) for x in V)); V.append(v); N.append(n)
+        if not V:
+            return
+        self.count[kind] = self.count.get(kind, 0) + 1
+        self.items.append((f"{kind}_{self.count[kind]}", mat, np.concatenate(V), np.concatenate(N), np.concatenate(F)))
+
+
+def _furniture(cat, M, w, h, d):
+    """A few boxes that read as the object (RoomPlan gives a box; +Z is the front)."""
+    if cat == "table":
+        t, l = min(0.05, h * 0.15), min(0.06, w * 0.1)
+        b = [(M, (0, h / 2 - t / 2, 0), (w, t, d))]
+        for sx in (-1, 1):
+            for sz in (-1, 1):
+                b.append((M, (sx * (w / 2 - l), -t / 2, sz * (d / 2 - l)), (l, h - t, l)))
+        return b
+    if cat == "chair":
+        seat = min(h * 0.5, 0.48) - h / 2
+        l = 0.04
+        b = [(M, (0, seat, 0), (w, 0.06, d)), (M, (0, (seat + h / 2) / 2, -d / 2 + 0.03), (w, h / 2 - seat, 0.06))]
+        for sx in (-1, 1):
+            for sz in (-1, 1):
+                b.append((M, (sx * (w / 2 - l), (seat - h / 2) / 2, sz * (d / 2 - l)), (l, seat + h / 2, l)))
+        return b
+    if cat == "sofa":
+        seat = min(h * 0.55, 0.45)
+        arm = min(0.2, w * 0.12)
+        return [(M, (0, -h / 2 + seat / 2, 0.08), (w - 2 * arm, seat, d - 0.16)),
+                (M, (0, 0, -d / 2 + 0.09), (w, h, 0.18)),
+                (M, (-w / 2 + arm / 2, -h / 2 + seat * 0.65, 0), (arm, seat * 1.3, d)),
+                (M, (w / 2 - arm / 2, -h / 2 + seat * 0.65, 0), (arm, seat * 1.3, d))]
+    if cat == "bed":
+        mat_h = min(0.5, h * 0.6)
+        return [(M, (0, -h / 2 + mat_h / 2, 0.03), (w, mat_h, d - 0.06)), (M, (0, 0, -d / 2 + 0.03), (w, h, 0.06))]
+    return [(M, (0, 0, 0), (w, h, d))]
+
+
+def _triangulate(P):
+    """Ear clipping of a simple polygon in 2D (list of (x, y)) -> triangles of indices."""
+    idx = list(range(len(P)))
+    area = sum(P[i][0] * P[(i + 1) % len(P)][1] - P[(i + 1) % len(P)][0] * P[i][1] for i in range(len(P)))
+    if area < 0:
+        idx.reverse()
+    tris, guard = [], 0
+    def inside(p, a, b, c):
+        d = lambda p1, p2, p3: (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+        d1, d2, d3 = d(p, a, b), d(p, b, c), d(p, c, a)
+        return not ((d1 < 0 or d2 < 0 or d3 < 0) and (d1 > 0 or d2 > 0 or d3 > 0))
+    while len(idx) > 3 and guard < 10000:
+        guard += 1
+        for k in range(len(idx)):
+            i0, i1, i2 = idx[k - 1], idx[k], idx[(k + 1) % len(idx)]
+            a, b, c = P[i0], P[i1], P[i2]
+            if (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) <= 0:
+                continue
+            if any(inside(P[j], a, b, c) for j in idx if j not in (i0, i1, i2)):
+                continue
+            tris.append((i0, i1, i2)); idx.pop(k); break
+        else:
+            break
+    if len(idx) == 3:
+        tris.append(tuple(idx))
+    return tris
+
+
+def roomplan_model(path: str):
+    """Parts of the rebuilt room, or None when the RoomPlan file has no walls."""
+    try:
+        S = json.load(open(path, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    walls = [w for w in S.get("walls") or [] if w.get("transform") and w.get("dimensions")]
+    if not walls:
+        return None
+    parts = Parts()
+    holes = {i: [] for i in range(len(walls))}
+    WM = [_m4(w["transform"]) for w in walls]
+    ids = {str(w.get("identifier")): i for i, w in enumerate(walls) if w.get("identifier")}
+    for kind in ("doors", "windows", "openings"):
+        for o in S.get(kind) or []:
+            try:
+                M = _m4(o["transform"]); W, H = float(o["dimensions"][0]), float(o["dimensions"][1])
+            except Exception:  # noqa: BLE001
+                continue
+            wi = ids.get(str(o.get("parentIdentifier")))
+            if wi is None:   # nearest wall plane that contains the centre
+                best = None
+                for i, Mw in enumerate(WM):
+                    loc = np.linalg.inv(Mw) @ np.append(M[:3, 3], 1)
+                    dw = float(walls[i]["dimensions"][0])
+                    if abs(loc[2]) < 0.3 and abs(loc[0]) <= dw / 2 + 0.1 and (best is None or abs(loc[2]) < best[0]):
+                        best = (abs(loc[2]), i)
+                wi = best[1] if best else None
+            if wi is not None:
+                loc = np.linalg.inv(WM[wi]) @ np.append(M[:3, 3], 1)
+                holes[wi].append((float(loc[0]), float(loc[1]), W, H))
+            if kind == "doors":
+                parts.add("Door", "door", [(M, (0, 0, 0), (W, H, 0.04))])
+            elif kind == "windows":
+                parts.add("Window", "window", [(M, (0, 0, 0), (W, H, 0.02))])
+                parts.add("WindowFrame", "frame", [(M, (0, -H / 2 + 0.025, 0), (W, 0.05, WALL_T + 0.02)),
+                                                   (M, (0, H / 2 - 0.025, 0), (W, 0.05, WALL_T + 0.02)),
+                                                   (M, (-W / 2 + 0.025, 0, 0), (0.05, H, WALL_T + 0.02)),
+                                                   (M, (W / 2 - 0.025, 0, 0), (0.05, H, WALL_T + 0.02))])
+    lows = []
+    for i, w in enumerate(walls):
+        Wd, Ht = float(w["dimensions"][0]), float(w["dimensions"][1])
+        lows.append((WM[i] @ np.array([0, -Ht / 2, 0, 1]))[1])
+        hs = [(max(-Wd / 2, x - a / 2), min(Wd / 2, x + a / 2), max(-Ht / 2, y - b / 2), min(Ht / 2, y + b / 2))
+              for x, y, a, b in holes[i]]
+        xs = sorted({-Wd / 2, Wd / 2, *[h[0] for h in hs], *[h[1] for h in hs]})
+        ys = sorted({-Ht / 2, Ht / 2, *[h[2] for h in hs], *[h[3] for h in hs]})
+        boxes = []
+        for x0, x1 in zip(xs, xs[1:]):
+            run = None
+            for y0, y1 in zip(ys, ys[1:]):
+                cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                solid = not any(h[0] < cx < h[1] and h[2] < cy < h[3] for h in hs)
+                if solid:
+                    run = (run[0], y1) if run else (y0, y1)
+                elif run:
+                    boxes.append((WM[i], ((x0 + x1) / 2, sum(run) / 2, 0), (x1 - x0, run[1] - run[0], WALL_T))); run = None
+            if run:
+                boxes.append((WM[i], ((x0 + x1) / 2, sum(run) / 2, 0), (x1 - x0, run[1] - run[0], WALL_T)))
+        parts.add("Wall", "wall", boxes)
+    floor_y = float(min(lows)) if lows else 0.0
+    # floor: the RoomPlan floor polygon when there is one, else the wall ends' hull
+    pts = []
+    for f in S.get("floors") or []:
+        try:
+            M = _m4(f["transform"])
+            pts = [(M @ np.array([float(c[0]), float(c[1]), float(c[2]) if len(c) > 2 else 0.0, 1]))[[0, 2]].tolist()
+                   for c in f.get("polygonCorners") or []]
+        except Exception:  # noqa: BLE001
+            pts = []
+        if len(pts) >= 3:
+            break
+    if len(pts) < 3:
+        ends = []
+        for i, w in enumerate(walls):
+            Wd = float(w["dimensions"][0])
+            for s in (-1, 1):
+                ends.append(tuple((WM[i] @ np.array([s * Wd / 2, 0, 0, 1]))[[0, 2]]))
+        ends = sorted(set((round(a, 3), round(b, 3)) for a, b in ends))
+        if len(ends) >= 3:   # convex hull (monotone chain)
+            def cr(o, a, b):
+                return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+            lo_, hi_ = [], []
+            for p in ends:
+                while len(lo_) >= 2 and cr(lo_[-2], lo_[-1], p) <= 0:
+                    lo_.pop()
+                lo_.append(p)
+            for p in reversed(ends):
+                while len(hi_) >= 2 and cr(hi_[-2], hi_[-1], p) <= 0:
+                    hi_.pop()
+                hi_.append(p)
+            pts = lo_[:-1] + hi_[:-1]
+    if len(pts) >= 3:
+        tris = _triangulate(pts)
+        if tris:
+            V = np.array([(x, floor_y - 0.005, z) for x, z in pts])
+            F = []
+            for a, b, c in tris:   # face up (+Y): (x,z) counter-clockwise seen from above is clockwise in x/-z
+                F.append((a, c, b))
+            parts.items.append(("Floor", "floor", V, np.tile([0, 1.0, 0], (len(V), 1)), np.array(F)))
+    for o in S.get("objects") or []:
+        try:
+            M = _m4(o["transform"]); w, h, d = (float(v) for v in o["dimensions"][:3])
+        except Exception:  # noqa: BLE001
+            continue
+        cat = _cat(o)
+        mat = _CAT_MAT.get(cat, cat if cat in MAT else "object")
+        parts.add(cat[:1].upper() + cat[1:], mat, _furniture(cat, M, w, h, d))
+    return parts
+
+
+def write_model_glb(path: str, parts: Parts) -> int:
+    mats = sorted({p[1] for p in parts.items})
+    mi = {m: i for i, m in enumerate(mats)}
+    blob, views, accs, meshes, nodes = b"", [], [], [], []
+    def put(arr, target):
+        nonlocal blob
+        b = arr.tobytes()
+        blob += b"\x00" * (-len(blob) % 4)
+        views.append({"buffer": 0, "byteOffset": len(blob), "byteLength": len(b), "target": target})
+        blob += b
+        return len(views) - 1
+    for name, mat, V, N, F in parts.items:
+        v = put(V.astype("<f4"), 34962); n = put(N.astype("<f4"), 34962); f = put(F.astype("<u4").ravel(), 34963)
+        accs += [{"bufferView": v, "componentType": 5126, "count": len(V), "type": "VEC3",
+                  "min": V.min(0).tolist(), "max": V.max(0).tolist()},
+                 {"bufferView": n, "componentType": 5126, "count": len(N), "type": "VEC3"},
+                 {"bufferView": f, "componentType": 5125, "count": int(F.size), "type": "SCALAR"}]
+        k = len(accs)
+        meshes.append({"name": name, "primitives": [{"attributes": {"POSITION": k - 3, "NORMAL": k - 2}, "indices": k - 1,
+                                                     "material": mi[mat]}]})
+        nodes.append({"name": name, "mesh": len(meshes) - 1})
+    materials = []
+    for m in mats:
+        (r, g, b), a = MAT.get(m, MAT["object"])
+        mm = {"name": m, "pbrMetallicRoughness": {"baseColorFactor": [r, g, b, a], "metallicFactor": 0,
+                                                    "roughnessFactor": 0.85}, "doubleSided": True}
+        if a < 1:
+            mm["alphaMode"] = "BLEND"
+        materials.append(mm)
+    gltf = {"asset": {"version": "2.0", "generator": "aiw scan3d model"}, "scene": 0,
+            "scenes": [{"nodes": list(range(len(nodes)))}], "nodes": nodes, "meshes": meshes, "materials": materials,
+            "buffers": [{"byteLength": len(blob) + (-len(blob) % 4)}], "bufferViews": views, "accessors": accs}
+    blob += b"\x00" * (-len(blob) % 4)
+    js = json.dumps(gltf, separators=(",", ":")).encode()
+    js += b" " * (-len(js) % 4)
+    total = 12 + 8 + len(js) + 8 + len(blob)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<III", 0x46546C67, 2, total))
+        fh.write(struct.pack("<II", len(js), 0x4E4F534A) + js)
+        fh.write(struct.pack("<II", len(blob), 0x004E4942) + blob)
+    return total
+
+
+def write_model_usdz(path: str, parts: Parts) -> str:
+    """'' when written, else why not (usd-core missing). Y up, metres: what iOS Quick Look / AR expects."""
+    try:
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, UsdUtils, Vt
+    except ImportError:
+        return "usd-core missing (python3 -m pip install --user usd-core)"
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="scan3d-usd-")
+    usdc = os.path.join(tmp, "model.usdc")
+    st = Usd.Stage.CreateNew(usdc)
+    UsdGeom.SetStageUpAxis(st, UsdGeom.Tokens.y)
+    UsdGeom.SetStageMetersPerUnit(st, 1.0)
+    root = UsdGeom.Xform.Define(st, "/Room")
+    st.SetDefaultPrim(root.GetPrim())
+    mats = {}
+    for m in sorted({p[1] for p in parts.items}):
+        (r, g, b), a = MAT.get(m, MAT["object"])
+        mat = UsdShade.Material.Define(st, f"/Room/Materials/{m}")
+        sh = UsdShade.Shader.Define(st, f"/Room/Materials/{m}/Surface")
+        sh.CreateIdAttr("UsdPreviewSurface")
+        sh.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(r, g, b))
+        sh.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.85)
+        sh.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        if a < 1:
+            sh.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(a))
+        mat.CreateSurfaceOutput().ConnectToSource(sh.ConnectableAPI(), "surface")
+        mats[m] = mat
+    for name, mat, V, N, F in parts.items:
+        mesh = UsdGeom.Mesh.Define(st, f"/Room/{name}")
+        mesh.CreatePointsAttr(Vt.Vec3fArray([Gf.Vec3f(*map(float, p)) for p in V]))
+        mesh.CreateFaceVertexCountsAttr(Vt.IntArray([3] * len(F)))
+        mesh.CreateFaceVertexIndicesAttr(Vt.IntArray([int(i) for i in F.ravel()]))
+        nrm = mesh.CreateNormalsAttr(Vt.Vec3fArray([Gf.Vec3f(*map(float, n)) for n in N]))
+        mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+        mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        mesh.CreateDoubleSidedAttr(True)
+        mesh.CreateExtentAttr(Vt.Vec3fArray([Gf.Vec3f(*map(float, V.min(0))), Gf.Vec3f(*map(float, V.max(0)))]))
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(mats[mat])
+        _ = nrm
+    st.GetRootLayer().Save()
+    if os.path.exists(path):
+        os.remove(path)
+    ok = UsdUtils.CreateNewARKitUsdzPackage(Sdf.AssetPath(usdc), path)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return "" if ok and os.path.isfile(path) else "usdz packaging failed"
+
+
+def model_view(name: str, parts: Parts, info: str) -> dict:
+    """The rebuilt room for the offline page: light baked into vertex colours (the page draws unlit)."""
+    V, C, F = [], [], []
+    L = np.array([0.35, 0.85, 0.4]); L /= np.linalg.norm(L)
+    for _, mat, v, n, f in parts.items:
+        (r, g, b), a = MAT.get(mat, MAT["object"])
+        if a < 1:   # glass: lighter, the page has no transparency
+            r, g, b = (0.5 * r + 0.5, 0.5 * g + 0.5, 0.5 * b + 0.5)
+        k = 0.62 + 0.38 * np.clip(n @ L, 0, 1)
+        col = np.clip(np.stack([r * k, g * k, b * k], 1) * 255, 0, 255).astype(np.uint8)
+        F.append(f + sum(len(x) for x in V)); V.append(v); C.append(col)
+    return viewer_room(name, np.concatenate(V).astype(np.float32), np.concatenate(C), np.concatenate(F), info)
 
 
 # ----------------------------------------------------------------------------------------------------------- viewer
@@ -457,7 +803,7 @@ def cmd_build(a) -> int:
     if not ss:
         print("NO_SCAN: no manifest.json / mesh/ / rooms/ inside: this is not a 3D Model Anything (house-capture) export")
         return 2
-    rooms_v, summary = [], {"scan": name, "source": os.path.abspath(a.src), "unpacked": root, "sessions": []}
+    rooms_v, models_v, summary = [], [], {"scan": name, "source": os.path.abspath(a.src), "unpacked": root, "sessions": []}
     md = [f"# {name}", ""]
     for s in ss:
         man = s["manifest"]
@@ -470,13 +816,32 @@ def cmd_build(a) -> int:
             rn = room_name(sd, man, i)
             rp = roomplan(os.path.join(sd, "rooms", f"room-{i}.json"))
             r = {"index": i, "name": rn, **rp}
+            tag = f"{name}-room-{i}" if (len(idxs) > 1 or len(ss) > 1) else name
+            parts = None if getattr(a, "no_model", False) else roomplan_model(os.path.join(sd, "rooms", f"room-{i}.json"))
+            if parts and parts.items:
+                mg = os.path.join(out, f"{tag}-model.glb")
+                r["model_glb"] = mg
+                r["model_glb_mb"] = round(write_model_glb(mg, parts) / 1048576, 2)
+                r["model_parts"] = dict(parts.count)
+                mu = os.path.join(out, f"{tag}-model.usdz")
+                why = write_model_usdz(mu, parts)
+                if why:
+                    r["model_usdz_error"] = why
+                else:
+                    r["model_usdz"] = mu
+                bits = [f"{rp['size_m'][0]}×{rp['size_m'][1]} m"] if rp.get("size_m") else []
+                bits.append(f"{len(parts.items)} 个部件")
+                models_v.append(model_view(f"{rn} · 建模", parts, " · ".join(bits)))
+            apple = os.path.join(sd, "rooms", f"room-{i}.usdz")   # RoomPlan's own parametric export, when the app kept it
+            if os.path.isfile(apple) and os.path.getsize(apple) > 0:
+                r["roomplan_usdz"] = os.path.join(out, f"{tag}-roomplan.usdz")
+                shutil.copyfile(apple, r["roomplan_usdz"])
             ply = os.path.join(sd, "mesh", f"room-{i}.ply")
             if os.path.isfile(ply):
                 mesh = read_ply(ply)
                 cols, how = vertex_colors(ply, mesh)
                 faces = keep_room(mesh)
                 v, c, f, cell = simplify(mesh["verts"], cols, faces, a.faces)
-                tag = f"{name}-room-{i}" if (len(idxs) > 1 or len(ss) > 1) else name
                 glb = os.path.join(out, f"{tag}.glb")
                 size = write_glb(glb, v, c, f, rn)
                 r.update({"glb": glb, "glb_mb": round(size / 1048576, 1), "colors": how,
@@ -488,15 +853,16 @@ def cmd_build(a) -> int:
                 if rp.get("height_m"):
                     bits.append(f"高 {rp['height_m']} m")
                 bits.append(f"{len(f)//1000}k 面")
-                rooms_v.append(viewer_room(rn, v, c, f, " · ".join(bits)))
+                rooms_v.append(viewer_room(f"{rn} · 扫描" if not getattr(a, "no_model", False) else rn, v, c, f, " · ".join(bits)))
             elif not rp:
                 continue
             sess["rooms"].append(r)
         summary["sessions"].append(sess)
     if not rooms_v:
-        print("NO_MESH: the scan has no mesh/room-N.ply (RoomPlan only); only the summary was written")
-    else:
-        html = VIEWER.replace("__TITLE__", f"{name} · 3D").replace("__DATA__", json.dumps({"rooms": rooms_v}))
+        print("NO_MESH: the scan has no mesh/room-N.ply (RoomPlan only)"
+              + ("; the rebuilt model was still written" if models_v else "; only the summary was written"))
+    if rooms_v or models_v:
+        html = VIEWER.replace("__TITLE__", f"{name} · 3D").replace("__DATA__", json.dumps({"rooms": models_v + rooms_v}, ensure_ascii=False))
         hp = os.path.join(out, f"{name}-3d.html")
         with open(hp, "w", encoding="utf-8") as f:
             f.write(html)
@@ -517,6 +883,10 @@ def cmd_build(a) -> int:
                     k = OBJ_ZH.get(o["category"], o["category"])
                     cnt[k] = cnt.get(k, 0) + 1
                 md.append("- 识别到的家具：" + "、".join(f"{k}×{v}" if v > 1 else k for k, v in cnt.items()))
+            if r.get("model_parts"):
+                md.append("- 建模：" + "、".join(f"{OBJ_ZH.get(k.lower(), PART_ZH.get(k, k))}×{v}" for k, v in r["model_parts"].items())
+                          + f"，GLB {r['model_glb_mb']} MB" + ("，USDZ（iPhone 点开可看、可 AR）" if r.get("model_usdz")
+                                                             else f"，没有 USDZ：{r.get('model_usdz_error')}"))
             if r.get("glb"):
                 md.append(f"- 网格：{r['mesh_in'][1]:,} → {r['mesh_out'][1]:,} 面（聚类 {r['cluster_cm']} cm），GLB {r['glb_mb']} MB，"
                           + ("照片颜色" if r["colors"] == "photo" else "没有照片颜色缓存，按墙/地/家具上色（在 App 里打开一次 3D 预览再分享就有颜色）"))
@@ -531,8 +901,10 @@ def cmd_build(a) -> int:
     for s in summary["sessions"]:
         for r in s["rooms"]:
             print(f"ROOM {r['name']}: " + ", ".join(f"{k}={r[k]}" for k in ("size_m", "height_m", "walls", "doors", "windows",
-                                                                              "glb_mb", "mesh_out", "colors") if k in r))
-    print("SEND:", " ".join(p for p in [summary.get("html")] + [r.get("glb") for s in summary["sessions"] for r in s["rooms"]]
+                                                                              "glb_mb", "mesh_out", "colors", "model_parts", "model_usdz_error") if k in r))
+    rs = [r for s in summary["sessions"] for r in s["rooms"]]
+    print("SEND:", " ".join(p for p in [summary.get("html")] + [r.get("model_usdz") for r in rs] + [r.get("roomplan_usdz") for r in rs] + [r.get("model_glb") for r in rs]
+                            + [r.get("glb") for r in rs]
                             + [os.path.join(out, f"{name}-summary.md")] if p))
     return 0
 
@@ -617,6 +989,7 @@ def main() -> int:
     b.add_argument("src")
     b.add_argument("--out")
     b.add_argument("--faces", type=int, default=300000, help="most triangles per room (default 300000)")
+    b.add_argument("--no-model", action="store_true", help="skip the rebuilt RoomPlan model (walls, doors, furniture)")
     s = sub.add_parser("slim")
     s.add_argument("folder")
     s.add_argument("--keep-depth", action="store_true")

@@ -93,6 +93,18 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.47 扫描建模出「重新建模」的模型：iPhone 点开 USDZ 原生预览 / AR
+
+- 之前的 `-3d.html` 只是 LiDAR 扫描网格。现在 `scan3d.py build` 还会按 RoomPlan 数据（rooms/room-N.json）重新建模：墙在门窗位置开洞，门、窗和窗框、地面都建出来；沙发、桌、椅、床做成有形状的几件，其他家具按尺寸做成盒子。每件都是一个带名字的部件（Wall_1、Sofa_1…）。
+- 交付 `<名>-model.usdz`：在 Aiw 的 iPhone App 里点开就走系统快速查看，原生 3D 预览，可以切到 AR 摆在桌上；`<名>-model.glb`：在 Blender 或 three.js editor 里每件都能单独移动、隐藏、改色。离线网页第一个视图就是「建模」，下拉菜单切到「扫描」。
+- zip 里如果有 App 自己存的 `rooms/room-N.usdz`（Apple RoomPlan 参数化导出），原样另存为 `<名>-roomplan.usdz` 一起交付。
+- USDZ 需要 usd-core（`aiw-skill-setup.sh scan-3d` 会自动装；装不上也照样交付 GLB 和网页，摘要里会注明）。已经装过扫描建模的电脑，下次任务会自动补装。
+
+## v3.9.46 扫描 zip 不再并进道闸任务，新要求的「继续」不再强行当修代码（task-610）
+
+- 跟进判断：zip 太常见，不再按「文件类型相同」把它算进旧任务（道闸图集任务生成过 zip，大厅.zip 就被并了进去）；压缩包要和任务有共同的名字词（如「道闸补充.zip」）才算同一件事。另外，话加附件能被自动技能认出来（如「建模」+ 扫描 zip → 扫描建模），而旧任务不是这类，就开新任务。
+- 模型路由：「长任务的继续/重试 → 修复代码」只给不带新要求的「继续」「重试」。带了新要求的继续（如「建模」）按新要求自己的话路由，不会再拿旧任务的 build_album.py 当源头去套修代码契约。
+
 ## v3.9.45 扫描建模：iPhone 扫的房间分享给 Aiw，直接出 3D 模型
 
 - 新技能「扫描建模」（scan-3d）：在「3D Model Anything」里 Share room → 分享给 Aiw → 说「建模」。附件是 zip，且话里有建模/3D/模型/扫描/房间这类词，就自动用这个技能（不会再被当成户型设计器或 CAD 画图）。任务派给「设计制图」电脑。

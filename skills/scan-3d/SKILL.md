@@ -1,7 +1,7 @@
 ---
 name: scan-3d
 title: 扫描建模
-description: 把 iPhone「3D Model Anything」扫描导出的房间 zip（house-capture 格式，含 manifest.json、mesh/room-N.ply、photos/）变成能看的 3D 模型：GLB + 手机能直接打开的离线 3D 网页 + 房间尺寸摘要；可选瘦身（照片重压、去掉深度帧）。精修成可编辑 Three.js 场景只在用户要时做。触发词：扫描建模、房间扫描、LiDAR、3D Model Anything、house-capture、scan zip、建模、三维模型、GLB。
+description: 把 iPhone「3D Model Anything」扫描导出的房间 zip（house-capture 格式，含 manifest.json、mesh/room-N.ply、photos/）变成能看的 3D 模型：按 RoomPlan 重新建模（USDZ 给 iPhone 预览/AR、GLB 可编辑）+ 扫描网格 GLB + 手机能直接打开的离线 3D 网页 + 房间尺寸摘要；可选瘦身（照片重压、去掉深度帧）。精修成可编辑 Three.js 场景只在用户要时做。触发词：扫描建模、房间扫描、LiDAR、3D Model Anything、house-capture、scan zip、建模、三维模型、GLB。
 ---
 
 # 扫描建模（scan-3d）
@@ -18,13 +18,18 @@ python3 ~/.claude/skills/scan-3d/scan3d.py build ~/workspace/uploads/<名>.zip
 - 解压到 `~/workspace/scan3d/<名>/src/`，每个房间：读 LiDAR 网格 → 只留本房间 → 简化到 ≤ 30 万面（`--faces` 可调）
   → 写 `<名>.glb`（多房间时 `<名>-room-N.glb`），再写一个离线网页 `<名>-3d.html`（不用 CDN，手机可直接打开：
   拖动旋转、双指缩放和平移、俯视、剖切滑块去掉天花板看内部）和 `<名>-summary.md`（尺寸、墙门窗、识别到的家具）。
+- 同时按 RoomPlan（`rooms/room-N.json`）**重新建模**：墙（门窗处开洞）、门、窗和窗框、地面、家具（沙发、桌、椅、床做成
+  有形状的几件，其他按尺寸做成盒子），每件一个带名字的部件（Wall_1、Sofa_1…）。写 `<名>-model.usdz`（iPhone 点开就是
+  原生 3D 预览，右上角能切 AR 摆到桌上；需要 usd-core，安装时自动装）和 `<名>-model.glb`（Blender / three.js editor
+  里每件都能单独移动、隐藏、改色）。离线网页第一个视图就是「建模」，下拉切到「扫描」看原始网格。
+  App 自己存的 `rooms/room-N.usdz`（Apple RoomPlan 参数化导出）如果在 zip 里，原样另存为 `<名>-roomplan.usdz`。
 - 最后一行 `SEND:` 列出要交付的文件，逐个 send_file（网页放第一个）。
 - 输出 `NO_SCAN`：不是这个 App 的导出，用 ask_user 说明需要在 App 里点 Share room 导出的 zip，不要猜。
 - 输出 `NO_MESH`：只有 RoomPlan 数据没有网格，交付摘要并说明需要重新扫描。
 - 摘要里写「没有照片颜色缓存」：模型按墙/地/家具上色。告诉用户在 App 里先打开一次 3D 预览再分享，就有照片颜色。
 - 不要自己写 PLY 解析、Open3D、Blender 脚本代替这一步，也不要先去读几百张照片。
 
-done 里写：房间尺寸、层高、墙门窗数量、家具、GLB 大小、解压后多大。
+done 里写：建模出了哪些部件、房间尺寸、层高、墙门窗数量、家具、GLB 大小、解压后多大。
 
 ## 第 2 步 · 瘦身（用户提到太大 / 要存档 / 要瘦身时做）
 

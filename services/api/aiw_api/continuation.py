@@ -144,11 +144,21 @@ def about_task(store, root: str, text: str, attachments: Optional[list] = None) 
         related = False
         for n in names:
             fam = _family(n)
-            if (fam and fam in fams) or (_words(n) & tw) or fam is None:
+            # v3.9.46 (task-610): a .zip is too generic to tie a message to a task by kind (the 道闸图集 task made zips,
+            # so a room scan 大厅.zip landed in it); an archive needs a shared name word
+            if (fam and fam in fams and fam != "archive") or (_words(n) & tw) or fam is None:
                 related = True
                 break
         if not related:
             return False
+    # v3.9.46: a request an auto skill picks up (a scan zip + 建模) is a new task unless the task was that kind too
+    try:
+        from agent_runtime.skills import is_scan3d_task
+        probe = t + "\n" + "\n".join(names)
+        if is_scan3d_task(probe) and not is_scan3d_task(ttext):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     mine, theirs = _skills(t), _skills(ttext)
     if mine and theirs and not (mine & theirs):
         return False

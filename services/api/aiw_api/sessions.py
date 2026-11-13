@@ -171,6 +171,14 @@ class SessionManager:
         try:
             if (getattr(task, "source", "") or "") not in ("retry", "continue", "resume") or not task.continues:
                 return False
+            # v3.9.46 (task-610): a continuation with a new goal ("建模" + a scan zip on the 道闸图集 task) is routed by
+            # its own words; only a bare 继续 / 重试 of a long run inherits the strong dev model and contract
+            m = re.search(r"【接着上次继续做】\s*用户补充[:：]\s*(.+)$", task.prompt or "", re.S)
+            if m:
+                from .continuation import is_bare_continue
+                extra = re.split(r"\n\s*附件[:：]", m.group(1))[0].strip()
+                if extra and not is_bare_continue(extra):
+                    return False
             n = 0
             for r in self.store.continuations(task.continues) or []:
                 if r.get("session_id") and r["id"] != task.id:

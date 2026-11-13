@@ -134,3 +134,61 @@ def test_not_a_scan(tmp_path, capsys):
     A.src, A.out = str(zp), str(tmp_path / "o")
     assert m.cmd_build(A) == 2
     assert "NO_SCAN" in capsys.readouterr().out
+
+
+def _roomplan_scan(tmp):
+    import math
+    s = tmp / "rp"
+    (s / "rooms").mkdir(parents=True)
+    def T(yaw, x, y, z):
+        c, sn = math.cos(yaw), math.sin(yaw)
+        return np.array([[c, 0, sn, x], [0, 1, 0, y], [-sn, 0, c, z], [0, 0, 0, 1]]).T.ravel().tolist()
+    walls = [{"identifier": "w0", "transform": T(0, 0, 1.35, -2), "dimensions": [5, 2.7, 0]},
+             {"identifier": "w1", "transform": T(0, 0, 1.35, 2), "dimensions": [5, 2.7, 0]},
+             {"identifier": "w2", "transform": T(math.pi / 2, -2.5, 1.35, 0), "dimensions": [4, 2.7, 0]},
+             {"identifier": "w3", "transform": T(math.pi / 2, 2.5, 1.35, 0), "dimensions": [4, 2.7, 0]}]
+    room = {"walls": walls,
+            "doors": [{"parentIdentifier": "w1", "transform": T(0, 1, 1.05, 2), "dimensions": [0.9, 2.1, 0]}],
+            "windows": [{"transform": T(0, -1, 1.5, -2), "dimensions": [1.5, 1.2, 0]}], "openings": [],
+            "objects": [{"category": {"sofa": {}}, "transform": T(0, -1, 0.42, -1.4), "dimensions": [2, 0.85, 0.9]},
+                        {"category": {"table": {}}, "transform": T(0, 1, 0.38, 0), "dimensions": [1.4, 0.76, 0.8]}]}
+    (s / "rooms" / "room-0.json").write_text(json.dumps(room))
+    (s / "rooms" / "room-0.usdz").write_bytes(b"PK-apple")
+    (s / "manifest.json").write_text(json.dumps({"format": "house-capture/5", "rooms": [{"index": 0, "name": "大厅"}]},
+                                                ensure_ascii=False))
+    return s
+
+
+def test_roomplan_rebuild(tmp_path, capsys):
+    mod = _mod()
+    s = _roomplan_scan(tmp_path)
+    parts = mod.roomplan_model(str(s / "rooms" / "room-0.json"))
+    assert parts.count["Wall"] == 4 and parts.count["Door"] == 1 and parts.count["Window"] == 1
+    assert parts.count["Sofa"] == 1 and parts.count["Table"] == 1
+    assert any(p[0] == "Floor" for p in parts.items)
+    wall_w0 = next(p for p in parts.items if p[0] == "Wall_1")
+    assert len(wall_w0[4]) == 12 * 4          # the window cuts wall 1 into 4 boxes (left, right, below, above)
+    out = tmp_path / "out"
+    import sys
+    argv = sys.argv
+    sys.argv = ["scan3d.py", "build", str(s), "--out", str(out)]
+    try:
+        assert mod.main() == 0
+    finally:
+        sys.argv = argv
+    so = capsys.readouterr().out
+    assert "NO_MESH" in so and "rebuilt model was still written" in so
+    glb = (out / "rp-model.glb").read_bytes()
+    assert glb[:4] == b"glTF"
+    js = json.loads(glb[20:20 + struct.unpack("<I", glb[12:16])[0]])
+    assert {"Wall_1", "Door_1", "Sofa_1", "Floor"} <= {n["name"] for n in js["nodes"]}
+    assert (out / "rp-roomplan.usdz").read_bytes() == b"PK-apple"
+    html = (out / "rp-3d.html").read_text()
+    assert "大厅 · 建模" in html
+    send = [l for l in so.splitlines() if l.startswith("SEND:")][0]
+    assert "rp-model.glb" in send and "rp-roomplan.usdz" in send
+    try:
+        import pxr  # noqa: F401
+        assert (out / "rp-model.usdz").read_bytes()[:2] == b"PK"
+    except ImportError:
+        assert "model_usdz_error" in (out / "rp-summary.json").read_text()

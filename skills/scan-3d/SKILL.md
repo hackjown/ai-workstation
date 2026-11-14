@@ -23,13 +23,18 @@ python3 ~/.claude/skills/scan-3d/scan3d.py build ~/workspace/uploads/<名>.zip
   原生 3D 预览，右上角能切 AR 摆到桌上；需要 usd-core，安装时自动装）和 `<名>-model.glb`（Blender / three.js editor
   里每件都能单独移动、隐藏、改色）。离线网页第一个视图就是「建模」，下拉切到「扫描」看原始网格。
   App 自己存的 `rooms/room-N.usdz`（Apple RoomPlan 参数化导出）如果在 zip 里，原样另存为 `<名>-roomplan.usdz`。
+- 每个房间画一张**平面图**：`<名>-plan.png`（手机直接看）和 `<名>-plan.svg`（可编辑、无限放大）：墙（门窗处断开）、门和开门方向、
+  窗、家具轮廓和名字、每面墙的长度、总尺寸、地面面积（RoomPlan 有地面多边形时）、1 m 比例尺。`--no-plan` 关掉。
+- 每个 USDZ 都会做**合规检查**（OpenUSD UsdValidation：usdz 打包、核心、几何、材质校验器，再加快速查看的规则：Y 轴向上、
+  metersPerUnit、defaultPrim、只用 UsdPreviewSurface），摘要里写「通过，iPhone 可以打开」或没通过的原因。没通过就别只发
+  USDZ，先说明原因。
 - 最后一行 `SEND:` 列出要交付的文件，逐个 send_file（网页放第一个）。
 - 输出 `NO_SCAN`：不是这个 App 的导出，用 ask_user 说明需要在 App 里点 Share room 导出的 zip，不要猜。
 - 输出 `NO_MESH`：只有 RoomPlan 数据没有网格，交付摘要并说明需要重新扫描。
 - 摘要里写「没有照片颜色缓存」：模型按墙/地/家具上色。告诉用户在 App 里先打开一次 3D 预览再分享，就有照片颜色。
 - 不要自己写 PLY 解析、Open3D、Blender 脚本代替这一步，也不要先去读几百张照片。
 
-done 里写：建模出了哪些部件、房间尺寸、层高、墙门窗数量、家具、GLB 大小、解压后多大。
+done 里写：平面图、USDZ 检查结果、建模出了哪些部件、房间尺寸、层高、墙门窗数量、家具、GLB 大小、解压后多大。
 
 ## 第 2 步 · 瘦身（用户提到太大 / 要存档 / 要瘦身时做）
 

@@ -676,6 +676,381 @@ def write_model_usdz(path: str, parts: Parts) -> str:
     return "" if ok and os.path.isfile(path) else "usdz packaging failed"
 
 
+
+# ------------------------------------------------------------------------------------------------ USDZ check
+# v3.9.48: OpenUSD replaced UsdUtils.ComplianceChecker with UsdValidation; run the usdz/core/geom/shade validators
+# plus the few rules Quick Look / AR adds on top, so the summary says before sharing whether an iPhone will open it.
+_QL_SHADERS = {"UsdPreviewSurface", "UsdUVTexture", "UsdPrimvarReader_float", "UsdPrimvarReader_float2",
+               "UsdPrimvarReader_float3", "UsdPrimvarReader_float4", "UsdPrimvarReader_int", "UsdPrimvarReader_string",
+               "UsdPrimvarReader_normal", "UsdPrimvarReader_point", "UsdPrimvarReader_vector", "UsdPrimvarReader_matrix",
+               "UsdTransform2d"}
+
+
+def check_usdz(path: str) -> dict:
+    """{'ok': bool, 'errors': [...], 'warnings': [...], 'how': ...}; ok None when usd-core is missing."""
+    res = {"ok": None, "errors": [], "warnings": [], "how": ""}
+    try:
+        from pxr import Usd, UsdGeom, UsdShade
+    except ImportError:
+        res["how"] = "usd-core missing"
+        return res
+    # the package itself: first file a usd layer, every entry stored (not deflated) and 64-byte aligned
+    try:
+        with zipfile.ZipFile(path) as z:
+            infos = z.infolist()
+            if not infos or not infos[0].filename.lower().endswith((".usdc", ".usda", ".usd")):
+                res["errors"].append("first file in the package is not a USD layer")
+            with open(path, "rb") as fh:
+                for zi in infos:
+                    if zi.compress_type != zipfile.ZIP_STORED:
+                        res["errors"].append(f"{zi.filename}: compressed (usdz entries must be stored)")
+                    fh.seek(zi.header_offset + 26)
+                    n, m = struct.unpack("<HH", fh.read(4))
+                    if (zi.header_offset + 30 + n + m) % 64:
+                        res["errors"].append(f"{zi.filename}: data not 64-byte aligned")
+    except zipfile.BadZipFile:
+        res["errors"].append("not a zip / usdz package")
+        res["ok"] = False
+        res["how"] = "zip"
+        return res
+    try:
+        st = Usd.Stage.Open(path)
+    except Exception as ex:  # noqa: BLE001  (pxr raises Tf.ErrorException)
+        st = None
+        res["errors"].append("USD cannot open it: " + str(ex).strip().splitlines()[-1].split(": ", 1)[-1][:200])
+    res["how"] = res["how"] or "UsdValidation"
+    if not st:
+        res["errors"].append("USD cannot open the stage")
+        res["ok"] = False
+        return res
+    try:
+        from pxr import UsdValidation
+        reg = UsdValidation.ValidationRegistry()
+        want = []
+        for m in reg.GetAllValidatorMetadata():
+            kw = set(m.GetKeywords())
+            if kw & {"UsdzValidators", "UsdCoreValidators", "UsdGeomValidators", "UsdShadeValidators"} and not m.isSuite:
+                v = reg.GetOrLoadValidatorByName(m.name)
+                if v:
+                    want.append(v)
+        for e in UsdValidation.ValidationContext(want).Validate(st):
+            if e.HasNoError():
+                continue
+            t = str(e.GetType())
+            msg = f"{e.GetValidator().GetMetadata().name if e.GetValidator() else ''}: {e.GetMessage()}".strip(": ")
+            (res["errors"] if "Error" in t else res["warnings"]).append(msg)
+        res["how"] = f"UsdValidation ({len(want)} validators)"
+    except ImportError:   # older usd-core: the deprecated checker
+        try:
+            from pxr import UsdUtils
+            c = UsdUtils.ComplianceChecker(arkit=True, skipARKitRootLayerCheck=False)
+            c.CheckCompliance(path)
+            res["errors"] += list(c.GetErrors()) + list(c.GetFailedChecks())
+            res["warnings"] += list(c.GetWarnings())
+            res["how"] = "ComplianceChecker"
+        except Exception as ex:  # noqa: BLE001
+            res["how"] = f"no USD validator ({ex})"
+    # Quick Look / AR rules
+    if UsdGeom.GetStageUpAxis(st) != UsdGeom.Tokens.y:
+        res["warnings"].append("upAxis is not Y (Quick Look will lay it on its side)")
+    if not st.HasAuthoredMetadata("metersPerUnit"):
+        res["warnings"].append("metersPerUnit not set (AR scale guessed as centimetres)")
+    if not st.GetDefaultPrim():
+        res["errors"].append("no defaultPrim")
+    for p in st.Traverse():
+        if p.IsA(UsdShade.Shader):
+            sid = UsdShade.Shader(p).GetIdAttr().Get()
+            if sid and sid not in _QL_SHADERS:
+                res["errors"].append(f"{p.GetPath()}: shader {sid} not supported by Quick Look")
+        if p.IsA(UsdGeom.Mesh):
+            if not UsdGeom.Mesh(p).GetPointsAttr().Get():
+                res["warnings"].append(f"{p.GetPath()}: empty mesh")
+    res["errors"] = list(dict.fromkeys(res["errors"]))[:20]
+    res["warnings"] = list(dict.fromkeys(res["warnings"]))[:20]
+    res["ok"] = not res["errors"]
+    return res
+
+
+# ------------------------------------------------------------------------------------------------ floor plan
+# v3.9.48: the app shows a live coverage map while scanning but exports no floor plan. Draw one from RoomPlan:
+# walls with gaps at doors / windows / openings, door swings, window sills, furniture outlines with names, each wall's
+# length, overall dimensions and floor area. SVG (exact, editable) + PNG (opens anywhere).
+FONT_PATHS = ["/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/truetype/arphic/uming.ttc", "/System/Library/Fonts/PingFang.ttc",
+              "/System/Library/Fonts/STHeiti Light.ttc", "/Library/Fonts/Arial Unicode.ttf"]
+
+
+def plan_geometry(path: str):
+    """Everything of the room in plan (metres, x right, y down the page), or None without walls."""
+    try:
+        S = json.load(open(path, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    walls = [w for w in S.get("walls") or [] if w.get("transform") and w.get("dimensions")]
+    if not walls:
+        return None
+    WM = [_m4(w["transform"]) for w in walls]
+    # square the plan to the walls: dominant wall direction (mod 90 deg) becomes the page's x axis
+    sx = sy = 0.0
+    for M, w in zip(WM, walls):
+        a = math.atan2(M[2, 0], M[0, 0]) * 4
+        sx += math.cos(a) * float(w["dimensions"][0]); sy += math.sin(a) * float(w["dimensions"][0])
+    th = -math.atan2(sy, sx) / 4
+    c, s = math.cos(th), math.sin(th)
+
+    def P(M, x, z=0.0):   # a point of a frame's local x / z axis -> plan
+        p = M @ np.array([x, 0.0, z, 1.0])
+        return (c * p[0] - s * p[2], s * p[0] + c * p[2])
+
+    ids = {str(w.get("identifier")): i for i, w in enumerate(walls) if w.get("identifier")}
+    holes = {i: [] for i in range(len(walls))}
+    doors, windows = [], []
+    for kind in ("doors", "windows", "openings"):
+        for o in S.get(kind) or []:
+            try:
+                M = _m4(o["transform"]); W = float(o["dimensions"][0])
+            except Exception:  # noqa: BLE001
+                continue
+            wi = ids.get(str(o.get("parentIdentifier")))
+            if wi is None:
+                best = None
+                for i, Mw in enumerate(WM):
+                    loc = np.linalg.inv(Mw) @ np.append(M[:3, 3], 1)
+                    if abs(loc[2]) < 0.3 and abs(loc[0]) <= float(walls[i]["dimensions"][0]) / 2 + 0.1 \
+                            and (best is None or abs(loc[2]) < best[0]):
+                        best = (abs(loc[2]), i)
+                wi = best[1] if best else None
+            if wi is None:
+                continue
+            x = float((np.linalg.inv(WM[wi]) @ np.append(M[:3, 3], 1))[0])
+            holes[wi].append((x - W / 2, x + W / 2))
+            a, b = P(WM[wi], x - W / 2), P(WM[wi], x + W / 2)
+            if kind == "doors":
+                doors.append((a, b, wi))
+            elif kind == "windows":
+                windows.append((a, b))
+    segs, lens = [], []
+    for i, w in enumerate(walls):
+        L = float(w["dimensions"][0])
+        lens.append((P(WM[i], -L / 2), P(WM[i], L / 2), L))
+        cuts = sorted((max(-L / 2, a), min(L / 2, b)) for a, b in holes[i])
+        x = -L / 2
+        for a, b in cuts:
+            if a > x + 0.01:
+                segs.append((P(WM[i], x), P(WM[i], a)))
+            x = max(x, b)
+        if x < L / 2 - 0.01:
+            segs.append((P(WM[i], x), P(WM[i], L / 2)))
+    floor = []
+    for f in S.get("floors") or []:
+        try:
+            M = _m4(f["transform"])
+            floor = []
+            for q in f.get("polygonCorners") or []:
+                p = M @ np.array([float(q[0]), float(q[1]), float(q[2]) if len(q) > 2 else 0.0, 1])
+                floor.append((c * p[0] - s * p[2], s * p[0] + c * p[2]))
+        except Exception:  # noqa: BLE001
+            floor = []
+        if len(floor) >= 3:
+            break
+    objs = []
+    for o in S.get("objects") or []:
+        try:
+            M = _m4(o["transform"]); w, _, d = (float(v) for v in o["dimensions"][:3])
+        except Exception:  # noqa: BLE001
+            continue
+        objs.append((_cat(o), [P(M, sx_ * w / 2, sz * d / 2) for sx_, sz in ((-1, -1), (1, -1), (1, 1), (-1, 1))]))
+    pts = [p for a, b, _ in lens for p in (a, b)]
+    x0, x1 = min(p[0] for p in pts), max(p[0] for p in pts)
+    y0, y1 = min(p[1] for p in pts), max(p[1] for p in pts)
+    area = None
+    if len(floor) >= 3:
+        area = abs(sum(floor[i][0] * floor[(i + 1) % len(floor)][1] - floor[(i + 1) % len(floor)][0] * floor[i][1]
+                       for i in range(len(floor)))) / 2
+    centre = ((x0 + x1) / 2, (y0 + y1) / 2)
+    return {"segs": segs, "lens": lens, "doors": doors, "windows": windows, "objs": objs, "floor": floor,
+            "box": (x0, y0, x1, y1), "area": area, "centre": centre}
+
+
+def _plan_layout(G, px_per_m=100, margin=0.9):
+    x0, y0, x1, y1 = G["box"]
+    W = (x1 - x0 + 2 * margin) * px_per_m
+    H = (y1 - y0 + 2 * margin) * px_per_m + 60
+
+    def T(p):
+        return ((p[0] - x0 + margin) * px_per_m, (p[1] - y0 + margin) * px_per_m + 60)
+    return W, H, T
+
+
+def _door_swing(a, b, centre):
+    """Hinge at a, leaf length |ab| swung into the room: (hinge, leaf end, arc end)."""
+    ax, ay = a; bx, by = b
+    L = math.hypot(bx - ax, by - ay) or 1e-6
+    nx, ny = -(by - ay) / L, (bx - ax) / L
+    if (centre[0] - ax) * nx + (centre[1] - ay) * ny < 0:
+        nx, ny = -nx, -ny
+    return (ax, ay), (ax + nx * L, ay + ny * L), (bx, by), L
+
+
+def write_floorplan_svg(path: str, G, title: str) -> None:
+    S = 100
+    W, H, T = _plan_layout(G, S)
+    e = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W:.0f}" height="{H:.0f}" viewBox="0 0 {W:.0f} {H:.0f}" '
+         f'font-family="PingFang SC,Noto Sans CJK SC,Microsoft YaHei,sans-serif">',
+         f'<rect width="100%" height="100%" fill="#fff"/>',
+         f'<text x="20" y="34" font-size="22" fill="#222">{_esc(title)}</text>']
+    if G["floor"]:
+        e.append('<polygon points="' + " ".join(f"{x:.1f},{y:.1f}" for x, y in map(T, G["floor"]))
+                 + '" fill="#f4efe6" stroke="none"/>')
+    for cat, q in G["objs"]:
+        qq = [T(p) for p in q]
+        e.append('<polygon points="' + " ".join(f"{x:.1f},{y:.1f}" for x, y in qq)
+                 + '" fill="#e8e2d6" stroke="#8a7f6c" stroke-width="1.5"/>')
+    for a, b in G["segs"]:
+        (ax, ay), (bx, by) = T(a), T(b)
+        e.append(f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{bx:.1f}" y2="{by:.1f}" stroke="#222" stroke-width="{WALL_T * S + 2:.0f}" stroke-linecap="square"/>')
+    for cat, q in G["objs"]:
+        cx, cy = T(_label_at(q, G["centre"]))
+        e.append(f'<text x="{cx:.1f}" y="{cy + 5:.1f}" font-size="14" text-anchor="middle" fill="#5a5245">'
+                 f'{_esc(OBJ_ZH.get(cat, cat))}</text>')
+    for a, b in G["windows"]:
+        (ax, ay), (bx, by) = T(a), T(b)
+        L = math.hypot(bx - ax, by - ay) or 1; nx, ny = -(by - ay) / L * 4, (bx - ax) / L * 4
+        for k in (-1, 0, 1):
+            e.append(f'<line x1="{ax + nx * k:.1f}" y1="{ay + ny * k:.1f}" x2="{bx + nx * k:.1f}" y2="{by + ny * k:.1f}" '
+                     f'stroke="#3a7bd5" stroke-width="1.6"/>')
+    for a, b, _ in G["doors"]:
+        h, leaf, end, L = _door_swing(T(a), T(b), T(G["centre"]))
+        e.append(f'<line x1="{h[0]:.1f}" y1="{h[1]:.1f}" x2="{leaf[0]:.1f}" y2="{leaf[1]:.1f}" stroke="#8b5a2b" stroke-width="3"/>')
+        cr = (leaf[0] - h[0]) * (end[1] - h[1]) - (leaf[1] - h[1]) * (end[0] - h[0])
+        e.append(f'<path d="M{leaf[0]:.1f},{leaf[1]:.1f} A{L:.1f},{L:.1f} 0 0 {1 if cr > 0 else 0} {end[0]:.1f},{end[1]:.1f}" '
+                 f'fill="none" stroke="#8b5a2b" stroke-width="1.2" stroke-dasharray="5 4"/>')
+    cx_, cy_ = T(G["centre"])
+    for a, b, L in G["lens"]:   # each wall's length, outside the room
+        (ax, ay), (bx, by) = T(a), T(b)
+        mx, my = (ax + bx) / 2, (ay + by) / 2
+        ll = math.hypot(bx - ax, by - ay) or 1
+        nx, ny = -(by - ay) / ll, (bx - ax) / ll
+        if (cx_ - mx) * nx + (cy_ - my) * ny > 0:
+            nx, ny = -nx, -ny
+        tx, ty = mx + nx * 26, my + ny * 26
+        ang = math.degrees(math.atan2(by - ay, bx - ax))
+        if ang > 90 or ang < -90:
+            ang += 180
+        e.append(f'<text x="{tx:.1f}" y="{ty + 5:.1f}" font-size="14" fill="#444" text-anchor="middle" '
+                 f'transform="rotate({ang:.1f} {tx:.1f} {ty:.1f})">{L:.2f} m</text>')
+    x0, y0, x1, y1 = G["box"]
+    info = f"{x1 - x0:.2f} × {y1 - y0:.2f} m" + (f" · 地面 {G['area']:.1f} m²" if G["area"] else "")
+    e.append(f'<text x="20" y="{H - 18:.0f}" font-size="15" fill="#555">{_esc(info)}</text>')
+    bx = W - 20 - S
+    e.append(f'<line x1="{bx:.0f}" y1="{H - 24:.0f}" x2="{bx + S:.0f}" y2="{H - 24:.0f}" stroke="#222" stroke-width="3"/>'
+             f'<text x="{bx + S / 2:.0f}" y="{H - 32:.0f}" font-size="13" text-anchor="middle" fill="#222">1 m</text>')
+    e.append("</svg>")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(e))
+
+
+def _label_at(q, centre):
+    """Where an object's name goes (plan metres): its centre, or for a thin thing against a wall (a TV, a shelf)
+    a little into the room so the wall does not cover it."""
+    cx = sum(p[0] for p in q) / 4; cy = sum(p[1] for p in q) / 4
+    thin = min(math.dist(q[0], q[1]), math.dist(q[1], q[2]))
+    if thin < 0.3:
+        dx, dy = centre[0] - cx, centre[1] - cy
+        n = math.hypot(dx, dy) or 1
+        cx += dx / n * 0.28; cy += dy / n * 0.28
+    return cx, cy
+
+
+def _esc(s: str) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def write_floorplan_png(path: str, G, title: str) -> str:
+    """'' when written, else why not. Chinese labels need a CJK font; without one the labels fall back to English."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return "pillow missing"
+    K = 2   # draw at 2x for a crisp phone screen
+    S = 100 * K
+    W, H, T0 = _plan_layout(G, 100)
+
+    def T(p):
+        x, y = T0(p)
+        return (x * K, y * K)
+    img = Image.new("RGB", (int(W * K), int(H * K)), "white")
+    d = ImageDraw.Draw(img)
+    fp = next((p for p in FONT_PATHS if os.path.isfile(p)), None)
+    try:
+        f14 = ImageFont.truetype(fp, 14 * K) if fp else ImageFont.load_default(14 * K)
+        f22 = ImageFont.truetype(fp, 22 * K) if fp else ImageFont.load_default(22 * K)
+    except Exception:  # noqa: BLE001
+        f14 = f22 = ImageFont.load_default()
+    zh = bool(fp)
+
+    def lab(cat):
+        return OBJ_ZH.get(cat, cat) if zh else cat
+    if G["floor"]:
+        d.polygon([T(p) for p in G["floor"]], fill=(244, 239, 230))
+    for cat, q in G["objs"]:
+        qq = [T(p) for p in q]
+        d.polygon(qq, fill=(232, 226, 214), outline=(138, 127, 108), width=2 * K // 2 + 1)
+    for a, b in G["segs"]:
+        d.line([T(a), T(b)], fill=(34, 34, 34), width=int(WALL_T * S + 2 * K))
+        for p in (T(a), T(b)):   # square caps
+            r = (WALL_T * S + 2 * K) / 2
+            d.rectangle([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=(34, 34, 34))
+    for a, b in G["windows"]:
+        (ax, ay), (bx, by) = T(a), T(b)
+        L = math.hypot(bx - ax, by - ay) or 1; nx, ny = -(by - ay) / L * 4 * K, (bx - ax) / L * 4 * K
+        d.line([(ax - nx * 1.5, ay - ny * 1.5), (bx - nx * 1.5, by - ny * 1.5)], fill="white", width=1)
+        d.polygon([(ax - nx * 1.4, ay - ny * 1.4), (bx - nx * 1.4, by - ny * 1.4), (bx + nx * 1.4, by + ny * 1.4),
+                   (ax + nx * 1.4, ay + ny * 1.4)], fill="white")
+        for k in (-1, 0, 1):
+            d.line([(ax + nx * k, ay + ny * k), (bx + nx * k, by + ny * k)], fill=(58, 123, 213), width=2 * K)
+    for cat, q in G["objs"]:
+        d.text(T(_label_at(q, G["centre"])), lab(cat), font=f14, fill=(90, 82, 69), anchor="mm")
+    for a, b, _ in G["doors"]:
+        h, leaf, end, L = _door_swing(T(a), T(b), T(G["centre"]))
+        d.line([h, leaf], fill=(139, 90, 43), width=3 * K)
+        a0 = math.degrees(math.atan2(leaf[1] - h[1], leaf[0] - h[0]))
+        a1 = math.degrees(math.atan2(end[1] - h[1], end[0] - h[0]))
+        lo, hi = (a0, a1) if (a1 - a0) % 360 <= 180 else (a1, a0)
+        d.arc([h[0] - L, h[1] - L, h[0] + L, h[1] + L], lo, hi if hi > lo else hi + 360, fill=(139, 90, 43), width=K)
+    cx_, cy_ = T(G["centre"])
+    for a, b, L in G["lens"]:
+        (ax, ay), (bx, by) = T(a), T(b)
+        mx, my = (ax + bx) / 2, (ay + by) / 2
+        ll = math.hypot(bx - ax, by - ay) or 1
+        nx, ny = -(by - ay) / ll, (bx - ax) / ll
+        if (cx_ - mx) * nx + (cy_ - my) * ny > 0:
+            nx, ny = -nx, -ny
+        txt = f"{L:.2f} m"
+        ang = math.degrees(math.atan2(by - ay, bx - ax))
+        if ang > 90 or ang < -90:
+            ang += 180
+        tb = d.textbbox((0, 0), txt, font=f14)
+        tw, th_ = tb[2] - tb[0] + 8, tb[3] - tb[1] + 8
+        t = Image.new("RGBA", (tw, th_), (255, 255, 255, 0))
+        ImageDraw.Draw(t).text((tw / 2, th_ / 2), txt, font=f14, fill=(68, 68, 68), anchor="mm")
+        t = t.rotate(-ang, expand=True, resample=Image.BICUBIC)
+        img.paste(t, (int(mx + nx * 26 * K - t.width / 2), int(my + ny * 26 * K - t.height / 2)), t)
+    d.text((20 * K, 34 * K), title if zh else re.sub(r"[^\x00-\x7f]+", "", title).strip(" ·") or "Floor plan",
+           font=f22, fill=(34, 34, 34), anchor="ls")
+    x0, y0, x1, y1 = G["box"]
+    info = f"{x1 - x0:.2f} × {y1 - y0:.2f} m" + ((f" · 地面 {G['area']:.1f} m²" if zh else f" · floor {G['area']:.1f} m²")
+                                                  if G["area"] else "")
+    d.text((20 * K, (H - 18) * K), info, font=f14, fill=(85, 85, 85), anchor="ls")
+    bx = W * K - 20 * K - S
+    d.line([(bx, (H - 24) * K), (bx + S, (H - 24) * K)], fill=(34, 34, 34), width=3 * K)
+    d.text((bx + S / 2, (H - 32) * K), "1 m", font=f14, fill=(34, 34, 34), anchor="ms")
+    img.save(path, optimize=True)
+    return "" if zh else "no CJK font: labels in English (apt install fonts-wqy-microhei)"
+
+
 def model_view(name: str, parts: Parts, info: str) -> dict:
     """The rebuilt room for the offline page: light baked into vertex colours (the page draws unlit)."""
     V, C, F = [], [], []
@@ -829,6 +1204,7 @@ def cmd_build(a) -> int:
                     r["model_usdz_error"] = why
                 else:
                     r["model_usdz"] = mu
+                    r["model_usdz_check"] = check_usdz(mu)
                 bits = [f"{rp['size_m'][0]}×{rp['size_m'][1]} m"] if rp.get("size_m") else []
                 bits.append(f"{len(parts.items)} 个部件")
                 models_v.append(model_view(f"{rn} · 建模", parts, " · ".join(bits)))
@@ -836,6 +1212,17 @@ def cmd_build(a) -> int:
             if os.path.isfile(apple) and os.path.getsize(apple) > 0:
                 r["roomplan_usdz"] = os.path.join(out, f"{tag}-roomplan.usdz")
                 shutil.copyfile(apple, r["roomplan_usdz"])
+                r["roomplan_usdz_check"] = check_usdz(r["roomplan_usdz"])
+            G = None if getattr(a, "no_plan", False) else plan_geometry(os.path.join(sd, "rooms", f"room-{i}.json"))
+            if G:
+                r["plan_svg"] = os.path.join(out, f"{tag}-plan.svg")
+                write_floorplan_svg(r["plan_svg"], G, f"{rn} · 平面图")
+                pp = os.path.join(out, f"{tag}-plan.png")
+                why = write_floorplan_png(pp, G, f"{rn} · 平面图")
+                if os.path.isfile(pp):
+                    r["plan_png"] = pp
+                if why:
+                    r["plan_note"] = why
             ply = os.path.join(sd, "mesh", f"room-{i}.ply")
             if os.path.isfile(ply):
                 mesh = read_ply(ply)
@@ -887,6 +1274,14 @@ def cmd_build(a) -> int:
                 md.append("- 建模：" + "、".join(f"{OBJ_ZH.get(k.lower(), PART_ZH.get(k, k))}×{v}" for k, v in r["model_parts"].items())
                           + f"，GLB {r['model_glb_mb']} MB" + ("，USDZ（iPhone 点开可看、可 AR）" if r.get("model_usdz")
                                                              else f"，没有 USDZ：{r.get('model_usdz_error')}"))
+            for k, lbl in (("model_usdz_check", "建模 USDZ"), ("roomplan_usdz_check", "RoomPlan USDZ")):
+                ck = r.get(k)
+                if ck and ck["ok"] is not None:
+                    md.append(f"- {lbl} 检查（{ck['how']}）：" + ("通过，iPhone 快速查看/AR 可以打开" if ck["ok"]
+                              else "没通过，iPhone 可能打不开：" + "；".join(ck["errors"][:3]))
+                              + (f"（提醒 {len(ck['warnings'])} 条：{ck['warnings'][0]}）" if ck["warnings"] else ""))
+            if r.get("plan_svg"):
+                md.append("- 平面图：PNG + SVG（墙长、门的开向、窗、家具位置）" + (f"；{r['plan_note']}" if r.get("plan_note") else ""))
             if r.get("glb"):
                 md.append(f"- 网格：{r['mesh_in'][1]:,} → {r['mesh_out'][1]:,} 面（聚类 {r['cluster_cm']} cm），GLB {r['glb_mb']} MB，"
                           + ("照片颜色" if r["colors"] == "photo" else "没有照片颜色缓存，按墙/地/家具上色（在 App 里打开一次 3D 预览再分享就有颜色）"))
@@ -901,10 +1296,12 @@ def cmd_build(a) -> int:
     for s in summary["sessions"]:
         for r in s["rooms"]:
             print(f"ROOM {r['name']}: " + ", ".join(f"{k}={r[k]}" for k in ("size_m", "height_m", "walls", "doors", "windows",
-                                                                              "glb_mb", "mesh_out", "colors", "model_parts", "model_usdz_error") if k in r))
+                                                                              "glb_mb", "mesh_out", "colors", "model_parts", "model_usdz_error") if k in r)
+                  + "".join(f", {k}={'ok' if r[k]['ok'] else r[k]['errors'][:2]}" for k in ("model_usdz_check", "roomplan_usdz_check")
+                            if k in r and r[k]["ok"] is not None))
     rs = [r for s in summary["sessions"] for r in s["rooms"]]
-    print("SEND:", " ".join(p for p in [summary.get("html")] + [r.get("model_usdz") for r in rs] + [r.get("roomplan_usdz") for r in rs] + [r.get("model_glb") for r in rs]
-                            + [r.get("glb") for r in rs]
+    print("SEND:", " ".join(p for p in [summary.get("html")] + [r.get("plan_png") for r in rs] + [r.get("model_usdz") for r in rs] + [r.get("roomplan_usdz") for r in rs] + [r.get("model_glb") for r in rs]
+                            + [r.get("glb") for r in rs] + [r.get("plan_svg") for r in rs]
                             + [os.path.join(out, f"{name}-summary.md")] if p))
     return 0
 
@@ -990,6 +1387,7 @@ def main() -> int:
     b.add_argument("--out")
     b.add_argument("--faces", type=int, default=300000, help="most triangles per room (default 300000)")
     b.add_argument("--no-model", action="store_true", help="skip the rebuilt RoomPlan model (walls, doors, furniture)")
+    b.add_argument("--no-plan", action="store_true", help="skip the floor plan (PNG + SVG)")
     s = sub.add_parser("slim")
     s.add_argument("folder")
     s.add_argument("--keep-depth", action="store_true")

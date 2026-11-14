@@ -192,3 +192,37 @@ def test_roomplan_rebuild(tmp_path, capsys):
         assert (out / "rp-model.usdz").read_bytes()[:2] == b"PK"
     except ImportError:
         assert "model_usdz_error" in (out / "rp-summary.json").read_text()
+
+
+def test_floorplan_and_usdz_check(tmp_path):
+    mod = _mod()
+    s = _roomplan_scan(tmp_path)
+    G = mod.plan_geometry(str(s / "rooms" / "room-0.json"))
+    assert len(G["doors"]) == 1 and len(G["windows"]) == 1 and len(G["objs"]) == 2
+    assert len(G["segs"]) == 6          # 4 walls, two of them cut by the door / window
+    assert sorted(round(L, 2) for _, _, L in G["lens"]) == [4.0, 4.0, 5.0, 5.0]
+    x0, y0, x1, y1 = G["box"]
+    assert abs((x1 - x0) * (y1 - y0) - 20) < 0.01
+    svg = tmp_path / "p.svg"
+    mod.write_floorplan_svg(str(svg), G, "大厅 · 平面图")
+    t = svg.read_text(encoding="utf-8")
+    assert "沙发" in t and "5.00 m" in t and "<path" in t
+    png = tmp_path / "p.png"
+    mod.write_floorplan_png(str(png), G, "大厅 · 平面图")
+    assert png.read_bytes()[:4] == b"\x89PNG"
+    bad = tmp_path / "bad.usdz"
+    bad.write_bytes(b"not a zip")
+    assert mod.check_usdz(str(bad))["ok"] in (False, None)
+    try:
+        import pxr  # noqa: F401
+    except ImportError:
+        return
+    good = tmp_path / "m.usdz"
+    assert mod.write_model_usdz(str(good), mod.roomplan_model(str(s / "rooms" / "room-0.json"))) == ""
+    ck = mod.check_usdz(str(good))
+    assert ck["ok"] is True, ck
+    import zipfile
+    with zipfile.ZipFile(good) as src, zipfile.ZipFile(tmp_path / "d.usdz", "w", zipfile.ZIP_DEFLATED) as z:
+        for i in src.infolist():
+            z.writestr(i.filename, src.read(i))
+    assert mod.check_usdz(str(tmp_path / "d.usdz"))["ok"] is False

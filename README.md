@@ -93,6 +93,12 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.48 扫描建模：自动平面图 + USDZ 合规检查
+
+- 3D Model Anything 扫描时只有覆盖范围小地图，不导出平面图。现在每个房间都会出 `<名>-plan.png` 和 `<名>-plan.svg`：墙（门窗处断开）、门和开门方向、窗、家具轮廓和名字、每面墙的长度、总尺寸、地面面积、1 m 比例尺。
+- 每个 USDZ（自己建的和 App 原生的 RoomPlan 导出）都会跑 OpenUSD 新的 UsdValidation（旧的 ComplianceChecker 已弃用），再加上快速查看的规则。摘要里会写「通过，iPhone 可以打开」，或者没通过的原因。
+- 安装时会尽量装 `fonts-wqy-microhei`，平面图 PNG 里的中文标注要用到；没有中文字体就改用英文标注，SVG 不受影响。
+
 ## v3.9.47 扫描建模出「重新建模」的模型：iPhone 点开 USDZ 原生预览 / AR
 
 - 之前的 `-3d.html` 只是 LiDAR 扫描网格。现在 `scan3d.py build` 还会按 RoomPlan 数据（rooms/room-N.json）重新建模：墙在门窗位置开洞，门、窗和窗框、地面都建出来；沙发、桌、椅、床做成有形状的几件，其他家具按尺寸做成盒子。每件都是一个带名字的部件（Wall_1、Sofa_1…）。

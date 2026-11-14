@@ -10,7 +10,7 @@ check() {
   test -f "$d/SKILL.md" || return 1
   case "$1" in
     webapp-testing) python3 -c 'import playwright' 2>/dev/null || return 1 ;;
-    scan-3d) python3 -c 'import numpy' 2>/dev/null && grep -q roomplan_model "$d/scan3d.py" || return 1 ;;
+    scan-3d) python3 -c 'import numpy' 2>/dev/null && grep -q plan_geometry "$d/scan3d.py" || return 1 ;;
   esac
 }
 if [ "${1:-}" = "check" ]; then shift; for s in "$@"; do check "$s" || exit 1; done; exit 0; fi
@@ -52,6 +52,10 @@ for s in "$@"; do
       # v3.9.47: usd-core writes the rebuilt model as USDZ (iPhone Quick Look / AR); optional, the GLB and page work without it
       python3 -c "import pxr" 2>/dev/null || python3 -m pip install -q --user usd-core 2>/dev/null || \
         python3 -m pip install -q --user --break-system-packages usd-core || echo "usd-core not installed: no USDZ"
+      # v3.9.48: a Chinese font for the floor plan PNG labels (without one they are drawn in English)
+      fc-list :lang=zh 2>/dev/null | grep -q . || ls /usr/share/fonts/truetype/wqy/wqy-microhei.ttc >/dev/null 2>&1 || \
+        { SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo -n"; $SUDO apt-get install -y -qq fonts-wqy-microhei >/dev/null 2>&1 || \
+          echo "no Chinese font: floor plan labels in English"; }
       ;;
     skill-creator)
       python3 -c 'import yaml' 2>/dev/null || python3 -m pip install -q --user pyyaml 2>/dev/null || \

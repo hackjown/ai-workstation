@@ -208,7 +208,7 @@ CATALOG: list[dict] = [
     {"id": "scan-3d", "title": "扫描建模", "icon": "cube",
      "desc": "iPhone「3D Model Anything」扫描的房间 zip → GLB 模型 + 手机能打开的 3D 网页 + 尺寸摘要；可瘦身，可精修成可编辑场景",
      "path": "~/.claude/skills/scan-3d", "auto": SCAN3D_AUTO,
-     "check": "test -f ~/.claude/skills/scan-3d/scan3d.py && grep -q 'def roomplan_model' ~/.claude/skills/scan-3d/scan3d.py && python3 -c 'import numpy'",
+     "check": "test -f ~/.claude/skills/scan-3d/scan3d.py && grep -q 'def plan_geometry' ~/.claude/skills/scan-3d/scan3d.py && python3 -c 'import numpy'",
      "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/aiw-skill-setup.sh "
                "-o /tmp/aiwss.sh && bash /tmp/aiwss.sh scan-3d"),
      "note": ("First step is always `python3 ~/.claude/skills/scan-3d/scan3d.py build <the .zip from ATTACHMENTS>` "

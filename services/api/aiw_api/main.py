@@ -354,6 +354,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     _omni.setup_logging()   # v3.9.35: the call's lifecycle (aiw.omni, INFO) shows in docker logs
     _omni.mount(app, store, secrets, chat, auth, lambda ws: _ok(ws_token(ws)))
     _pv.mount(app, store, secrets, auth)   # v3.9.33: 设置 › 模型 › 供应商 (/api/providers)
+    from . import dsweb as _dsweb   # v3.9.49: DeepSeek 联网工具 (/api/web-tools): web_search / web_fetch / doc_ask
+    _dsweb.mount(app, store, secrets, auth)
 
     # ------------------------------------------------------------- tasks
 

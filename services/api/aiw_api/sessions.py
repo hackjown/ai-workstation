@@ -1060,6 +1060,16 @@ class SessionManager:
                         extra["session_search"] = srch.tool(exclude_task=task.id)
                 except Exception as e:  # noqa: BLE001
                     log.warning("session_search unavailable: %s", e)
+                web_rules = ""
+                try:  # v3.9.49: DeepSeek 联网工具 on the API host - web_search / web_fetch / doc_ask, no screen
+                    from . import dsweb as _ds
+                    if self.secrets is not None and _ds.enabled(self.store, self.secrets):
+                        wt = _ds.tools(self.store, self.secrets, origin="task",
+                                       resolve_path=_ds.resolver(self.settings.artifacts_dir))
+                        extra.update(wt)
+                        web_rules = _ds.TASK_RULES
+                except Exception as e:  # noqa: BLE001
+                    log.warning("web tools unavailable: %s", e)
                 try:  # hosts the user authorised for ops work (设置 › 电脑 › 运维主机)
                     from . import remote_hosts
                     if self.secrets and remote_hosts.hosts(self.store):
@@ -1084,7 +1094,7 @@ class SessionManager:
                     await cloud.wake(task.machine_id)
                     hold = cloud.hold(task.machine_id)
                     computer = self.computer(task.machine_id)   # a restarted agent means a fresh connection
-                sx = system_extra
+                sx = system_extra + web_rules
                 if not cleanup:   # skills an earlier task installed on this computer (cached 5 min per computer)
                     try:
                         sx += await self._installed_skills(task, computer)
@@ -1160,6 +1170,9 @@ class SessionManager:
                                      config=LoopConfig(max_steps=task.max_steps, timeout_s=task.timeout_s,
                                                        artifacts_dir=self.settings.artifacts_dir))
                     loop.geometry_llm = self._geometry_llm()
+                    if getattr(loop, "_web_lite", False):   # v3.9.49: lookup / read / summarise, no desktop
+                        await emit(AgentEvent(session_id=sid, type=EventType.MESSAGE,
+                                              data={"text": "联网：DeepSeek（不开浏览器）", "web_lite": True}))
                     try:   # v3.9.30: flash only for compaction / summaries; the dev steps run on the routed (strong) model
                         loop.summary_llm = self._summary_llm(v24.small_llm() if v24 is not None else None)
                     except Exception as e:  # noqa: BLE001

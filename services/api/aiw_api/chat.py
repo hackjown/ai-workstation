@@ -664,7 +664,9 @@ class Chat:
         if getattr(self, "search", None) is not None:
             tools.append("搜以前的聊天、任务和文件（session_search，用户说「上次/之前/那个…」时先搜）")
         if getattr(self, "_search_names", None):
-            tools.insert(0, "联网搜索")
+            tools.insert(0, "联网搜索（web_search 有的话优先用它）" if "web_search" in self._search_names else "联网搜索")
+        if getattr(self, "_doc_on", False):
+            tools.append("问文档（doc_ask：用户发来的 PDF/Word/PPT/Excel/文本，问内容或总结时用；照片、扫描件、压缩包、模型文件不能用）")
         if getattr(self, "_image_on", False):
             tools.append("AI 生成图片（generate_image）、AI 改用户发来的图片（edit_image）——用户只是要一张图或改图时直接用它们，"
                          "不要交给电脑；生成后用一句话说明，图片会自动显示")
@@ -999,6 +1001,18 @@ class Chat:
         if srch is not None:   # v3.9.14: earlier chats, tasks and files
             out["session_search"] = srch.tool()
         self._search_names = []
+        self._doc_on = False
+        try:   # v3.9.49: DeepSeek 联网工具 (web_search, doc_ask) when 设置 › 联网工具 is on and a DeepSeek key is set
+            from . import dsweb as _ds
+            if self.store is not None and _ds.enabled(self.store, self.secrets):
+                ds = _ds.tools(self.store, self.secrets, origin="chat", resolve_path=self._allowed)
+                out["web_search"] = ds["web_search"]
+                self._search_names.append("web_search")
+                if "doc_ask" in ds:
+                    out["doc_ask"] = ds["doc_ask"]
+                    self._doc_on = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("chat web tools: %s", e)
         try:
             loader = self.tool_loader
             if loader is None and self.secrets is not None:
@@ -1009,7 +1023,7 @@ class Chat:
             ext = await asyncio.wait_for(loader(), 10) if loader else {}
             for name, (schema, fn) in (ext or {}).items():
                 if re.search(r"search|搜索|tavily|exa|bing|serp|google", name + " " + (schema.get("description") or "")[:80], re.I) \
-                        and len(self._search_names) < 3:
+                        and len(self._search_names) < 3 and name not in out:
                     out[name] = (schema, fn)
                     self._search_names.append(name)
         except Exception as e:  # noqa: BLE001
@@ -1022,7 +1036,7 @@ class Chat:
             return "正在搜索…"
         return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…",
                 "session_search": "正在翻以前的记录…", "generate_image": "正在画图…",
-                "edit_image": "正在改图…"}.get(name, "正在查…")
+                "edit_image": "正在改图…", "doc_ask": "正在读文档…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:
@@ -1030,7 +1044,8 @@ class Chat:
         try:
             res = await asyncio.wait_for(tools[name][1](args),
                                          float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")) * 2 + 30
-                                         if name in ("generate_image", "edit_image") else 40)
+                                         if name in ("generate_image", "edit_image") else 300 if name == "doc_ask" else 60
+                                         if name in ("read_url", "web_search") else 40)
         except Exception as e:  # noqa: BLE001
             return f"工具出错：{type(e).__name__}: {str(e)[:200]}"
         return res if isinstance(res, str) else json.dumps(res, ensure_ascii=False, default=str)
@@ -1095,6 +1110,20 @@ class Chat:
         url = str(a.get("url") or "").strip()
         if not re.match(r"^https?://", url, re.I):
             return "只能读取 http(s) 网址"
+        try:   # v3.9.49: with a DeepSeek key, read through the Fetch API (Markdown, script-built pages too)
+            from . import dsweb as _ds
+            if self.store is not None and _ds.enabled(self.store, self.secrets) and _ds.cfg(self.store).get("chat_fetch", True):
+                try:
+                    page = await _ds.fetch(self.store, self.secrets, url, origin="chat")
+                except _ds.DSError as e:
+                    log.info("read_url via DeepSeek failed, direct: %s", e.message)
+                else:
+                    if page["blocked"]:
+                        return (f"读不到正文：{page['blocked']}（{url}）。这个网页要登录或过验证，"
+                                "需要在电脑的浏览器里打开：可以交给电脑去做。")
+                    return f"[200 DeepSeek Fetch] {url}\n# {page['title']}\n{page['content'][:8000]}"
+        except Exception as e:  # noqa: BLE001
+            log.warning("read_url dsweb: %s", e)
         async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent": UA}) as c:
             r = await c.get(url)
         ctype = r.headers.get("content-type") or ""

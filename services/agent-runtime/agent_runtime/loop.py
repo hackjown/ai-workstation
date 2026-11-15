@@ -172,6 +172,11 @@ class AgentLoop:
         self._desktop_free = (not self._cad_task and not _GUI_TASK.search(_gui_text(task.prompt or ""))
                               and os.environ.get("AIW_ALWAYS_LOOK_FIRST", "0") != "1")
         self._gui_used = False   # aiw-fix-1: True once the task touches the screen or a browser
+        # v3.9.49: a lookup / read / summarise task with the DeepSeek web tools runs without the desktop until it
+        # needs a browser (browser_open etc. set _gui_used and the screen comes back)
+        self._web_lite = bool((extra_tools or {}).get("web_search")) and not self._cad_task and web_lite(task.prompt or "")
+        if self._web_lite:
+            self._desktop_free = True
         self._images_read: dict[str, tuple] = {}  # path -> (step, description, question): history keeps only ~25 steps
         self.step = 0
         self.ask, self.remember = ask, remember
@@ -1174,6 +1179,8 @@ class AgentLoop:
             self._last_tool = decision.tool
             if (decision.tool and decision.tool not in _NO_SCREEN_TOOLS and decision.tool not in _NON_GUI_TOOLS
                     and not str(decision.tool).startswith(("ext_", "mcp_"))):
+                if self._web_lite and not self._gui_used:   # v3.9.49: the web tools were not enough
+                    await self.emit(EventType.MESSAGE, text=f"联网：改用桌面浏览器（{decision.tool}）", web_lite=False)
                 self._gui_used = True   # aiw-fix-1
             await self.emit(EventType.ACTION, tool=decision.tool, args=decision.args)
             if decision.tool in _vg.TOOLS and _vg.is_open(self):   # 3.8.8: vision service down, don't call it
@@ -3706,7 +3713,41 @@ def _gui_text(prompt: str) -> str:
 
 
 _NON_GUI_TOOLS = {"read_file", "grep", "glob", "todo_write", "files_patch", "verify_html", "ask_user", "update_plan", "remember", "done", "fail", "wait", "request_takeover",
-                  "note_finding", "ssh_exec", "remote_exec", "session_search", "deploy_server", "browser_network"}
+                  "note_finding", "ssh_exec", "remote_exec", "session_search", "deploy_server", "browser_network",
+                  "web_search", "web_fetch", "doc_ask"}
+
+# v3.9.49 web_lite(): the task only looks things up, reads pages / documents and writes a summary
+_LITE_WANT = re.compile(
+    r"查|搜|找一?下|找找|检索|调研|了解|看看|读一?下|阅读|总结|摘要|概括|汇总|整理|归纳|对比|比较|评测|新闻|资讯|快讯|动态|"
+    r"最新|行情|价格|多少钱|是什么|有哪些|怎么样|为什么|介绍|解读|翻译|报告|简报|日报|周报|"
+    r"\bsearch|\blook ?up|\bresearch|\bsummar|\bnews\b|\bread\b|\bcompare|\bwhat (is|are)\b|\bfind\b", re.I)
+_LITE_STOP = re.compile(
+    r"登录|登陆|注册|下单|购买|买一?[个件份台]|加购|购物车|付款|支付|预订|预定|订票|抢购|抢票|秒杀|签到|领券|领取|"
+    r"点击|点一下|点开|双击|拖动|滑块|截图|截屏|录屏|填写|填表|表单|提交|报名|发布|发帖|发文|评论|回复|私信|点赞|关注|"
+    r"上传|下载并?安装|安装|卸载|打开.{0,8}(app|应用|软件|客户端)|在.{0,6}(app|应用|软件|客户端)里|"
+    r"微信|小红书|抖音|快手|淘宝|天猫|京东|拼多多|美团|饿了么|闲鱼|b站|bilibili|"
+    r"桌面|屏幕|窗口|远程|浏览器|chrome|firefox|browseros|"
+    r"画图|绘图|(?<![a-z])cad(?![a-z])|dwg|dxf|librecad|(?<![a-z])ps(?![a-z])|photoshop|photopea|修图|改图|p图|抠图|生成图片|视频|剪辑|配音|"
+    r"发邮件|发送邮件|写代码|改代码|部署|编译|运行脚本|\blog ?in\b|\bsign ?(in|up)\b|\bbuy\b|\border\b|"
+    r"\bcheckout\b|\bclick\b|\bscreenshot\b|\bupload\b|\binstall\b|\bdesktop\b", re.I)
+_LITE_SKILL = re.compile(r"【技能[:：]\s*([^】]+)】")
+_LITE_SKILLS_OK = re.compile(r"搜索|调研|研究|research|search|新闻|news|总结|summar|阅读|read", re.I)
+
+
+def web_lite(prompt: str) -> bool:
+    """v3.9.49: True when the request is only to look up, read and summarise (查/读/总结) - no login, order, click,
+    screenshot or named app. Such a task runs on web_search / web_fetch / doc_ask and opens no screen; the first
+    browser_open (or any GUI tool) brings the desktop back. Judged on the user's own words (a continuation's addition)."""
+    p = _gui_text(prompt or "")
+    m = _LITE_SKILL.search(p)
+    if m and not _LITE_SKILLS_OK.search(m.group(1)):
+        return False   # a task picked a non-research skill (CAD, officecli, xhs ...)
+    p = _LITE_SKILL.sub(" ", p)
+    if not p.strip() or _LITE_STOP.search(p):
+        return False
+    if _VIDEO_TASK.search(p) or _IMAGE_TASK.search(p):
+        return False
+    return bool(_LITE_WANT.search(p))
 
 
 _VIDEO_TASK = re.compile(r"视频|讲解片|宣传片|发布片|动画片|动效|huashu-motion|\bvideo\b|\.mp4\b|explainer", re.I)
@@ -3780,7 +3821,9 @@ _NO_SCREEN_TOOLS = {"read_file", "grep", "glob", "todo_write", "files_patch", "v
                     # 3.8.9 (task-3fc): file-only drawing steps; a desktop look + vision description cost 12-15 s each
                     "drawing_auto", "drawing_build", "drawing_note", "drawing_read",
                     # v3.9.17: facts, remote commands and the request log never change the screen
-                    "note_finding", "ssh_exec", "remote_exec", "browser_network", "session_search"}
+                    "note_finding", "ssh_exec", "remote_exec", "browser_network", "session_search",
+                    # v3.9.49: DeepSeek web tools run on the API host
+                    "web_search", "web_fetch", "doc_ask"}
 _OCR_RE = re.compile(r"\b(tesseract|rapidocr|paddleocr|easyocr)\b", re.I)
 _NO_REPEAT = {"files_write", "shell", "browser_open", "send_file", "files_download", "delegate", "dispatch", "open_app"}
 

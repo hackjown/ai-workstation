@@ -906,6 +906,7 @@ function connectEvents() {
 
 /* ---------------------------------------------------------------- settings ("Apps") */
 async function loadSettings() {
+  setTimeout(() => loadWebTools().catch(() => {}), 0);   // v3.9.49: fills #sWeb once the page is drawn
   const cloudList = await api("GET", "/api/cloud").catch(() => []);
   if (cloudList.some((c) => !["ready", "error"].includes(c.status))) setTimeout(cloudRefresh, 3000);
   const [prof, mems, models, notify, integ, secs, vmnet] = await Promise.all([api("GET", "/api/profile"), api("GET", "/api/memories"), api("GET", "/api/settings/models"),
@@ -947,6 +948,8 @@ async function loadSettings() {
       <select name="thinking"><option value="off" ${(models.thinking || "off") === "off" ? "selected" : ""}>关闭（推荐，更快）</option><option value="on" ${models.thinking === "on" ? "selected" : ""}>模型默认</option></select>
     </div>
     <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="fetchModels(true)">刷新模型列表</button><span id="modelListNote" class="small"></span></div></form>
+
+  <form class="card sec" id="sWeb" onsubmit="saveWebTools(event)"><h3>${icon("search")} 联网工具</h3><div class="muted">读取中…</div></form>
 
   ${cloudCard(cloudList)}
 
@@ -1348,4 +1351,52 @@ function stepTimes(s) {
   if (s.tms != null && s.tms > 0) p.push(`工具 ${fmtDur(s.tms)}`);
   if (s.wms) p.push(`等确认 ${fmtDur(s.wms)}`);
   return p.join(" · ");
+}
+
+
+/* v3.9.49 设置 › 联网工具: DeepSeek Search / Fetch / 文档解析 (GET/PUT /api/web-tools, POST /api/web-tools/test).
+   后端 deepseek = 查、读、总结的任务不开屏幕，用 web_search / web_fetch / doc_ask；vm = 全部走虚拟机里的浏览器。 */
+const WEB_KEY_SRC = { picked: "选定的供应商", deepseek_provider: "DeepSeek 供应商", default: "默认供应商", env: "环境变量 DEEPSEEK_API_KEY" };
+async function loadWebTools() {
+  const box = document.getElementById("sWeb");
+  if (!box) return;
+  let w;
+  try { w = await api("GET", "/api/web-tools"); } catch (e) { box.innerHTML = `<h3>${icon("search")} 联网工具</h3><div class="muted">读取失败：${esc(String(e.message || e).slice(0, 120))}</div>`; return; }
+  const u = w.usage || {}, t = u.today || {}, tot = u.total || {};
+  const money = (v) => "$" + (Number(v || 0)).toFixed(4);
+  const keyLine = w.key ? `Key 来自：${esc(WEB_KEY_SRC[w.key.source] || w.key.source)}（${esc(w.key.name || "")}）`
+    : `<span style="color:var(--red,#c33)">没有 DeepSeek Key</span>：在上面「供应商」里加 DeepSeek（https://api.deepseek.com），或设环境变量 DEEPSEEK_API_KEY`;
+  box.innerHTML = `<h3>${icon("search")} 联网工具</h3>
+    <div class="muted">查资料、读网页、总结这类任务用 DeepSeek 的搜索和读页接口，在服务器上完成，不开虚拟机屏幕；要登录、点击、下单或读不到正文时自动切回桌面浏览器。小秘聊天也会用它搜索和读网页。</div>
+    <div class="kv">
+      <span class="muted">后端</span><select name="backend"><option value="deepseek" ${w.backend === "deepseek" ? "selected" : ""}>DeepSeek（推荐，不开屏幕）</option><option value="vm" ${w.backend === "vm" ? "selected" : ""}>虚拟机浏览器（旧方式）</option></select>
+      <span class="muted">供应商<div class="small">用哪个供应商的 Key</div></span><select name="provider"><option value="">自动（DeepSeek 供应商 › 默认 › 环境变量）</option>${(w.providers || []).map((p) => `<option value="${esc(p.id)}" ${w.provider === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
+      <span class="muted">文档解析<div class="small">doc_ask：PDF/Word/PPT/Excel 发给 DeepSeek 解析，1 小时过期、用完即删；照片、扫描包、模型文件不发</div></span><label><input type="checkbox" name="doc_ask" ${w.doc_ask ? "checked" : ""} /> 开启</label>
+      <span class="muted">聊天读网页<div class="small">小秘的 read_url 走 Fetch API</div></span><label><input type="checkbox" name="chat_fetch" ${w.chat_fetch ? "checked" : ""} /> 开启</label>
+    </div>
+    <div class="small">${w.active ? "✓ 已启用" : "未启用"} · ${keyLine}</div>
+    <div class="small muted">今天：搜索 ${t.search || 0} 次 · 读页 ${t.fetch || 0} 次 · 文档 ${t.doc || 0} 次${t.failed ? ` · 失败 ${t.failed}` : ""} · 约 ${money(t.cost)}；近 ${u.days || 14} 天约 ${money(tot.cost)}（${esc(u.note || "估算")}）</div>
+    <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="testWebTools(this)">测试</button><span id="webTestOut" class="small"></span></div>`;
+}
+async function saveWebTools(e) {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api("PUT", "/api/web-tools", { backend: f.backend.value, provider: f.provider.value, doc_ask: f.doc_ask.checked, chat_fetch: f.chat_fetch.checked });
+    toast("联网工具已保存"); loadWebTools();
+  } catch (err) { toast("保存失败：" + (err.message || err)); }
+}
+async function testWebTools(btn) {
+  const out = document.getElementById("webTestOut");
+  btn.disabled = true; if (out) out.textContent = "测试中（搜索 1 次 + 读页 1 次，约 $0.0015）…";
+  try {
+    const r = await api("POST", "/api/web-tools/test", {});
+    if (!out) return;
+    if (r.error) { out.textContent = "✕ " + r.error; return; }
+    const s = r.search || {}, fe = r.fetch || {};
+    out.textContent = (s.ok ? `✓ 搜索 ${s.count} 条 ${(s.ms / 1000).toFixed(1)}s` : `✕ 搜索：${(s.error || "").slice(0, 80)}`) + "；"
+      + (fe.ok ? `✓ 读页 ${fe.chars} 字 ${(fe.ms / 1000).toFixed(1)}s` : `✕ 读页：${(fe.error || fe.blocked || "").slice(0, 80)}`);
+    loadWebTools().then(() => { const o = document.getElementById("webTestOut"); if (o) o.textContent = out.textContent; });
+  } catch (err) { if (out) out.textContent = "✕ " + (err.message || err); }
+  finally { btn.disabled = false; }
 }

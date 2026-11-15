@@ -1358,25 +1358,52 @@ function stepTimes(s) {
    后端 deepseek = 查、读、总结的任务不开屏幕，用 web_search / web_fetch / doc_ask；vm = 全部走虚拟机里的浏览器。 */
 const WEB_KEY_SRC = { picked: "选定的供应商", deepseek_provider: "DeepSeek 供应商", default: "默认供应商", env: "环境变量 DEEPSEEK_API_KEY" };
 async function loadWebTools() {
-  const box = document.getElementById("sWeb");
+  const grp = document.getElementById("g-web");   // ui.js 分组设置页（现在的默认页面）
+  const box = grp || document.getElementById("sWeb");
   if (!box) return;
+  const no = grp && typeof secNo === "function" ? secNo("g-web") : "";
+  const head = (chip, act) => grp ? `<div class="grp-h"><h2>${no}联网工具</h2>${chip}${act ? `<div class="act">${act}</div>` : ""}</div>` : `<h3>${icon("search")} 联网工具</h3>`;
   let w;
-  try { w = await api("GET", "/api/web-tools"); } catch (e) { box.innerHTML = `<h3>${icon("search")} 联网工具</h3><div class="muted">读取失败：${esc(String(e.message || e).slice(0, 120))}</div>`; return; }
+  try { w = await api("GET", "/api/web-tools"); } catch (e) {
+    box.innerHTML = head('<span class="chip bad">读取失败</span>') + `<div class="${grp ? "grp-d" : "muted"}">读取失败：${esc(String(e.message || e).slice(0, 120))}（API 还是旧版本？）</div>`; return; }
   const u = w.usage || {}, t = u.today || {}, tot = u.total || {};
   const money = (v) => "$" + (Number(v || 0)).toFixed(4);
   const keyLine = w.key ? `Key 来自：${esc(WEB_KEY_SRC[w.key.source] || w.key.source)}（${esc(w.key.name || "")}）`
-    : `<span style="color:var(--red,#c33)">没有 DeepSeek Key</span>：在上面「供应商」里加 DeepSeek（https://api.deepseek.com），或设环境变量 DEEPSEEK_API_KEY`;
-  box.innerHTML = `<h3>${icon("search")} 联网工具</h3>
-    <div class="muted">查资料、读网页、总结这类任务用 DeepSeek 的搜索和读页接口，在服务器上完成，不开虚拟机屏幕；要登录、点击、下单或读不到正文时自动切回桌面浏览器。小秘聊天也会用它搜索和读网页。</div>
+    : `<span style="color:var(--bad,#c33)">没有 DeepSeek Key</span>：在「模型 › 供应商」里加 DeepSeek（https://api.deepseek.com），或设环境变量 DEEPSEEK_API_KEY`;
+  const desc = "查资料、读网页、总结这类任务用 DeepSeek 的搜索和读页接口，在服务器上完成，不开虚拟机屏幕；要登录、点击、下单或读不到正文时自动切回桌面浏览器。小秘聊天也会用它搜索和读网页。";
+  const fBackend = `<select name="backend"><option value="deepseek" ${w.backend === "deepseek" ? "selected" : ""}>DeepSeek（推荐，不开屏幕）</option><option value="vm" ${w.backend === "vm" ? "selected" : ""}>虚拟机浏览器（旧方式）</option></select>`;
+  const fProv = `<select name="provider"><option value="">自动（DeepSeek 供应商 › 默认 › 环境变量）</option>${(w.providers || []).map((p) => `<option value="${esc(p.id)}" ${w.provider === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>`;
+  const fDoc = `<label><input type="checkbox" name="doc_ask" ${w.doc_ask ? "checked" : ""} /> 开启</label>`;
+  const fChat = `<label><input type="checkbox" name="chat_fetch" ${w.chat_fetch ? "checked" : ""} /> 开启</label>`;
+  const hDoc = "doc_ask：PDF/Word/PPT/Excel 发给 DeepSeek 解析，1 小时过期、用完即删；照片、扫描包、模型文件不发";
+  const status = `${w.active ? "✓ 已启用" : "未启用"} · ${keyLine}`;
+  const usage = `今天：搜索 ${t.search || 0} 次 · 读页 ${t.fetch || 0} 次 · 文档 ${t.doc || 0} 次${t.failed ? ` · 失败 ${t.failed}` : ""} · 约 ${money(t.cost)}；近 ${u.days || 14} 天约 ${money(tot.cost)}（${esc(u.note || "估算")}）`;
+  const testBtn = `<button type="button" class="btn sm" onclick="testWebTools(this)">测试</button>`;
+  if (grp) {
+    box.innerHTML = head(pill(!!w.active, "已启用", w.key ? "未启用" : "没有 Key"), `<button class="btn sm primary">保存</button>`)
+      + `<div class="grp-d">${desc}</div><div class="rows">`
+      + row("后端", "DeepSeek = 查读总结不开屏幕；虚拟机浏览器 = 关掉这三个工具", fBackend)
+      + row("供应商", "用哪个供应商的 Key", fProv)
+      + row("文档解析", hDoc, fDoc)
+      + row("聊天读网页", "小秘的 read_url 走 Fetch API", fChat)
+      + row("状态", "", `<span class="small">${status}</span>`)
+      + row("用量", "搜索、读页各 $0.75 / 千次成功请求", `<span class="small">${usage}</span>`)
+      + row("测试", "搜 1 次 + 读 1 次，约 $0.0015", `<span id="webTestOut" class="small"></span>`, testBtn)
+      + `</div>`;
+    if (typeof paintIcons === "function") paintIcons(box);
+    return;
+  }
+  box.innerHTML = `${head()}
+    <div class="muted">${desc}</div>
     <div class="kv">
-      <span class="muted">后端</span><select name="backend"><option value="deepseek" ${w.backend === "deepseek" ? "selected" : ""}>DeepSeek（推荐，不开屏幕）</option><option value="vm" ${w.backend === "vm" ? "selected" : ""}>虚拟机浏览器（旧方式）</option></select>
-      <span class="muted">供应商<div class="small">用哪个供应商的 Key</div></span><select name="provider"><option value="">自动（DeepSeek 供应商 › 默认 › 环境变量）</option>${(w.providers || []).map((p) => `<option value="${esc(p.id)}" ${w.provider === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
-      <span class="muted">文档解析<div class="small">doc_ask：PDF/Word/PPT/Excel 发给 DeepSeek 解析，1 小时过期、用完即删；照片、扫描包、模型文件不发</div></span><label><input type="checkbox" name="doc_ask" ${w.doc_ask ? "checked" : ""} /> 开启</label>
-      <span class="muted">聊天读网页<div class="small">小秘的 read_url 走 Fetch API</div></span><label><input type="checkbox" name="chat_fetch" ${w.chat_fetch ? "checked" : ""} /> 开启</label>
+      <span class="muted">后端</span>${fBackend}
+      <span class="muted">供应商<div class="small">用哪个供应商的 Key</div></span>${fProv}
+      <span class="muted">文档解析<div class="small">${hDoc}</div></span>${fDoc}
+      <span class="muted">聊天读网页<div class="small">小秘的 read_url 走 Fetch API</div></span>${fChat}
     </div>
-    <div class="small">${w.active ? "✓ 已启用" : "未启用"} · ${keyLine}</div>
-    <div class="small muted">今天：搜索 ${t.search || 0} 次 · 读页 ${t.fetch || 0} 次 · 文档 ${t.doc || 0} 次${t.failed ? ` · 失败 ${t.failed}` : ""} · 约 ${money(t.cost)}；近 ${u.days || 14} 天约 ${money(tot.cost)}（${esc(u.note || "估算")}）</div>
-    <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="testWebTools(this)">测试</button><span id="webTestOut" class="small"></span></div>`;
+    <div class="small">${status}</div>
+    <div class="small muted">${usage}</div>
+    <div class="row gap wrap"><button class="btn primary">保存</button>${testBtn}<span id="webTestOut" class="small"></span></div>`;
 }
 async function saveWebTools(e) {
   e.preventDefault();

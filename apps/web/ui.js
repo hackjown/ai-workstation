@@ -111,7 +111,7 @@ MODEL_ROLES.forEach((r) => { if (HINTS[r.key]) r.hint = HINTS[r.key]; });
 loadThreads();
 
 /* ---------- settings: grouped page (模型 / 电脑 / 集成 / 通知 / 你 / 关于), same handlers */
-const SECTIONS = [["g-model", "模型"], ["g-pc", "电脑"], ["g-conn", "连接器"], ["g-int", "集成"], ["g-skill", "技能"], ["g-travel", "出行"], ["g-notify", "通知"], ["g-me", "你和记忆"], ["g-upd", "更新"], ["g-about", "关于"]];
+const SECTIONS = [["g-model", "模型"], ["g-web", "联网"], ["g-pc", "电脑"], ["g-conn", "连接器"], ["g-int", "集成"], ["g-skill", "技能"], ["g-travel", "出行"], ["g-notify", "通知"], ["g-me", "你和记忆"], ["g-upd", "更新"], ["g-about", "关于"]];
 const secNo = (id) => { const i = SECTIONS.findIndex((x) => x[0] === id); return `<span class="no">// ${String(i + 1).padStart(2, "0")}</span>`; };
 const pill = (ok, on, off) => `<span class="chip ${ok === true ? "ok" : ok === false ? "" : "bad"}">${ok ? on : off}</span>`;
 function row(k, hint, v, t = "", cls = "") { return `<div class="rw ${cls}"><div class="k">${k}${hint ? `<small>${hint}</small>` : ""}</div><div class="v">${v}</div><div class="t">${t}</div></div>`; }
@@ -241,6 +241,10 @@ loadSettings = async function () {
     </div>
   </form>
 
+  <form class="grp" id="g-web" onsubmit="saveWebTools(event)">
+    <div class="grp-h"><h2>${secNo("g-web")}联网工具</h2><span class="sub">读取中…</span></div>
+  </form>
+
   <section class="grp" id="g-pc">
     <div class="grp-h"><h2>${secNo("g-pc")}电脑</h2><span class="sub">Agent 在这些电脑上操作，聊天里随时切换</span></div>
     <form class="rows" id="sVmNet" onsubmit="saveVmNet(event)">
@@ -365,6 +369,7 @@ loadSettings = async function () {
   const g = $("g-model"); $("sModel").remove(); g.id = "sModel"; g.dataset.anchor = "g-model";
   const idx = document.querySelector('.set-index a[href="#g-model"]'); if (idx) idx.setAttribute("onclick", idx.getAttribute("onclick").replace("'g-model'", "'sModel'"));
   paintIcons($("settingsPage"));
+  if (typeof loadWebTools === "function") loadWebTools().catch(() => {});   // v3.9.49 设置 › 联网工具
   applyProfile();
   fetchModels(false);
   connFilter(S.connCat || "全部");

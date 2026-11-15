@@ -363,3 +363,11 @@ def test_web_compare_report(app, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "帮我查一下今天的 AI 新闻" in out and "总结 https://example.com/a" in out and "登录京东" not in out
     assert "| 旧 task-0 | succeeded | 1.0 | 1 | 1 | 1 |" in out
+
+
+def test_settings_card_is_on_the_grouped_settings_page():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    ui = (root / "apps/web/ui.js").read_text()
+    assert '["g-web", "联网"]' in ui and 'id="g-web"' in ui and "loadWebTools()" in ui
+    assert 'getElementById("g-web")' in (root / "apps/web/app.js").read_text()

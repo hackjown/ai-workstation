@@ -99,6 +99,7 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 - 路由：`web_lite()` 判断任务是不是只「查、读、总结」（没有登录、下单、点击、截图、指定 App、画图、视频…）。是的话任务开头不截图、不调视觉模型，时间线显示「联网：DeepSeek（不开浏览器）」；读到登录页、验证页或正文太短，`web_fetch` 返回 FAILED 并提示改用 `browser_open`，一旦用浏览器就自动切回桌面（时间线「联网：改用桌面浏览器」）。
 - 小秘聊天：多了 `web_search`、`doc_ask`；配了 Key 时 `read_url` 走 Fetch API（读不到再直连）。
 - `doc_ask` 不发：照片/图片、压缩包和扫描包、3D/CAD/模型权重文件、文件名像证件/扫描件/银行流水的文件。
+- 自定义第三方（中转）：设置 › 联网 › 供应商 里选它（「添加自定义」= 模型 › 供应商 › 添加），请求发到它自己的地址和 Key，不发给 DeepSeek；中转没转发 /tools 接口时测试会直说。
 - Key 查找顺序：设置里指定的供应商 > 地址是 api.deepseek.com 的供应商 > 「默认」供应商（仅当它就是 api.deepseek.com，别家的 Key 不会发给 DeepSeek）> 环境变量 `DEEPSEEK_API_KEY`。用该供应商的代理。
 - 设置 › 联网工具：后端 DeepSeek / 虚拟机浏览器、选供应商、文档解析开关、聊天读网页开关、今日和近 14 天用量与费用估算、测试按钮（搜 1 次 + 读 1 次，约 $0.0015）。接口 `GET/PUT /api/web-tools`、`POST /api/web-tools/test`；用量表 `web_tools_usage`。
 - 价格（2026-11-15 官方）：搜索、读页各 $0.75 / 千次成功请求（空结果、失败不计费）；文档解析 $0.225 / 千页；`deepseek-flash` 按 token。

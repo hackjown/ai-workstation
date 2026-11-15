@@ -371,3 +371,65 @@ def test_settings_card_is_on_the_grouped_settings_page():
     ui = (root / "apps/web/ui.js").read_text()
     assert '["g-web", "联网"]' in ui and 'id="g-web"' in ui and "loadWebTools()" in ui
     assert 'getElementById("g-web")' in (root / "apps/web/app.js").read_text()
+
+
+# --------------------------------------------------------------------------------------------- third-party gateway
+def test_picked_third_party_gateway_gets_its_own_address_and_key(app, tmp_path):
+    """A picked relay is called at its own base_url; its key never reaches api.deepseek.com."""
+    seen = []
+
+    def relay(req: httpx.Request) -> httpx.Response:
+        seen.append((req.url.host, req.url.path, req.headers.get("authorization"), req.content))
+        p = req.url.path
+        if p == "/v1/tools/search":
+            return httpx.Response(200, json={"results": [{"title": "t", "url": "https://a.example/x", "summary": "s"}]})
+        if p == "/v1/tools/fetch":
+            return httpx.Response(200, json={"title": "文章", "content": LONG})
+        if p == "/v1/files" and req.method == "POST":
+            return httpx.Response(200, json={"id": "f1"})
+        if p == "/v1/chat/completions":
+            return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}})
+        if p == "/v1/files/f1":
+            return httpx.Response(200, json={"deleted": True})
+        return httpx.Response(404, json={"error": {"message": "?"}})
+
+    ds.TRANSPORT = httpx.MockTransport(relay)
+    st, sec = app.state.store, app.state.secrets
+    add_provider(app, "relay", "http://relay.example.com:8787/v1/", KEY_OTHER)
+    st.kv_set(ds.KV, {"provider": "relay", "doc_model": "workbuddy/cn:deepseek-v4.1"})
+    k = ds.resolve_key(st, sec)
+    assert k["third_party"] and k["base"] == "http://relay.example.com:8787/v1"
+    asyncio.run(ds.search(st, sec, "q"))
+    asyncio.run(ds.fetch(st, sec, "https://a.example/x"))
+    doc = tmp_path / "合同.txt"
+    doc.write_text("付款 30 天")
+    asyncio.run(ds.doc_ask(st, sec, str(doc), "几天付款"))
+    assert {h for h, *_ in seen} == {"relay.example.com"}
+    assert all(a == f"Bearer {KEY_OTHER}" for _, _, a, _ in seen)
+    assert [p for _, p, _, _ in seen] == ["/v1/tools/search", "/v1/tools/fetch", "/v1/files", "/v1/chat/completions",
+                                          "/v1/files/f1"]
+    chat = json.loads(next(b for _, p, _, b in seen if p == "/v1/chat/completions"))
+    assert chat["model"] == "workbuddy/cn:deepseek-v4.1"
+    pub = ds.public(st, sec)
+    assert pub["key"]["third_party"] and pub["key"]["host"] == "relay.example.com"
+    assert {p["id"]: p["official"] for p in pub["providers"]}["relay"] is False
+
+
+def test_third_party_without_the_tools_says_so(app):
+    ds.TRANSPORT = httpx.MockTransport(lambda req: httpx.Response(404, text="404 page not found"))
+    add_provider(app, "relay", "http://relay.example.com/v1", KEY_OTHER)
+    app.state.store.kv_set(ds.KV, {"provider": "relay"})
+    with pytest.raises(ds.DSError) as e:
+        asyncio.run(ds.search(app.state.store, app.state.secrets, "q"))
+    assert "不支持 /tools/search" in e.value.message and "第三方「relay」" in e.value.message
+    ds.TRANSPORT = httpx.MockTransport(lambda req: httpx.Response(200, text="<html>hi</html>", headers={"content-type": "text/html"}))
+    with pytest.raises(ds.DSError) as e:
+        asyncio.run(ds.search(app.state.store, app.state.secrets, "q"))
+    assert "不是 JSON" in e.value.message
+
+
+def test_doc_model_setting_is_validated(app):
+    from fastapi.testclient import TestClient
+    c = TestClient(app)
+    assert c.put("/api/web-tools", headers=H, json={"doc_model": "a b"}).status_code == 400
+    assert c.put("/api/web-tools", headers=H, json={"doc_model": "deepseek-v4.1"}).json()["doc_model"] == "deepseek-v4.1"

@@ -1338,7 +1338,10 @@ async function delSecret(n) { if (!confirm("删除密钥 " + n + "？")) return;
 /* ---------------------------------------------------------------- boot */
 paintIcons();
 api("GET", "/api/profile").then((p) => { S.profile = p; applyProfile(); renderChat(); }).catch(() => {});
-go("chat"); loadThreads(); refreshThread(true); loadDraft(); loadMachines().then(() => { loadDesktop(); refreshMachine(); }); loadNotes(); connectEvents();
+// v3.9.49: open straight on the home chat (home.js takes over a moment later); booting on the old task view first
+// flashed the last task's empty welcome page and the desktop pane on every refresh
+if (document.getElementById("v-home")) TITLES.home = TITLES.home || "聊天";
+go(document.getElementById("v-home") ? "home" : "chat"); loadThreads(); refreshThread(true); loadDraft(); loadMachines().then(() => { loadDesktop(); refreshMachine(); }); loadNotes(); connectEvents();
 setInterval(refreshMachine, 10000);
 setInterval(() => { if (busyTask && S.view === "chat") renderChat(); }, 5000);
 if (NATIVE) { document.body.classList.add("native"); NATIVE.postMessage({ op: "ready" }); }
@@ -1369,10 +1372,13 @@ async function loadWebTools() {
   const u = w.usage || {}, t = u.today || {}, tot = u.total || {};
   const money = (v) => "$" + (Number(v || 0)).toFixed(4);
   const keyLine = w.key ? `Key 来自：${esc(WEB_KEY_SRC[w.key.source] || w.key.source)}（${esc(w.key.name || "")}）`
+      + (w.key.third_party ? ` · 第三方，请求发到 ${esc(w.key.host || "")}，不发给 DeepSeek` : "")
     : `<span style="color:var(--bad,#c33)">没有 DeepSeek Key</span>：在「模型 › 供应商」里加 DeepSeek（https://api.deepseek.com），或设环境变量 DEEPSEEK_API_KEY`;
   const desc = "查资料、读网页、总结这类任务用 DeepSeek 的搜索和读页接口，在服务器上完成，不开虚拟机屏幕；要登录、点击、下单或读不到正文时自动切回桌面浏览器。小秘聊天也会用它搜索和读网页。";
   const fBackend = `<select name="backend"><option value="deepseek" ${w.backend === "deepseek" ? "selected" : ""}>DeepSeek（推荐，不开屏幕）</option><option value="vm" ${w.backend === "vm" ? "selected" : ""}>虚拟机浏览器（旧方式）</option></select>`;
-  const fProv = `<select name="provider"><option value="">自动（DeepSeek 供应商 › 默认 › 环境变量）</option>${(w.providers || []).map((p) => `<option value="${esc(p.id)}" ${w.provider === p.id ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>`;
+  const fProv = `<select name="provider"><option value="">自动（DeepSeek 供应商 › 默认 › 环境变量）</option>${(w.providers || []).map((p) => `<option value="${esc(p.id)}" ${w.provider === p.id ? "selected" : ""}>${esc(p.name)}${p.official ? "（DeepSeek 官方）" : p.host ? `（第三方 · ${esc(p.host)}）` : ""}</option>`).join("")}</select>`;
+  const addProv = `<button type="button" class="btn sm ghost" onclick="webAddProvider()">${icon("plus")}添加自定义</button>`;
+  const fDocModel = `<input name="doc_model" value="${esc(w.doc_model || "")}" placeholder="deepseek-flash" />`;
   const fDoc = `<label><input type="checkbox" name="doc_ask" ${w.doc_ask ? "checked" : ""} /> 开启</label>`;
   const fChat = `<label><input type="checkbox" name="chat_fetch" ${w.chat_fetch ? "checked" : ""} /> 开启</label>`;
   const hDoc = "doc_ask：PDF/Word/PPT/Excel 发给 DeepSeek 解析，1 小时过期、用完即删；照片、扫描包、模型文件不发";
@@ -1383,7 +1389,8 @@ async function loadWebTools() {
     box.innerHTML = head(pill(!!w.active, "已启用", w.key ? "未启用" : "没有 Key"), `<button class="btn sm primary">保存</button>`)
       + `<div class="grp-d">${desc}</div><div class="rows">`
       + row("后端", "DeepSeek = 查读总结不开屏幕；虚拟机浏览器 = 关掉这三个工具", fBackend)
-      + row("供应商", "用哪个供应商的 Key", fProv)
+      + row("供应商", "第三方中转：请求发到它自己的地址，Key 不会发给 DeepSeek", fProv, addProv)
+      + row("文档模型", "doc_ask 用的模型名，留空 = deepseek-flash；第三方中转要填它那边的名字", fDocModel)
       + row("文档解析", hDoc, fDoc)
       + row("聊天读网页", "小秘的 read_url 走 Fetch API", fChat)
       + row("状态", "", `<span class="small">${status}</span>`)
@@ -1397,7 +1404,8 @@ async function loadWebTools() {
     <div class="muted">${desc}</div>
     <div class="kv">
       <span class="muted">后端</span>${fBackend}
-      <span class="muted">供应商<div class="small">用哪个供应商的 Key</div></span>${fProv}
+      <span class="muted">供应商<div class="small">第三方中转发到它自己的地址</div></span><div>${fProv} ${addProv}</div>
+      <span class="muted">文档模型<div class="small">留空 = deepseek-flash</div></span>${fDocModel}
       <span class="muted">文档解析<div class="small">${hDoc}</div></span>${fDoc}
       <span class="muted">聊天读网页<div class="small">小秘的 read_url 走 Fetch API</div></span>${fChat}
     </div>
@@ -1405,11 +1413,18 @@ async function loadWebTools() {
     <div class="small muted">${usage}</div>
     <div class="row gap wrap"><button class="btn primary">保存</button>${testBtn}<span id="webTestOut" class="small"></span></div>`;
 }
+// 「添加自定义」: the provider form lives in 模型 › 供应商 (same list the models use); jump there and open it
+function webAddProvider() {
+  if (typeof editProvider === "function") return editProvider();
+  const g = document.getElementById("g-prov") || document.getElementById("sModel");
+  if (g) g.scrollIntoView({ behavior: "smooth", block: "start" });
+}
 async function saveWebTools(e) {
   e.preventDefault();
   const f = e.target;
   try {
-    await api("PUT", "/api/web-tools", { backend: f.backend.value, provider: f.provider.value, doc_ask: f.doc_ask.checked, chat_fetch: f.chat_fetch.checked });
+    await api("PUT", "/api/web-tools", { backend: f.backend.value, provider: f.provider.value, doc_ask: f.doc_ask.checked, chat_fetch: f.chat_fetch.checked,
+      doc_model: f.doc_model ? f.doc_model.value.trim() : "" });
     toast("联网工具已保存"); loadWebTools();
   } catch (err) { toast("保存失败：" + (err.message || err)); }
 }

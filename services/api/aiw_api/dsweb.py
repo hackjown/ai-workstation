@@ -14,6 +14,9 @@ The key (first that has one):
   1. kv web_tools.provider: the provider the user picked in 设置 › 联网工具
   2. a provider whose base_url host is api.deepseek.com
   3. the 默认 provider, only when its base_url is api.deepseek.com (another vendor's key is never sent to DeepSeek)
+  A picked provider whose address is NOT api.deepseek.com (a relay / third-party gateway) is called at its own
+  address: {base_url}/tools/search, /tools/fetch, /files, /chat/completions, with its own key and doc model.
+  Its key never goes to api.deepseek.com, and "auto" never picks a third party.
   4. env DEEPSEEK_API_KEY
 The provider's proxy is used for every call.
 
@@ -47,7 +50,7 @@ KV = "web_tools"
 DEEPSEEK_HOST = "api.deepseek.com"
 BASE = "https://api.deepseek.com"
 DOC_MODEL = os.environ.get("AIW_DSWEB_DOC_MODEL", "deepseek-flash")
-DEFAULTS = {"backend": "deepseek", "provider": "", "doc_ask": True, "chat_fetch": True}
+DEFAULTS = {"backend": "deepseek", "provider": "", "doc_ask": True, "chat_fetch": True, "doc_model": ""}
 BACKENDS = ("deepseek", "vm")
 TZ_OFFSET = 8 * 3600
 MIN_CHARS = int(os.environ.get("AIW_DSWEB_MIN_CHARS", "200"))   # shorter page text = nothing to read
@@ -89,8 +92,11 @@ def resolve_key(store, secrets, env: Optional[dict] = None) -> Optional[dict]:
             p = pv.find(store, pid) if pid != pv.DEFAULT_ID else None
             k = pv.conn(store, secrets, pid) if (pid == pv.DEFAULT_ID or (p and p.get("enabled") is not False)) else None
             if k and k.get("key") and not k.get("fell_back"):
+                third = _host(k.get("base_url") or "") != DEEPSEEK_HOST
                 return {"key": k["key"], "source": "picked", "provider": k["id"], "name": k.get("name") or k["id"],
-                        "proxy": k.get("proxy") or ""}
+                        "proxy": k.get("proxy") or "", "third_party": third,
+                        "base": (k.get("base_url") or "").rstrip("/") if third else "",
+                        "doc_model": str(c.get("doc_model") or "").strip()}
         for p in pv.stored(store):
             if p.get("enabled") is False or _host(p.get("base_url") or "") != DEEPSEEK_HOST:
                 continue
@@ -105,6 +111,18 @@ def resolve_key(store, secrets, env: Optional[dict] = None) -> Optional[dict]:
     if k:
         return {"key": k, "source": "env", "provider": "", "name": "DEEPSEEK_API_KEY", "proxy": ""}
     return None
+
+
+def _url(k: dict, path: str) -> str:
+    """path is the official one (/v1/tools/search, /files, /chat/completions). A third-party gateway gets it under
+    its own base_url (which already carries its /v1): {base}/tools/search, {base}/files, {base}/chat/completions."""
+    if k.get("third_party") and k.get("base"):
+        return k["base"] + (path[3:] if path.startswith("/v1/") else path)
+    return BASE + path
+
+
+def _who(k: dict) -> str:
+    return f"第三方「{k.get('name') or k.get('provider')}」" if k.get("third_party") else "DeepSeek"
 
 
 def enabled(store, secrets) -> bool:
@@ -240,14 +258,20 @@ async def _post_json(k: dict, path: str, body: dict, timeout: float = 30) -> dic
     for attempt in range(2):
         try:
             async with _client(k, timeout) as cl:
-                r = await cl.post(BASE + path, json=body,
+                r = await cl.post(_url(k, path), json=body,
                                   headers={"Authorization": f"Bearer {k['key']}", "Content-Type": "application/json"})
         except Exception as e:  # noqa: BLE001  network: one retry
-            last = DSError(0, f"连不上 DeepSeek：{type(e).__name__}: {str(e)[:150]}")
+            last = DSError(0, f"连不上 {_who(k)}：{type(e).__name__}: {str(e)[:150]}")
         else:
             if r.status_code == 200:
-                return r.json()
+                try:
+                    return r.json()
+                except ValueError:
+                    raise DSError(502, f"{_who(k)} 返回的不是 JSON（{r.headers.get('content-type', '?')}）：多半不支持这个接口")
             last = DSError(r.status_code, _err_text(r.status_code, r.text))
+            if k.get("third_party") and r.status_code in (404, 405, 501):
+                raise DSError(r.status_code, f"{_who(k)} 不支持 {path[3:] if path.startswith('/v1/') else path} 接口"
+                                             f"（{r.status_code}）：它只转发了聊天模型。联网工具要 DeepSeek 官方 Key，或转发了这个接口的中转")
             if not (r.status_code in (408, 429) or r.status_code >= 500):
                 raise last
         if attempt == 0:
@@ -407,7 +431,7 @@ async def doc_ask(store, secrets, path: str, question: str, key: Optional[dict] 
         async with _client(k, 240) as cl:
             with open(path, "rb") as f:
                 # purpose BEFORE file (documents get 400 otherwise); httpx sends data fields before files
-                r = await cl.post(BASE + "/files", headers={"Authorization": f"Bearer {k['key']}"},
+                r = await cl.post(_url(k, "/files"), headers={"Authorization": f"Bearer {k['key']}"},
                                   data={"purpose": purpose, "expires_after[anchor]": "created_at",
                                         "expires_after[seconds]": str(FILE_TTL)},
                                   files={"file": (os.path.basename(path), f)})
@@ -416,11 +440,11 @@ async def doc_ask(store, secrets, path: str, question: str, key: Optional[dict] 
             fid = r.json().get("id")
             if not fid:
                 raise DSError(500, "上传后没拿到 file_id")
-            body = {"model": DOC_MODEL, "thinking": {"type": "disabled"},
+            body = {"model": k.get("doc_model") or DOC_MODEL, "thinking": {"type": "disabled"},
                     "messages": [{"role": "system", "content": "只根据文档回答，用中文，引用页码或小节（有的话）。文档里没有的就说没有。"},
                                  {"role": "user", "content": [{"type": "file", "file_id": fid},
                                                               {"type": "text", "text": q[:4000]}]}]}
-            r = await cl.post(BASE + "/chat/completions", json=body,
+            r = await cl.post(_url(k, "/chat/completions"), json=body,
                               headers={"Authorization": f"Bearer {k['key']}", "Content-Type": "application/json"})
             if r.status_code != 200:
                 raise DSError(r.status_code, "提问失败：" + _err_text(r.status_code, r.text))
@@ -433,12 +457,12 @@ async def doc_ask(store, secrets, path: str, question: str, key: Optional[dict] 
         raise
     except Exception as e:  # noqa: BLE001
         record(store, "doc", False, fid is not None, origin, pages=pages if fid else 0, err=str(e))
-        raise DSError(0, f"连不上 DeepSeek：{type(e).__name__}: {str(e)[:150]}")
+        raise DSError(0, f"连不上 {_who(k)}：{type(e).__name__}: {str(e)[:150]}")
     finally:
         if fid:
             try:
                 async with _client(k, 20) as cl:
-                    d = await cl.delete(f"{BASE}/files/{fid}", headers={"Authorization": f"Bearer {k['key']}"})
+                    d = await cl.delete(_url(k, f"/files/{fid}"), headers={"Authorization": f"Bearer {k['key']}"})
                 deleted = d.status_code == 200
             except Exception as e:  # noqa: BLE001  it still expires in an hour
                 log.warning("delete %s: %s", fid, e)
@@ -555,10 +579,15 @@ def public(store, secrets) -> dict:
     k = resolve_key(store, secrets)
     ds = [{"id": p["id"], "name": p.get("name") or p["id"]} for p in pv.stored(store)
           if p.get("enabled") is not False and _host(p.get("base_url") or "") == DEEPSEEK_HOST]
-    allp = [{"id": pv.DEFAULT_ID, "name": pv.DEFAULT_NAME}] + [{"id": p["id"], "name": p.get("name") or p["id"]}
-                                                              for p in pv.stored(store) if p.get("enabled") is not False]
+    d = pv.default_conn(store, secrets)
+    allp = [{"id": pv.DEFAULT_ID, "name": pv.DEFAULT_NAME, "host": _host(d.get("base_url") or ""),
+             "official": _host(d.get("base_url") or "") == DEEPSEEK_HOST}] + [
+        {"id": p["id"], "name": p.get("name") or p["id"], "host": _host(p.get("base_url") or ""),
+         "official": _host(p.get("base_url") or "") == DEEPSEEK_HOST}
+        for p in pv.stored(store) if p.get("enabled") is not False]
     return {**c, "active": c["backend"] == "deepseek" and k is not None,
-            "key": ({"source": k["source"], "provider": k["provider"], "name": k["name"]} if k else None),
+            "key": ({"source": k["source"], "provider": k["provider"], "name": k["name"],
+                     "third_party": bool(k.get("third_party")), "host": _host(k.get("base") or BASE)} if k else None),
             "deepseek_providers": ds, "providers": allp, "usage": usage_summary(store, 14)}
 
 
@@ -577,6 +606,11 @@ def validate(body: dict, cur: dict) -> dict:
     for f in ("doc_ask", "chat_fetch"):
         if f in body:
             out[f] = bool(body[f])
+    if "doc_model" in body:
+        m = str(body["doc_model"] or "").strip()
+        if len(m) > 120 or any(ch.isspace() for ch in m):
+            raise ValueError("文档模型名不对")
+        out["doc_model"] = m
     return out
 
 
@@ -611,7 +645,7 @@ def mount(app, store, secrets, auth) -> None:
         k = resolve_key(store, secrets)
         if not k:
             return {"ok": False, "error": "没有 DeepSeek API Key"}
-        out: dict = {"key": {"source": k["source"], "name": k["name"]}}
+        out: dict = {"key": {"source": k["source"], "name": k["name"], "third_party": bool(k.get("third_party"))}}
         t0 = time.time()
         try:
             res = await search(store, secrets, str(body.get("query") or "DeepSeek API"), 3, key=k, origin="test")

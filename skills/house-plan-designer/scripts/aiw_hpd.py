@@ -35,7 +35,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 ENV_FILE = Path.home() / ".config" / "aiw" / "hpd.env"
-PY_MODS = {"numpy": "numpy", "PIL": "pillow", "cv2": "opencv-python-headless", "fitz": "pymupdf", "ezdxf": "ezdxf"}
+PY_MODS = {"numpy": "numpy", "PIL": "pillow", "cv2": "opencv-python-headless", "fitz": "pymupdf", "ezdxf": "ezdxf", "scipy": "scipy"}
 CHROMES = ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser",
            "/snap/bin/chromium", "/opt/google/chrome/chrome"]
 

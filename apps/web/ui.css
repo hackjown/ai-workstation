@@ -501,6 +501,10 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 .skjob.done{border-style:solid;background:transparent;border-color:var(--line)}
 .skm-row{display:grid;grid-template-columns:minmax(90px,auto) auto 1fr;gap:10px;align-items:center}
 .skm-row details{grid-column:1/-1}
+.skupd{margin:0 18px 10px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;display:flex;flex-direction:column;gap:8px}
+.skupd-h{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}.skupd-h .sp{flex:1}
+.skupd .skm-row b small{font-weight:400;opacity:.6}
+.skupd details{grid-column:1/-1}
 .skm-row pre{max-height:180px;overflow:auto;font-size:11.5px;white-space:pre-wrap;margin:6px 0 0;padding:8px;border-radius:8px;background:var(--panel2,rgba(127,127,127,.08))}
 .skmanual{padding:6px 18px 10px}.skmanual summary{cursor:pointer;padding:6px 0}
 .threads button{position:relative}

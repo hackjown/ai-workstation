@@ -74,12 +74,26 @@
 ### 房间 rooms
 
 - `at` 必须落在墙围合的区域里面（check.mjs 会报 `labelsOutsideRooms`）。
+- `at` 也不要落在 `structs`（管井、柱、烟道）的占地上：自动水电按房间名布点时会认不出这个房间（水井、管井标签尤其要避开里面的 shaft）。
+- 「入户花园」按楼内有顶的入户门厅处理（开关装在花园里、有吊顶、地面默认 tile），不当露天花园 / 阳台；真正露天的写「露台」「庭院」。
 - 一个区域放多个标签会合并显示（如“客厅 + 餐厅”）。开放空间通常只放一个标签。
+- **`area`：图上标的房间面积（㎡）一定写上**（`{"at": [..], "name": "主卧", "area": 14.6}`）。自查按墙面算的净面积逐间对账，差超过 max(0.4㎡, 6%) 报「面积对不上」（墙位置 / 墙厚错了、漏墙）；原图按轴线 / 建筑面积标的，用 `areaTol` 放宽并在交付时说明。
+- 两个卧室 / 卫生间 / 书房的标签落在同一个封闭区域，自查报「房间合并」：中间漏了墙、墙没接上，或门写成了洞口。主卧 + 衣帽间、卫生间 + 淋浴这类本来连通的不报。
 - `mat` 地面材质。不填时按名字猜：卫/厨 → `bath`，车库 → `epoxy`，庭院/花园 → `paving`，阳台/露台 → `deck`，客餐厅/过道 → `tile`，主卧 → `walnut`，其余 → `oak`。
   可选值：`oak` 橡木、`walnut` 胡桃木、`herring` 人字拼、`tile` 灰白大板、`marble` 米白大理石、`cement` 微水泥、`bath` 防滑砖、`terrazzo` 水磨石、`deck` 户外木塑、`paving` 庭院石材、`grass` 草坪、`epoxy` 环氧地坪（车库）。`deck` / `paving` / `grass` 算室外（没有吊顶、不贴踢脚线）。
 - `wallMat` 墙面：`latexWhite`、`latexGrey`、`latexSage`、`latexWarm`、`wallpaper`、`wallTile`、`woodPanel`。卫生间/厨房不填时自动用 `wallTile` 和 300mm 平顶吊顶。
-- `ceil` 吊顶：`{ "type": "none" | "flat" | "edge", "drop": 250, "edgeW": 450, "cove": true }`（edge 是边吊，cove 是灯带）。
+- `ceil` 吊顶：`{ "type": "none" | "flat" | "edge" | "tray" | "float" | "alu" | "wood", "drop": 250, "edgeW": 450, "cove": true, "drop2": 150, "edgeW2": 300, "curtain": 200, "cornice": true, "color": "#f1efea" }`
+  - `flat` 平顶整体下吊；`edge` 边吊（四周 edgeW 宽一圈下吊 drop，中间原顶）；`tray` 回字形叠级（外圈 drop/edgeW，第二圈 drop2/edgeW2，中间原顶）；
+    `float` 悬浮（中间整块下吊 drop，四周 edgeW 宽一圈高 100 藏灯带）；`alu` 铝扣板集成吊顶（厨卫）；`wood` 木饰面 / 木格栅
+  - `cove: true` 做灯槽：设计器**自动沿台阶放 LED 灯带**（plan.elec 里 `kind: "strip"`、`auto: "cove:…"`），跟着吊顶尺寸自动更新、自动挂到房间开关上
+  - `curtain` 窗帘盒宽（靠窗那面墙留一条到原顶的槽，0 = 不做）；`cornice` 石膏顶角线
+  - 同一个区域有多个标签（客厅 + 餐厅 + 门厅）时，吊顶按**第一个标签**算——每个标签都写同样的 `ceil`
+- 局部吊顶造型（餐厅上方方形 / 圆形吊顶、假梁、木格栅片）放家具：`ceilZone`（画轮廓）、`ceilZoneCove`（带一圈灯带）、`ceilZoneRound`、`ceilBeamWood`、`ceilSlats`，
+  `h` = 下吊厚度，顶面自动贴在顶棚下；只在顶面图层显示和选中。
 - `skirting` 踢脚线：`none` | `wood` | `metal`。
+- `lighting` 排灯（无主灯筒灯 / 射灯阵列）：`{"kind": "downlight" | "spot" | "light", "sx": 1200, "sy": 1200, "wall": 600, "fit": "center" | "even", "keepMain": false}`
+  sx / sy 横纵间距，wall 离墙面距离；center = 按间距排、整组居中（离墙 ≥ wall），even = 首尾正好离墙 wall、中间均分；keepMain = 还保留沙发区 / 卧室主灯。
+  写了它，autoElec 在这个房间按阵列排灯（餐桌吊灯照放），不再按覆盖补筒灯。图上画了筒灯阵列 / 用户说“无主灯、筒灯间距 1.2m 离墙 0.6m”就写。设计器里在房间或筒灯的属性栏「排灯」改参数、点「按设置重新排灯」；选中一盏灯时平面上显示到墙（蓝）和到相邻灯（绿）的距离，点数字直接输入挪灯。
 - `tile` 自定义铺砖（可选，写了就按砖一块块铺，覆盖 `mat` 的预设纹理；不写的字段用默认值）：
   ```json
   "tile": { "w": 800, "h": 800, "gap": 2, "pattern": "grid", "color": "#e6e1d8", "grout": "#c4beb4", "tex": "marble", "origin": "center" }
@@ -167,6 +181,26 @@
 | grandPiano / barCounter / sauna / chandelier | 三角钢琴 / 吧台（带水槽）/ 桑拿房 / 挑空水晶大吊灯（吸顶，挂在所在层顶面） | 1550×1900 / 2400×650 / 1500 / 1200（h 1600） |
 | boiler / manifold / waterSoftener | 壁挂炉（地暖 + 热水，带燃气、冷热水）/ 地暖分集水器 / 中央软水机 | 450×350 / 800×120 / 350×450 |
 | outdoorSet / plantShelf / bike / yogaMat / catTree / petBed | 户外桌椅（带遮阳伞）/ 花架 / 动感单车 / 瑜伽垫 / 猫爬架 / 宠物窝 | 1600 / 1000×350 / 550×1100 / 610×1830 / 600 / 700×550 |
+| ductAC / linearVent / linearVentSide / linearReturn / cassetteAC | 中央空调：风管机内机（吸顶，藏吊顶内）/ 线性下出风口 / 侧出风口（边吊侧面）/ 回风口带检修口 / 天花机四面出风 | 1000×500 / 1500×150 / 1500×60 / 1200×300 / 840 |
+| vrfOutdoor / freshAirUnit / thermostat / heatPump / bufferTank / floorHeat | 多联机外机 / 新风主机（吸顶）/ 温控面板 / 空气能热泵外机 / 缓冲水箱 / 地暖盘管示意 | 940×370 / 800×600 / 86 / 1000×400 / 500 / 按房间拉大 |
+| centralPurifier / preFilter / dehumidifier | 中央净水机 / 前置过滤器 / 除湿机 | 350×300 / 180×150 / 400×300 |
+| ceilLamp / linearPendant / bubblePendant / ceilingFan | 吸顶灯（家具款）/ 线性吊灯 / 泡泡（魔豆）吊灯 / 风扇灯：都吸顶、可点亮 | 600 / 1200×80 / 900 / 1320 |
+| gardenLamp / inGround / wallWasher | 庭院灯 2.8m / 地埋灯 / 户外壁灯（可点亮） | 380 / 140 / 160×140 |
+| integratedStove / washerTower / builtinFridge / smartToilet / ledMirror / projector | 集成灶 / 洗烘套装叠放 / 嵌入式冰箱 / 智能马桶 / 智能背光浴镜（可点亮）/ 吊装投影仪 | 900×600 / 600×650 / 600×600 / 400×700 / 800×40 / 400×320 |
+| hedge / flowerBed / planterBox / palm / bamboo / rock | 绿篱 / 砖砌花坛（带花）/ 木花箱 / 棕榈 / 竹丛 / 景观石 | 2000×600 / 1600×800 / 1000×400 / 2400 / 1500×600 / 1200×800 |
+| pergola / outdoorSofa / hammock / kidsSlide / dogHouse / firePit / outdoorSink | 花架廊 / 户外藤编沙发组 / 吊床 / 儿童滑梯 / 狗屋 / 火盆 / 户外洗手池 | 3000 / 2600×2000 / 3000×1000 / 1000×2600 / 800×1000 / 1000 / 600×500 |
+| landLawn / landGravel / landPaver / landDeck / landWater / landBed | 场地块（自由轮廓，`opt.outline` 写 "x,y\|x,y…" 局部 mm）：草坪（自带草丛）/ 碎石 / 石材铺装 / 户外木平台（能站上去）/ 水景鱼池 / 花境（自带花） | 按图 |
+| laundryCabinet / blinds / wallNiche / grabBar | 阳台洗衣柜（左洗衣机位 + 右台盆 + 通长吊柜，自带水电）/ 百叶帘·卷帘（窗内，z 900）/ 壁龛（带灯带，挂墙）/ 适老安全扶手（挂墙 z 800） | 1400×650×2400 / 1200×60 / 600×60×300 / 600×80 |
+| murphyBed / safeBox / toiletCabinet / litterBox | 翻板床（收起状态的柜体，平面虚线画放下后的床位）/ 保险柜 / 马桶上方置物柜（挂墙 z 1300）/ 猫砂盆 | 1500×450×2200 / 400×380 / 600×200 / 550×450 |
+| freeModel | 自由造型工作台建的组合模型（`opt.model` 由工作台生成，手写 spec 一般不用） | — |
+
+### 揉捏变形 quad（非 90° 夹角、梯形、斜切）
+
+图上家具 / 柜子不是矩形（斜墙夹角里的柜子一端斜切、梯形台面、平行四边形地台、斜边地毯），写 `"quad"`：8 个数 = 四个角相对矩形角的偏移（家具局部坐标 mm，背面朝 -y），
+顺序 `[后左 dx, dy, 后右 dx, dy, 前右 dx, dy, 前左 dx, dy]`。例：前沿两端各收 300 的梯形台面 `"quad": [0, 0, 0, 0, -300, 0, 300, 0]`；右端顺着斜墙斜切（前端往里收 250）`[0, 0, 0, 0, -250, 0, 0, 0]`。
+2D 符号、3D 模型（整件家具的网格按双线性映射跟着变形，柜门、台面、抽屉一起斜）、碰撞、通道、嵌墙检查、DXF 都按变形后的形状。
+设计器里：属性栏「形状 · 揉捏变形」→「揉捏」后平面上拖橙色角点 / 边中点（角点吸附墙面，Alt 不吸）；「贴合斜墙」把后沿、两端、前沿贴到 600mm 内的墙面上；「宽度 / 进深撑满两墙」；也能直接输入左右端斜切角度、前后沿错位。
+写 spec 时先按矩形放好，斜的那一端照图量出偏移写进 quad；拿不准就放矩形、交付时提示用户点「贴合斜墙」。
 
 挂墙、吸顶的家具（空调、热水器、油烟机、壁挂电视、浴霸、晾衣架……）和落地家具上下错开，可以叠在床、马桶、洗衣机上方，不算重叠。
 家电要放齐：每个卧室和客厅一台空调；卫生间一台热水器（电热水器挂在马桶或淋浴上方）或在厨房/阳台放燃气热水器；
@@ -192,7 +226,8 @@
 也可以手写 `elec`（和 autoElec 一起写时手写的在前，自动的不会在同一位置重复放）：
 - 强电：`socket` 五孔、`socketUSB` USB、`socketW` 防水、`socket16` 16A、`socketAC` 空调、`socketHood` 烟机、`socketFloor` 地插、`socketEV` 充电桩电源（32A 独立回路）、`panel` 强电箱
 - 开关：`switch1` 单控、`switch2` 双控、`switch3` 三开、`dimmer` 调光
-- 灯具：`light` 吸顶灯、`pendant` 吊灯、`downlight` 筒灯、`spot` 射灯、`wallLamp` 壁灯（挂墙）
+- 灯具：`light` 吸顶灯、`pendant` 吊灯、`downlight` 筒灯、`spot` 射灯、`wallLamp` 壁灯（挂墙）；
+  沿线灯具 `strip` LED 灯带、`track` 磁吸轨道灯、`linear` 嵌入式线性灯：写 `"pts": [[x, y], …]`（不用写 `at`），`"loop": true` 首尾相连，`"h"` 离地高度（0 = 贴顶；柜底 1450、踢脚 80、床底 150），`"cct": 3000` 色温，`"w"` 线性灯槽宽
 - 弱电：`weak` 弱电箱、`net` 网络、`tv` 电视、`intercom` 可视对讲、`smoke` 烟感
 - 给排水：`cold` 冷水、`hot` 热水、`waste` 墙排水、`waterIn` 进水总阀（管线排布的冷水起点，autoElec 会自动放在厨房旁管井 / 厨房冷水点旁，知道实际进户位置就手写）；暖通燃气：`acHole` 空调孔、`freshAir` 新风口、`gas` 燃气
 
@@ -251,6 +286,11 @@
 `mmPerPx` 是比例，`x`、`y` 是图片左上角的世界坐标（mm）。analyze.py 输出的 draft.json 已经算好；
 如果你换了原点，`x = -OX * mmPerPx`，`y = -OY * mmPerPx`（OX、OY 是原点在图上的像素位置）。
 可选 `rotate`：图片先顺时针转多少度（0 / 90 / 180 / 270，设计图整体转过方向时用）；EXIF 方向标记会自动摆正，不用写。
+用 `rectify.py` 拉正过的图：`image` 写 `rectified.png`，`mmPerPx` / `x` / `y` 照 rectify 打印的写（底图和 spec 坐标严格对齐，叠图和各个对账才准）。
+
+### 不对账区域 exclude（可选）
+
+`"exclude": [{"rect": [x0, y0, x1, y1], "why": "电梯厅不还原"}]`（mm，顶层或 `floors[i]` 里）：`coverage.py` 反向对账时这些区域不算（公共区不还原、图例 / 指北针压在户型里）。设计器忽略这个字段。
 
 ### 场地 site（整栋楼可选）
 

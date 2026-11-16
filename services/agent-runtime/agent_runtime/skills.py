@@ -39,6 +39,8 @@ def is_scan3d_task(prompt: str) -> bool:
 
 MARK = re.compile(r"【技能[:：]\s*([^】]+)】")
 
+# v3.9.51: upstream ZWD11/house-plan-designer commit vendored in skills/house-plan-designer (NOTICE.md, setup check)
+HPD_REV = "dd5a610"
 SEARCH_DIRS = "~/.claude/skills ~/.workbuddy/skills ~/.codebuddy/skills ~/.agents/skills"
 
 CATALOG: list[dict] = [
@@ -126,7 +128,7 @@ CATALOG: list[dict] = [
      "auto": DESIGNER_AUTO,
      # v3.9.16: the upstream commit in NOTICE.md is part of the check, so a computer with the older copy reinstalls
      "check": ("test -f ~/.claude/skills/house-plan-designer/assets/template.html && "
-               "grep -q b94183f ~/.claude/skills/house-plan-designer/NOTICE.md && "
+               f"grep -q {HPD_REV} ~/.claude/skills/house-plan-designer/NOTICE.md && "
                "python3 ~/.claude/skills/house-plan-designer/scripts/aiw_hpd.py doctor | grep -q '\"ok\": true'"),
      "setup": ("curl -fsSL https://raw.githubusercontent.com/hackjown/ai-workstation/main/deploy/vm/house-plan-designer-setup.sh "
                "-o /tmp/hpds.sh && bash /tmp/hpds.sh"),

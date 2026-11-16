@@ -269,7 +269,13 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         for e in cloud.list():  # a setup interrupted by an API restart carries on
             if e.get("status") in ("adding", "creating", "installing"):
                 cloud.start_setup(e["id"])
+        skill_auto = None
+        if settings.scheduler_enabled and os.environ.get("AIW_SKILL_AUTO", "1") != "0":   # v3.9.51 自建技能自动同步
+            from . import skillupdate as _su
+            skill_auto = asyncio.create_task(_su.auto_loop(app.state.skillupd, store.kv_get))
         yield
+        if skill_auto:
+            skill_auto.cancel()
         await scheduler.stop()
         try:
             await app.state.v3924.on_stop()
@@ -1581,6 +1587,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     @app.put("/api/skills/custom", dependencies=[Depends(auth)])
     async def put_custom_skills(body: list[dict]):
+        prev = {c.get("id"): c for c in store.kv_get("skills_custom", []) or []}
         out = []
         for s_ in body:
             sid = re.sub(r"[^A-Za-z0-9_.-]", "-", str(s_.get("id") or "").strip())[:60]
@@ -1589,6 +1596,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             out.append({"id": sid, "title": str(s_.get("title") or sid)[:60], "desc": str(s_.get("desc") or "")[:200],
                         "path": str(s_.get("path") or f"~/.claude/skills/{sid}")[:300], "setup": str(s_.get("setup") or "")[:300],
                         "source": str(s_.get("source") or "")[:200], "machines": list(s_.get("machines") or [])[:20]})
+            for k in ("rev", "rev_date", "self"):   # v3.9.51: kept by 检查更新, not sent back by the page
+                if k in (prev.get(sid) or {}):
+                    out[-1][k] = prev[sid][k]
         store.kv_set("skills_custom", out)
         return await get_skills()
 
@@ -1617,9 +1627,28 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         ms = [m for m in store.machines() if not body.get("machines") or m["id"] in body["machines"]]
         if not ms:
             raise HTTPException(400, "还没有电脑")
-        asyncio.create_task(skillsync.install_all(pkg, ms, _skill_shell, _skill_wake, store.kv_get, store.kv_set))
+        asyncio.create_task(_install_and_record(pkg, ms))
         await asyncio.sleep(0.05)
         return store.kv_get("skills_install_job", None)
+
+    async def _install_and_record(pkg: str, ms: list[dict]) -> dict:
+        """v3.9.51: install, then remember which GitHub commit was installed so 检查更新 can tell a newer one."""
+        from . import skillsync, skillupdate as _su
+        repo = _su.gh_repo(pkg)
+        head = None
+        if repo:
+            try:
+                head = await _su.gh_head(repo)
+            except Exception:  # noqa: BLE001
+                head = None
+        job = await skillsync.install_all(pkg, ms, _skill_shell, _skill_wake, store.kv_get, store.kv_set)
+        if head and any(m.get("state") == "ok" for m in (job.get("machines") or {}).values()):
+            custom = store.kv_get("skills_custom", []) or []
+            for c in custom:
+                if c.get("source") == pkg:
+                    c["rev"], c["rev_date"] = head["sha"][:12], head["date"]
+            store.kv_set("skills_custom", custom)
+        return job
 
     @app.get("/api/skills/install", dependencies=[Depends(auth)])
     async def install_skill_status():
@@ -1648,6 +1677,81 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                 out[mid] = {"name": m.get("name") or mid, "offline": True, "error": str(e)[:120]}
         await asyncio.gather(*(one(m) for m in store.machines()))
         return out
+
+    # ------------------------------------------------------------- v3.9.51 技能检查更新 / 一键更新 / 自建同步
+    async def _skill_online(mid: str) -> bool:
+        if cloud.is_cloud(mid):
+            try:
+                return (await cloud.state(mid)).get("state") == "running"
+            except Exception:  # noqa: BLE001
+                return False
+        return True
+
+    async def _skill_read(mid: str, rel: str) -> bytes:
+        r = await sessions.computer(mid).execute("files.read", {"path": rel, "binary": True}, observe=False, timeout=300)
+        if not r.success:
+            raise RuntimeError(r.error or "读取失败")
+        res = r.result or {}
+        data = base64.b64decode(res.get("content_b64") or "")
+        if res.get("size") is not None and int(res["size"]) != len(data):
+            raise RuntimeError("文件超过 40 MB，读不全")
+        return data
+
+    async def _skill_write(mid: str, rel: str, data: bytes) -> None:
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tgz") as f:
+            f.write(data)
+            tmp = f.name
+        try:
+            await _uploads.push_to_vm(sessions.computer(mid), tmp, rel, timeout=300)
+        finally:
+            os.unlink(tmp)
+
+    async def _skill_install(pkg: str, ms: list[dict]) -> dict:
+        return await _install_and_record(pkg, ms)
+
+    from . import skillupdate as _skillupdate
+    skillupd = _skillupdate.SkillUpdater(
+        machines=store.machines, shell=_skill_shell, read_file=_skill_read, write_file=_skill_write,
+        is_online=_skill_online, kv_get=store.kv_get, kv_set=store.kv_set,
+        store_dir=os.path.join(os.path.dirname(os.path.realpath(settings.artifacts_dir)), "skills_store"),
+        install=_skill_install)
+    app.state.skillupd = skillupd
+
+    @app.get("/api/skills/updates", dependencies=[Depends(auth)])
+    async def skill_updates(refresh: int = 0):
+        """检查更新: cached result, or a fresh check of every running computer (paused cloud ones are not woken)."""
+        cur = store.kv_get("skills_updates", None)
+        if refresh or not cur:
+            if skillupd.lock.locked():
+                raise HTTPException(409, "正在更新技能，稍后再查")
+            cur = await skillupd.check()
+        return {**cur, "auto": _skillupdate.auto_cfg(store.kv_get), "job": store.kv_get("skills_update_job", None)}
+
+    @app.post("/api/skills/update", dependencies=[Depends(auth)])
+    async def skill_update(body: dict = Body(default={})):
+        """一键更新 (ids omitted = everything that has an update / needs syncing)."""
+        if skillupd.lock.locked():
+            raise HTTPException(409, "上一次更新还没结束")
+        ids = [str(i) for i in (body.get("ids") or [])] or None
+        asyncio.create_task(skillupd.update(ids))
+        await asyncio.sleep(0.05)
+        return store.kv_get("skills_update_job", None)
+
+    @app.get("/api/skills/update", dependencies=[Depends(auth)])
+    async def skill_update_status():
+        return store.kv_get("skills_update_job", None)
+
+    @app.put("/api/settings/skills_auto", dependencies=[Depends(auth)])
+    async def skill_auto_put(body: dict = Body(...)):
+        c = _skillupdate.auto_cfg(store.kv_get)
+        for k in ("sync_self", "update_all"):
+            if k in body:
+                c[k] = bool(body[k])
+        if "hours" in body:
+            c["hours"] = min(48.0, max(0.5, float(body["hours"])))
+        store.kv_set("skills_auto", c)
+        return c
 
     # ------------------------------------------------------------- integrations (HTTP / OpenAPI / MCP)
     @app.get("/api/integrations", dependencies=[Depends(auth)])

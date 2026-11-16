@@ -93,6 +93,17 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.51 技能「检查更新 / 一键更新」，自建技能在各电脑间同步；户型设计器升级到上游 dd5a610
+
+- 设置 › 技能 新增「检查更新」和「一键更新（N）」，每个技能一行：类型（内置 / 安装 / 自建）、状态（最新 / 有更新 / 待同步 / 多处改动 / 上游有新版）、每台电脑上的情况，也可以单个「更新」。未开机的云电脑不唤醒，开机后下次检查补上。
+- **内置技能**（仓库 `skills/<id>`）：每台电脑上的副本按同一份文件清单算哈希，和 AIW 里的版本比；旧的就在那台电脑上重跑它的安装脚本。NOTICE.md 写了上游仓库和提交的（如 house-plan-designer），顺便查上游领先几个提交，只提示，要合并进 AIW 后随新版更新。
+- **安装的技能**（设置 › 技能 › 安装，`npx skills add`）：安装时记下 GitHub 最新提交；检查时 GitHub 有新提交、各电脑版本不一致或有电脑没装，就用同一来源在所有电脑重装。以前装的没记录版本，第一次一键更新后补上。
+- **自建技能**（自己写的、任务里 skill-creator 生成的、手动拷进 `~/.claude/skills/` 的）：API 主机存一份最近同步的打包（`skills_store/<id>.tgz`，不含 node_modules / .git / __pycache__）。哪台电脑上改了就以它为准同步到其他电脑；几台都改了且不一样时用最近改的那台，其他电脑的旧版放到 `~/.claude/.aiw-skill-backup/`（每个技能留最近 3 份）。电脑上没有的会补上；在一台电脑上删了不会删别的电脑。同步后自动登记，「+」菜单里能选。单个技能打包后超过 40 MB 不同步。
+- 自动：默认每 2 小时自动同步一次自建技能（只查开着的电脑，不访问 GitHub）；勾「全部自动更新」则内置和安装的也自动更新。`PUT /api/settings/skills_auto {"sync_self":true,"update_all":false,"hours":2}`，环境变量 `AIW_SKILL_AUTO=0` 关闭。
+- 接口：`GET /api/skills/updates[?refresh=1]`、`POST /api/skills/update {"ids":[…]}`（不填 = 全部）、`GET /api/skills/update`（进度）。GitHub 匿名每小时 60 次，设置 `AIW_GITHUB_TOKEN` 可放宽。
+- house-plan-designer 从上游 b94183f 升级到 dd5a610（11-05 吊顶 7 种做法与灯带、自由造型工作台、户外场地与 40 多件新家具；11-09 家具揉捏变形、只看某个回路、排灯间距、斜墙铺砖；11-13 图片拉正 rectify.py、反向对账 coverage.py、门开向 doorcheck.py、回归基准 bench.py、水电审计 elecaudit.mjs）。AIW 层保留，SKILL.md AIW 说明里加了拍照图先拉正、交付前跑一次 coverage / doorcheck / elecaudit；`aiw_hpd.py ensure` 多装 scipy。已装旧版的电脑在下次用到或一键更新时重装。
+- 详见 `docs/v3.9.51.md`。
+
 ## v3.9.50 同一任务里的修改不再当成「修代码」、金额大写自检、早报发到聊天框并带详细天气
 
 - 意图判断（`intent.py`）：对话里交付的都是文档/表格/图片（docx、pdf、xlsx、png…），用户这句话又没提脚本/代码/页面时，「修改 / 修正 / 改成…」一律算**修改交付物**（同一个任务改完重新生成），不再进「修复代码」路由（不再换 dev 模型、不出任务契约、不要 verify_html）。顺带修了 `\bword\b` 在「word版本」里匹配不到的问题；报价/标书/比价/响应文件/税率/总价/金额等词算文档工作。网页、脚本类交付物（task-830 那种）照旧走修代码。

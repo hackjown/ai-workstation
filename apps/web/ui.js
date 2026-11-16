@@ -374,7 +374,7 @@ loadSettings = async function () {
   fetchModels(false);
   connFilter(S.connCat || "全部");
   updResume();
-  checkSkillMachines();
+  checkSkillMachines(); loadSkillUpdates(false);
   if (S.skillJob && !S.skillJob.done) pollSkillJob();
 };
 
@@ -470,6 +470,7 @@ function skillSection(list) {
       <form onsubmit="installSkill(event)">${row("安装技能", "装到所有电脑", `<div class="inl"><input name="src" placeholder="npx skills add openfilm/openfilm，或 owner/repo、GitHub 链接" required ${job && !job.done ? "disabled" : ""} /></div>`,
         `<button class="btn sm primary" ${job && !job.done ? "disabled" : ""}>${job && !job.done ? "安装中…" : "安装"}</button>`, "top")}</form>
       <div id="skJob">${skillJobHtml(job)}</div>
+      <div id="skUpd" class="skupd"><span class="small">正在读取技能版本…</span></div>
       ${(list || []).map((s) => `<div class="rw"><div class="k">${esc(s.title)}<small>${esc(s.id)}</small></div><div class="v"><span class="small">${esc(s.desc || "")}</span>${s.path ? `<span class="mono">${esc(s.path)}</span>` : ""}${s.builtin ? "" : `<span class="skm" data-sk="${esc(s.id)}"><span class="small">正在检查各电脑…</span></span>`}</div>
         <div class="t">${s.builtin ? '<span class="tag">内置</span>' : `${s.source ? `<button class="btn sm ghost" onclick="syncSkill('${esc(s.source)}')" title="${esc(s.source)}">同步</button>` : ""}<button class="btn sm ghost" style="color:var(--bad)" onclick="delSkill('${esc(s.id)}')">删除</button>`}</div></div>`).join("")}
       <details class="skmanual"><summary class="small">已经手动装好了？只登记文件夹</summary>
@@ -501,6 +502,59 @@ function pollSkillJob() {
     const box = $("skJob"); if (box) box.innerHTML = skillJobHtml(S.skillJob);
     if (S.skillJob && !S.skillJob.done) pollSkillJob(); else if (S.view === "settings") loadSettings();
   }, 2000);
+}
+/* v3.9.51 检查更新 / 一键更新：内置技能对比 AIW 里的版本，安装的技能对比 GitHub 最新提交，自建技能在各电脑间同步 */
+const SKU_KIND = { builtin: "内置", installed: "安装", self: "自建" };
+const SKU_ST = { ok: ["最新", "ok"], update: ["有更新", "warn"], sync: ["待同步", "warn"], conflict: ["多处改动", "bad"],
+  upstream: ["上游有新版", ""], record: ["待存档", ""], "n/a": ["随安装脚本", ""] };
+const SKU_M = { ok: "✓", has: "✓", old: "旧版", missing: "未装", changed: "改过", conflict: "冲突" };
+let skuPoll = null;
+async function loadSkillUpdates(refresh) {
+  const box = $("skUpd"); if (!box) return;
+  if (refresh) box.innerHTML = `<span class="small">正在检查每台电脑和 GitHub…</span>`;
+  try { S.skUpd = await api("GET", "/api/skills/updates" + (refresh ? "?refresh=1" : "")); }
+  catch (e) { box.innerHTML = `<span class="small">检查失败：${esc(e.message)}</span> <button class="btn sm ghost" onclick="loadSkillUpdates(true)">重试</button>`; return; }
+  renderSkillUpdates();
+  if (S.skUpd.job && !S.skUpd.job.done) pollSkillUpdate();
+}
+function renderSkillUpdates() {
+  const box = $("skUpd"), u = S.skUpd; if (!box || !u) return;
+  const job = u.job && !u.job.done ? u.job : null, auto = u.auto || {};
+  const act = (u.items || []).filter((i) => ["update", "sync", "conflict", "record"].includes(i.state));
+  const when = u.checked_at ? new Date(u.checked_at * 1000).toLocaleString() : "";
+  const mname = (id) => ((u.machines || {})[id] || {}).name || id;
+  const off = Object.values(u.machines || {}).filter((m) => !m.online).map((m) => m.name);
+  const rows = (u.items || []).filter((i) => i.state !== "ok" || i.kind === "self").map((i) => {
+    const st = SKU_ST[i.state] || [i.state, ""]; const js = job && job.items && job.items[i.id];
+    const up = i.upstream && i.upstream.ahead ? `<details><summary class="small">上游 ${esc(i.upstream.repo)} 新 ${i.upstream.ahead} 个提交</summary><div class="small">${(i.upstream.msgs || []).map(esc).join("<br>")}</div></details>` : "";
+    return `<div class="skm-row"><b>${esc(i.title || i.id)}<small> ${SKU_KIND[i.kind] || ""}</small></b>
+      <span class="chip ${js ? (js.state === "ok" ? "ok" : js.state === "failed" ? "bad" : "") : st[1]}">${js ? (SK_ST[js.state] || ({ running: "更新中" })[js.state] || js.state) : st[0]}</span>
+      <span class="small">${esc(js && (js.error || js.msg) || i.detail || "")} ${Object.entries(i.machines || {}).map(([m, s]) => `<span class="chip ${s === "ok" || s === "has" || s === "changed" ? "ok" : s === "conflict" ? "bad" : ""}">${esc(mname(m))} ${SKU_M[s] || s}</span>`).join("")}
+      ${["update", "sync", "conflict", "record"].includes(i.state) && !job ? `<button class="btn sm ghost" onclick="runSkillUpdate(['${esc(i.id)}'])">更新</button>` : ""}</span>${up}</div>`;
+  }).join("");
+  box.innerHTML = `<div class="skupd-h"><span class="small">${when ? "上次检查 " + esc(when) : "还没检查过"}${off.length ? " · 未开机：" + off.map(esc).join("、") : ""}</span>
+      <span class="sp"></span>
+      <label class="small"><input type="checkbox" ${auto.sync_self ? "checked" : ""} onchange="setSkillAuto({sync_self:this.checked})" /> 自建技能每 ${auto.hours || 2} 小时自动同步</label>
+      <label class="small"><input type="checkbox" ${auto.update_all ? "checked" : ""} onchange="setSkillAuto({update_all:this.checked})" /> 全部自动更新</label>
+      <button class="btn sm ghost" ${job ? "disabled" : ""} onclick="loadSkillUpdates(true)">检查更新</button>
+      <button class="btn sm primary" ${job || !act.length ? "disabled" : ""} onclick="runSkillUpdate()">${job ? "更新中…" : act.length ? `一键更新（${act.length}）` : "一键更新"}</button></div>
+    ${rows || `<div class="small">${when ? "所有技能都是最新的。" : ""}</div>`}`;
+}
+async function runSkillUpdate(ids) {
+  try { const j = await api("POST", "/api/skills/update", ids ? { ids } : {}); S.skUpd = { ...(S.skUpd || {}), job: j }; renderSkillUpdates(); pollSkillUpdate(); }
+  catch (e) { toast(e.message); }
+}
+function pollSkillUpdate() {
+  clearTimeout(skuPoll);
+  skuPoll = setTimeout(async () => {
+    let j; try { j = await api("GET", "/api/skills/update"); } catch (e) { return; }
+    S.skUpd = { ...(S.skUpd || {}), job: j }; renderSkillUpdates();
+    if (j && !j.done) pollSkillUpdate();
+    else { const bad = Object.values((j && j.items) || {}).filter((x) => x.state === "failed").length; toast(bad ? `${bad} 个技能没更新成功` : "技能已更新"); loadSkillUpdates(false); checkSkillMachines(); }
+  }, 2500);
+}
+async function setSkillAuto(c) {
+  try { const a = await api("PUT", "/api/settings/skills_auto", c); S.skUpd = { ...(S.skUpd || {}), auto: a }; renderSkillUpdates(); } catch (e) { toast(e.message); }
 }
 async function checkSkillMachines() {
   if (!document.querySelector(".skm[data-sk]")) return;

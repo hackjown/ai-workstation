@@ -2,6 +2,8 @@
 and screenshots pasted / dropped straight into the web composer (paste.js)."""
 import importlib.util
 import subprocess
+
+from agent_runtime import skills
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -26,15 +28,15 @@ def test_upstream_files_and_aiw_layer():
     assert all((HPD / f).is_file() for f in man) and "scripts/dimocr.py" in man and "scripts/aiw_hpd.py" in man
     skill = (HPD / "SKILL.md").read_text(encoding="utf-8")
     assert skill.index("# AIW 内置版说明") < skill.index("# 上游 SKILL.md") and "dimocr.py" in skill and "黑底 CAD 截图" in skill
-    assert "b94183f" in (HPD / "NOTICE.md").read_text(encoding="utf-8")
+    assert skills.HPD_REV in (HPD / "NOTICE.md").read_text(encoding="utf-8")
     assert "timeout: 90000" in (HPD / "scripts" / "check.mjs").read_text(encoding="utf-8")
 
 
 def test_catalog_check_needs_the_new_copy():
     from agent_runtime.skills import CATALOG
     hpd = next(s for s in CATALOG if s["id"] == "house-plan-designer")
-    assert "b94183f" in hpd["check"]
-    assert "b94183f" in (ROOT / "deploy" / "vm" / "house-plan-designer-setup.sh").read_text()
+    assert skills.HPD_REV in hpd["check"]
+    assert skills.HPD_REV in (ROOT / "deploy" / "vm" / "house-plan-designer-setup.sh").read_text()
 
 
 def test_dark_screenshot_goes_to_cadshot(tmp_path):

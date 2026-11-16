@@ -740,6 +740,22 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         store.update("routines", rid, last_run=time.time(), last_task_id=res["task"]["id"], thread_id=res["thread_id"])
         return res
 
+    # v3.9.50: the brief's weather (brief_weather.py): city, which routines get it, and the text itself
+    @app.get("/api/settings/weather", dependencies=[Depends(auth)])
+    async def get_weather_cfg():
+        from . import brief_weather as _bw
+        return _bw.cfg(store)
+
+    @app.put("/api/settings/weather", dependencies=[Depends(auth)])
+    async def put_weather_cfg(body: dict):
+        from . import brief_weather as _bw
+        return _bw.save(store, body or {})
+
+    @app.get("/api/weather/today", dependencies=[Depends(auth)])
+    async def weather_today():
+        from . import brief_weather as _bw
+        return {"city": _bw.cfg(store).get("city"), "text": await _bw.today_text(store)}
+
     # ------------------------------------------------------------- watches (page tracking)
     @app.get("/api/watches", dependencies=[Depends(auth)])
     async def watches():

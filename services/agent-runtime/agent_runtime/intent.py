@@ -29,8 +29,28 @@ FORCED_DEV = re.compile(r"【技能[:：][^】]*\bdev\b", re.I)
 # dev_fix because the thread had script-made files ("修改" + code thread). A picked non-dev skill, or a request about an
 # office document / picture with no code words of its own, is that skill's job, never a source-code fix.
 SKILL_TAG = re.compile(r"【技能[:：]\s*([^】]+)】")
-DOC_WORK = re.compile(r"\.(?:docx?|xlsx?|pptx?|pdf|odt|ods|odp|rtf)\b|\bword\b|\bexcel\b|\bppt\b|"
-                      r"文档|幻灯片|演示文稿|简历|合同|试卷|姓名牌|名牌|桌牌|台卡|证书", re.I)
+# v3.9.50 (task-271): "最终我要word版本" — `\bword\b` never matched, because 版 is a word character in Python's
+# unicode regex, so a bid document revision ("税率为1%，总价不要171900元整") fell through to dev_fix. ASCII-only
+# boundaries now, plus the words of quotes / bids / reports.
+DOC_WORK = re.compile(r"\.(?:docx?|xlsx?|pptx?|pdf|odt|ods|odp|rtf|wps)\b|"
+                      r"(?<![A-Za-z])(?:word|excel|ppt|pdf|wps|docx?|xlsx?)(?![A-Za-z])|"
+                      r"文档|幻灯片|演示文稿|简历|合同|试卷|姓名牌|名牌|桌牌|台卡|证书|表格|报表|报价|报价单|报价表|标书|"
+                      r"投标|招标|比价|响应文件|采购文件|询价|清单|预算|结算|发票|税率|税额|含税|不含税|总价|单价|金额|大写|"
+                      r"方案书|说明书|报告|公文|通知|申请书|承诺函|授权书|委托书|会议纪要|讲稿|海报|简章", re.I)
+
+# v3.9.50 (task-271): what the thread DELIVERED decides whether a follow-up is a code fix. task-038 wrote make_doc.py
+# itself to build a .docx/.pdf; that script is a tool of the job, not the user's code. A follow-up in a thread whose
+# deliverables are documents / sheets / pictures edits that deliverable (the same task, regenerate it), unless the
+# user's own words name code.
+_DELIVERED_CODE = re.compile(r"\.(?:py|js|mjs|ts|tsx|jsx|html?|css|vue|go|rs|java|sh|php|rb|kt|swift|c|cc|cpp|h)$", re.I)
+OWN_CODE = re.compile(r"脚本|代码|源码|源代码|函数|接口|\.py\b|\.js\b|\.ts\b|css|html|网页|页面|前端|后端|程序|仓库|repo|"
+                      r"\bbug\b|报错|编译|部署|\bapi\b|生成器", re.I)
+
+
+def delivered_docs_only(signals: Optional[dict]) -> bool:
+    """True when the thread delivered files and none of them is code / a web page (docx, pdf, xlsx, png, dxf …)."""
+    sent = [str(f) for f in (signals or {}).get("sent_files") or [] if f]
+    return bool(sent) and not any(_DELIVERED_CODE.search(f.split("?")[0]) for f in sent)
 
 
 def non_dev_skill(text: str) -> list[str]:
@@ -118,6 +138,10 @@ def classify(text: str, signals: Optional[dict] = None, context: Optional[str] =
         return {"intent": OTHER, "forced": False, "reasons": ["选了技能：" + "、".join(skills)[:40] + "（不是改代码）"]}
     if DOC_WORK.search(SKILL_TAG.sub(" ", plain)) and not own_code and not STRONG.search(plain):
         return {"intent": OTHER, "forced": False, "reasons": ["改文档，不是改代码"]}
+    # v3.9.50: the thread delivered only documents / pictures and the user does not talk about code: whatever the verbs
+    # (修改 / 修正 / 改成 …) this edits the deliverable of the same job, never a source-code fix
+    if delivered_docs_only(sig) and not OWN_CODE.search(plain):
+        return {"intent": OTHER, "forced": False, "reasons": ["修改已交付的文档/图片（同一个任务的修改，不是改代码）"]}
     strong = [m.group(0) for m in STRONG.finditer(plain)]
     weak = [m.group(0) for m in WEAK.finditer(plain)]
     code_words = [m.group(0) for m in CODE_WORDS.finditer(plain)]

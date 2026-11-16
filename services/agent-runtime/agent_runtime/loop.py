@@ -1269,6 +1269,14 @@ class AgentLoop:
                 self.history.append(f"{self.step}. send_file({decision.args.get('path')}) -> {refused}")
                 note = refused
                 continue
+            money = (self._money_check(outcome.result) if decision.tool == "send_file" and outcome.success
+                     and isinstance(outcome.result, dict) else None)
+            if money:   # v3.9.50 (task-271): a document whose 金额大写 is wrong is never delivered
+                await self.emit(EventType.ACTION_RESULT, tool="send_file", success=False, error="金额大写错误", result={})
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="拒绝交付：金额大写有错（大小写不一致）")
+                self.history.append(f"{self.step}. send_file({decision.args.get('path')}) -> REFUSED: 金额大写错误")
+                note = money
+                continue
             if decision.tool == "send_file" and outcome.success and isinstance(outcome.result, dict):
                 self._record_delivery(outcome.result, str((decision.args or {}).get("path") or ""))   # v3.9.26
                 await self._deliver_file(outcome.result)
@@ -2070,6 +2078,30 @@ class AgentLoop:
             raise
         except Exception as e:  # noqa: BLE001
             __import__("logging").getLogger("aiw.loop").warning("dev after: %s", e)
+
+    def _money_check(self, res: dict) -> Optional[str]:
+        """v3.9.50 (task-271): every 人民币大写 amount in a delivered .docx/.pdf must be written correctly and match the
+        小写 figure next to it. A wrong one refuses send_file (twice per file at most; the third send goes through
+        with a warning on the timeline, so a checker mistake can never trap the task)."""
+        try:
+            b64 = res.get("content_b64")
+            name = Path(str(res.get("path") or "file")).name
+            if not b64 or not re.search(r"\.(docx|pdf|txt|md|html?)$", name, re.I):
+                return None
+            from . import money_cn as _mc
+            issues = _mc.check_file(base64.b64decode(b64), name)
+            if not issues:
+                return None
+            n = self.__dict__.setdefault("_money_rejects", {})
+            n[name] = n.get(name, 0) + 1
+            if n[name] > 2:
+                self.history.append(f"{self.step}. (WARNING: {name} still has 金额大写 problems: "
+                                    + "；".join(i["found"] for i in issues[:3]) + ")")
+                return None
+            return _mc.refusal(name, issues)
+        except Exception as e:  # noqa: BLE001  a checker failure never blocks a delivery
+            __import__("logging").getLogger("aiw.loop").warning("money check: %s", e)
+            return None
 
     def _record_delivery(self, res: dict, asked: str = "") -> None:
         """send_file: which command made the file (provenance) and its feature fingerprint, kept per thread."""

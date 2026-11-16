@@ -389,7 +389,8 @@ class Chat:
         groups: dict[str, list[int]] = {}
         for i, m in enumerate(msgs):
             d = m.get("data") or {}
-            if m.get("role") != "assistant" or m.get("kind") not in self.OLD_TASK_KINDS or d.get("card") == CARD_V:
+            if m.get("role") != "assistant" or m.get("kind") not in self.OLD_TASK_KINDS or d.get("card") == CARD_V \
+                    or d.get("routine"):   # v3.9.50: a routine's result message (早报) is shown as it is, never folded
                 continue
             tid = m.get("task_id") or d.get("task_id")
             if not tid:
@@ -1533,6 +1534,14 @@ class Chat:
         return _row(r[0]) if r else None
 
     async def on_task_event(self, task, sid: str, msg: dict):
+        if getattr(task, "source", "") == "routine" and os.environ.get("AIW_ROUTINE_TO_CHAT", "1") != "0":
+            # v3.9.50: a scheduled routine (the 7:30 新闻早报) posts its whole result into the chat, never only in 任务
+            if msg.get("type") == "task.end":
+                try:
+                    await self.post_routine_result(task, msg)
+                except Exception as e:  # noqa: BLE001  never breaks the task
+                    log.warning("routine to chat: %s", e)
+            return
         card = self.card_for(task.id, getattr(task, "thread_id", None))
         if not card:
             return
@@ -1629,6 +1638,29 @@ class Chat:
                                                      "has_more": len(res.strip()) > len(line) + 2, "at": time.time(),
                                                      **({"cards": cards} if cards else {})}},
                         task_id=task.id)
+
+    async def post_routine_result(self, task, msg: dict) -> Optional[dict]:
+        """v3.9.50: one result message per routine run: ⏰ name, today's weather for a brief, the full summary, the files."""
+        from . import brief_weather as _bw
+        st = msg.get("status") or "failed"
+        if st in ("cancelled",):
+            return None
+        r = _bw.routine_for(self.store, task) or {}
+        name = r.get("name") or ((self.store.thread(task.thread_id) or {}).get("title") if task.thread_id else "") or "定时任务"
+        name = re.sub(r"^⏰\s*", "", str(name))
+        res = str(msg.get("result") or "").strip()
+        parts = [f"⏰ **{name}**" + ("" if st == "succeeded" else f"（{STATUS_CN.get(st, st)}）")]
+        if _bw.wants_weather(self.store, name, r.get("prompt") or getattr(task, "prompt", "") or ""):
+            parts.append(await _bw.today_text(self.store))
+        if res:
+            parts.append(res if st == "succeeded" else ("没有生成成功：" + one_line(res, 300)))
+        elif st == "succeeded":
+            parts.append("（这次没有文字结果，见附件）")
+        files = files_of(msg.get("files") or [])
+        m = self.add("assistant", "task_result", "\n\n".join(parts)[:12000], {
+            "status": st, "task_id": task.id, "thread_id": task.thread_id, "session_id": msg.get("session_id"),
+            "routine_id": r.get("id"), "routine": name, "files": files, "has_more": False}, task_id=task.id)
+        return m
 
     def _line(self, cd: dict, status: str) -> str:
         return cd.get("current") or STATUS_CN.get(status, status)

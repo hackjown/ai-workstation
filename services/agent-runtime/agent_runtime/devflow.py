@@ -52,6 +52,11 @@ _PATHISH = re.compile(r"(?:~|\.{0,2}/|\$HOME/)?[\w.@+-]+(?:/[\w.@+-]+)*\.(?:py|j
                       r"j2|jinja2?|sh|md|txt|yaml|yml|toml)\b")
 _TEST_CMD = re.compile(r"\b(pytest|py\.test|python3? -m (pytest|unittest)|npm (run )?test|pnpm test|yarn test|node --test|"
                        r"go test|cargo test|make (test|check)|vitest|jest)\b")
+# v3.9.50 (task-271): a document deliverable (docx/pdf/xlsx …) is checked by reading the regenerated file's text, not with
+# verify_html (task-271 ran verify_html on a PDF, "embed=0", only to get past the gate)
+_DOC_CHECK = re.compile(r"pymupdf|\bfitz\b|pdftotext|pdfinfo|docx2txt|from docx import|\bDocument\(|openpyxl|load_workbook|"
+                        r"python-pptx|from pptx import|unzip -p|xmllint|\bmoney_cn\b", re.I)
+_DOC_EXT = re.compile(r"\.(docx?|pdf|xlsx?|pptx?|odt|ods|odp|rtf|csv|txt|md|png|jpe?g|dxf|dwg|svg)$", re.I)
 # verification approaches (task-830 tried headless chrome, BrowserOS MCP 9210, CDP on 9222 …)
 _V_HEADLESS = re.compile(r"\b(google-chrome(-stable)?|chromium(-browser)?|chrome|headless_shell)\b[^;&|]*(--headless|--screenshot|"
                          r"--dump-dom|--print-to-pdf)", re.I)
@@ -217,6 +222,7 @@ class DevFlow:
         self.verify_ok: list = []
         self.verify_fail = 0
         self.test_ok: list = []
+        self.doc_ok: list = []          # v3.9.50: steps that read a regenerated document's text
         self.patchers: dict = {}
         self._reads: list = []
         self._diag_noted = False
@@ -359,6 +365,8 @@ class DevFlow:
                             self.just_written.add(tgt)
             if ok and _TEST_CMD.search(cmd):
                 self.test_ok.append(step)
+            if ok and _DOC_CHECK.search(cmd):
+                self.doc_ok.append(step)
             if re.search(r"\bgit\s+apply\b|\bpatch\s+-p\d|\bapply_patch\b", cmd) and ok:
                 self.patched, self.last_source_step = True, step
         if not self.dev:
@@ -475,6 +483,11 @@ class DevFlow:
         self.delivered[norm(path)] = fp
 
     # ------------------------------------------------------------------ done
+    def docs_only(self) -> bool:
+        """v3.9.50: every deliverable of this task is a document / sheet / picture (no web page or code)."""
+        d = list((self.contract or {}).get("deliverables") or []) + list(self.gen_outputs or [])
+        return bool(d) and all(_DOC_EXT.search(str(x).split("?")[0]) for x in d)
+
     def deliverable(self) -> Optional[str]:
         """The file whose fingerprint is compared: the newest generator output of this run, else the contract's."""
         if self.gen_outputs:
@@ -568,7 +581,13 @@ class DevFlow:
                         f"REJECTED: the source was changed (step {self.last_source_step}) but the generator was not run again "
                         f"after that. Run it now: {c.get('generator_cmd') or gen}, then verify the REGENERATED file."))
         last = max([self.last_source_step] + self.gen_runs)
-        if changed and not any(s >= last for s in self.verify_ok + self.test_ok):
+        evidence = self.verify_ok + self.test_ok + (self.doc_ok if self.docs_only() else [])
+        if changed and self.docs_only() and not any(s >= last for s in evidence):
+            out.append(("no_acceptance", "拒绝 done：改动后没有核对重新生成的文档内容",
+                        "REJECTED: no check of the regenerated document after the last change. Read the regenerated file's "
+                        f"text ({self.deliverable() or 'the deliverable'}: pdftotext / pymupdf / python-docx) and check every "
+                        "value the user asked to change, then done. verify_html is for web pages, not documents."))
+        elif changed and not any(s >= last for s in evidence):
             out.append(("no_acceptance", "拒绝 done：改动后没有验收证据（verify_html / 测试没有在最后一次改动后通过）",
                         "REJECTED: no acceptance evidence after the last change. Run verify_html on the regenerated file "
                         f"({self.deliverable() or 'the deliverable'}) with the contract's checks (selectors: "

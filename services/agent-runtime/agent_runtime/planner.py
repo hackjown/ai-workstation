@@ -120,12 +120,27 @@ Rules:
   `pip install --user --break-system-packages <pkg>` (plain pip is blocked). The desktop folder is ~/Desktop or ~/桌面.
 - If a shell command fails, read its stderr in PREVIOUS STEPS and fix the cause; never resend the same command.
 - For Word/Excel/PPT prefer python (python-docx / openpyxl / python-pptx) or `libreoffice --headless` via `shell`.
+- Quotes, bids and other documents with money (报价/投标/比价/响应文件/合同/结算):
+  * "X 左右 / 约 X / 上下浮动" means a total NEAR X, never exactly X and never a round number: pick a non-round total
+    within about ±1% of X (e.g. 171,900 左右 -> 171,6xx.xx or 172,1xx.xx) and make the line items add up to it.
+  * The tax rate (税率) comes from the user or the procurement document. If neither states it, ask_user before
+    pricing (一般纳税人 9% / 6%, 小规模纳税人 1% / 3% give different totals); never pick one silently.
+  * 人民币大写 is checked at send_file: a wrong 大写 or one that differs from its 小写 figure is refused. Generate it
+    with the standard rule (no 零 between 万 and a thousands digit: 171,866 = 壹拾柒万壹仟捌佰陆拾陆元整).
+  * The deliverable format is what the user asked for (Word = .docx, PDF = .pdf); send that file.
+  * ID cards and licences: a name or ID number in the document must come from the attachment image placed in the same
+    document. If it is unclear whose ID an attachment is (a file name naming another company or person), ask_user
+    before using its number or leaving the image out. In chat summaries mask ID numbers (5137**********4910).
+- A follow-up in the same task ("在这个基础上修改…") edits the delivered file: change the values in the script/data
+  that made it, regenerate, read the new file's text to check each requested change, send_file, done. Do not treat it
+  as a code-fixing job.
 - To check an HTML page (does a click open the detail, console errors, how many elements match a selector), call
   verify_html (built in: headless Chromium with a hard timeout). Do not start chrome/chromium/CDP/BrowserOS by hand for it.
 - Fixing code that GENERATES a file (a script that writes an html/report): change the script, run it again, verify the
   new output. Never patch the generated file itself or write side scripts (inject*/patch*) that edit it.
 - Verify with the screenshot before calling `done`. Never claim success you cannot see.
-- Never try to gain root, touch Proxmox, or change the network. Payments and bulk deletes require user confirmation.
+- Never try to gain root, touch Proxmox, or change the network. Payments and bulk deletes outside the task's own
+  folder (~/workspace/tasks/<task>/) require user confirmation; clearing your own scratch output there does not.
 - If the user took over and returned control, the screen may differ: re-assess from the current screenshot.
 - A PLAN checklist is shown to the user. After finishing a plan step call `update_plan` with its index (cheap, no screen change).
   Tick each step THE MOMENT it is finished, one call per step; never save the ticks for the end.

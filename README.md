@@ -93,6 +93,18 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.50 同一任务里的修改不再当成「修代码」、金额大写自检、早报发到聊天框并带详细天气
+
+- 意图判断（`intent.py`）：对话里交付的都是文档/表格/图片（docx、pdf、xlsx、png…），用户这句话又没提脚本/代码/页面时，「修改 / 修正 / 改成…」一律算**修改交付物**（同一个任务改完重新生成），不再进「修复代码」路由（不再换 dev 模型、不出任务契约、不要 verify_html）。顺带修了 `\bword\b` 在「word版本」里匹配不到的问题；报价/标书/比价/响应文件/税率/总价/金额等词算文档工作。网页、脚本类交付物（task-830 那种）照旧走修代码。
+- 删除确认：`cd ~/workspace/tasks/<任务>/… && rm -f out/*.pdf pg-*.png` 这类清理任务自己目录里的产物不再弹确认、也不再在编码任务里被拦；`rm -rf *`、跳出任务目录、`~/workspace` 根目录下的通配删除照旧要确认。
+- 人民币金额大写（新 `money_cn.py`）：`send_file` 交付 .docx/.pdf/.txt/.md/.html 时检查每个「…元整 / …角…分」：写法不对（如 171,866 写成「壹拾柒万**零**壹仟…」）或和旁边的小写金额对不上就拒绝交付，告诉模型正确写法和一段标准换算代码；同一个文件最多拒两次，第三次放行并在时间线留警告（检查器出错也不会卡死任务）。
+- 文档类修复任务的验收：交付物是文档时，读回重新生成文件的文字（pymupdf / pdftotext / python-docx / openpyxl）就算验收证据，不再要求对 PDF 跑 verify_html。
+- 提示词：报价「X 左右 / 上下浮动」取非整数；税率没说先问；交付格式按用户说的（Word = .docx）；证件号码必须和放进文件的证件图同源，归属不清先问；聊天摘要里身份证号打码。
+- 定时任务（routine）的结果现在直接发到聊天框（一条完整结果消息 + 附件，「查看任务」可跳过去），不用再去「任务」里找；`AIW_ROUTINE_TO_CHAT=0` 关闭。
+- 早报类定时任务（名称或提示词含 早报/晨报/日报/简报/新闻/资讯/brief/news）在结果最前面加「今日天气」：当前温度/体感/湿度/风向风力级数和阵风/云量/能见度/气压，今天最高最低（含体感），降水概率、雨量、时长和集中时段，紫外线，日出日落，AQI 和 PM2.5/PM10，3 小时分时段预报，以及带伞/防晒/温差/大风/空气提示。数据来自 Open-Meteo（免 Key）。
+- 天气城市：默认 `海口`（`AIW_WEATHER_CITY` 可改），或 `PUT /api/settings/weather {"city":"定安,海南"}`；`{"routines":"all"|"auto"|"off"}` 控制哪些定时任务带天气；`GET /api/weather/today` 看当前文字。
+- 详见 `docs/v3.9.50.md`。
+
 ## v3.9.49 联网工具：DeepSeek 搜索 / 读页 / 文档问答，查资料的任务不开屏幕
 
 - 新模块 `dsweb.py`：`web_search`（`POST https://api.deepseek.com/v1/tools/search`）、`web_fetch`（`/v1/tools/fetch`，网页转 Markdown）、`doc_ask`（`/files` 上传时设 1 小时过期 → `deepseek-flash` 回答 → 立刻删除）。都在 API 主机上跑，不碰虚拟机屏幕。

@@ -93,6 +93,7 @@ PAY_WORDS = re.compile(r"(checkout|payment|pay now|place order|立即支付|确�
 
 _RMRF = re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r|-r\s+-f|-f\s+-r|-f|-r|-rf)\s+([^;&|\n]+)")
 _PROTECTED = {"workspace", "uploads", "outputs", "home", "data", ".", "..", "~", "/"}
+_TASK_DIR = r"(~|\$HOME|\$\{HOME\}|/data/home|/home/[\w.-]+|/root)/workspace/tasks/[\w.@%+-]+(/[\w.@%+-]+)*"
 
 
 def scratch_delete(cmd: str) -> bool:
@@ -115,12 +116,19 @@ def scratch_delete(cmd: str) -> bool:
     rel_ok = bool(cds) and bool(re.fullmatch(ws, cds[0].rstrip("/"))) and ".." not in cds[0] and all(
         (re.fullmatch(ws, c.rstrip("/")) or re.fullmatch(r"[\w@%+-][\w.@%+-]*(/[\w.@%+-]+)*", c.rstrip("/")))
         and ".." not in c for c in cds)
+    # v3.9.50 (task-038: 13 confirmation cards for `cd ~/workspace/tasks/task-x && rm -f out/*.pdf out/pg-*.png`, and
+    # task-271 was blocked on the same command): ~/workspace/tasks/<task>/ is the task's own scratch folder that AIW
+    # made for it. A relative delete there (glob in the last part included) is routine; `rm -rf *` / `.*` still asks.
+    in_task_dir = rel_ok and any(re.fullmatch(_TASK_DIR, c.rstrip("/")) for c in cds)
     for m in hits:
         for t in m.group(2).split():
             t = t.strip("'\"")
             if not t or t.startswith("-"):
                 continue
             first = t.split("/")[0]
+            if in_task_dir and not t.startswith(("/", "~", "$")) and first not in _PROTECTED and "*" not in t.rstrip("/").rpartition("/")[0] \
+                    and t.rstrip("/").rpartition("/")[2].strip("*.") != "" and re.fullmatch(r"[\w.@%+*-]+(/[\w.@%+*-]+)*/?", t):
+                continue
             if "*" in t:  # a glob only in the last part, inside a project folder: out/v*.mp4 (task-8bd asked 5 min for it)
                 head, _, last = t.rstrip("/").rpartition("/")
                 if "*" in head or last.strip("*.") == "" or not (

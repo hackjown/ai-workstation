@@ -949,8 +949,15 @@ struct HomeChatView: View {
             return
         }
         guard let d = try? await item.loadTransferable(type: Data.self) else { m.err = "读不了这张照片"; return }
+        let stamp = Int(Date().timeIntervalSince1970)
+        // v3.9.52 (task-22d): a video whose type the picker did not report came up as photo-<ts>.jpg (37 MB QuickTime)
+        if UIImage(data: d) == nil, let vx = videoExt(d) {
+            await uploadData(d, name: "video-\(stamp).\(vx)", type: vx == "mp4" ? "video/mp4" : "video/quicktime")
+            return
+        }
         let jpg = UIImage(data: d)?.jpegData(compressionQuality: 0.85) ?? d
-        await uploadData(jpg, name: "photo-\(Int(Date().timeIntervalSince1970)).jpg", type: "image/jpeg")
+        await uploadData(jpg, name: UIImage(data: d) == nil ? "file-\(stamp)" : "photo-\(stamp).jpg",
+                         type: UIImage(data: d) == nil ? "application/octet-stream" : "image/jpeg")
     }
     func addFile(_ u: URL) async {
         let ok = u.startAccessingSecurityScopedResource()

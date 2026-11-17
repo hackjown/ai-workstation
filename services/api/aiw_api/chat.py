@@ -227,6 +227,25 @@ def _file_kind(path: str) -> str:
     return "file"
 
 
+def _unzip_single_html(path: str) -> str:
+    """A .zip holding exactly one .html (and nothing else but folders): that html, written next to the zip.
+    Anything else, or any error: the path unchanged."""
+    if not str(path).lower().endswith(".zip") or not os.path.isfile(path):
+        return path
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist() if not n.endswith("/")]
+            if len(names) != 1 or not names[0].lower().endswith((".html", ".htm")):
+                return path
+            dst = os.path.join(os.path.dirname(path), os.path.basename(names[0]))
+            with open(dst, "wb") as f:
+                f.write(z.read(names[0]))
+            return dst
+    except Exception:  # noqa: BLE001
+        return path
+
+
 def files_of(paths: list[str]) -> list[dict]:
     seen, out = set(), []
     for p in paths or []:
@@ -1650,13 +1669,23 @@ class Chat:
         name = re.sub(r"^⏰\s*", "", str(name))
         res = str(msg.get("result") or "").strip()
         parts = [f"⏰ **{name}**" + ("" if st == "succeeded" else f"（{STATUS_CN.get(st, st)}）")]
-        if _bw.wants_weather(self.store, name, r.get("prompt") or getattr(task, "prompt", "") or ""):
-            parts.append(await _bw.today_text(self.store))
+        prompt = r.get("prompt") or getattr(task, "prompt", "") or ""
+        paths = [str(p) for p in (msg.get("files") or [])]
+        # v3.9.52 (task-ea6): a brief that asked for its html and got a zip of it posts the html itself
+        if re.search(r"html", prompt, re.I):
+            paths = [_unzip_single_html(p) for p in paths]
+        weather = ""
+        if _bw.wants_weather(self.store, name, prompt):
+            weather = await _bw.today_text(self.store)
+            parts.append(weather)
+            for p in paths:   # v3.9.52: the 早报 page itself opens with today's weather too
+                if p.lower().endswith((".html", ".htm")) and os.path.isfile(p):
+                    _bw.inject_html(p, weather)
         if res:
             parts.append(res if st == "succeeded" else ("没有生成成功：" + one_line(res, 300)))
         elif st == "succeeded":
             parts.append("（这次没有文字结果，见附件）")
-        files = files_of(msg.get("files") or [])
+        files = files_of(paths)
         m = self.add("assistant", "task_result", "\n\n".join(parts)[:12000], {
             "status": st, "task_id": task.id, "thread_id": task.thread_id, "session_id": msg.get("session_id"),
             "routine_id": r.get("id"), "routine": name, "files": files, "has_more": False}, task_id=task.id)

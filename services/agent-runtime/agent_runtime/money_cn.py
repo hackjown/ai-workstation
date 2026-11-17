@@ -206,6 +206,9 @@ def check_text(text: str) -> list[dict]:
         core = re.sub(r"^人民币", "", raw)
         if not re.search(r"[元圆]", core) and len(core) < 2:
             continue
+        # v3.9.52 (task-ea6): 「亿元」「万元」「拾万元」 in a news page are units, not a 大写 amount; one needs a 大写 digit
+        if not re.search(r"[壹贰叁肆伍陆柒捌玖]", core):
+            continue
         v = parse(core)
         if v is None:
             issues.append({"found": raw, "value": None, "expected": None, "problem": "写法无法识别"})
@@ -273,6 +276,7 @@ def refusal(name: str, issues: list[dict]) -> str:
             lines.append(f"「{i['found']}」写法无法识别")
     return (f"REFUSED: {name} 的金额大写有错，不能交付（大小写不一致的报价文件会被判无效）：\n- " + "\n- ".join(lines) +
             "\nFix it at the source (the script / data that writes the document), regenerate, then send_file again. "
+            "Never zip, rename or re-encode the file to get it past this check: the user gets the file type they asked for. "
             "In python use exactly this converter instead of writing your own:\n" + SNIPPET)
 
 

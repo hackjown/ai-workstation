@@ -2093,8 +2093,10 @@ class AgentLoop:
             if not issues:
                 return None
             n = self.__dict__.setdefault("_money_rejects", {})
-            n[name] = n.get(name, 0) + 1
-            if n[name] > 2:
+            # v3.9.52 (task-ea6): counted per task, not per file name: a renamed copy or a zip of the same file is
+            # the same delivery (the model zipped a refused news page to get it through)
+            n["*"] = n.get("*", 0) + 1
+            if n["*"] > 2:
                 self.history.append(f"{self.step}. (WARNING: {name} still has 金额大写 problems: "
                                     + "；".join(i["found"] for i in issues[:3]) + ")")
                 return None

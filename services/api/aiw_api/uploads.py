@@ -23,6 +23,68 @@ CHUNK = int(os.environ.get("AIW_UPLOAD_CHUNK_MB", "16")) * MB
 VIDEO_EXT = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".3gp", ".hevc")
 
 
+IMAGE_EXT = (".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".webp", ".bmp")
+
+
+def sniff(head: bytes) -> str:
+    """v3.9.52 (task-22d): what a file really is from its first bytes: "mov" / "mp4" / "webm" / "avi" / "jpg" /
+    "png" / "heic" / "gif" / "webp", or "" when unknown. An iPhone video picked from 相册 came up as
+    photo-<ts>.jpg (37 MB QuickTime) and the agent was told it was a photo."""
+    h = head or b""
+    if len(h) >= 12 and h[4:8] == b"ftyp":
+        brand = h[8:12]
+        if brand in (b"qt  ",):
+            return "mov"
+        if brand in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1"):
+            return "heic"
+        if brand == b"avif":
+            return "avif"
+        if brand in (b"M4A ", b"M4B "):
+            return "m4a"
+        return "mp4"
+    if len(h) >= 8 and h[4:8] in (b"moov", b"mdat", b"wide", b"free", b"skip"):
+        return "mov"
+    if h[:4] == b"\x1a\x45\xdf\xa3":
+        return "webm"
+    if h[:4] == b"RIFF" and h[8:12] == b"AVI ":
+        return "avi"
+    if h[:4] == b"RIFF" and h[8:12] == b"WEBP":
+        return "webp"
+    if h[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if h[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if h[:4] == b"GIF8":
+        return "gif"
+    return ""
+
+
+def fix_kind(name: str, local: str) -> tuple[str, str]:
+    """A video (or other non-image) saved under an image name is renamed to what it is: photo-1794874653.jpg ->
+    photo-1794874653.mov, on disk too. Returns (name, local); anything else is left alone."""
+    try:
+        with open(local, "rb") as f:
+            real = sniff(f.read(32))
+    except OSError:
+        return name, local
+    stem, ext = os.path.splitext(name)
+    if not real or not ext or ext.lower() not in IMAGE_EXT:
+        return name, local
+    if real in ("mov", "mp4", "webm", "avi", "m4a"):
+        new = f"{stem}.{real}"
+    elif real in ("png", "gif", "webp", "heic", "avif") and ext.lower() in (".jpg", ".jpeg"):
+        new = f"{stem}.{real}"
+    else:
+        return name, local
+    dst = os.path.join(os.path.dirname(local), os.path.basename(local)[: -len(name)] + new) \
+        if os.path.basename(local).endswith(name) else os.path.splitext(local)[0] + "." + real
+    try:
+        os.replace(local, dst)
+    except OSError:
+        return name, local
+    return new, dst
+
+
 class PushError(RuntimeError):
     pass
 

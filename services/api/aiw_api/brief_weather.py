@@ -249,19 +249,126 @@ def render(data: dict, now: Optional[datetime] = None) -> str:
 _CACHE: dict = {}
 
 
+WTTR_URL = "https://wttr.in/{q}"
+
+
+_EN = {"sunny": "晴", "clear": "晴", "partly cloudy": "多云", "cloudy": "多云", "overcast": "阴", "mist": "薄雾",
+       "fog": "雾", "freezing fog": "冻雾", "patchy rain nearby": "局部有雨", "patchy rain possible": "可能有零星小雨",
+       "patchy light drizzle": "零星毛毛雨", "light drizzle": "毛毛雨", "patchy light rain": "零星小雨",
+       "light rain": "小雨", "light rain shower": "小阵雨", "moderate rain": "中雨", "moderate rain at times": "间歇中雨",
+       "heavy rain": "大雨", "heavy rain at times": "间歇大雨", "moderate or heavy rain shower": "中到大阵雨",
+       "torrential rain shower": "暴雨", "thundery outbreaks possible": "可能有雷雨", "thundery outbreaks in nearby": "附近有雷雨",
+       "patchy light rain with thunder": "零星雷阵雨", "moderate or heavy rain with thunder": "中到大雷雨",
+       "light snow": "小雪", "moderate snow": "中雪", "heavy snow": "大雪", "light sleet": "小雨夹雪"}
+
+
+def _zh(t: str) -> str:
+    return _EN.get(t.lower().strip(), t) if t and t.isascii() else t
+
+
+async def fetch_wttr(store, timeout: float = 15.0) -> str:
+    """v3.9.52: the second source (wttr.in, no key) when Open-Meteo cannot be reached from the API host."""
+    c = cfg(store)
+    q = f"{c['lat']},{c['lon']}" if c.get("lat") is not None and c.get("lon") is not None else c["city"]
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        d = await _get(client, WTTR_URL.format(q=q), {"format": "j1", "lang": "zh"})
+    return render_wttr(d, c.get("name") or c["city"])
+
+
+def render_wttr(d: dict, name: str, now: Optional[datetime] = None) -> str:
+    now = now or datetime.now(ZoneInfo(TZ))
+    cur = (d.get("current_condition") or [{}])[0]
+    day = (d.get("weather") or [{}])[0]
+    desc = lambda x: _zh(((x.get("lang_zh") or x.get("weatherDesc") or [{}])[0].get("value") or "").strip())   # noqa: E731
+    lines = [f"### 今日天气 · {name} · {now.month}月{now.day}日 周{WEEK[now.weekday()]}"]
+    head = f"**{desc(cur) or '—'}**"
+    if day.get("mintempC") and day.get("maxtempC"):
+        head += f"，{day['mintempC']}~{day['maxtempC']}°C"
+    lines.append(head)
+    if cur:
+        kmh = float(cur.get("windspeedKmph") or 0)
+        lines.append(f"- 现在：{cur.get('temp_C')}°C，体感 {cur.get('FeelsLikeC')}°C，湿度 {cur.get('humidity')}%，"
+                     f"{wind_dir(cur.get('winddirDegree'))} {wind_level(kmh)}级（{round(kmh)} km/h），"
+                     f"云量 {cur.get('cloudcover')}%，能见度 {cur.get('visibility')} km，气压 {cur.get('pressure')} hPa")
+    hours = day.get("hourly") or []
+    if hours:
+        pp = max(int(h.get("chanceofrain") or 0) for h in hours)
+        mm = sum(float(h.get("precipMM") or 0) for h in hours)
+        lines.append(f"- 降水：概率 {pp}%，预计 {mm:.1f} mm")
+        gust = max(float(h.get("WindGustKmph") or 0) for h in hours)
+        lines.append(f"- 阵风最大 {round(gust)} km/h（{wind_level(gust)}级）")
+        slots = [f"{int(h.get('time') or 0) // 100:02d}时 {h.get('tempC')}° {desc(h)} 雨{h.get('chanceofrain')}%"
+                 for h in hours if int(h.get("time") or 0) // 100 >= now.hour - 2]
+        if slots:
+            lines.append("- 分时段：" + " ｜ ".join(slots))
+    uv = day.get("uvIndex")
+    ast = (day.get("astronomy") or [{}])[0]
+    if uv is not None:
+        lines.append(f"- 紫外线：{uv}（{uv_cn(float(uv))}）；日出 {ast.get('sunrise', '')}，日落 {ast.get('sunset', '')}")
+    return "\n".join(lines)
+
+
 async def today_text(store) -> str:
-    """The section, or one line saying the weather could not be read (never raises). Cached 20 minutes per city."""
+    """The section, or one line saying the weather could not be read (never raises). Cached 20 minutes per city.
+    v3.9.52: Open-Meteo twice (a 7:30 run can meet a slow first connection), then wttr.in."""
     key = cfg(store).get("city")
     hit = _CACHE.get(key)
     if hit and time.time() - hit[0] < 1200:
         return hit[1]
+    errs = []
+    for attempt in range(2):
+        try:
+            txt = render(await fetch(store, timeout=12.0 + 8 * attempt))
+            _CACHE[key] = (time.time(), txt)
+            return txt
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"open-meteo {type(e).__name__}")
+            log.warning("weather (open-meteo, try %d): %s", attempt + 1, e)
     try:
-        txt = render(await fetch(store))
+        txt = await fetch_wttr(store)
         _CACHE[key] = (time.time(), txt)
         return txt
     except Exception as e:  # noqa: BLE001
-        log.warning("weather: %s", e)
-        return f"### 今日天气 · {key}\n（天气暂时没读到：{type(e).__name__}）"
+        errs.append(f"wttr {type(e).__name__}")
+        log.warning("weather (wttr): %s", e)
+    return f"### 今日天气 · {key}\n（天气暂时没读到：{'；'.join(errs)}）"
+
+
+def to_html(md: str) -> str:
+    """The weather section as an HTML block for the top of a brief page (v3.9.52: the 早报 html carries it too)."""
+    import html as _h
+    out, items = [], []
+    for ln in (md or "").splitlines():
+        t = _h.escape(ln.strip())
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        if t.startswith("### "):
+            out.append(f'<h2 style="margin:0 0 8px;font-size:20px">{t[4:]}</h2>')
+        elif t.startswith("- "):
+            items.append(f"<li>{t[2:]}</li>")
+        elif t:
+            out.append(f'<p style="margin:4px 0;font-size:17px">{t}</p>')
+    if items:
+        out.append('<ul style="margin:6px 0 0;padding-left:20px;line-height:1.7">' + "".join(items) + "</ul>")
+    return ('<section id="aiw-weather" style="margin:16px auto;max-width:960px;padding:16px 20px;border-radius:14px;'
+            'background:#eef6ff;color:#123;font-family:-apple-system,system-ui,sans-serif">' + "".join(out) + "</section>")
+
+
+def inject_html(path: str, md: str) -> bool:
+    """Put the weather section right after <body> of a brief page (once). True when the file was changed."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            page = f.read()
+        if 'id="aiw-weather"' in page:
+            return False
+        block = to_html(md)
+        m = re.search(r"<body[^>]*>", page, re.I)
+        page = page[:m.end()] + block + page[m.end():] if m else block + page
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(page)
+        return True
+    except OSError as e:
+        log.warning("weather into %s: %s", path, e)
+        return False
 
 
 def routine_for(store, task) -> Optional[dict]:

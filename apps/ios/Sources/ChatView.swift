@@ -896,6 +896,17 @@ struct CameraPicker: UIViewControllerRepresentable {
 
 
 /// A video from the photo library, copied to a temp file (videos are too big to load as Data first).
+/// v3.9.52: "mov" / "mp4" when the bytes are a QuickTime / MP4 video (ftyp box), else nil.
+func videoExt(_ d: Data) -> String? {
+    guard d.count >= 12, d[d.startIndex + 4 ..< d.startIndex + 8] == Data("ftyp".utf8) else {
+        if d.count >= 8, ["moov", "mdat", "wide"].contains(where: { d[d.startIndex + 4 ..< d.startIndex + 8] == Data($0.utf8) }) { return "mov" }
+        return nil
+    }
+    let brand = String(decoding: d[d.startIndex + 8 ..< d.startIndex + 12], as: UTF8.self)
+    if ["heic", "heix", "hevc", "heim", "heis", "mif1", "msf1", "avif"].contains(brand) { return nil }
+    return brand == "qt  " ? "mov" : "mp4"
+}
+
 struct PickedMovie: Transferable {
     let url: URL
     static var transferRepresentation: some TransferRepresentation {

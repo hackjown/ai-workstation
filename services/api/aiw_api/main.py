@@ -1863,6 +1863,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
 
     async def _upload_done(name: str, local: str, size: int, machine_id: str, local_only: bool,
                            thread_id: Optional[str] = None, task_id: Optional[str] = None) -> dict:
+        name, local = _uploads.fix_kind(name, local)   # v3.9.52: a .mov sent as photo-<ts>.jpg is stored as .mov
         kind = "video" if name.lower().endswith(_uploads.VIDEO_EXT) else ""
         # 3.8.5: every upload stays on the API host and is recorded, so any later run on any computer gets it
         rec = _uploads.record(store, name, local, size, kind, thread_id or None, task_id or None,

@@ -1681,6 +1681,19 @@ class Chat:
             for p in paths:   # v3.9.52: the 早报 page itself opens with today's weather too
                 if p.lower().endswith((".html", ".htm")) and os.path.isfile(p):
                     _bw.inject_html(p, weather)
+        # v3.9.53: 全球 AI 要闻 into every brief page, GitHub 新榜 into a page that came back without one
+        if st == "succeeded" and _bw.wants_weather(self.store, name, prompt):
+            try:
+                from . import brief_extras as _bx
+                try:
+                    small = self.llm("small")
+                except Exception:  # noqa: BLE001
+                    small = None
+                ex = await asyncio.wait_for(_bx.enrich(paths, self.store, self.secrets, small), 150)
+                if ex.get("md"):
+                    parts.append(ex["md"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("brief extras: %s", e)
         if res:
             parts.append(res if st == "succeeded" else ("没有生成成功：" + one_line(res, 300)))
         elif st == "succeeded":

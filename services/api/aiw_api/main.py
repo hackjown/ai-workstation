@@ -2152,7 +2152,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
                                     headers={"Cache-Control": "private, max-age=86400", **disp})
             except zipfile.BadZipFile:
                 return [] if images else Response(status_code=404)
-        return FileResponse(real, filename=os.path.basename(real) if download else None)
+        # v3.9.53: an uploaded iPhone .mov plays in the chat: Chrome plays H.264 QuickTime only when it is labelled mp4
+        mt = "video/mp4" if not download and real.lower().endswith((".mov", ".m4v")) else None
+        return FileResponse(real, filename=os.path.basename(real) if download else None, media_type=mt)
 
     @app.websocket("/ws/events")
     async def ws_events(ws: WebSocket):

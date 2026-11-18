@@ -65,6 +65,27 @@ function hUserText(t) {   // the skill marker shows as amber chips, like iOS
   const chips = m[1].split(/[、,，\s]+/).filter(Boolean).map((id) => `<span class="hsk-chip">✨ ${esc(hSkillTitle(id))}</span>`).join("");
   return chips + (t.slice(m[0].length) ? "<br>" + esc(t.slice(m[0].length)) : "");
 }
+/* v3.9.53: a sent photo / video shows itself (thumbnail → lightbox, inline player), not only its file name.
+   The file is the upload's copy on the API host (a.artifact); anything else stays a chip. */
+const H_IMG_RE = /\.(jpe?g|png|gif|webp|bmp)$/i, H_VID_RE = /\.(mp4|mov|m4v|webm)$/i;
+function hAttKind(a) {
+  const n = a.name || a.artifact || "";
+  if (a.kind === "video" || H_VID_RE.test(n)) return "video";
+  if (a.kind === "image" || H_IMG_RE.test(n)) return "image";
+  return "";
+}
+function hAttPreview(list) {
+  const pics = [], vids = [], other = [];
+  for (const a of list) {
+    const k = a.artifact ? hAttKind(a) : "";
+    (k === "image" ? pics : k === "video" ? vids : other).push(a);
+  }
+  let h = pics.length ? gallery(pics.map((a) => ({ src: artUrl(a.artifact), dl: artUrl(a.artifact, true), name: a.name || "图片" }))) : "";
+  for (const a of vids)
+    h += `<div class="hvid"><video controls playsinline preload="metadata" src="${esc(artUrl(a.artifact))}#t=0.1"></video><a class="small muted" href="${esc(artUrl(a.artifact, true))}" download="${esc(a.name || "")}">${esc(a.name || "视频")} · 下载</a></div>`;
+  const chips = other.map((a) => `<span class="chip">${hAttIcon(a)} ${esc(a.name || "")}</span>`).join("");
+  return (h ? `<div class="hattm">${h}</div>` : "") + (chips ? `<div class="hatt">${chips}</div>` : "");
+}
 const hAttIcon = (a) => (a.kind === "video" || /\.(mp4|mov|m4v|webm|mkv)$/i.test(a.name || "") ? "🎥" : a.kind === "image" || /\.(jpe?g|png|gif|webp|heic)$/i.test(a.name || "") ? "🖼" : "📎");
 function hFiles(files) {
   if (!files || !files.length) return "";
@@ -218,8 +239,8 @@ function hConfirm(m) {
 function hMsg(m) {
   const d = m.data || {};
   if (m.role === "user") {
-    const att = (d.attachments || []).map((a) => `<span class="chip">${hAttIcon(a)} ${esc(a.name || "")}</span>`).join("");
-    return `<div class="u hrow" data-id="${m.id}"><div><div class="bubble">${hUserText(m.text)}</div>${att ? `<div class="hatt">${att}</div>` : ""}<div class="meta">${m.tmp ? "发送中…" : hTime(m.created_at)}</div></div></div>`;
+    const att = hAttPreview(d.attachments || []);
+    return `<div class="u hrow" data-id="${m.id}"><div><div class="bubble">${hUserText(m.text)}</div>${att}<div class="meta">${m.tmp ? "发送中…" : hTime(m.created_at)}</div></div></div>`;
   }
   if (m.kind === "task") return hTaskCard(m);
   if (m.kind === "ask") return hAsk(m);

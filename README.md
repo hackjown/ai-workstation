@@ -93,6 +93,13 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.53 早报：全球 AI 要闻、GitHub 新榜兜底；聊天里上传的图片和视频直接预览
+
+- **全球 AI 要闻**：早报页面天气下面加一栏，取近 36 小时的量子位、36氪（只留 AI）、MIT Technology Review、The Verge、TechCrunch、Ars Technica、Hacker News（只留 AI），配了联网工具 Key 时再加一次 DeepSeek 搜索；小模型挑 10 条写成中文标题 + 一句话，附原文链接。`AIW_BRIEF_AI_NEWS=0` 关闭。
+- **GitHub 新榜**：早报页面里 GitHub 仓库链接不到 3 个（脚本没抓到）时，API 主机自己读 github.com/trending（今日），失败重试一次，再改用 GitHub 搜索 API（近 7 天新建仓库按 star）；都不行写明原因。`GITHUB_TOKEN` 可选，`HTTPS_PROXY` 生效。`AIW_BRIEF_TRENDING=0` 关闭。
+- **附件预览**：聊天里自己发的图片显示缩略图（点开大图），视频显示可播放的预览（网页内联播放；iOS 显示首帧，点开全屏播放）。其他文件仍是文件名。`.mov` 在网页里按 video/mp4 播放。
+- 详见 `docs/v3.9.53.md`。
+
 ## v3.9.52 早报：天气写进早报页面、发 html 不发压缩包；上传的 .mov 不再被当成照片
 
 - **早报天气**：定时早报的结果消息和早报 html 页面顶部都放「今日天气」（天气、温度和体感、现在的风湿云能见度气压、降水概率与时段、风力、紫外线、日出日落、空气质量、分时段、提示）。Open-Meteo 连不上时重试一次，再换 wttr.in；都不行写明原因。

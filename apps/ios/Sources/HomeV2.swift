@@ -85,11 +85,7 @@ struct UserBubbleV2: View {
             .padding(.horizontal, 14).padding(.vertical, 10)
             .background(BubbleShape.user.fill(LinearGradient(colors: [hAmber2, hAmber], startPoint: .topLeading, endPoint: .bottomTrailing))
                 .copyMenu(p.text))
-            ForEach(attachments.indices, id: \.self) { i in
-                let a = attachments[i]
-                Label(a.s("name"), systemImage: a.s("kind") == "video" ? "film" : fileIcon(a.s("name"))).font(.caption).foregroundColor(.secondary)
-                    .lineLimit(1).truncationMode(.middle)
-            }
+            if !attachments.isEmpty { AttachmentPreviews(attachments: attachments) }   // v3.9.53 photo / video previews
         }
     }
 }

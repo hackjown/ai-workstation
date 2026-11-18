@@ -14,6 +14,10 @@
 .bubble.hmd pre { white-space:pre-wrap; word-break:break-word; }
 .bubble.hmd a { word-break:break-all; }
 .bubble.err { border:1px solid var(--badLine); }
+.hattm { display:flex; flex-direction:column; align-items:flex-end; gap:6px; margin-top:4px; }
+.hattm .gallery { margin:0; width:min(360px,72vw); }
+.hvid { display:flex; flex-direction:column; align-items:flex-end; gap:2px; }
+.hvid video { display:block; width:min(360px,72vw); max-height:420px; border-radius:12px; background:#000; }
 .hatt { display:flex; flex-wrap:wrap; gap:4px; justify-content:flex-end; margin-top:4px; }
 .hrow .opts { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
 

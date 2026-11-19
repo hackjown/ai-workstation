@@ -1571,9 +1571,14 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     async def machine_roles_put(body: dict = Body(...)):
         from . import roles as _roles
         c = _roles.cfg(store)
-        for k in ("enabled", "exclude_local", "lan_to_local", "strict"):
+        for k in ("enabled", "exclude_local", "lan_to_local", "strict", "code_to_local"):
             if k in body:
                 c[k] = bool(body[k])
+        if "code_machine" in body:   # v3.9.55
+            cmid = str(body.get("code_machine") or "")
+            if cmid and not store.machine(cmid):
+                raise HTTPException(404, "machine not found")
+            c["code_machine"] = cmid
         for mid, r in (body.get("machines") or {}).items():
             if r in _roles.ROLES and store.machine(mid):
                 c["machines"][mid] = r

@@ -93,6 +93,12 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.55 代码任务一律在本地 VM 执行
+
+- 写程序、修 bug、调试、编译打包、部署、git/仓库、`.py` 等代码相关的新任务，一律分到本地 VM（装了 Antigravity），不再因为提到图片 / UI / logo 被分到「设计制图」云电脑。本地忙时在本地排队。
+- 本地 VM 在任务卡片上显示「本地VM · 代码开发」；多机并行时代码子任务也分给它。
+- 关闭：`aiw-roles.sh code off`；多台本地电脑时 `aiw-roles.sh code on <电脑>` 指定。详见 `docs/v3.9.55.md`。
+
 ## v3.9.54 接入 Antigravity CLI：AIW 派活、监督、验收
 
 - **新工具 `antigravity`**：AIW 把编码任务交给电脑上的 Google Antigravity CLI（`agy`）。agy 在独立的 git worktree、新分支 `aiw/<job>` 里改代码，不推送；AIW 实时读它的每一步（stream-json），它说做完后由 AIW 自己跑测试/构建/verify_html 验收，不过就把失败输出发回同一个会话让它继续改，最后把分支交给你决定合并。

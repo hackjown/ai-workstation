@@ -127,7 +127,9 @@ def test_default_roles_and_routing():
     assert R.pick(s, "帮我想一下这个问题", L) != L
     assert R.pick(s, "备份 192.168.50.1 上的 singbox 配置", L) == L
     assert R.pick(s, "用 云B 帮我整理 excel", L) == "cloud-b"
-    assert R.label(s, "cloud-a") == "云A · 设计制图" and R.label(s, L) == "本地VM"
+    assert R.label(s, "cloud-a") == "云A · 设计制图" and R.label(s, L) == "本地VM · 代码开发"   # v3.9.55
+    s.store.kv["machine_roles"] = {"code_to_local": False}
+    assert R.label(s, L) == "本地VM"
 
 
 def test_busy_role_machine_and_strict():
@@ -139,6 +141,7 @@ def test_busy_role_machine_and_strict():
 
 def test_dispatch_sees_roles_and_skips_local():
     s = _s()
+    s.store.kv["machine_roles"] = {"code_to_local": False}   # v3.9.55: with code work on, the local VM is "code"
     ro = R.annotate(s, [{"id": L, "available": True}, {"id": "cloud-a", "available": True}])
     assert ro[0]["available"] is False and ro[1]["role"] == "design"
     it = R.place_auto(s, [{"machine": "auto", "goal": "剪一个 30 秒视频"}, {"machine": "auto", "goal": "做一份 PPT"}])

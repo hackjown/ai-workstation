@@ -5,6 +5,8 @@ kv "machine_roles":
    "exclude_local": true,    # the local VM takes no routed or dispatched work...
    "lan_to_local": true,     # ...except work that needs the home network (192.168.x, iStoreOS, sing-box, NAS)
    "strict": false,          # true: wait for the role's computer even when it is busy; false: an idle cloud one helps
+   "code_to_local": true,    # v3.9.55: every code task (write / fix / debug / build / deploy) runs on the local VM
+   "code_machine": "",       # ...this one when there are several local computers (default: the first local one)
    "machines": {"<machine id>": "design" | "media" | "office" | "general"}}
 
 What is routed: a NEW task from the chat or the task composer. A continuation (继续/修改/补充) stays on the computer
@@ -29,6 +31,7 @@ ROLES: dict[str, dict] = {
                "re": r"word|excel|ppt|pdf|docx|xlsx|pptx|officecli|文档|表格|幻灯片|报告|周报|合同|简历|网页|网站|浏览器|"
                      r"搜索|查一下|比价|价格|京东|淘宝|拼多多|天猫|注册|登录|小红书|xhs|开发|写(个|一个)?(程序|脚本|网站|页面)|"
                      r"代码|部署|github|python|api"},
+    "code": {"title": "代码开发", "desc": "写程序、修 bug、调试、构建、部署（本地电脑，装了 Antigravity）", "re": r"$^"},
     "general": {"title": "通用", "desc": "什么都做", "re": r"$^"},
 }
 ORDER = ["design", "media", "office"]   # default roles, given to the cloud computers in id order
@@ -39,7 +42,8 @@ LAN = re.compile(r"192\.168\.\d|(?<![\d.])10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[
 
 def cfg(store) -> dict:
     c = store.kv_get(KEY, None) or {}
-    out = {"enabled": True, "exclude_local": True, "lan_to_local": True, "strict": False, "machines": {}}
+    out = {"enabled": True, "exclude_local": True, "lan_to_local": True, "strict": False, "code_to_local": True,
+           "code_machine": "", "machines": {}}
     out.update({k: v for k, v in c.items() if k in out})
     out["machines"] = dict(out.get("machines") or {})
     return out
@@ -82,6 +86,8 @@ def label(sessions, mid: Optional[str]) -> str:
     name = m.get("name") or mid
     try:
         r = roles_of(sessions).get(mid) if cfg(sessions.store)["enabled"] else None
+        if not r and cfg(sessions.store)["enabled"] and mid == code_machine(sessions):
+            r = "code"
     except Exception:  # noqa: BLE001
         r = None
     return f"{name} · {title(r)}" if r else name
@@ -109,6 +115,60 @@ def skill_role(prompt: str) -> Optional[str]:
         if r:
             votes[r] = votes.get(r, 0) + 1
     return max(votes, key=lambda r: (votes[r], -ORDER.index(r))) if votes else None
+
+
+# ---------------------------------------------------------------- v3.9.55: code work -> the local VM
+# Words that make a request a coding job. Picture / page words alone (图片, png, 页面, ui) are NOT here: a coding job
+# that mentions them used to score 设计制图 and land on the design computer.
+CODE = re.compile(
+    r"代码|源码|编程|写代码|改代码|修(复|改|一下)?.{0,8}(bug|报错|错误|异常|崩溃|闪退|问题)|\bbug\b|报错|调试|debug|"
+    r"编译|构建|打包|重构|单元测试|跑测试|pytest|写(个|一个|一段)?(程序|脚本|工具|网站|小程序|app|插件|接口|爬虫|服务)|"
+    r"开发(?!票)|脚本(?!.{0,2}(文案|分镜))|(?<!视频)(?<!拍摄)(?<!口播)程序|github|gitee|\bgit\b|仓库|\brepo\b|"
+    r"补丁|\bpatch\b|pull request|\bcommit\b|\bpython\b|\bjava(script)?\b|\btypescript\b|\bgolang\b|\brust\b|"
+    r"\bkotlin\b|\bswift(ui)?\b|\bnode(js)?\b|\bnpm\b|\bpnpm\b|\bflask\b|\bdjango\b|\bfastapi\b|\breact\b|\bvue\b|"
+    r"\bapi\b|接口|前端|后端|数据库|\bsql\b|\bdocker\b|"
+    r"\bapk\b|\bipa\b|xcode|gradle|smali|apktool|antigravity|\bagy\b|反重力|"
+    r"[\w./-]+\.(py|js|ts|tsx|jsx|java|kt|go|rs|swift|sh|c|cpp|h|vue|sql)\b", re.I)
+
+
+NOT_CODE = re.compile(r"(视频|拍摄|口播|直播|带货|短视频|广告|剧本|演讲)[^，。,.]{0,4}脚本|脚本文案|分镜脚本|文案", re.I)
+
+
+def is_code(prompt: str) -> bool:
+    """A coding job? The dev skill, the agent's own dev_fix intent, or a code word in the request."""
+    text = prompt or ""
+    if NOT_CODE.search(text) and not CODE.search(text):   # 视频脚本 / 口播文案 are writing, not code
+        return False
+    try:
+        from agent_runtime import skills as _sk
+        if "dev" in [n.lower() for n in _sk.picked(text) + _sk.mentioned(text)]:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from agent_runtime import intent as _in
+        if _in.classify(text).get("intent") == _in.DEV_FIX:
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return bool(CODE.search(text))
+
+
+def local_ids(sessions) -> list[str]:
+    clouds = set(cloud_ids(sessions)) | set(((getattr(sessions, "cloud", None) and sessions.cloud.entries()) or {}).keys())
+    return [m["id"] for m in sessions.store.machines() if m["id"] not in clouds]
+
+
+def code_machine(sessions) -> Optional[str]:
+    """The computer every code task goes to: machine_roles.code_machine when it is a local one, else the first local."""
+    c = cfg(sessions.store)
+    if not c.get("code_to_local", True):
+        return None
+    local = local_ids(sessions)
+    want = str(c.get("code_machine") or "")
+    if want and want in local:
+        return want
+    return local[0] if local else None
 
 
 def best_role(prompt: str) -> Optional[str]:
@@ -158,6 +218,9 @@ def pick(sessions, prompt: str, current: Optional[str]) -> Optional[str]:
     p = pinned(sessions, prompt)
     if p:
         return p
+    cm = code_machine(sessions)
+    if cm and is_code(prompt):   # v3.9.55: code work always runs on the local VM (it queues there when busy)
+        return cm
     local = [m["id"] for m in sessions.store.machines() if m["id"] not in clouds]
     if c["lan_to_local"] and local and LAN.search(prompt or ""):
         return current if current in local else local[0]
@@ -292,8 +355,9 @@ def annotate(sessions, roster: list[dict], own: Optional[str] = None) -> list[di
     roles = roles_of(sessions)
     if not roles:
         return roster
+    cm = code_machine(sessions)
     for m in roster:
-        r = roles.get(m["id"])
+        r = roles.get(m["id"]) or ("code" if m["id"] == cm else None)
         if r:
             m["role"] = r
             m["role_title"] = title(r)
@@ -309,9 +373,13 @@ def place_auto(sessions, items: list[dict]) -> list[dict]:
     if not c["enabled"]:
         return items
     roles = roles_of(sessions)
+    cm = code_machine(sessions)
     taken = {str(it.get("machine") or "") for it in items}
     for it in items:
         if str(it.get("machine") or "auto").strip().lower() != "auto":
+            continue
+        if cm and is_code(it.get("goal") or ""):   # v3.9.55: code pieces go to the local VM (they queue there)
+            it["machine"] = cm
             continue
         r = best_role(it.get("goal") or "")
         fit = [m for m in roles if roles[m] == r and m not in taken]
@@ -324,10 +392,11 @@ def place_auto(sessions, items: list[dict]) -> list[dict]:
 def show(sessions) -> dict:
     c = cfg(sessions.store)
     roles = roles_of(sessions)
+    cm = code_machine(sessions)
     ms = []
     for m in sessions.store.machines():
-        r = roles.get(m["id"])
-        ms.append({"id": m["id"], "name": m.get("name") or m["id"], "kind": "cloud" if r else "local",
+        r = roles.get(m["id"]) or ("code" if m["id"] == cm else None)
+        ms.append({"id": m["id"], "name": m.get("name") or m["id"], "kind": "cloud" if m["id"] in roles else "local",
                    "role": r or ("excluded" if c["exclude_local"] else ""), "role_title": title(r) if r else
                    ("不参与（只做家里内网的活）" if c["exclude_local"] and c["lan_to_local"] else
                     "不参与" if c["exclude_local"] else "")})
@@ -366,13 +435,20 @@ def _cli():
     elif a and a[0] == "local" and len(a) == 2 and a[1] in ("lan", "off", "on"):
         c["exclude_local"] = a[1] != "on"
         c["lan_to_local"] = a[1] == "lan"
+    elif a and a[0] == "code" and len(a) in (2, 3) and a[1] in ("on", "off"):
+        c["code_to_local"] = a[1] == "on"
+        if len(a) == 3:
+            hit = [m["id"] for m in st.machines() if a[2] in (m["id"], m.get("name"))]
+            if not hit or hit[0] in cloud_ids(s):
+                sys.exit(f"不是一台本地电脑：{a[2]}")
+            c["code_machine"] = hit[0]
     elif a and a[0] == "test":
-        print(json.dumps({"prompt": " ".join(a[1:]), "role": best_role(" ".join(a[1:])),
+        print(json.dumps({"prompt": " ".join(a[1:]), "role": best_role(" ".join(a[1:])), "code": is_code(" ".join(a[1:])),
                           "computer": pick(s, " ".join(a[1:]), None)}, ensure_ascii=False))
         return
     elif a and a[0] != "show":
         sys.exit("用法：show | set <电脑id或名字> <design|media|office|general> | on | off | strict | loose | "
-                 "local lan|off|on | test <任务文字>")
+                 "local lan|off|on | code on|off [本地电脑id或名字] | test <任务文字>")
     if not (a and a[0] == "show") and a:
         c["machines"].update({k: v for k, v in roles_of(s).items() if k not in c["machines"]})
         st.kv_set(KEY, c)

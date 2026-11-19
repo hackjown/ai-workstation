@@ -131,6 +131,31 @@ TOOLS: list[ToolSpec] = [
               "save": {"type": "string", "description": "output .png, relative to ~/workspace (default "
                                                         "images/gen-<time>.png; extra versions get -2, -3…)"}},
              ["prompt"]),
+    ToolSpec("antigravity", None,
+             "Hand a coding job to Google Antigravity CLI (agy) on this computer and supervise it. agy works in its "
+             "own git worktree on a new branch aiw/<job>; it never pushes. Flow: op=start (repo = git repo path, "
+             "task = the complete brief; the acceptance items of the task contract are appended automatically) -> "
+             "op=wait (blocks until its turn ends; shows its tool steps, report, changed files, denied actions) -> "
+             "verify it YOURSELF in the worktree (tests / build / verify_html; its report is not evidence) -> if "
+             "anything fails op=send the exact failure to the same job and op=wait again -> op=diff full=true to "
+             "review -> done naming the branch for the user to merge. op=stop ends a session; op=check (probe=true "
+             "also tests the sign-in); op=list shows jobs. Use only when the user asked for Antigravity.",
+             {"op": {"type": "string", "enum": ["check", "start", "wait", "send", "diff", "stop", "list"]},
+              "repo": {"type": "string", "description": "start: path of the git repository (default ~/workspace)"},
+              "task": {"type": "string", "description": "start: the brief for agy (goal, files, constraints)"},
+              "base": {"type": "string", "description": "start: branch/commit to start from (default HEAD)"},
+              "model": {"type": "string", "description": "start: agy model slug (default from settings)"},
+              "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+              "mode": {"type": "string", "enum": ["accept-edits", "plan", "auto", "default"],
+                       "description": "start: plan = only write an implementation plan, no edits"},
+              "conversation": {"type": "string", "description": "start: resume an earlier agy conversation id"},
+              "job": {"type": "string", "description": "wait/send/diff/stop: the job id from start"},
+              "message": {"type": "string", "description": "send: the follow-up prompt (e.g. the failing test output)"},
+              "seconds": {"type": "integer", "description": "wait: max seconds to block (default 600, max 1500)"},
+              "cursor": {"type": "integer", "description": "wait: the cursor from the previous wait (only new steps)"},
+              "full": {"type": "boolean", "description": "diff: include the full patch"},
+              "probe": {"type": "boolean", "description": "check: also run a tiny prompt to test the sign-in"}},
+             ["op"]),
     ToolSpec("photopea", None,
              "Edit images like in Photoshop: PSD/PNG/JPG/WebP in Photopea (a Photoshop clone) in a browser window on "
              "(when mcp_adobe_* tools are listed and the user named Photoshop/Adobe, use those first) "
@@ -408,7 +433,7 @@ BY_NAME = {t.name: t for t in TOOLS}
 BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
-LOOP_TOOLS = {"read_file", "grep", "glob", "todo_write", "verify_html", "done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image"}
+LOOP_TOOLS = {"read_file", "grep", "glob", "todo_write", "verify_html", "done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image", "antigravity"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_patch", "files_download", "done", "fail")
 
 

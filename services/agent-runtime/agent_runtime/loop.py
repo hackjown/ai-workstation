@@ -40,6 +40,7 @@ from . import provenance as _pv
 from . import fingerprint as _fpm
 from . import dev_contract as _dc
 from . import verify_html as _vh
+from . import antigravity as _agy
 from . import git_ops as _git
 from .findings import FindingsBoard
 from .progress_guard import ProgressGuard
@@ -468,6 +469,9 @@ class AgentLoop:
         try:
             ex = getattr(self.computer, "execute", None)
             if ex:
+                for jid in list(getattr(self, "_agy_jobs", ()) or ()):   # v3.9.54 agy runs detached
+                    await asyncio.wait_for(ex("shell.exec", {"command": _agy.stop_command(jid), "timeout": 40},
+                                              observe=False, timeout=50), 55)
                 await asyncio.wait_for(ex("shell.kill", {}, observe=False, timeout=8), 10)
         except BaseException:  # noqa: BLE001  an older vm-agent has no shell.kill
             pass
@@ -1529,6 +1533,8 @@ class AgentLoop:
             return await self._generate_image(a)
         if t == "photopea":
             return await self._photopea(a, decision.thought)
+        if t == "antigravity":   # v3.9.54 Antigravity CLI as a supervised coder
+            return await self._antigravity(a, decision.thought)
         if t == "remember":
             text = (a.get("text") or "").strip()
             if text and self.remember:
@@ -3162,6 +3168,66 @@ class AgentLoop:
                         result={"saved": _pp.saved_paths(res), "log": (res.get("echo") or [])[:5]})
         return _pp.summarize(res)
 
+    async def _antigravity(self, a: dict, intent: str) -> str:
+        """v3.9.54: drive Antigravity CLI through the bridge on the computer (antigravity.py / agy_bridge.py). agy
+        edits a worktree; this loop stays the verifier, so a wait result is reported, never counted as verification."""
+        op = str(a.get("op") or "").strip().lower()
+        if op not in _agy.OPS:
+            await self.emit(EventType.ACTION_RESULT, tool="antigravity", success=False, error="bad op", result={})
+            return f"FAILED: antigravity needs op = one of {', '.join(_agy.OPS)}"
+        if op in ("wait", "send", "diff", "stop") and not a.get("job"):
+            jobs = list(getattr(self, "_agy_jobs", ()) or ())
+            if jobs:
+                a = {**a, "job": jobs[-1]}
+            else:
+                await self.emit(EventType.ACTION_RESULT, tool="antigravity", success=False, error="no job", result={})
+                return "FAILED: no agy job yet in this task: op=start first (or pass job=<id> from op=list)"
+        if op == "send" and not str(a.get("message") or "").strip():
+            return "FAILED: op=send needs message"
+        if not getattr(self, "_agy_installed", False):
+            r = await self.tools.run("shell", {"command": _agy.install_command(), "timeout": 60},
+                                     intent="install the AIW Antigravity bridge on this computer")
+            o = ((r.result or {}).get("stdout") or "") if isinstance(r.result, dict) else ""
+            if "AGY_BRIDGE_OK" not in o:
+                e = ((r.result or {}).get("stderr") if isinstance(r.result, dict) else None) or r.error or o
+                await self.emit(EventType.ACTION_RESULT, tool="antigravity", success=False, error=str(e)[-200:], result={})
+                return f"FAILED: could not install the Antigravity bridge on the computer: {str(e)[-400:]}"
+            self._agy_installed = True
+        job = None
+        if op == "start":
+            task = str(a.get("task") or "").strip() or (self.task.prompt or "")
+            contract = self.dev.contract if getattr(self, "_intent", None) == _in.DEV_FIX else None
+            job = _agy.job_from_args(a, _agy.brief(task, contract))
+        cmd, t_out = _agy.command(op, {**a, "cursor": a.get("cursor") if a.get("cursor") is not None
+                                        else getattr(self, "_agy_cursor", {}).get(str(a.get("job") or ""), 0)}, job)
+        t0 = time.monotonic()
+        r = await self.tools.run("shell", {"command": cmd, "timeout": t_out}, intent=intent or f"antigravity {op}")
+        raw = r.result if isinstance(r.result, dict) else {}
+        res = _agy.parse(raw.get("stdout") or "")
+        if res is None:
+            e = ((raw.get("stderr") or "") + (r.error or ""))[-500:] or "no result from the bridge"
+            await self.emit(EventType.ACTION_RESULT, tool="antigravity", success=False, error=e[-200:], result={"op": op})
+            return f"FAILED: antigravity {op}: {e}"
+        if op == "start" and res.get("job"):
+            self._agy_jobs = list(getattr(self, "_agy_jobs", []) or []) + [res["job"]]
+        if res.get("job") and res.get("cursor") is not None:
+            self._agy_cursor = {**(getattr(self, "_agy_cursor", {}) or {}), res["job"]: int(res["cursor"])}
+        ok = bool(res.get("ok", True)) and res.get("status") not in ("error", "stuck", "timed_out", "turn_failed")
+        if op in ("start", "send") and res.get("ok"):
+            self._acted = True
+        ch = res.get("changes") or {}
+        await self.emit(EventType.ACTION_RESULT, tool="antigravity", success=ok, error=None if ok else str(
+            res.get("error") or res.get("status"))[:200],
+                        result=_short({"op": op, "job": res.get("job"), "status": res.get("status"),
+                                       "branch": res.get("branch"), "turn": res.get("turn"),
+                                       "tools": res.get("tools_total"), "changes": ch.get("stat") or res.get("stat"),
+                                       "denied": len(res.get("denied") or []),
+                                       "report": str(res.get("response") or "")[:500]}),
+                        tool_ms=int((time.monotonic() - t0) * 1000))
+        text = _agy.render(op, res)
+        self.history.append(f"{self.step}. antigravity {op} {res.get('job') or ''}: {res.get('status') or ('ok' if ok else 'failed')}")
+        return text
+
     async def _read_image(self, a: dict) -> str:
         """read_image with paths=[...]: all images at once. Read one per step, the 8 design images of task-960 took
         7.5 min (about 50 s each on the vision model); in parallel they take about as long as the slowest one."""
@@ -3473,6 +3539,8 @@ class AgentLoop:
             hide.append("verify_html")
         if getattr(self, "_intent", None) != _in.DEV_FIX:   # v3.9.30: the lean dev toolset only for coding tasks
             hide.extend(_dl.DEV_TOOLS)
+        if not _agy.offered(self.task.prompt or "", getattr(self, "_intent", None) == _in.DEV_FIX):
+            hide.append("antigravity")   # v3.9.54
         return tuple(hide)
 
     async def _dispatch(self, a: dict) -> str:
@@ -3746,7 +3814,7 @@ def _gui_text(prompt: str) -> str:
     return _GIT_URL.sub(" ", p)
 
 
-_NON_GUI_TOOLS = {"read_file", "grep", "glob", "todo_write", "files_patch", "verify_html", "ask_user", "update_plan", "remember", "done", "fail", "wait", "request_takeover",
+_NON_GUI_TOOLS = {"antigravity", "read_file", "grep", "glob", "todo_write", "files_patch", "verify_html", "ask_user", "update_plan", "remember", "done", "fail", "wait", "request_takeover",
                   "note_finding", "ssh_exec", "remote_exec", "session_search", "deploy_server", "browser_network",
                   "web_search", "web_fetch", "doc_ask"}
 
@@ -3851,7 +3919,7 @@ def _ws_rel(p: str) -> str:
 
 
 _GUESSED_HOME = re.compile(r"(/home/(?:user|aiw|ubuntu|debian)/)workspace(?=/|\b)")
-_NO_SCREEN_TOOLS = {"read_file", "grep", "glob", "todo_write", "files_patch", "verify_html", "read_image", "image_edit", "generate_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
+_NO_SCREEN_TOOLS = {"antigravity", "read_file", "grep", "glob", "todo_write", "files_patch", "verify_html", "read_image", "image_edit", "generate_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
                     # 3.8.9 (task-3fc): file-only drawing steps; a desktop look + vision description cost 12-15 s each
                     "drawing_auto", "drawing_build", "drawing_note", "drawing_read",
                     # v3.9.17: facts, remote commands and the request log never change the screen

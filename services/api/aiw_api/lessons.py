@@ -580,7 +580,7 @@ TOOL_FAMILY = {
     "send_file": "files", "ssh_exec": "remote", "remote_exec": "remote", "browser_open": "browser",
     "browser_navigate": "browser", "browser_click": "browser", "browser_fill": "browser", "browser_network": "browser",
     "click": "screen", "type": "screen", "click_element": "screen", "screenshot": "screen", "read_image": "vision",
-    "image_edit": "image", "generate_image": "image", "photopea": "image", "cad_command": "cad", "drawing_build": "cad",
+    "image_edit": "image", "generate_image": "image", "photopea": "image", "antigravity": "shell", "cad_command": "cad", "drawing_build": "cad",
 }
 _FAMILY_WORDS = {
     "shell": r"\bshell\b|命令|终端|\bpip\b|\bapt\b|\bnpm\b|python|bash|路径|workspace|脚本",

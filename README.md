@@ -93,6 +93,14 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.54 接入 Antigravity CLI：AIW 派活、监督、验收
+
+- **新工具 `antigravity`**：AIW 把编码任务交给电脑上的 Google Antigravity CLI（`agy`）。agy 在独立的 git worktree、新分支 `aiw/<job>` 里改代码，不推送；AIW 实时读它的每一步（stream-json），它说做完后由 AIW 自己跑测试/构建/verify_html 验收，不过就把失败输出发回同一个会话让它继续改，最后把分支交给你决定合并。
+- **默认只在你点名时启用**（请求里提到 Antigravity / agy / 反重力）。`AIW_AGY=1` 让所有编码任务都可以用，`AIW_AGY=0` 关闭。
+- **权限**：首次使用时如果没有 `~/.gemini/antigravity-cli/settings.json`，写入默认白名单（git 查看/提交、测试、构建）和黑名单（git push、reset --hard、sudo、curl|sh 等）。被拒的动作会列在结果里，由 AIW 问你。
+- **监督**：单次会话总时长 `AIW_AGY_TIMEOUT_MIN`（120）、无输出超时 `AIW_AGY_IDLE_MIN`（15）、最多轮数 `AIW_AGY_MAX_TURNS`（8）；停止 AIW 任务会一并停掉 agy。
+- 电脑上需要先装好 `agy` 并登录一次（国内电脑设 `HTTPS_PROXY`）。详见 `docs/v3.9.54.md`。
+
 ## v3.9.53 早报：全球 AI 要闻、GitHub 新榜兜底；聊天里上传的图片和视频直接预览
 
 - **全球 AI 要闻**：早报页面天气下面加一栏，取近 36 小时的量子位、36氪（只留 AI）、MIT Technology Review、The Verge、TechCrunch、Ars Technica、Hacker News（只留 AI），配了联网工具 Key 时再加一次 DeepSeek 搜索；小模型挑 10 条写成中文标题 + 一句话，附原文链接。`AIW_BRIEF_AI_NEWS=0` 关闭。

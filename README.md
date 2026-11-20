@@ -93,6 +93,14 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.59 iOS：引擎
+
+- 首页右上角 ＋ 菜单，「电脑」下面多了「引擎」：对话列表（右上角新建），点进去和电脑上的 agy 对话，接口和网页的引擎页相同（`/api/bots*`）。
+- 输入框和首页聊天一样：＋（拍照、录视频、照片/视频、文件、技能 /），附件条，`/` 选技能；长按消息「引用」「复制」。
+- 标题栏点一下或 ⋯ 菜单换模型和强度（`/api/bots/engines/agy/models`），从下一句起生效，接着原会话。
+- ⋯ 菜单：交给管家（目标 + 轮数）、收回、停止、改名、删除。对话进行中每 2 秒刷新，空闲 8 秒。
+- 新文件 `apps/ios/Sources/EngineView.swift`；`HomeSheet.engine`；版本 3.9.59 (33)。推到 main 后 ipa 工作流编译，结果评论在 issue #1。
+
 ## v3.9.58 引擎：附件、技能、模型和强度
 
 - 「引擎对话」改名「引擎」。

@@ -5,7 +5,7 @@ import AVFoundation
 /// native menu; 任务 (every task, was 历史对话) and the rest open as large sheets with × and a centred title. A task opens
 /// as a pushed page (ChatView: the computer on top, the steps below); back returns to the chat where it was.
 enum HomeSheet: String, Identifiable {
-    case history, archive, tracking, routine, computer, search
+    case history, archive, tracking, routine, computer, search, engine   // v3.9.59 引擎 (EngineView.swift)
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -15,6 +15,7 @@ enum HomeSheet: String, Identifiable {
         case .routine: return "例程"
         case .computer: return "电脑"
         case .search: return "搜索"
+        case .engine: return "引擎"
         }
     }
 }
@@ -60,6 +61,7 @@ struct RootView: View {
         case .routine: RoutineSheet(open: openThread, close: close)
         case .computer: ComputerSheet(close: close)
         case .search: SearchSheet(close: close)
+        case .engine: EngineSheet(close: close)
         }
     }
 

@@ -1,0 +1,736 @@
+import SwiftUI
+import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
+
+// v3.9.59 引擎 on iOS: the web page's 引擎 (bots.js, /api/bots*) as a sheet from the top-right "+" menu, next to
+// 任务 / 电脑. The list of engine conversations (agy now, Codex later) -> one conversation: the engine's replies with
+// their steps, quote (long press › 引用), the chat's "+" (拍照 / 照片 / 文件 / 技能) and "/" skills, model and strength,
+// 交给管家 / 收回 / 停止. Like the web page it polls the conversation (2 s while it runs, 8 s otherwise).
+
+let engineEffortName: [String: String] = ["minimal": "最低", "low": "低", "medium": "中", "high": "高", "xhigh": "超高", "max": "最高"]
+let engineEffortOrder = ["minimal", "low", "medium", "high", "xhigh", "max"]
+
+/// The models this computer's agy account can use (GET /api/bots/engines/agy/models: groups of a model and its strengths)
+final class EngineModels: ObservableObject {
+    static let shared = EngineModels()
+    @Published var groups: [JSON] = []
+    @Published var error = ""
+    @Published var loading = false
+    private var loaded = false
+    @MainActor func load(refresh: Bool = false) async {
+        if loaded && !refresh { return }
+        loading = true; defer { loading = false }
+        do {
+            let r = try await API.shared.obj("GET", "/api/bots/engines/agy/models" + (refresh ? "?refresh=1" : ""))
+            groups = r.a("groups"); error = ""; loaded = true
+        } catch { self.error = "读不到模型列表（\(error.localizedDescription)），先用 agy 的默认模型" }
+    }
+    /// (group, strength) for a stored model: a group id, or a slug that names its strength
+    func find(_ model: String) -> (JSON, String)? {
+        for g in groups {
+            if g.s("id") == model { return (g, "") }
+            for (e, v) in g.o("slugs") where (v as? String) == model { return (g, e) }
+        }
+        return nil
+    }
+    func name(_ c: JSON) -> String {
+        let model = c.s("model"), effort = c.s("effort")
+        if model.isEmpty && effort.isEmpty { return "默认模型" }
+        let hit = model.isEmpty ? nil : find(model)
+        let n = hit.map { $0.0.s("label").isEmpty ? $0.0.s("id") : $0.0.s("label") } ?? (model.isEmpty ? "默认模型" : model)
+        let e = (hit?.1.isEmpty == false ? hit!.1 : effort)
+        return e.isEmpty ? n : n + " · " + (engineEffortName[e] ?? e)
+    }
+    /// the strengths a group offers (its slugs, else --effort low…max), and whether "默认" is allowed
+    func efforts(_ gid: String) -> ([String], Bool) {
+        let g = groups.first { $0.s("id") == gid }
+        let own = (g?["efforts"] as? [String]) ?? []
+        if let g = g, !own.isEmpty { return (own, g.b("plain")) }
+        return (engineEffortOrder.filter { $0 != "minimal" }, true)
+    }
+    /// what create / PATCH take: a slug that names its strength goes alone
+    func value(_ gid: String, _ eff: String) -> JSON {
+        if let g = groups.first(where: { $0.s("id") == gid }), !eff.isEmpty, let slug = g.o("slugs")[eff] as? String {
+            return ["model": slug, "effort": ""]
+        }
+        return ["model": gid, "effort": eff]
+    }
+}
+
+/// 模型 + 强度 (a Section inside a Form)
+struct EngineModelSection: View {
+    @ObservedObject private var models = EngineModels.shared
+    @Binding var group: String
+    @Binding var effort: String
+    init(group: Binding<String>, effort: Binding<String>) { _group = group; _effort = effort }
+    var body: some View {
+        Section(header: HStack {
+            Text("模型和强度"); Spacer()
+            Button("刷新") { Task { await models.load(refresh: true) } }.font(.caption)
+        }.textCase(nil), footer: Text(models.error.isEmpty ? "强度越高越慢、越仔细。选「默认」就用 agy 自己的设置。" : models.error)) {
+            Picker("模型", selection: $group) {
+                Text("默认（agy 自己的设置）").tag("")
+                ForEach(models.groups.indices, id: \.self) { i in
+                    let g = models.groups[i]
+                    Text(g.s("label").isEmpty ? g.s("id") : g.s("label")).tag(g.s("id"))
+                }
+                if !group.isEmpty && !models.groups.contains(where: { $0.s("id") == group }) { Text(group).tag(group) }
+            }
+            let ep = models.efforts(group)
+            Picker("强度", selection: $effort) {
+                if ep.1 { Text("默认").tag("") }
+                ForEach(ep.0, id: \.self) { e in Text("\(engineEffortName[e] ?? e)（\(e)）").tag(e) }
+            }
+            if models.loading { HStack { ProgressView(); Text("读取模型…").font(.footnote).foregroundColor(.secondary) } }
+        }
+        .onChange(of: group) { _ in fixEffort() }
+        .onChange(of: models.groups.count) { _ in fixEffort() }
+    }
+    func fixEffort() {
+        let (effs, plain) = models.efforts(group)
+        if effs.contains(effort) || (plain && effort.isEmpty) { return }
+        effort = plain ? "" : (effs.contains("high") ? "high" : (effs.last ?? ""))
+    }
+    /// the picker state for a stored model / effort
+    static func split(_ model: String, _ effort: String) -> (String, String) {
+        if let (g, e) = EngineModels.shared.find(model) { return (g.s("id"), e.isEmpty ? effort : e) }
+        return (model, effort)
+    }
+}
+
+// MARK: - the list
+
+struct EngineSheet: View {
+    let close: () -> Void
+    @State private var convs: [JSON] = []
+    @State private var engines: [JSON] = []
+    @State private var error = ""
+    @State private var showNew = false
+    @State private var open: String? = nil
+    @State private var loaded = false
+    var body: some View {
+        SheetChrome("引擎", close: close, trailing: {
+            Button { showNew = true } label: { Image(systemName: "square.and.pencil").font(.system(size: 17)) }.accessibilityLabel("新对话")
+        }) {
+            List {
+                if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
+                if loaded && convs.isEmpty {
+                    Section {
+                        Text("还没有对话。新建一个，直接和电脑上的 Antigravity 说话；也可以把目标交给 AIW 管家，让它替你和 Antigravity 来回沟通。")
+                            .font(.subheadline).foregroundColor(.secondary)
+                        Button { showNew = true } label: { Label("新对话", systemImage: "plus") }.foregroundColor(amber)
+                    }
+                }
+                Section(footer: Text(soon)) {
+                    ForEach(convs.indices, id: \.self) { i in
+                        let c = convs[i]
+                        NavigationLink(tag: c.s("id"), selection: $open) {
+                            EngineConvView(cid: c.s("id"), engines: engines) { Task { await load() } }
+                        } label: { row(c) }
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .refreshable { await load() }
+        }
+        .task { await load() }
+        .sheet(isPresented: $showNew) {
+            EngineNewSheet(engines: engines) { c in
+                showNew = false
+                convs.insert(c, at: 0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { open = c.s("id") }
+            }
+        }
+    }
+    var soon: String {
+        engines.filter { !$0.b("available") }.map { $0.s("title") + "：下一版接入" }.joined(separator: " · ")
+    }
+    func row(_ c: JSON) -> some View {
+        let eng = engines.first { $0.s("id") == c.s("bot") }
+        let last = c.o("last")
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(c.s("title")).font(.subheadline.weight(.semibold)).lineLimit(1)
+                if c.b("busy") || c.s("status") == "running" { ProgressView().controlSize(.mini) }
+                if !c.o("takeover").isEmpty {
+                    Text("管家").font(.caption2.weight(.bold)).foregroundColor(amber)
+                        .padding(.horizontal, 5).padding(.vertical, 1).overlay(Capsule().stroke(amber))
+                }
+                Spacer()
+                Text(when(c.d("updated_at"))).font(.caption2).foregroundColor(.secondary)
+            }
+            Text("\(eng?.s("title") ?? c.s("bot")) · \(EngineModels.shared.name(c))").font(.caption).foregroundColor(.secondary).lineLimit(1)
+            if !last.isEmpty {
+                Text((last.s("role") == "user" ? "我：" : "") + last.s("text")).font(.caption).foregroundColor(.secondary).lineLimit(2)
+            }
+        }.padding(.vertical, 2)
+    }
+    @MainActor func load() async {
+        do {
+            let r = try await API.shared.obj("GET", "/api/bots")
+            engines = r.a("engines"); convs = r.a("convs"); error = ""
+        } catch { error = "读不到引擎对话：\(error.localizedDescription)" }
+        loaded = true
+        await EngineModels.shared.load()
+    }
+}
+
+struct EngineNewSheet: View {
+    let engines: [JSON]
+    let done: (JSON) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var bot = "agy"
+    @State private var title = ""
+    @State private var workdir = ""
+    @State private var group = ""
+    @State private var effort = ""
+    @State private var busy = false
+    @State private var error = ""
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(header: Text("引擎")) {
+                    Picker("引擎", selection: $bot) {
+                        ForEach(engines.indices, id: \.self) { i in
+                            let e = engines[i]
+                            Text(e.s("title") + (e.b("available") ? "" : "（即将支持）")).tag(e.s("id"))
+                        }
+                    }
+                }
+                Section(header: Text("标题")) { TextField("例如 ldok 重建", text: $title) }
+                Section(header: Text("工作文件夹"), footer: Text("电脑上的文件夹，它就在这里改文件；空着就新建一个。")) {
+                    TextField("~/workspace/ldok-rebuild", text: $workdir).textInputAutocapitalization(.never).autocorrectionDisabled()
+                }
+                EngineModelSection(group: $group, effort: $effort)
+                if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
+            }
+            .navigationTitle("新对话").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    if busy { ProgressView() } else { Button("开始") { Task { await create() } }.bold() }
+                }
+            }
+        }
+        .task { await EngineModels.shared.load() }
+    }
+    @MainActor func create() async {
+        if let e = engines.first(where: { $0.s("id") == bot }), !e.b("available") { error = "\(e.s("title")) 还没接入"; return }
+        busy = true; defer { busy = false }
+        var req: JSON = ["bot": bot, "title": title, "workdir": workdir]
+        for (k, v) in EngineModels.shared.value(group, effort) { req[k] = v }
+        do { done(try await API.shared.obj("POST", "/api/bots/convs", req)) }
+        catch { self.error = "没能新建：\(error.localizedDescription)" }
+    }
+}
+
+// MARK: - one conversation
+
+struct EngineQuote: Equatable { let id: String; let who: String; let text: String }
+
+struct EngineConvView: View {
+    let cid: String
+    let engines: [JSON]
+    let changed: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var cs
+    @State private var conv: JSON = [:]
+    @State private var msgs: [JSON] = []
+    @State private var err = ""
+    @State private var text = ""
+    @State private var focused = false
+    @State private var sending = false
+    @State private var quote: EngineQuote? = nil
+    @State private var attach: [JSON] = []
+    @State private var uploading = false
+    @State private var pct: Double = 0
+    @State private var skills: [JSON] = []
+    @State private var picked: [String] = []
+    @State private var showAttach = false
+    @State private var pending: AttachKind? = nil
+    @State private var camera: CamMode? = nil
+    @State private var photos: [PhotosPickerItem] = []
+    @State private var showPhotos = false
+    @State private var showFiles = false
+    @State private var showTake = false
+    @State private var showModel = false
+    @State private var showRename = false
+    @State private var newTitle = ""
+    @State private var confirmDelete = false
+    @State private var lastCount = 0
+
+    var engine: JSON { engines.first { $0.s("id") == conv.s("bot") } ?? ["title": "Antigravity", "short": "agy"] }
+    var takeover: JSON { (conv["takeover"] as? JSON) ?? [:] }
+    var live: Bool { conv.b("busy") || conv.s("status") == "running" }
+    var slashQ: String? { slashQuery(text) }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    if msgs.isEmpty && !conv.isEmpty {
+                        Text("直接说要它做什么。它在电脑的 \(conv.s("workdir")) 里干活，改动不会自动推送。")
+                            .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
+                    }
+                    ForEach(msgs.indices.map { HRowKey(i: $0, id: msgs[$0].s("id")) }, id: \.id) { k in row(msgs[k.i]) }
+                    if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red) }
+                    Color.clear.frame(height: 1).id("end")
+                }.padding(.horizontal, 14).padding(.vertical, 10)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .safeAreaInset(edge: .top) { if !takeover.isEmpty { takeBar } }
+            .safeAreaInset(edge: .bottom) { composer }
+            .onChange(of: msgs.count) { n in
+                if n != lastCount { lastCount = n; withAnimation { proxy.scrollTo("end", anchor: .bottom) } }
+            }
+            .onChange(of: msgs.last?.s("text") ?? "") { _ in proxy.scrollTo("end", anchor: .bottom) }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 0) {
+                    Text(conv.s("title").isEmpty ? "引擎" : conv.s("title")).font(.subheadline.weight(.bold)).lineLimit(1)
+                    Text("\(engine.s("title")) · \(EngineModels.shared.name(conv))").font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                }.onTapGesture { showModel = true }
+            }
+            ToolbarItem(placement: .navigationBarTrailing) { menu }
+        }
+        .task { await poll() }
+        .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
+        .onChange(of: text) { t in onText(t) }
+        .onChange(of: photos) { items in
+            guard !items.isEmpty else { return }
+            let list = items; photos = []
+            Task { for it in list { await addPicked(it) } }
+        }
+        .photosPicker(isPresented: $showPhotos, selection: $photos, maxSelectionCount: 9, matching: .any(of: [.images, .videos]))
+        .sheet(isPresented: $showAttach, onDismiss: runPending) {
+            AttachSheet(kinds: [.photo, .video, .library, .file, .skill]) { k in pending = k; showAttach = false }
+                .presentationDetents([.height(AttachSheet.height)]).presentationDragIndicator(.hidden)
+        }
+        .fullScreenCover(item: $camera) { md in
+            HomeCamera(mode: md) { u, img in camera = nil; Task { await gotCamera(u, img) } }.ignoresSafeArea()
+        }
+        .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item], allowsMultipleSelection: true) { r in
+            if case .success(let urls) = r { Task { for u in urls { await addFile(u) } } }
+        }
+        .sheet(isPresented: $showTake) {
+            EngineTakeSheet(engine: engine.s("title")) { goal, rounds in
+                do {
+                    _ = try await API.shared.obj("POST", "/api/bots/convs/\(cid)/takeover", ["goal": goal, "rounds": rounds])
+                    await load(); return nil
+                } catch { return "没能交给管家：\(error.localizedDescription)" }
+            }
+        }
+        .sheet(isPresented: $showModel) {
+            EngineModelSheet(model: conv.s("model"), effort: conv.s("effort")) { v in
+                do {
+                    _ = try await API.shared.obj("PATCH", "/api/bots/convs/\(cid)", v)
+                    await load(); changed(); return nil
+                } catch { return "没改成：\(error.localizedDescription)" }
+            }
+        }
+        .alert("对话名称", isPresented: $showRename) {
+            TextField("名称", text: $newTitle)
+            Button("保存") { Task { await act("PATCH", "", ["title": newTitle]); changed() } }
+            Button("取消", role: .cancel) {}
+        }
+        .confirmationDialog("删除这个对话？", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("删除", role: .destructive) {
+                Task {
+                    do { _ = try await API.shared.call("DELETE", "/api/bots/convs/\(cid)"); changed(); dismiss() }
+                    catch { err = error.localizedDescription }
+                }
+            }
+        } message: { Text("电脑上的文件夹和文件不会删。") }
+    }
+
+    // MARK: header
+    var menu: some View {
+        Menu {
+            if takeover.isEmpty {
+                Button { showTake = true } label: { Label("交给管家", systemImage: "person.2") }
+            } else {
+                Button { Task { await act("DELETE", "/takeover") } } label: { Label("收回", systemImage: "hand.raised") }
+            }
+            if live { Button { Task { await act("POST", "/stop") } } label: { Label("停止", systemImage: "stop.circle") } }
+            Button { showModel = true } label: { Label("模型和强度", systemImage: "cpu") }
+            Button { newTitle = conv.s("title"); showRename = true } label: { Label("改名", systemImage: "pencil") }
+            Button(role: .destructive) { confirmDelete = true } label: { Label("删除对话", systemImage: "trash") }
+        } label: { Image(systemName: "ellipsis.circle").font(.system(size: 18)) }.accessibilityLabel("更多")
+    }
+    var takeBar: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("AIW 管家接管中（第 \(Int(takeover.d("rounds")))/\(Int(takeover.d("max"))) 轮）").font(.caption.weight(.bold)).foregroundColor(amber)
+            Text(takeover.s("goal")).font(.caption).lineLimit(2)
+            Text("你随时可以插话，它会先发你的话再继续；菜单里「收回」自己接手。").font(.caption2).foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12).padding(.vertical, 8).background(amber.opacity(0.1)).background(.bar)
+    }
+
+    // MARK: rows
+    @ViewBuilder func row(_ m: JSON) -> some View {
+        switch m.s("role") {
+        case "system":
+            Text(m.s("text")).font(.caption).foregroundColor(.secondary).multilineTextAlignment(.center).frame(maxWidth: .infinity)
+        case "user", "aiw": mine(m)
+        default: bot(m)
+        }
+    }
+    func mine(_ m: JSON) -> some View {
+        let d = m.o("data"), aiw = m.s("role") == "aiw"
+        let atts = d.a("attachments"), sk = (d["skills"] as? [String]) ?? []
+        let bad = atts.filter { $0.s("vm_path").isEmpty }.map { $0.s("name") }
+        return VStack(alignment: .trailing, spacing: 4) {
+            if aiw { Text("AIW 管家" + (d["report"] is String ? " · " + d.s("report") : "")).font(.caption2.weight(.semibold)).foregroundColor(.secondary) }
+            if !d.o("quote").isEmpty { quoteView(d.o("quote").s("who"), d.o("quote").s("text")) }
+            if !sk.isEmpty {
+                HStack(spacing: 4) { ForEach(sk, id: \.self) { s in Text("✨ " + skillTitle(s)).font(.caption2.weight(.semibold)).foregroundColor(hHL)
+                    .padding(.horizontal, 6).padding(.vertical, 2).background(Capsule().fill(hTok)) } }
+            }
+            if !m.s("text").isEmpty {
+                Group {
+                    if d.b("report") { RichText(text: m.s("text")) } else { Text(m.s("text")).textSelection(.enabled) }
+                }
+                .font(.callout).foregroundColor(aiw ? .primary : hInk)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(aiw ? amber.opacity(0.15) : hAmber))
+            }
+            ForEach(atts.indices, id: \.self) { i in
+                Label(atts[i].s("name"), systemImage: atts[i].s("kind") == "video" ? "film" : fileIcon(atts[i].s("name")))
+                    .font(.caption).lineLimit(1).padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Capsule().fill(Color(.secondarySystemBackground)))
+            }
+            if !bad.isEmpty { Text("有附件没能放到电脑上：" + bad.joined(separator: "、")).font(.caption2).foregroundColor(.red) }
+            Text((d.b("queued") ? "排队中，它回完这一轮就发 · " : "") + when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing).padding(.leading, 40)
+        .contextMenu { msgMenu(m) }
+    }
+    func bot(_ m: JSON) -> some View {
+        let d = m.o("data"), st = d.s("status"), running = st == "running"
+        let steps = d.a("steps"), denied = d.a("denied"), files = (d.o("changes")["files"] as? [String]) ?? []
+        let said = ((d["said"] as? [String]) ?? []).first ?? ""
+        return VStack(alignment: .leading, spacing: 5) {
+            Text(engine.s("title") + (st == "blocked" ? " · 被权限挡住" : st == "stopped" ? " · 已停止" : ""))
+                .font(.caption2.weight(.semibold)).foregroundColor(.secondary)
+            if running && m.s("text").isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(said.isEmpty ? "在电脑上干活…" : String(said.prefix(80))).font(.footnote).foregroundColor(.secondary).lineLimit(2)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color(.secondarySystemBackground)))
+            } else {
+                RichText(text: m.s("text"))
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(["error", "failed", "blocked"].contains(st) ? Color.red.opacity(0.1) : Color(.secondarySystemBackground)))
+            }
+            if !steps.isEmpty {
+                DisclosureGroup("\(running ? "正在做" : "做了") \(steps.count) 步") {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(steps.suffix(15).enumerated()), id: \.offset) { _, s in
+                            (Text(s.s("tool")).bold() + Text(" " + s.s("arg")) + Text(s.s("error").isEmpty ? "" : "  " + s.s("error")).foregroundColor(.red))
+                                .font(.system(.caption2, design: .monospaced)).lineLimit(3)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading).padding(.top, 4)
+                }.font(.caption).tint(.secondary)
+            }
+            if !denied.isEmpty {
+                Text("被拒绝的操作：" + denied.map { "\($0.s("tool")) \($0.s("target"))（\($0.s("why").isEmpty ? $0.s("action") : $0.s("why"))）" }.joined(separator: "；"))
+                    .font(.caption2).foregroundColor(.orange)
+            }
+            if !files.isEmpty {
+                Text("改动：" + files.prefix(8).joined(separator: "，") + (files.count > 8 ? " …" : "")).font(.caption2).foregroundColor(.secondary)
+            }
+            Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading).padding(.trailing, 24)
+        .contextMenu { if !running { msgMenu(m) } }
+    }
+    @ViewBuilder func msgMenu(_ m: JSON) -> some View {
+        Button { setQuote(m) } label: { Label("引用", systemImage: "quote.bubble") }
+        Button { UIPasteboard.general.string = m.s("text") } label: { Label("复制", systemImage: "doc.on.doc") }
+    }
+    func setQuote(_ m: JSON) {
+        let who = m.s("role") == "bot" ? engine.s("title") : (m.s("role") == "aiw" ? "AIW 管家" : "我")
+        quote = EngineQuote(id: m.s("id"), who: who, text: m.s("text"))
+        focused = true
+    }
+    func quoteView(_ who: String, _ t: String) -> some View {
+        HStack(spacing: 6) {
+            Rectangle().fill(hAmber).frame(width: 2)
+            Text((who.isEmpty ? "" : who + "：") + t).font(.caption).foregroundColor(.secondary).lineLimit(2)
+        }.fixedSize(horizontal: false, vertical: true)
+    }
+
+    // MARK: composer (the chat's: "+" sheet, attachment chips, "/" skills, IMEField)
+    var composer: some View {
+        VStack(spacing: 8) {
+            if let q = slashQ { SkillPicker(rows: skillRows(q), query: q) { chooseSkill($0) } }
+            if let q = quote {
+                HStack(spacing: 6) {
+                    quoteView(q.who, q.text)
+                    Spacer(minLength: 4)
+                    Button { quote = nil } label: { Image(systemName: "xmark.circle.fill").foregroundColor(.secondary) }.accessibilityLabel("取消引用")
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            if !attach.isEmpty || uploading {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack {
+                        if uploading {
+                            HStack(spacing: 6) { ProgressView(value: pct).frame(width: 60).tint(hAmber); Text("上传 \(Int(pct * 100))%").font(.caption2.monospacedDigit()) }
+                                .padding(.horizontal, 8).padding(.vertical, 5).background(Color(.secondarySystemBackground)).clipShape(Capsule())
+                        }
+                        ForEach(attach.indices, id: \.self) { i in
+                            HStack(spacing: 4) {
+                                Image(systemName: attach[i].s("kind") == "video" ? "film" : fileIcon(attach[i].s("name"))); Text(attach[i].s("name")).lineLimit(1)
+                                Button { attach.remove(at: i) } label: { Image(systemName: "xmark.circle.fill") }.accessibilityLabel("移除附件")
+                            }.font(.caption).padding(.horizontal, 8).padding(.vertical, 5).background(Color(.secondarySystemBackground)).clipShape(Capsule())
+                        }
+                    }
+                }
+            }
+            HStack(alignment: .bottom, spacing: 6) {
+                Button { focused = false; showAttach = true } label: {
+                    Image(systemName: "plus").font(.system(size: 22, weight: .light)).foregroundColor(hAmber).frame(width: 36, height: 36)
+                }.accessibilityLabel("添加：拍照、照片、文件、技能")
+                HStack(spacing: 6) {
+                    ForEach(picked, id: \.self) { id in SkillToken(title: skillTitle(id)) { picked.removeAll { $0 == id } } }
+                    IMEField(placeholder: takeover.isEmpty ? "和 \(engine.s("title")) 说…（/ 选技能）" : "插话，管家会先发你的话", text: $text, focused: $focused, maxLines: 6)
+                }
+                if canSend {
+                    Button { Task { await send() } } label: {
+                        Image(systemName: "arrow.up").font(.system(size: 16, weight: .bold)).foregroundColor(hInk)
+                            .frame(width: 36, height: 36).background(hAmber).clipShape(Circle())
+                    }.disabled(sending).accessibilityLabel(live ? "排队发送" : "发送")
+                } else if live {
+                    Button { Task { await act("POST", "/stop") } } label: {
+                        Image(systemName: "stop.fill").font(.system(size: 13, weight: .bold)).foregroundColor(hAmber)
+                            .frame(width: 36, height: 36).background(Color(white: 0.2)).clipShape(Circle())
+                    }.accessibilityLabel("停止")
+                }
+            }
+            .padding(.leading, 4).padding(.trailing, 6).padding(.vertical, 5)
+            .background(Color(.systemBackground))
+            .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(focused ? hAmber.opacity(0.6) : Color(.separator), lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        }
+        .padding(.horizontal, 12).padding(.top, 6).padding(.bottom, 8)
+        .background(.bar)
+    }
+    var canSend: Bool { !uploading && (!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attach.isEmpty) }
+
+    // MARK: skills (the chat's "/" picker)
+    func skillTitle(_ id: String) -> String {
+        let s = skills.first { $0.s("id") == id }
+        return (s?.s("title").isEmpty ?? true) ? id : s!.s("title")
+    }
+    func skillRows(_ q: String) -> [JSON] {
+        let k = q.lowercased()
+        let hit = skills.filter { s in k.isEmpty || [s.s("id"), s.s("title"), s.s("desc")].contains { $0.lowercased().contains(k) } }
+        let first = hit.filter { $0.s("id").lowercased().hasPrefix(k) }, rest = hit.filter { !$0.s("id").lowercased().hasPrefix(k) }
+        return Array((first + rest).prefix(30))
+    }
+    func chooseSkill(_ id: String) {
+        if let r = text.range(of: "/[^\\s/]*$", options: .regularExpression) { text.removeSubrange(r) }
+        if !picked.contains(id) { picked.append(id) }
+        focused = true
+    }
+    func onText(_ t: String) {
+        guard t.hasSuffix("\n") else { return }
+        let before = String(t.dropLast())
+        if let q = slashQuery(before), let first = skillRows(q).first { text = before; chooseSkill(first.s("id")) }
+    }
+    func runPending() {
+        guard let k = pending else { return }
+        pending = nil
+        switch k {
+        case .photo, .video:
+            if UIImagePickerController.isSourceTypeAvailable(.camera) { camera = k == .video ? .video : .photo }
+            else { err = "这台设备没有可用的相机" }
+        case .library: showPhotos = true
+        case .file: showFiles = true
+        case .skill:
+            text += (text.isEmpty || text.hasSuffix(" ") || text.hasSuffix("\n")) ? "/" : " /"
+            focused = true
+        default: focused = true
+        }
+    }
+
+    // MARK: server
+    @MainActor func load() async {
+        do {
+            let r = try await API.shared.obj("GET", "/api/bots/convs/\(cid)?after=0")
+            conv = r.o("conv"); msgs = r.a("messages")
+            if err.hasPrefix("读不到") { err = "" }
+        } catch { err = "读不到这个对话：\(error.localizedDescription)" }
+    }
+    @MainActor func poll() async {
+        await EngineModels.shared.load()
+        while !Task.isCancelled {
+            await load()
+            let busy = live || !takeover.isEmpty || conv.d("queued") > 0
+            try? await Task.sleep(nanoseconds: (busy ? 2 : 8) * 1_000_000_000)
+        }
+    }
+    @MainActor func act(_ method: String, _ path: String, _ body: JSON? = nil) async {
+        do { _ = try await API.shared.call(method, "/api/bots/convs/\(cid)\(path)", body); await load() }
+        catch { err = error.localizedDescription }
+    }
+    @MainActor func send() async {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if uploading { err = "附件还在上传，传完再发"; return }
+        if body.isEmpty && attach.isEmpty { if !picked.isEmpty { err = "说说要用这个技能做什么" }; return }
+        sending = true; defer { sending = false }
+        var req: JSON = ["text": body, "attachments": attach, "skills": picked]
+        if let q = quote { req["quote"] = q.id }
+        let keep = (text, attach, picked, quote)
+        text = ""; attach = []; picked = []; quote = nil; err = ""
+        do { _ = try await API.shared.call("POST", "/api/bots/convs/\(cid)/send", req, timeout: 180); await load() }
+        catch {
+            (text, attach, picked, quote) = keep
+            err = "没发出去：\(error.localizedDescription)"
+        }
+    }
+
+    // MARK: uploads (POST /api/uploads/raw, local_only: the server copies them into the conversation's folder on send)
+    func gotCamera(_ u: URL?, _ img: UIImage?) async {
+        if let u = u {
+            await uploadFile(u, name: u.lastPathComponent, type: u.pathExtension.lowercased() == "mp4" ? "video/mp4" : "video/quicktime")
+        } else if let img = img, let jpg = img.jpegData(compressionQuality: 0.85) {
+            await uploadData(jpg, name: "photo-\(Int(Date().timeIntervalSince1970)).jpg", type: "image/jpeg")
+        }
+    }
+    func addPicked(_ item: PhotosPickerItem) async {
+        if item.supportedContentTypes.contains(where: { $0.conforms(to: .movie) || $0.conforms(to: .video) }) {
+            do {
+                guard let mv = try await item.loadTransferable(type: PickedMovie.self) else { err = "读不了这个视频"; return }
+                let ext = mv.url.pathExtension.lowercased()
+                await uploadFile(mv.url, name: "video-\(Int(Date().timeIntervalSince1970)).\(ext.isEmpty ? "mov" : ext)",
+                                 type: ext == "mp4" ? "video/mp4" : "video/quicktime")
+            } catch { err = "读不了这个视频：\(error.localizedDescription)" }
+            return
+        }
+        guard let d = try? await item.loadTransferable(type: Data.self) else { err = "读不了这张照片"; return }
+        let stamp = Int(Date().timeIntervalSince1970)
+        if UIImage(data: d) == nil, let vx = videoExt(d) {
+            await uploadData(d, name: "video-\(stamp).\(vx)", type: vx == "mp4" ? "video/mp4" : "video/quicktime")
+            return
+        }
+        let img = UIImage(data: d)
+        let jpg = img?.jpegData(compressionQuality: 0.85) ?? d
+        await uploadData(jpg, name: img == nil ? "file-\(stamp)" : "photo-\(stamp).jpg", type: img == nil ? "application/octet-stream" : "image/jpeg")
+    }
+    func addFile(_ u: URL) async {
+        let ok = u.startAccessingSecurityScopedResource()
+        defer { if ok { u.stopAccessingSecurityScopedResource() } }
+        let dst = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString.prefix(6))-\(u.lastPathComponent)")
+        try? FileManager.default.removeItem(at: dst)
+        do { try FileManager.default.copyItem(at: u, to: dst) } catch { err = "读不了 \(u.lastPathComponent)"; return }
+        let type = UTType(filenameExtension: u.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+        await uploadFile(dst, name: u.lastPathComponent, type: type)
+    }
+    func uploadData(_ data: Data, name: String, type: String) async {
+        let dst = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do { try data.write(to: dst) } catch { err = "存不了临时文件：\(error.localizedDescription)"; return }
+        await uploadFile(dst, name: name, type: type)
+    }
+    func uploadFile(_ u: URL, name: String, type: String) async {
+        let size = ((try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? NSNumber)?.intValue ?? 0
+        if size > 500 * 1024 * 1024 { err = "\(name) 超过 500MB"; return }
+        uploading = true; pct = 0
+        defer { uploading = false }
+        let q = name.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? "file"
+        let mid = API.shared.machine.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? ""
+        do {
+            var r = try await API.shared.postFile("/api/uploads/raw?name=\(q)&machine_id=\(mid)&local_only=true", file: u, contentType: type) { f in
+                DispatchQueue.main.async { pct = f }
+            }
+            if r.s("kind").isEmpty && type.hasPrefix("video") { r["kind"] = "video" }
+            attach.append(r)
+        } catch { err = "上传失败：\(name)：\(error.localizedDescription)" }
+    }
+}
+
+// MARK: - 交给管家 / 模型和强度
+
+struct EngineTakeSheet: View {
+    let engine: String
+    let go: (String, Int) async -> String?
+    @Environment(\.dismiss) private var dismiss
+    @State private var goal = ""
+    @State private var rounds = 8
+    @State private var busy = false
+    @State private var error = ""
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(header: Text("目标和验收标准"), footer: Text("管家会替你和 \(engine) 来回沟通，直到目标完成、需要你决定或轮数用完。它不会让对方推送、合并或删除东西。")) {
+                    TextEditor(text: $goal).frame(minHeight: 110)
+                }
+                Section { Stepper("最多来回 \(rounds) 轮", value: $rounds, in: 1...30) }
+                if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
+            }
+            .navigationTitle("交给 AIW 管家").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    if busy { ProgressView() } else {
+                        Button("交给管家") {
+                            Task {
+                                busy = true
+                                let e = await go(goal.trimmingCharacters(in: .whitespacesAndNewlines), rounds)
+                                busy = false
+                                if let e = e { error = e } else { dismiss() }
+                            }
+                        }.bold().disabled(goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct EngineModelSheet: View {
+    let save: (JSON) async -> String?
+    @Environment(\.dismiss) private var dismiss
+    @State private var group: String
+    @State private var effort: String
+    @State private var busy = false
+    @State private var error = ""
+    init(model: String, effort: String, save: @escaping (JSON) async -> String?) {
+        self.save = save
+        let (g, e) = EngineModelSection.split(model, effort)
+        _group = State(initialValue: g); _effort = State(initialValue: e)
+    }
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section { Text("从下一句起生效：agy 会带着原会话重新启动，前面聊的都还在。").font(.footnote).foregroundColor(.secondary) }
+                EngineModelSection(group: $group, effort: $effort)
+                if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
+            }
+            .navigationTitle("模型和强度").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    if busy { ProgressView() } else {
+                        Button("保存") {
+                            Task {
+                                busy = true
+                                let e = await save(EngineModels.shared.value(group, effort))
+                                busy = false
+                                if let e = e { error = e } else { dismiss() }
+                            }
+                        }.bold()
+                    }
+                }
+            }
+        }
+    }
+}

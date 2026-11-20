@@ -533,6 +533,8 @@ struct HomeChatView: View {
                     Button { openSheet(.tracking) } label: { Label("追踪", systemImage: "scope") }
                     Button { openSheet(.routine) } label: { Label("例程", systemImage: "arrow.triangle.2.circlepath") }
                     Button { openSheet(.computer) } label: { Label("电脑", systemImage: "desktopcomputer") }
+                    // v3.9.59: 引擎 (agy / Codex conversations, the web page's 引擎) right under 电脑
+                    Button { openSheet(.engine) } label: { Label("引擎", systemImage: "terminal") }
                 } label: { Image(systemName: "plus").font(.system(size: 19, weight: .medium)) }.accessibilityLabel("菜单")
             }
         }
@@ -864,6 +866,7 @@ struct HomeChatView: View {
             case "routines": openSheet(.routine)
             case "tracking": openSheet(.tracking)
             case "computer": openSheet(.computer)
+            case "engine", "bots": openSheet(.engine)
             case "tasks": openSheet(.history)
             default: focused = true
             }

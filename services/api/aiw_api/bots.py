@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -60,10 +61,11 @@ def ensure_tables(store) -> None:
     store._x("CREATE TABLE IF NOT EXISTS bot_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, "
              "conv TEXT, role TEXT, text TEXT, data TEXT, created_at REAL, updated_at REAL)")
     store._x("CREATE INDEX IF NOT EXISTS ix_botmsg_conv ON bot_messages(conv, seq)")
-    try:
-        store._x("ALTER TABLE bot_convs ADD COLUMN cursor INTEGER DEFAULT 0")
-    except Exception:  # noqa: BLE001  already there
-        pass
+    for col in ("cursor INTEGER DEFAULT 0", "model TEXT", "effort TEXT", "job_model TEXT"):   # v3.9.58: model, effort
+        try:
+            store._x(f"ALTER TABLE bot_convs ADD COLUMN {col}")
+        except Exception:  # noqa: BLE001  already there
+            pass
 
 
 def _j(v, default):
@@ -104,6 +106,58 @@ def quote_block(q: dict | None) -> str:
         lines.append("［它前后的对话］")
         lines += [f"{c.get('who')}：{clip(c.get('text'), 400)}" for c in ctx]
     return "\n".join(lines)
+
+
+def skills_block(skills: list, custom: Optional[list] = None) -> str:
+    """v3.9.58: skills picked with "/" or "+ 技能" in the engine page: the same brief a task gets (agent_runtime/skills.py).
+    The bridge copies each named skill folder into the session folder's .aiw-context/, where agy may read it."""
+    if not skills:
+        return ""
+    try:
+        from agent_runtime import skills as _sk
+        return _sk.brief("【技能：" + "、".join(skills) + "】", custom or [])
+    except Exception:  # noqa: BLE001  (no runtime package: name them plainly)
+        return "The user picked these skills; find each one's SKILL.md under ~/.claude/skills and follow it: " + ", ".join(skills)
+
+
+def files_block(attachments: list) -> str:
+    """v3.9.58: files the user attached, already copied onto the computer."""
+    rows = [a for a in attachments or [] if a.get("vm_path")]
+    if not rows:
+        return ""
+    return "［用户发来的附件，已放到电脑上］\n" + "\n".join(f"- {a.get('name') or ''}：{a['vm_path']}" for a in rows)
+
+
+def vm_rel_dir(workdir: str) -> tuple:
+    """Where attachments go: <workdir>/uploads when the folder is under ~/workspace (files.upload writes relative
+    to ~/workspace), else ~/workspace/uploads (the bridge then copies what the prompt names into the folder)."""
+    w = (workdir or "").strip().rstrip("/")
+    for pre in ("~/workspace/", "$HOME/workspace/"):
+        if w.startswith(pre) and ".." not in w:
+            rel = w[len(pre):] + "/uploads"
+            return rel, f"~/workspace/{rel}"
+    return "uploads", "~/workspace/uploads"
+
+
+TIER_RE = re.compile(r"-(minimal|low|medium|high|xhigh|max)$")
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def model_flags(conv: dict) -> tuple:
+    """(--model, --effort) for a conversation. A slug that already names its strength (gemini-4-neon-high) takes no
+    --effort (agy: "conflicts with --effort"); a plain one does, when the user picked one."""
+    model = str(conv.get("model") or "").strip()
+    effort = str(conv.get("effort") or "").strip().lower()
+    if effort not in EFFORTS:
+        effort = ""
+    if model and TIER_RE.search(model):
+        effort = ""
+    return model, effort
+
+
+def model_key(conv: dict) -> str:
+    m, e = model_flags(conv)
+    return f"{m}|{e}"
 
 
 def parse_decision(out: str) -> dict:
@@ -158,7 +212,12 @@ class AgyEngine:
         j = agy.job_from_args({"conversation": conv.get("session") or ""}, prompt)
         j.update({"plain": True, "workdir": conv.get("workdir") or "~/workspace/agy-chat",
                   "max_turns": 1000, "timeout_min": 24 * 60, "keep_min": 120, "idle_min": 20})
+        model, effort = model_flags(conv)
+        j["model"], j["effort"] = model, effort
         return j
+
+    async def models(self, mid: str) -> dict:
+        return await self.op(mid, "models", {})
 
     async def start(self, mid: str, conv: dict, prompt: str) -> dict:
         return await self.op(mid, "start", {}, self.job(conv, prompt))
@@ -185,6 +244,7 @@ class Bots:
         self.queues: dict[str, list] = {}
         self.runners: dict[str, asyncio.Task] = {}
         self.listeners: list = []
+        self._models: dict = {}
 
     # ------------------------------------------------------------------ computer
     async def _shell(self, mid: str, command: str, timeout: int) -> str:
@@ -222,7 +282,8 @@ class Bots:
         self._emit("conv", c)
         return c
 
-    def create(self, bot: str, title: str = "", workdir: str = "", machine_id: str = "") -> dict:
+    def create(self, bot: str, title: str = "", workdir: str = "", machine_id: str = "", model: str = "",
+               effort: str = "") -> dict:
         eng = ENGINES.get(bot)
         if not eng:
             raise ValueError(f"没有这个引擎：{bot}")
@@ -237,7 +298,25 @@ class Bots:
                       "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                       (cid, bot, (title or "").strip()[:60] or f"{eng['title']} 对话", machine_id or self.default_machine(),
                        wd, None, None, "idle", None, now, now))
+        if model or effort:
+            self.set_model(cid, model, effort, announce=False)
         return self.conv(cid)
+
+    def set_model(self, cid: str, model: str = "", effort: str = "", announce: bool = True) -> dict:
+        """v3.9.58: the model and strength for the next turn. A running agy keeps the model it started with, so the
+        next turn restarts it with --conversation (same session, new model); see _turn."""
+        model = (model or "").strip()[:80]
+        effort = (effort or "").strip().lower()
+        if model and not re.fullmatch(r"[\w.\- ()]{1,80}", model):
+            raise ValueError("模型名不合法")
+        if effort and effort not in EFFORTS:
+            raise ValueError("强度只能是 " + "/".join(EFFORTS))
+        before = model_key(self.conv(cid) or {})
+        c = self.set_conv(cid, model=model or None, effort=effort or None)
+        if announce and model_key(c) != before:
+            m, e = model_flags(c)
+            self.add(cid, "system", f"模型改成 {m or '默认'}{' · ' + e if e else ''}，下一句起生效（接着原会话）")
+        return c
 
     def delete(self, cid: str) -> bool:
         self.store._x("DELETE FROM bot_messages WHERE conv=?", (cid,))
@@ -303,23 +382,75 @@ class Bots:
             return chat.quote(ref)
         return None
 
+    # ------------------------------------------------------------------ models
+    async def models(self, bot: str, mid: str, refresh: bool = False) -> dict:
+        key = f"{bot}@{mid}"
+        hit = self._models.get(key)
+        if hit and not refresh and _now() - hit[0] < 600:
+            return hit[1]
+        r = await self.engines[bot].models(mid)
+        if not r.get("ok"):
+            raise RuntimeError(r.get("error") or "agy models 失败")
+        res = {"groups": r.get("groups") or [], "efforts": list(EFFORTS)}
+        self._models[key] = (_now(), res)
+        return res
+
+    # ------------------------------------------------------------------ files
+    async def push_files(self, cid: str, attachments: list, allowed: Optional[Callable[[str], Optional[str]]] = None) -> list:
+        """v3.9.58: chat uploads live on the API host (local_only); copy each onto the conversation's computer."""
+        c = self.conv(cid) or {}
+        rel, shown = vm_rel_dir(c.get("workdir") or "")
+        out = []
+        for a in [x for x in attachments or [] if isinstance(x, dict)][:10]:
+            a = {k: v for k, v in a.items() if k not in ("up", "pct", "uid")}
+            local = allowed(a.get("artifact") or "") if allowed else None
+            name = os.path.basename(str(a.get("name") or (local or "file"))).replace("/", "_") or "file"
+            if local and not a.get("vm_path"):
+                try:
+                    from .uploads import push_to_vm
+                    cloud = getattr(self.sessions, "cloud", None)
+                    if cloud and cloud.is_cloud(c.get("machine_id")):
+                        await cloud.wake(c.get("machine_id"))
+                    await push_to_vm(self.sessions.computer(c.get("machine_id")), local, f"{rel}/{name}")
+                    a["vm_path"] = f"{shown}/{name}"
+                except Exception as e:  # noqa: BLE001
+                    log.warning("bot attachment upload: %r", e)
+                    a["vm_error"] = clip(e, 200)
+            out.append(a)
+        return out
+
     # ------------------------------------------------------------------ talking
     def busy(self, cid: str) -> bool:
         t = self.runners.get(cid)
         return bool(t and not t.done())
 
-    def send(self, cid: str, text: str, role: str = "user", quote: Optional[dict] = None) -> dict:
+    def send(self, cid: str, text: str, role: str = "user", quote: Optional[dict] = None,
+             attachments: Optional[list] = None, skills: Optional[list] = None) -> dict:
         c = self.conv(cid)
         if not c:
             raise KeyError(cid)
         text = (text or "").strip()
+        attachments = [a for a in (attachments or []) if isinstance(a, dict)][:10]
+        skills = [str(x).strip() for x in (skills or []) if str(x).strip()][:8]
+        if not text and attachments:
+            text = "看一下这些附件"
         if not text:
             raise ValueError("空消息")
-        data = {"quote": quote} if quote else {}
+        data: dict = {"quote": quote} if quote else {}
+        if attachments:
+            data["attachments"] = attachments
+        if skills:
+            data["skills"] = skills
         if self.busy(cid):
             data["queued"] = True
         m = self.add(cid, role, text, data)
-        prompt = (quote_block(quote) + "\n\n" + text) if quote else text
+        custom = []
+        try:
+            custom = self.store.kv_get("skills_custom", []) or []
+        except Exception:  # noqa: BLE001
+            pass
+        parts = [quote_block(quote) if quote else "", skills_block(skills, custom), files_block(attachments), text]
+        prompt = "\n\n".join(p for p in parts if p)
         self.queues.setdefault(cid, []).append({"msg": m["id"], "prompt": prompt})
         self._kick(cid)
         return m
@@ -359,6 +490,12 @@ class Bots:
         reply = self.add(cid, "bot", "", {"status": "running", "steps": [], "started": _now()})
         r: dict = {}
         job = c.get("job")
+        if job and (c.get("job_model") or "|") != model_key(c):
+            try:                                          # v3.9.58: the model changed: restart, resuming the session
+                await eng.stop(mid, job)
+            except Exception as e:  # noqa: BLE001
+                log.warning("agy restart for model: %s", e)
+            job = None
         if job:
             try:
                 r = await eng.send(mid, job, prompt)
@@ -377,7 +514,7 @@ class Bots:
                 self.set_conv(cid, status="idle", job=None)
                 return {"status": "error", "error": msg}
             job = r["job"]
-            self.set_conv(cid, job=job, cursor=0)
+            self.set_conv(cid, job=job, cursor=0, job_model=model_key(c))
             cursor = 0
         else:
             cursor = int(c.get("cursor") or 0)
@@ -538,10 +675,14 @@ class ConvIn(BaseModel):
     title: str = ""
     workdir: str = ""
     machine_id: str = ""
+    model: str = ""
+    effort: str = ""
 
 class SendIn(BaseModel):
-    text: str
+    text: str = ""
     quote: Optional[str] = None
+    attachments: list = []
+    skills: list = []
 
 class TakeIn(BaseModel):
     goal: str
@@ -549,6 +690,8 @@ class TakeIn(BaseModel):
 
 class PatchIn(BaseModel):
     title: Optional[str] = None
+    model: Optional[str] = None
+    effort: Optional[str] = None
 
 
 def mount(app, bots: Bots, auth, chat=None) -> None:
@@ -569,7 +712,7 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     @app.post("/api/bots/convs", dependencies=dep)
     async def bots_create(body: ConvIn):
         try:
-            return bots.create(body.bot, body.title, body.workdir, body.machine_id)
+            return bots.create(body.bot, body.title, body.workdir, body.machine_id, body.model, body.effort)
         except ValueError as e:
             raise HTTPException(400, str(e))
 
@@ -582,10 +725,26 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
 
     @app.patch("/api/bots/convs/{cid}", dependencies=dep)
     async def bots_patch(cid: str, body: PatchIn):
-        need(cid)
+        c = need(cid)
         if body.title is not None:
-            return bots.set_conv(cid, title=body.title.strip()[:60] or "对话")
-        return bots.conv(cid)
+            c = bots.set_conv(cid, title=body.title.strip()[:60] or "对话")
+        if body.model is not None or body.effort is not None:
+            try:
+                c = bots.set_model(cid, c.get("model") or "" if body.model is None else body.model,
+                                   c.get("effort") or "" if body.effort is None else body.effort)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+        return c
+
+    @app.get("/api/bots/engines/{bot}/models", dependencies=dep)
+    async def bots_models(bot: str, machine_id: str = "", refresh: int = 0):
+        """v3.9.58: the models this computer's agy account can use (`agy models`), grouped with their strengths."""
+        if bot not in bots.engines:
+            raise HTTPException(404, "这个引擎还没接入")
+        try:
+            return await bots.models(bot, machine_id or bots.default_machine(), bool(refresh))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, "读不到模型列表：" + clip(e, 200))
 
     @app.delete("/api/bots/convs/{cid}", dependencies=dep)
     async def bots_delete(cid: str):
@@ -598,8 +757,14 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     async def bots_send(cid: str, body: SendIn):
         need(cid)
         q = bots.quote(body.quote, chat) if body.quote else None
+        att = body.attachments or []
+        if att:
+            att = await bots.push_files(cid, att, getattr(chat, "_allowed", None))
+            bad = [a.get("name") or "" for a in att if not a.get("vm_path")]
+            if bad and len(bad) == len(att) and not (body.text or "").strip():
+                raise HTTPException(502, "附件没能放到电脑上：" + "、".join(bad))
         try:
-            return bots.send(cid, body.text, "user", q)
+            return bots.send(cid, body.text, "user", q, att, body.skills or [])
         except ValueError as e:
             raise HTTPException(400, str(e))
 

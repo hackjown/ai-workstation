@@ -138,6 +138,8 @@ def command(op: str, a: dict, job: dict | None = None) -> tuple[str, int]:
         return f"{py} diff {jid}" + (" --full" if a.get("full") else ""), 150
     if op == "stop":
         return f"{py} stop {jid}", 60
+    if op == "models":
+        return f"{py} models", 120
     return f"{py} list", 30
 
 

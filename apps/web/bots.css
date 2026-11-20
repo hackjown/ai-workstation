@@ -1,4 +1,4 @@
-/* v3.9.57 引擎对话 (bots.js) */
+/* v3.9.57 引擎 (bots.js) */
 #v-bots { display:none; }
 #v-bots.on { display:flex; flex-direction:column; min-height:0; }
 .bt-wrap { flex:1; display:flex; min-height:0; }
@@ -46,3 +46,17 @@
   #v-bots.bt-open .bt-list { display:none; }
   #v-bots.bt-open .bt-conv { display:flex; }
 }
+/* v3.9.58: + menu, attachments and skills in the engine composer (the chat's look) */
+#v-bots .bt-cw { position:relative; }
+#v-bots .bt-cw > .attachments, #v-bots .bt-cw > .hcomposer { max-width:780px; margin-left:auto; margin-right:auto; }
+.bt-menu { position:absolute; left:16px; bottom:100%; z-index:21; display:flex; flex-direction:column; min-width:150px; padding:6px; border-radius:14px;
+  background:var(--panel, #141414); border:1px solid var(--accLine, rgba(240,160,48,.47)); box-shadow:0 8px 30px rgba(0,0,0,.35); }
+.bt-menu[hidden] { display:none; }
+.bt-menu button { display:flex; align-items:center; gap:10px; padding:9px 10px; border:0; background:none; color:var(--text); border-radius:10px; cursor:pointer; font-size:14px; text-align:left; }
+.bt-menu button:hover { background:var(--panel2); }
+.bt-menu button span { display:inline-flex; width:20px; color:var(--dim); }
+.bt-row .hatt, .bt-row .hatts { margin-top:6px; }
+.bt-menu button.only-mobile { display:none; }
+@media (max-width: 760px) { .bt-menu button.only-mobile { display:flex; } }
+.bt-model { max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+@media (max-width: 760px) { .bt-model { max-width:120px; } }

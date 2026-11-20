@@ -1,12 +1,13 @@
-/* v3.9.57 引擎对话 (Bot): talk to Antigravity (then Codex) on the computer directly, or hand the talking to AIW 管家.
+/* v3.9.57 引擎 (Bot; was 引擎对话): talk to Antigravity (then Codex) on the computer directly, or hand the talking to AIW 管家.
    GET /api/bots, POST /api/bots/convs, GET|PATCH|DELETE /api/bots/convs/{id}, POST …/send|stop|takeover. */
-const BT = { engines: [], convs: [], cid: null, conv: null, msgs: [], quote: null, poll: null, last: 0, sending: false };
+const BT = { engines: [], convs: [], cid: null, conv: null, msgs: [], quote: null, poll: null, last: 0, sending: false, attach: [], skills: [] };
 const BT_WHO = { user: "我", aiw: "AIW 管家", system: "" };
 
 async function btLoad() {
   try { const r = await api("GET", "/api/bots"); BT.engines = r.engines || []; BT.convs = r.convs || []; }
-  catch (e) { toast("引擎对话加载失败：" + e.message); return; }
+  catch (e) { toast("引擎加载失败：" + e.message); return; }
   btRenderList();
+  btModels().then(() => { if (BT.conv) btRenderConv(); }).catch(() => {});   // v3.9.58: names for the model chip
   const want = BT.cid || localStorage.getItem("aiw_bot_conv");
   if (want && BT.convs.some((c) => c.id === want)) btOpen(want, true);
   else btShowConv(false);
@@ -20,33 +21,35 @@ function btRenderList() {
       <span class="bt-av ${esc(c.bot)}">${esc((e.short || e.title).slice(0, 3))}</span>
       <span class="grow"><span class="t1">${esc(c.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${c.last ? esc(c.last.text) : esc(e.title)}</span></span></button>`;
   }).join("");
-  box.innerHTML = `<div class="bt-head"><div class="heading">引擎对话</div><button class="btn sm primary" onclick="btNew()">${icon("plus")}新对话</button></div>`
+  box.innerHTML = `<div class="bt-head"><div class="heading">引擎</div><button class="btn sm primary" onclick="btNew()">${icon("plus")}新对话</button></div>`
     + (items || `<div class="muted pad">还没有对话。新建一个，直接和电脑上的 Antigravity 说话；也可以把目标交给 AIW 管家，让它替你和 Antigravity 来回沟通。</div>`)
     + `<div class="small muted pad">${BT.engines.filter((e) => !e.available).map((e) => esc(e.title) + "：下一版接入").join(" · ")}</div>`;
   paintIcons(box);
 }
 function btNew() {
   const opts = BT.engines.map((e) => `<option value="${esc(e.id)}" ${e.available ? "" : "disabled"}>${esc(e.title)}${e.available ? "" : "（即将支持）"}</option>`).join("");
-  modal(`<div class="heading">新的引擎对话</div>
+  modal(`<div class="heading">新对话</div>
     <form class="col gap" onsubmit="btCreate(event)">
       <label class="small muted">引擎</label><select name="bot">${opts}</select>
       <label class="small muted">标题</label><input name="title" placeholder="例如 ldok 重建" />
       <label class="small muted">工作文件夹（电脑上，它就在这里改文件；空着就新建一个）</label>
       <input name="workdir" placeholder="~/workspace/ldok-rebuild" />
+      ${btModelFields()}
       <div class="row gap"><button class="btn primary">开始</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
+  btModelsFill("", "");
 }
 async function btCreate(ev) {
   ev.preventDefault();
   const f = ev.target;
   try {
-    const c = await api("POST", "/api/bots/convs", { bot: f.bot.value, title: f.title.value, workdir: f.workdir.value });
+    const c = await api("POST", "/api/bots/convs", { bot: f.bot.value, title: f.title.value, workdir: f.workdir.value, ...btModelValue(f) });
     closeOverlays(); BT.convs.unshift(c); btOpen(c.id);
   } catch (e) { toast("没能新建：" + e.message); }
 }
 function btShowConv(on) { const v = $("v-bots"); if (v) v.classList.toggle("bt-open", !!on); }
 async function btOpen(id, quiet) {
-  if (BT.cid !== id) { BT.msgs = []; BT.last = 0; BT.quote = null; }
+  if (BT.cid !== id) { BT.msgs = []; BT.last = 0; BT.quote = null; BT.attach = []; BT.skills = []; btRenderAttach(); btRenderTokens(); }
   BT.cid = id; localStorage.setItem("aiw_bot_conv", id);
   btShowConv(true); btRenderList();
   await btRefresh(true);
@@ -81,7 +84,10 @@ function btMsg(m) {
   if (m.role === "system") return `<div class="bt-sys">${esc(m.text)}</div>`;
   if (m.role === "user" || m.role === "aiw") {
     return `<div class="bt-row me ${m.role}"><div class="bt-col">${m.role === "aiw" ? `<div class="bt-name">AIW 管家${d.report && typeof d.report === "string" ? " · " + esc(d.report) : ""}</div>` : ""}
-      ${q}<div class="bubble ${m.role === "aiw" ? "bt-aiw" : ""} ${d.report === true ? "hmd" : ""}">${d.report === true ? hMd(m.text) : esc(m.text)}</div>
+      ${q}${(d.skills || []).length ? `<div>${d.skills.map((id) => `<span class="htok">✨ ${esc(hSkillTitle(id))}</span>`).join(" ")}</div>` : ""}
+      <div class="bubble ${m.role === "aiw" ? "bt-aiw" : ""} ${d.report === true ? "hmd" : ""}">${d.report === true ? hMd(m.text) : esc(m.text)}</div>
+      ${(d.attachments || []).length && typeof hAttPreview === "function" ? hAttPreview(d.attachments) : ""}
+      ${(d.attachments || []).some((a) => !a.vm_path) ? `<div class="small" style="color:var(--bad)">有附件没能放到电脑上：${esc(d.attachments.filter((a) => !a.vm_path).map((a) => a.name).join("、"))}</div>` : ""}
       <div class="meta">${d.queued ? "排队中，它回完这一轮就发 · " : ""}${hTime(m.created_at)}${acts}</div></div></div>`;
   }
   // bot reply
@@ -104,6 +110,7 @@ function btRenderConv() {
   $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
     <div class="grow"><div class="heading" onclick="btRename()" title="点一下改名">${esc(c.title)}</div>
       <div class="small muted">${esc(eng.title)} · ${esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</div></div>
+    <button class="btn sm bt-model" onclick="btModelEdit()" title="换模型和强度">${esc(btModelName(c))}</button>
     ${tk ? `<button class="btn sm" onclick="btRelease()">收回</button>` : `<button class="btn sm primary" onclick="btTake()">交给管家</button>`}
     ${live ? `<button class="btn sm" onclick="btStop()">停止</button>` : ""}
     <button class="icon" onclick="btDelete()" aria-label="删除对话" title="删除对话">${icon("x")}</button>`;
@@ -116,17 +123,110 @@ function btRenderConv() {
 async function btSend(ev) {
   if (ev) ev.preventDefault();
   const el = $("btPrompt"), text = el.value.trim();
-  if (!text || !BT.cid || BT.sending) return;
+  if (!BT.cid || BT.sending) return;
+  if (BT.attach.some((a) => a.up)) { toast("附件还在上传，传完再发"); return; }
+  if (!text && !BT.attach.length) { if (BT.skills.length) toast("说说要用这个技能做什么"); return; }
   BT.sending = true;
-  const quote = BT.quote ? BT.quote.id : null;
+  const quote = BT.quote ? BT.quote.id : null, skills = BT.skills.slice();
+  const attachments = BT.attach.map(({ up, pct, uid, ...a }) => a);
   try {
-    await api("POST", `/api/bots/convs/${BT.cid}/send`, { text, quote });
-    el.value = ""; autoGrow(el); BT.quote = null;
+    await api("POST", `/api/bots/convs/${BT.cid}/send`, { text, quote, attachments, skills });
+    el.value = ""; autoGrow(el); BT.quote = null; BT.attach = []; BT.skills = []; btRenderAttach(); btRenderTokens();
     await btRefresh(true);
   } catch (e) { toast("没发出去：" + e.message); }
   finally { BT.sending = false; }
 }
-function btKey(e) { if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(hover:hover)").matches) { e.preventDefault(); btSend(); } }
+function btKey(e) {
+  if (BK.open) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); btSkMove(e.key === "ArrowDown" ? 1 : -1); return; }
+    if (e.key === "Enter" || e.key === "Tab") { const r = BK.rows[BK.sel]; if (r) { e.preventDefault(); btSkChoose(r.id); return; } }
+    if (e.key === "Escape") { e.preventDefault(); btSkClose(); return; }
+  }
+  const t = e.target;
+  if (e.key === "Backspace" && BT.skills.length && t.selectionStart === 0 && t.selectionEnd === 0) { e.preventDefault(); btSkRemove(BT.skills[BT.skills.length - 1]); return; }
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(hover:hover)").matches) { e.preventDefault(); btSend(); }
+}
+function btInput(el) { autoGrow(el); btSlashCheck(el); }
+
+/* v3.9.58: the chat's attachments and skills, in the engine composer. Files go up like the chat's (POST /api/uploads/raw,
+   kept on the API host); the send copies them into the session folder on the computer and names the paths in the
+   prompt. Skills go as the task's skill brief (agent_runtime/skills.py); the bridge copies each skill into .aiw-context/. */
+function btMenu(on) {
+  const m = $("btMenu"); if (!m) return;
+  if (on === undefined) on = m.hidden;
+  m.hidden = !on;
+  if (on) { btSkClose(); m.querySelectorAll("[data-hi]").forEach((x) => { if (!x.innerHTML) x.innerHTML = icon(x.dataset.hi); }); }
+}
+document.addEventListener("click", (e) => { const m = $("btMenu"); if (m && !m.hidden && !e.target.closest("#btMenu, .bt-cw .hplus")) m.hidden = true; });
+function btPick(id) { btMenu(false); $(id).click(); }
+async function btUpload(list, input) {
+  const files = [...(list || [])];
+  if (input) input.value = "";
+  for (const f of files) {
+    if (f.size > H_MAX_MB * 1048576) { toast(`${f.name} 超过 ${H_MAX_MB} MB`); continue; }
+    const kind = (f.type || "").startsWith("video") ? "video" : (f.type || "").startsWith("image") ? "image" : "";
+    const a = { uid: "u" + Date.now() + Math.random(), name: f.name || "file", size: f.size, kind, up: true, pct: 0 };
+    BT.attach.push(a); btRenderAttach();
+    try {
+      const r = await hRawUpload(f, (p) => { a.pct = p; btRenderAttach(); });
+      Object.assign(a, r, { kind: r.kind || kind, up: false });
+    } catch (e) { BT.attach = BT.attach.filter((x) => x !== a); toast(`上传失败：${f.name}：${e.message}`); }
+    btRenderAttach();
+  }
+}
+function btRemoveAttach(i) { BT.attach.splice(i, 1); btRenderAttach(); }
+function btRenderAttach() {
+  const box = $("btAttach"); if (!box) return;
+  box.innerHTML = BT.attach.map((a, i) => `<span class="chip ${a.up ? "up" : ""}">${hAttIcon(a)} ${esc(a.name)}${a.up ? `<span class="hpct">${a.pct || 0}%</span>` : ""}<button class="link" aria-label="移除" onclick="btRemoveAttach(${i})">${icon("x")}</button></span>`).join("");
+}
+const BK = { open: false, sel: 0, q: "", start: -1, rows: [], pack: null };
+function btSlashCheck(el) {
+  const pos = el.selectionStart == null ? el.value.length : el.selectionStart;
+  const m = el.value.slice(0, pos).match(/(^|\s)\/([^\s/]*)$/);
+  if (!m) { btSkClose(); return; }
+  BK.start = pos - m[2].length - 1; BK.q = m[2].toLowerCase();
+  btSkOpen();
+}
+async function btSkOpen() {
+  const list = await hSkillList(), q = BK.q;
+  const hit = (s) => !q || [s.id, s.title, s.desc].some((v) => String(v || "").toLowerCase().includes(q));
+  if (!q && !BK.pack) BK.rows = skillGroups(list).map((g) => g.items ? { id: "pack:" + g.pack, title: g.title, desc: `技能包 · ${g.items.length} 个技能，回车展开`, pack: g.pack } : g).slice(0, 40);
+  else if (BK.pack) BK.rows = [{ id: "pack:", title: "← 返回", desc: "" }].concat(list.filter((s) => s.pack === BK.pack && hit(s)));
+  else BK.rows = list.filter(hit).sort((a, b) => (String(a.id).toLowerCase().startsWith(q) ? 0 : 1) - (String(b.id).toLowerCase().startsWith(q) ? 0 : 1)).slice(0, 30);
+  BK.sel = Math.min(BK.sel, Math.max(0, BK.rows.length - 1)); BK.open = true; btSkRender();
+}
+function btSkRender() {
+  const box = $("btSkills"); if (!box) return;
+  box.hidden = !BK.open; if (!BK.open) return;
+  box.innerHTML = `<div class="hsk-hd">技能${BK.q ? ` · “${esc(BK.q)}”` : ""}<span>↑↓ 选择 · 回车确定 · Esc 关闭</span></div>`
+    + (BK.rows.map((s, i) => `<div class="hsk-r ${i === BK.sel ? "on" : ""}" role="option" aria-selected="${i === BK.sel}" data-id="${esc(s.id)}"
+        onmousedown="event.preventDefault()" onclick="btSkChoose(this.dataset.id)"><span class="n">${s.pack ? "▸ " + esc(s.pack.split("/").pop()) : s.id === "pack:" ? "←" : "/" + esc(s.id)}</span><span class="g"><b>${esc(s.title || s.id)}</b><small>${esc(s.desc || "")}</small></span></div>`).join("")
+    || `<div class="hsk-none">没有匹配的技能</div>`);
+  const on = box.querySelector(".hsk-r.on"); if (on) on.scrollIntoView({ block: "nearest" });
+}
+function btSkMove(d) { if (!BK.rows.length) return; BK.sel = (BK.sel + d + BK.rows.length) % BK.rows.length; btSkRender(); }
+function btSkClose() { BK.pack = null; if (!BK.open) return; BK.open = false; BK.sel = 0; btSkRender(); }
+function btSkChoose(id) {
+  const el = $("btPrompt");
+  if (String(id).startsWith("pack:")) { BK.pack = id.slice(5) || null; BK.sel = 0; btSkOpen(); el.focus(); return; }
+  const pos = el.selectionStart == null ? el.value.length : el.selectionStart;
+  if (BK.start >= 0 && el.value[BK.start] === "/") { el.value = el.value.slice(0, BK.start) + el.value.slice(pos); el.selectionStart = el.selectionEnd = BK.start; }
+  if (!BT.skills.includes(id)) BT.skills.push(id);
+  BK.start = -1; btSkClose(); btRenderTokens(); autoGrow(el); el.focus();
+}
+function btSkRemove(id) { BT.skills = BT.skills.filter((x) => x !== id); btRenderTokens(); $("btPrompt").focus(); }
+function btRenderTokens() {
+  const box = $("btTokens"); if (!box) return;
+  box.innerHTML = BT.skills.map((id) => `<span class="htok">✨ ${esc(hSkillTitle(id))}<button type="button" aria-label="移除技能" onclick="btSkRemove('${esc(id)}')">×</button></span>`).join("");
+  $("btPrompt").placeholder = BT.skills.length ? "说说要用它做什么…" : "对它说，或输入 / 选技能…（管家接管时也可以插话）";
+}
+function btSlash() {
+  const el = $("btPrompt"); el.focus();
+  const pos = el.selectionStart == null ? el.value.length : el.selectionStart, pre = el.value.slice(0, pos);
+  const ins = (pre && !/\s$/.test(pre) ? " " : "") + "/";
+  el.value = pre + ins + el.value.slice(pos); el.selectionStart = el.selectionEnd = pos + ins.length;
+  btInput(el);
+}
 function btQuote(id) {
   const m = BT.msgs.find((x) => x.id === id); if (!m) return;
   BT.quote = { id, who: m.role === "bot" ? btEngine(BT.conv.bot).title : (BT_WHO[m.role] || m.role), text: m.text || "" };
@@ -166,8 +266,81 @@ async function btRename() {
   try { await api("PATCH", `/api/bots/convs/${BT.cid}`, { title: t }); btRefresh(false); btLoad(); } catch (e) { toast(e.message); }
 }
 
+/* v3.9.58: model and strength. GET /api/bots/engines/agy/models runs `agy models` on the computer (this account's
+   models), grouped: gemini-4-neon-high/-low… is one model with strengths; a model without variants takes --effort.
+   Changing it mid-conversation restarts agy on the next turn with --conversation, so the session carries on. */
+const BM = { groups: null, loading: null };
+const BT_EFF = { minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "超高", max: "最高" };
+async function btModels(refresh) {
+  if (BM.groups && !refresh) return BM.groups;
+  if (!BM.loading || refresh) BM.loading = api("GET", "/api/bots/engines/agy/models" + (refresh ? "?refresh=1" : ""))
+    .then((r) => (BM.groups = r.groups || [])).catch((e) => { BM.loading = null; throw e; });
+  return BM.loading;
+}
+function btGroupOf(model) {
+  for (const g of BM.groups || []) {
+    if (g.id === model) return { g, eff: "" };
+    for (const [e, slug] of Object.entries(g.slugs || {})) if (slug === model) return { g, eff: e };
+  }
+  return null;
+}
+function btModelName(c) {
+  if (!c.model && !c.effort) return "默认模型";
+  const hit = c.model ? btGroupOf(c.model) : null;
+  const name = hit ? hit.g.label : (c.model || "默认模型"), eff = (hit && hit.eff) || c.effort;
+  return name + (eff ? " · " + (BT_EFF[eff] || eff) : "");
+}
+function btModelFields() {
+  return `<label class="small muted">模型 <button type="button" class="link small" onclick="btModelsFill(null,null,true)">刷新</button></label>
+    <select name="mgroup" id="btMG" onchange="btEffFill()"><option value="">读取中…</option></select>
+    <label class="small muted">强度（越高越慢、越仔细）</label><select name="meff" id="btME"><option value="">默认</option></select>
+    <div class="small muted" id="btMNote"></div>`;
+}
+async function btModelsFill(model, effort, refresh) {
+  const sel = $("btMG"); if (!sel) return;
+  if (model === null) { model = sel.dataset.model || ""; effort = sel.dataset.effort || ""; }
+  sel.dataset.model = model || ""; sel.dataset.effort = effort || "";
+  let groups = [];
+  try { groups = await btModels(refresh); $("btMNote").textContent = ""; }
+  catch (e) { $("btMNote").textContent = "读不到模型列表（" + e.message + "），先用 agy 的默认模型"; }
+  const hit = model ? btGroupOf(model) : null;
+  sel.innerHTML = `<option value="">默认（agy 自己的设置）</option>` + groups.map((g) => `<option value="${esc(g.id)}">${esc(g.label)}</option>`).join("")
+    + (model && !hit ? `<option value="${esc(model)}">${esc(model)}</option>` : "");
+  sel.value = hit ? hit.g.id : (model || "");
+  btEffFill((hit && hit.eff) || effort || "");
+}
+function btEffFill(want) {
+  const sel = $("btMG"), es = $("btME"); if (!sel || !es) return;
+  const g = (BM.groups || []).find((x) => x.id === sel.value);
+  const effs = g && (g.efforts || []).length ? g.efforts : Object.keys(BT_EFF).filter((e) => e !== "minimal");
+  if (want === undefined) want = es.value;
+  const plain = !g || !(g.efforts || []).length || g.plain;
+  es.innerHTML = (plain ? `<option value="">默认</option>` : "") + effs.map((e) => `<option value="${e}">${BT_EFF[e] || e}（${e}）</option>`).join("");
+  es.value = effs.includes(want) ? want : plain ? "" : (effs.includes("high") ? "high" : effs[effs.length - 1]);
+}
+function btModelValue(f) {
+  const gid = f.mgroup ? f.mgroup.value : "", eff = f.meff ? f.meff.value : "";
+  const g = (BM.groups || []).find((x) => x.id === gid);
+  if (g && eff && (g.slugs || {})[eff]) return { model: g.slugs[eff], effort: "" };   // the slug names its strength
+  return { model: gid, effort: eff };
+}
+function btModelEdit() {
+  const c = BT.conv; if (!c) return;
+  modal(`<div class="heading">模型和强度</div>
+    <div class="small muted">从下一句起生效：agy 会带着原会话重新启动，前面聊的都还在。</div>
+    <form class="col gap" onsubmit="btModelSave(event)">${btModelFields()}
+      <div class="row gap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
+    </form>`);
+  btModelsFill(c.model || "", c.effort || "");
+}
+async function btModelSave(ev) {
+  ev.preventDefault();
+  try { await api("PATCH", `/api/bots/convs/${BT.cid}`, btModelValue(ev.target)); closeOverlays(); btRefresh(true); }
+  catch (e) { toast("没改成：" + e.message); }
+}
+
 /* navigation */
-TITLES.bots = "引擎对话";
+TITLES.bots = "引擎";
 const _goBots = go;
 go = function (view) {
   const r = _goBots.apply(this, arguments);

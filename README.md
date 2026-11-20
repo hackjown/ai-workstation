@@ -93,6 +93,13 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.58 引擎：附件、技能、模型和强度
+
+- 「引擎对话」改名「引擎」。
+- 引擎的输入框和聊天一样：＋ 里有拍照（手机）、照片/视频、文件、技能，输入 `/` 也能选技能（技能包可展开）。附件发送时复制到对话的工作文件夹 `uploads/` 里，提示词写明路径；技能按任务的方式写成技能说明，桥接把技能文件夹复制进 `.aiw-context/` 让 agy 读得到。
+- 模型和强度：新建对话或点顶部的模型按钮选择。列表来自电脑上的 `agy models`（这个账号能用的模型），同一模型的强度变体（如 `gemini-4-neon-high/-low`）合成一个模型 + 强度；没有变体的模型用 `--effort`（low…max）。对话中途换模型，下一句起生效：agy 带 `--conversation` 原会话重启。
+- 桥接 v4：新增 `models` 操作。接口：`GET /api/bots/engines/agy/models`，`PATCH /api/bots/convs/{id}` 支持 `model`、`effort`，`POST …/send` 支持 `attachments`、`skills`。
+
 ## v3.9.57 引擎对话：直接和 Antigravity 聊，也能交给 AIW 管家；聊天可以引用
 
 - 新页面「引擎对话」：每个对话绑定电脑上一个 Antigravity 会话和一个工作文件夹（原地修改，不建分支、不推送）。进程空闲 2 小时退出后，下一句话用 `--conversation` 接上原会话。

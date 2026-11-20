@@ -3,6 +3,16 @@
 import json, os, sys, time, uuid
 if "--version" in sys.argv:
     print("agy 9.9.9-fake"); sys.exit(0)
+if len(sys.argv) > 1 and sys.argv[1] == "models":   # v3.9.58: one slug per effort variant, like agy 1.1.15+
+    ms = [("gemini-4-neon-high", "Gemini 4 Neon (High)"), ("gemini-4-neon-low", "Gemini 4 Neon (Low)"),
+          ("gemini-3.8-flash", "Gemini 3.8 Flash"), ("claude-opus-5.5-thinking", "Claude Opus 5.5 (Thinking)")]
+    if "--output-format" in sys.argv:
+        print(json.dumps({"type": "models", "data": {"models": [{"id": i, "label": l} for i, l in ms]}}))
+    else:
+        print("\n".join(f"{i}\t{l}" for i, l in ms))
+    sys.exit(0)
+with open(os.environ.get("FAKE_AGY_ARGS", "/dev/null"), "a") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
 if "-p" in sys.argv:
     print(json.dumps({"conversation_id": "c-probe", "status": "SUCCESS", "response": "ok\n"})); sys.exit(0)
 cid = str(uuid.uuid4())

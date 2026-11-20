@@ -37,7 +37,7 @@ import threading
 import time
 import uuid
 
-AGYV = "3"
+AGYV = "4"
 ROOT = os.path.expanduser("~/.config/aiw/agy")
 JOBS = os.path.join(ROOT, "jobs")
 MAX_TOOL_OUT = 600
@@ -788,6 +788,81 @@ def op_list():
     out({"ok": True, "jobs": rows[-30:]})
 
 
+TIER_RE = re.compile(r"^(.*?)-(minimal|low|medium|high|xhigh|max)$")
+TIER_LABEL = re.compile(r"\s*\((minimal|low|medium|high|xhigh|max)\)\s*$", re.I)
+
+
+def group_models(models: list) -> list:
+    """v3.9.58: `agy models` lists one slug per effort variant (gemini-4-neon-high, -low…). Group them so the page shows a
+    model and its strengths; a model with no variants takes --effort (low…max, as the model allows)."""
+    groups: dict = {}
+    order = []
+    for m in models:
+        mid = str(m.get("id") or "").strip()
+        if not mid:
+            continue
+        label = str(m.get("label") or mid).strip()
+        t = TIER_RE.match(mid)
+        base, eff = (t.group(1), t.group(2)) if t else (mid, "")
+        g = groups.get(base)
+        if not g:
+            g = groups[base] = {"id": base, "label": TIER_LABEL.sub("", label) or base, "efforts": [], "slugs": {}}
+            order.append(base)
+        if eff:
+            g["efforts"].append(eff)
+            g["slugs"][eff] = mid
+        else:
+            g["plain"] = True
+    rank = ["minimal", "low", "medium", "high", "xhigh", "max"]
+    for g in groups.values():
+        g["efforts"].sort(key=lambda e: rank.index(e) if e in rank else 9)
+    return [groups[b] for b in order]
+
+
+def parse_models(stdout: str) -> list:
+    txt = (stdout or "").strip()
+    try:
+        d = json.loads(txt)
+        lst = d.get("models") or (d.get("data") or {}).get("models") or [] if isinstance(d, dict) else d
+        out = []
+        for m in lst or []:
+            if isinstance(m, dict):
+                out.append({"id": m.get("id") or m.get("slug") or m.get("name"), "label": m.get("label") or m.get("display_name") or m.get("name")})
+            elif isinstance(m, str):
+                out.append({"id": m, "label": m})
+        if out:
+            return out
+    except ValueError:
+        pass
+    out = []
+    for line in txt.splitlines():
+        line = line.strip()
+        m = re.match(r"^([a-z0-9][a-z0-9.\-]+)(?:\s{2,}|\t)(.+)$", line)
+        if m:
+            out.append({"id": m.group(1), "label": m.group(2).strip()})
+        elif line and not line.lower().startswith(("available", "model", "-", "=")):
+            out.append({"id": line, "label": line})    # older agy: display names only (they work with --model too)
+    return out
+
+
+def op_models():
+    b = agy_bin()
+    if not b:
+        out({"ok": False, "installed": False, "error": "agy not found on PATH"})
+    last = ""
+    for args in ([b, "models", "--output-format", "json"], [b, "models"]):
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=45)
+        except Exception as e:  # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+            continue
+        ms = parse_models(r.stdout) if r.returncode == 0 else []
+        if ms:
+            out({"ok": True, "models": ms, "groups": group_models(ms)})
+        last = (r.stderr or r.stdout or "").strip()[-300:]
+    out({"ok": False, "error": last or "agy models printed nothing"})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("op")
@@ -824,6 +899,8 @@ def main():
         op_list()
     elif a.op == "settings":
         op_settings(a.reset)
+    elif a.op == "models":
+        op_models()
     else:
         out({"ok": False, "error": f"unknown op {a.op}"}, 2)
 

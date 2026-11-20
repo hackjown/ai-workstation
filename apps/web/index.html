@@ -39,7 +39,7 @@
     <div class="navs">
       <button data-view="home" onclick="go('home')"><i data-i="chat"></i>聊天<span class="badge" id="chatBadge"></span></button>
       <button data-view="tasks" onclick="go('tasks')"><i data-i="bolt"></i>任务</button>
-      <button data-view="bots" onclick="go('bots')"><i data-i="monitor"></i>引擎对话</button>
+      <button data-view="bots" onclick="go('bots')"><i data-i="monitor"></i>引擎</button>
       <button data-view="activity" onclick="go('activity')"><i data-i="activity"></i>活动<span class="badge" id="needBadge"></span></button>
       <button data-view="tracking" onclick="go('tracking')"><i data-i="target"></i>追踪</button>
       <button data-view="routines" onclick="go('routines')"><i data-i="clock"></i>例程</button>
@@ -125,7 +125,7 @@
       </div>
     </div>
 
-    <!-- v3.9.57 引擎对话 (bots.js): conversations with Antigravity / Codex on the computer, AIW 管家 can take over -->
+    <!-- v3.9.57 引擎 (bots.js; v3.9.58 attachments + skills): conversations with Antigravity / Codex on the computer, AIW 管家 can take over -->
     <div class="view" id="v-bots">
       <div class="bt-wrap">
         <aside id="btList" class="bt-list scroll"></aside>
@@ -133,10 +133,23 @@
           <div id="btHead" class="bt-top"></div>
           <div id="btTake"></div>
           <div id="btMsgs" class="scroll bt-msgs"><div class="muted pad center">选一个对话，或新建一个</div></div>
-          <div class="composer-wrap">
+          <div class="composer-wrap bt-cw">
+            <div id="btSkills" class="hskills" role="listbox" aria-label="技能" hidden></div>
+            <div id="btMenu" class="bt-menu" hidden>
+              <button type="button" class="only-mobile" onclick="btPick('btCam')"><span data-hi="camera"></span>拍照</button>
+              <button type="button" onclick="btPick('btLib')"><span data-hi="image"></span>照片/视频</button>
+              <button type="button" onclick="btPick('btFile')"><span data-hi="folder"></span>文件</button>
+              <button type="button" onclick="btMenu(false);btSlash()"><span data-hi="sparkle"></span>技能 /</button>
+            </div>
             <div id="btQuote" class="hquote-bar" hidden></div>
-            <form class="composer" onsubmit="btSend(event)">
-              <textarea id="btPrompt" rows="1" placeholder="对它说…（管家接管时也可以插话）" oninput="autoGrow(this)" onkeydown="btKey(event)"></textarea>
+            <div id="btAttach" class="attachments"></div>
+            <form class="composer hcomposer" onsubmit="btSend(event)">
+              <button type="button" class="icon soft hplus" onclick="btMenu()" aria-label="添加：照片、文件、技能" title="添加">＋</button>
+              <input type="file" id="btFile" hidden multiple onchange="btUpload(this.files, this)" />
+              <input type="file" id="btCam" hidden accept="image/*" capture="environment" onchange="btUpload(this.files, this)" />
+              <input type="file" id="btLib" hidden multiple accept="image/*,video/*" onchange="btUpload(this.files, this)" />
+              <div class="hinput"><span id="btTokens" class="htokens"></span>
+                <textarea id="btPrompt" rows="1" placeholder="对它说，或输入 / 选技能…（管家接管时也可以插话）" oninput="btInput(this)" onkeydown="btKey(event)" onblur="setTimeout(btSkClose,150)"></textarea></div>
               <button class="send" aria-label="发送"><i data-i="up"></i></button>
             </form>
           </div>

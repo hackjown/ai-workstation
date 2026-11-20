@@ -31,18 +31,11 @@ REMOTE = "$HOME/.config/aiw/agy/agy_bridge.py"
 OPS = ("check", "start", "wait", "send", "diff", "stop", "list")
 WANT = re.compile(r"antigravity|反重力|\bagy\b|gemini\s*(?:4|cli)|谷歌.{0,4}(?:编程|写代码|agent)", re.I)
 
-# what agy may do without asking (settings.json permissions); anything else is soft-denied in headless mode and
-# shows up in the job's `denied` list, which AIW turns into a question for the user
-DEFAULT_ALLOW = [
-    "command(git status)", "command(git diff)", "command(git log)", "command(git add)", "command(git commit)",
-    "command(regex:(npm|pnpm|yarn) (run )?(build|lint|test|typecheck)( .*)?)",
-    "command(regex:(python3?|uv run) -m (pytest|unittest|py_compile|ruff|mypy)( .*)?)",
-    "command(regex:pytest( .*)?)", "command(regex:(ls|cat|head|tail|wc|grep|rg|find) .*)",
-]
-DEFAULT_DENY = [
-    "command(regex:git push.*)", "command(regex:git (reset --hard|clean|checkout \\.|restore \\.).*)",
-    "command(regex:rm -rf? (/|~|\\$HOME).*)", "command(regex:sudo .*)", "command(regex:.*(curl|wget)[^|]*\\|\\s*(ba)?sh.*)",
-]
+# what agy may do without asking (settings.json permissions) lives in the bridge (v3.9.56: written by
+# `agy_bridge.py settings`, only valid actions read_file / write_file / command); anything else is soft-denied in
+# headless mode and shows up in the job's `denied` list (which step, on what, why)
+from . import agy_bridge as _ab  # noqa: E402
+DEFAULT_ALLOW, DEFAULT_DENY = _ab.DEFAULT_ALLOW, _ab.DEFAULT_DENY
 
 
 def mode() -> str:
@@ -60,17 +53,16 @@ def offered(prompt: str, dev_task: bool) -> bool:
 
 
 def install_command() -> str:
-    """Write the bridge (and the default permission rules, if the user has none) in one shell call."""
+    """Write the bridge, then let it write the default permission rules (only when agy has none, or AIW manages the
+    file) in one shell call. v3.9.56: the command never names agy's settings path, so the policy rule that stops the
+    agent from editing agy's settings does not catch AIW's own install."""
     src = BRIDGE_SRC.read_bytes()
     b64 = base64.b64encode(src).decode()
     digest = hashlib.sha1(src).hexdigest()
-    settings = base64.b64encode(json.dumps({"permissions": {"allow": DEFAULT_ALLOW, "deny": DEFAULT_DENY},
-                                            "artifactReviewPolicy": "always-proceed"}, indent=2).encode()).decode()
     return (f'mkdir -p "$HOME/.config/aiw/agy" && f="{REMOTE}" && '
             f'if [ "$(sha1sum "$f" 2>/dev/null | cut -d" " -f1)" != "{digest}" ]; then '
             f"echo '{b64}' | base64 -d > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; fi && "
-            f's="$HOME/.gemini/antigravity-cli/settings.json" && if [ ! -s "$s" ]; then mkdir -p "$(dirname "$s")" && '
-            f"echo '{settings}' | base64 -d > \"$s\" && echo SETTINGS_WRITTEN; fi && "
+            f"python3 \"$f\" settings >/dev/null 2>&1; "
             f"[ \"$(sha1sum \"$f\" | cut -d' ' -f1)\" = \"{digest}\" ] && echo AGY_BRIDGE_OK")
 
 
@@ -100,7 +92,8 @@ def brief(task: str, contract: dict | None = None, extra: str = "") -> str:
         parts.append("Only change files under: " + ", ".join(str(x) for x in c["allowed_paths"][:10]))
     if extra.strip():
         parts.append(extra.strip())
-    parts.append("Rules: work only inside this git worktree. Commit your finished work on the current branch with a "
+    parts.append("Rules: work only inside this git worktree (your current directory); use paths relative to it, and "
+                 "run each shell command on its own (no `cd x && ...` chains). Commit your finished work on the current branch with a "
                  "clear message. Never push, never rebase or reset other branches. Run the relevant tests before "
                  "you finish. End with a short report: files changed, how you verified, anything left undone.")
     return "\n\n".join(parts)
@@ -172,6 +165,11 @@ def render(op: str, r: dict) -> str:
     if op == "check":
         s = f"agy {r.get('version') or ''} at {r.get('path')}; git={'yes' if r.get('git') else 'NO'}; " \
             f"proxy={'set' if r.get('proxy') else 'not set'}"
+        se = r.get("settings") or {}
+        if se.get("ignored_rules"):
+            s += "; agy IGNORES these permission rules (unknown action): " + " | ".join(se["ignored_rules"][:6])
+        if se.get("skip_all"):
+            s += "; WARNING: settings auto-approve everything"
         if "signed_in" in r:
             s += "; signed in" if r.get("signed_in") else f"; NOT signed in: {r.get('error')}"
         return s
@@ -195,6 +193,9 @@ def render(op: str, r: dict) -> str:
     if op == "start":
         lines.append(f"started agy job {r.get('job')} on branch {r.get('branch')} in {r.get('worktree')} "
                      f"(base {r.get('base')}).")
+        if r.get("staged"):
+            lines.append("copied into the worktree's .aiw-context/ (agy cannot read outside its worktree): "
+                         + "; ".join(r["staged"][:8]))
         lines.append(f"NEXT: antigravity op=wait job={r.get('job')} (blocks until its turn ends).")
         return "\n".join(lines)
     st = r.get("status")
@@ -212,7 +213,11 @@ def render(op: str, r: dict) -> str:
         if ch.get("commits"):
             lines.append("commits: " + " | ".join(ch["commits"][:10]))
     if r.get("denied"):
-        lines.append("DENIED actions (agy needed approval it could not get): " + " | ".join(r["denied"][-5:]))
+        lines.append("DENIED steps (headless agy cannot ask, so it stopped): " + " | ".join(
+            (f"{d.get('tool')} {d.get('target') or ''} [{d.get('action')} permission: {d.get('why')}]"
+             if isinstance(d, dict) else str(d)) for d in r["denied"][-5:]))
+    if r.get("ignored_rules"):
+        lines.append("agy ignores these settings rules (unknown action): " + " | ".join(r["ignored_rules"][:5]))
     if r.get("auth_error"):
         lines.append(f"AUTH: {r['auth_error']}")
     if r.get("error"):
@@ -224,7 +229,29 @@ def render(op: str, r: dict) -> str:
                      "verify_html there; read the diff with op=diff full=true). If something fails, op=send the exact "
                      "failure output back to the same job; when it passes, finish with done and tell the user the branch "
                      "to merge. If DENIED actions matter, ask_user whether to allow them.")
+    elif st == "blocked":
+        lines.append("NEXT: agy was blocked by a permission. NEVER work around it: do not run `agy` yourself in shell, "
+                     "never pass --dangerously-skip-permissions, never edit ~/.gemini (those are forbidden and will be "
+                     "refused). If the denied path is outside the worktree, op=send the same job the path of the file "
+                     "inside the worktree (or under .aiw-context/) and tell it to continue; otherwise ask_user, quoting "
+                     "the denied step and its reason, whether to allow it. If you finish the work yourself instead, "
+                     "say so to the user: Antigravity did not do it.")
     elif st in ("stuck", "timed_out", "error"):
         lines.append("NEXT: the session ended abnormally. Check op=diff; if the work is usable verify it, otherwise "
                      "tell the user what happened (start a new job with conversation=<conversation_id> to resume).")
     return "\n".join(lines)
+
+
+def with_report(result: str, rep: dict | None) -> str:
+    """v3.9.56: the task result ends with Antigravity's own last report (what agy says it did), marked as its words,
+    so the user reads it next to AIW's verified summary. AIW_AGY_SHOW_REPORT=0 turns it off."""
+    if not rep or not rep.get("text") or os.environ.get("AIW_AGY_SHOW_REPORT", "1") == "0":
+        return result
+    text = rep["text"]
+    if len(text) > 3000:
+        text = text[:3000].rstrip() + " …（完整内容在电脑上 ~/.config/aiw/agy/jobs/" + str(rep.get("job")) + "/）"
+    if text[:200] in (result or ""):
+        return result
+    head = f"Antigravity 的总结（job {rep.get('job')}" + (f"，分支 {rep['branch']}" if rep.get("branch") else "") + \
+        (f"，{rep['changes']}" if rep.get("changes") else "") + "；这是它自己的说法，以上面 AIW 的结论为准）："
+    return (result or "").rstrip() + "\n\n" + head + "\n" + text

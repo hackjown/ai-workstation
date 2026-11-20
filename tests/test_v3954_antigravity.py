@@ -60,11 +60,11 @@ def test_full_cycle(repo):
     assert w["status"] == "turn_done", w
     assert "Done turn 1" in w["response"]
     assert w["tools"][0]["tool"] == "write_to_file"
-    assert any("git push" in d for d in w["denied"])
+    assert not w["denied"]
     assert "hello.py" in " ".join(w["changes"]["files"])
     assert not (rp / "hello.py").exists()          # the main checkout is untouched
     note = agy.render("wait", w)
-    assert "do NOT trust" in note and "DENIED" in note
+    assert "do NOT trust" in note
     q = run(home, "send", s["job"], "--text-b64", base64.b64encode("test failed: fix it".encode()).decode())
     assert q["queued"]
     w2 = run(home, "wait", s["job"], "--seconds", "30", "--cursor", str(w["cursor"]))
@@ -105,8 +105,8 @@ def test_offered(monkeypatch):
 
 def test_install_command_shape():
     c = agy.install_command()
-    assert "AGY_BRIDGE_OK" in c and "settings.json" in c and "git push" not in c   # rules are base64
-    assert json.loads(base64.b64decode(c.split("echo '")[2].split("'")[0]))["permissions"]["deny"]
+    # v3.9.56: the bridge writes the rules itself (`settings`); the command never names agy's settings file
+    assert "AGY_BRIDGE_OK" in c and " settings " in c and ".gemini" not in c and "git push" not in c
 
 
 def test_registry_has_tool():

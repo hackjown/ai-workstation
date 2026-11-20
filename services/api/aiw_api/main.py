@@ -1601,7 +1601,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             out.append({"id": sid, "title": str(s_.get("title") or sid)[:60], "desc": str(s_.get("desc") or "")[:200],
                         "path": str(s_.get("path") or f"~/.claude/skills/{sid}")[:300], "setup": str(s_.get("setup") or "")[:300],
                         "source": str(s_.get("source") or "")[:200], "machines": list(s_.get("machines") or [])[:20]})
-            for k in ("rev", "rev_date", "self"):   # v3.9.51: kept by 检查更新, not sent back by the page
+            for k in ("rev", "rev_date", "self", "pack"):   # v3.9.51: kept by 检查更新, not sent back by the page
                 if k in (prev.get(sid) or {}):
                     out[-1][k] = prev[sid][k]
         store.kv_set("skills_custom", out)
@@ -1742,6 +1742,18 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         asyncio.create_task(skillupd.update(ids))
         await asyncio.sleep(0.05)
         return store.kv_get("skills_update_job", None)
+
+    @app.delete("/api/skills/pack", dependencies=[Depends(auth)])
+    async def skill_pack_delete(owner: str):
+        """v3.9.56 删除整包: the pack's skills move to ~/.claude/.aiw-skill-backup/pack-<time>/ on each running computer."""
+        if skillupd.lock.locked():
+            raise HTTPException(409, "正在更新技能，稍后再删")
+        try:
+            r = await skillupd.remove_pack(owner)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        store.kv_set("skills_updates", None)
+        return r
 
     @app.get("/api/skills/update", dependencies=[Depends(auth)])
     async def skill_update_status():

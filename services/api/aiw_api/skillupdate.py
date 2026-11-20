@@ -15,6 +15,9 @@ Three kinds of skills live in ~/.claude/skills/<id> on each computer:
              whose copy changed since then is the new version and is copied to the others; when several changed
              differently the newest wins and the others are kept in ~/.claude/.aiw-skill-backup/. Missing copies are
              filled in. Deletions are not propagated (删除 in 设置 only removes the entry).
+* pack       (v3.9.56) skills whose SKILL.md names a pack (owner: system-pack/istoreos), as a pack installer such as
+             linkease/kai-skills leaves them: one folder per skill. Shown as one pack, never self-synced, removed
+             together (删除整包 moves them into the backup folder on every running computer).
 
 Every computer is reached through the callables main.py passes in (shell / read_file / write_file / is_online), so the
 logic is tested with local folders standing in for computers.
@@ -91,17 +94,37 @@ if os.path.isdir(base):
         if sid.startswith(".") or not os.path.isfile(os.path.join(d, "SKILL.md")):
             continue
         h, mt, n, size = tree_hash(d, SPEC.get(sid))
-        desc = ""
+        desc, owner = "", ""
         try:
             head = open(os.path.join(d, "SKILL.md"), encoding="utf-8", errors="replace").read(4000)
             m = re.search(r"^description:\s*(.+)$", head, re.M)
             desc = (m.group(1).strip().strip('"') if m else "")[:200]
+            m = re.search(r"^owner:\s*(.+)$", head, re.M)
+            owner = (m.group(1).strip().strip('"') if m else "")[:80]
         except OSError:
             pass
-        items.append({"id": sid, "hash": h, "mtime": mt, "files": n, "size": size, "desc": desc,
+        items.append({"id": sid, "hash": h, "mtime": mt, "files": n, "size": size, "desc": desc, "owner": owner,
                       "link": os.path.islink(d)})
 print("AIW_INV " + json.dumps(items, ensure_ascii=False))
 '''
+
+
+# ------------------------------------------------------------------------------------------------ v3.9.56 skill packs
+# A pack's installer copies each of its skills into its own folder (agents only find ~/.claude/skills/<id>/SKILL.md),
+# so one pack shows up as many skills. Their SKILL.md front matter names the pack (owner: system-pack/istoreos):
+# such skills are shown as one pack, are never treated as self-built and never self-synced, and are removed together.
+PACK_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+KNOWN_PACKS = {"system-pack/istoreos": {"title": "iStoreOS 技能包", "source": "linkease/kai-skills"}}
+
+
+def pack_of(owner: str) -> str:
+    owner = (owner or "").strip()
+    return owner if PACK_RE.match(owner) else ""
+
+
+def pack_info(owner: str) -> dict:
+    k = KNOWN_PACKS.get(owner) or {}
+    return {"id": owner, "title": k.get("title") or owner.split("/")[-1] + " 技能包", "source": k.get("source", "")}
 
 
 # ------------------------------------------------------------------------------------------------ what each kind is
@@ -272,8 +295,13 @@ class SkillUpdater:
         by_src = {c["id"]: c for c in custom if c.get("source") and not c.get("self")}
         selfstate = self.kv_get("skills_selfsync", {}) or {}
         builtins = builtin_ids() | set(vend)
+        owners = {sid: pack_of(x.get("owner", "")) for m in inv.values() for sid, x in m.items()}
+        packed = {sid: o for sid, o in owners.items() if o and sid not in builtins and sid not in by_src}
+        self._adopt_packs(packed)
+        selfstate = self.kv_get("skills_selfsync", {}) or {}
         ids = sorted({sid for m in inv.values() for sid in m} | set(by_src) | set(selfstate))
         items = []
+        packs: dict[str, dict] = {}
         heads: dict[str, Any] = {}
 
         async def head(repo):
@@ -309,6 +337,16 @@ class SkillUpdater:
                                 it["detail"] = f"上游 {up['repo']} 比 AIW 内置版新 {a['ahead']} 个提交，要等 AIW 合并后随新版更新"
                         except Exception as e:  # noqa: BLE001
                             it["upstream"]["error"] = str(e)[:120]
+            elif sid in packed:   # v3.9.56: part of a skill pack, not self-built and not synced
+                pk = packed[sid]
+                first = next(iter(on.values()), {})
+                it.update(kind="pack", pack=pk, title=sid, desc=first.get("desc", ""))
+                it["machines"] = {m: ("has" if m in on else "missing") for m in online}
+                pi = packs.setdefault(pk, {**pack_info(pk), "ids": [], "machines": {}})
+                pi["ids"].append(sid)
+                for m in online:
+                    if m in on:
+                        pi["machines"][m] = pi["machines"].get(m, 0) + 1
             elif sid in by_src:
                 c = by_src[sid]
                 it.update(kind="installed", title=c.get("title") or sid, source=c["source"], rev=c.get("rev", ""))
@@ -361,7 +399,12 @@ class SkillUpdater:
                 if not on and selfstate.get(sid):
                     it["detail"] = "开着的电脑上都没有（不自动删除）"
             items.append(it)
-        res = {"checked_at": time.time(), "machines": ms, "items": items,
+        for pk, pi in packs.items():
+            n = len(pi["ids"])
+            pi["state"] = "ok" if all(pi["machines"].get(m) == n for m in online) else "partial"
+            if pi["state"] == "partial":
+                pi["detail"] = "不是每台电脑都装齐了" + (f"；要装齐，在「安装技能」里装 {pi['source']}" if pi["source"] else "")
+        res = {"checked_at": time.time(), "machines": ms, "items": items, "packs": packs,
                "counts": {k: sum(1 for i in items if i["state"] == k)
                           for k in ("update", "sync", "conflict", "upstream", "record")}}
         if gh or not self.kv_get("skills_updates", None):   # a quick (no GitHub) auto run keeps the full check shown
@@ -502,6 +545,59 @@ class SkillUpdater:
         if p["backups"]:
             msg += f"，{len(p['backups'])} 台的旧版放在 {BACKUP_DIR}/"
         return msg
+
+    def _adopt_packs(self, packed: dict[str, str]):
+        """v3.9.56: skills that belong to a pack stop being self-built: no sync record, marked with their pack."""
+        if not packed:
+            return
+        state = self.kv_get("skills_selfsync", {}) or {}
+        if any(sid in state for sid in packed):
+            self.kv_set("skills_selfsync", {k: v for k, v in state.items() if k not in packed})
+        custom = self.kv_get("skills_custom", []) or []
+        changed = False
+        for c in custom:
+            pk = packed.get(c.get("id"))
+            if pk and (c.get("self") or c.get("pack") != pk):
+                c.pop("self", None)
+                c["pack"] = pk
+                changed = True
+        if changed:
+            self.kv_set("skills_custom", custom)
+
+    async def remove_pack(self, owner: str) -> dict:
+        """v3.9.56 删除整包: every skill of the pack leaves ~/.claude/skills on each running computer (moved into
+        the backup folder, not deleted) and leaves the skill list."""
+        if not pack_of(owner):
+            raise ValueError("不是技能包")
+        async with self.lock:
+            vend, ms, inv = await self.scan()
+            builtins = builtin_ids() | set(vend)
+            res: dict[str, Any] = {"pack": owner, "machines": {}}
+
+            async def one(mid):
+                ids = [sid for sid, x in inv.get(mid, {}).items()
+                       if pack_of(x.get("owner", "")) == owner and sid not in builtins and ID_RE.match(sid)]
+                if not ids:
+                    res["machines"][mid] = {"name": ms[mid]["name"], "removed": 0}
+                    return
+                q = " ".join(shlex.quote(i) for i in ids)
+                r = await self.shell(mid, (
+                    f"set -e; d={SKILLS_DIR}; b={BACKUP_DIR}/pack-$(date +%Y%m%d-%H%M%S); mkdir -p \"$b\"; "
+                    f"for s in {q}; do [ -e \"$d/$s\" ] || [ -L \"$d/$s\" ] && mv \"$d/$s\" \"$b/\"; done; echo AIW_OK"), 120)
+                ok = "AIW_OK" in (r.get("stdout") or "")
+                res["machines"][mid] = {"name": ms[mid]["name"], "removed": len(ids) if ok else 0,
+                                        **({} if ok else {"error": (r.get("stderr") or "失败")[:200]})}
+                res.setdefault("ids", set()).update(ids)
+            await asyncio.gather(*(one(m) for m, v in ms.items() if v["online"]))
+            gone = res.pop("ids", set())
+            custom = [c for c in self.kv_get("skills_custom", []) or []
+                      if c.get("pack") != owner and c.get("id") not in gone]
+            self.kv_set("skills_custom", custom)
+            state = self.kv_get("skills_selfsync", {}) or {}
+            self.kv_set("skills_selfsync", {k: v for k, v in state.items() if k not in gone})
+            res["removed"] = sorted(gone)
+            res["offline"] = [v["name"] for v in ms.values() if not v["online"]]
+            return res
 
     def _register(self, sid: str, it: dict, machines: list[str]):
         """Self-built skills show up in the「+」menu like the others."""

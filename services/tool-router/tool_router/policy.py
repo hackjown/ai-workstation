@@ -47,7 +47,16 @@ Rule = Callable[[str, dict], Optional[Decision]]
 
 SHELL_L4 = [
     (r"\bsudo\s+su\b|\bsu\s+-?\s*root\b|\bsudo\s+-i\b|\bsudo\s+-s\b", "root shell"),
-    (r"/etc/pve\b|\bpvesh\b|\bqm\s+|\bpct\s+|\bpvecm\b|:8006\b", "touches Proxmox"),
+    # v3.9.56: qm / pct only as a command word (`git commit -qm "msg"` is not Proxmox; task-d31e6e1305)
+    (r"/etc/pve\b|\bpvesh\b|(?:^|[;&|(`]\s*|\bsudo\s+|\bssh\s+\S+\s+['\"]?)(?:qm|pct)\s+|\bpvecm\b|:8006\b",
+     "touches Proxmox"),
+    # v3.9.56 (task-d31e6e1305): Antigravity runs only through the antigravity tool, under its permission rules.
+    # The agent ran `agy --print --dangerously-skip-permissions` itself and edited agy's settings three times.
+    (r"(?:^|[;&|(`]\s*|\b(?:nohup|exec|timeout\s+\S+|env(?:\s+\w+=\S+)*|setsid|script\s+-\S+)\s+)"
+     r"(?:[\w.~$/{}-]*/)?agy(?=\s|$|[;&|)])", "runs Antigravity directly (use the antigravity tool)"),
+    (r"--dangerously-skip-permissions|dangerouslySkipPermissions", "turns off Antigravity's permission checks"),
+    (r"\.gemini/[^\s'\"]*(?:settings|permission|grant)|agy_bridge\.py['\"]?\s+settings\s+--reset",
+     "changes Antigravity's permission settings (only the user does that)"),
     (r"\bmkfs\b|\bdd\s+.*of=/dev/|>\s*/dev/sd", "raw disk write"),
     (r"\b(shutdown|poweroff|halt|reboot)\b", "power control belongs to VM Runtime"),
     (r":\(\)\s*\{\s*:\|:&\s*\};:", "fork bomb"),
@@ -250,6 +259,8 @@ class PolicyEngine:
         if not action.startswith("files."):
             return None
         path = p.get("path", "") or ""
+        if action not in ("files.list", "files.read") and re.search(r"(^|/)\.gemini/|(^|/)\.config/aiw/agy/", path):
+            return Decision(RiskLevel.L4, "changes Antigravity's settings or bridge (only the user does that)")
         if action == "files.upload" and SENSITIVE_PATH.search(path):
             return Decision(RiskLevel.L3, "upload of sensitive file")
         if SENSITIVE_PATH.search(path):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AIW <-> Antigravity CLI bridge (v3.9.54). Runs ON THE COMPUTER, stdlib only.
+"""AIW <-> Antigravity CLI bridge (v3.9.54, v3.9.56). Runs ON THE COMPUTER, stdlib only.
 
 The agent writes this file to ~/.config/aiw/agy/agy_bridge.py on first use (antigravity.py), then drives it with
 one shell call per op. Every op prints exactly one line `AGYRESULT {json}` as its last stdout line.
@@ -13,6 +13,9 @@ one shell call per op. Every op prints exactly one line `AGYRESULT {json}` as it
   diff  JOB [--full]       git status / diff of the worktree against the base commit
   stop  JOB                end the agy process (the worktree and branch stay for review)
   list                     jobs on this computer
+  settings [--reset]       v3.9.56: write AIW's permission rules into agy's settings.json when it has none (or AIW
+                           manages it), report rules agy ignores; --reset (run by the user in a terminal) puts the
+                           AIW defaults back after a backup
   daemon JOB               (internal) the process that owns agy
 
 Job state lives in ~/.config/aiw/agy/jobs/<job>/: job.json, state.json, events.jsonl, inbox/, stderr.log.
@@ -34,11 +37,39 @@ import threading
 import time
 import uuid
 
-AGYV = "1"
+AGYV = "2"
 ROOT = os.path.expanduser("~/.config/aiw/agy")
 JOBS = os.path.join(ROOT, "jobs")
 MAX_TOOL_OUT = 600
 MAX_RESP = 6000
+SETTINGS = os.path.expanduser("~/.gemini/antigravity-cli/settings.json")
+CTX = ".aiw-context"                 # files from outside the worktree are copied here (ignored by git)
+CTX_MAX_BYTES = 60 * 1024 * 1024
+SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv"}
+
+# v3.9.56: agy's permission grammar only knows these actions (cli logs of 2026-11-20: "unknown action" for bash,
+# shell, run_command, edit_file, apply_patch, glob, grep_search, list_directory: those rules were silently ignored).
+VALID_ACTIONS = ("read_file", "write_file", "command")
+DEFAULT_ALLOW = [
+    "command(git status)", "command(git diff)", "command(git log)", "command(git add)", "command(git commit)",
+    "command(regex:git (status|diff|log|show|add|commit|branch|rev-parse|ls-files)( .*)?)",
+    "command(regex:(ls|cat|head|tail|wc|grep|rg|find|tree|du|stat|file|diff|cmp|sort|uniq|cut|awk|jq|sha1sum|md5sum|"
+    "realpath|basename|dirname|pwd|which|echo|printf|date) .*)",
+    "command(regex:(mkdir|cp|mv|touch|ln) .*)",
+    "command(regex:(tar|unzip|zip|gzip|gunzip) .*)",
+    "command(regex:(npm|pnpm|yarn) (run )?(build|lint|test|typecheck|install|ci)( .*)?)",
+    "command(regex:(python3?|uv run) -m (pytest|unittest|py_compile|ruff|mypy|http\\.server|json\\.tool)( .*)?)",
+    "command(regex:(python3?|node|bash|sh) [\\w./-]+\\.(py|js|mjs|cjs|sh)( .*)?)",
+    "command(regex:pytest( .*)?)",
+]
+DEFAULT_DENY = [
+    "command(regex:.*git push.*)", "command(regex:.*git (reset --hard|clean|checkout \\.|restore \\.).*)",
+    "command(regex:.*rm -rf? (/|~|\\$HOME).*)", "command(regex:.*sudo .*)",
+    "command(regex:.*(curl|wget)[^|]*\\|\\s*(ba)?sh.*)",
+    "command(regex:.*\\.gemini/.*)", "command(regex:.*\\.config/aiw/.*)",
+    "command(regex:.*--dangerously-skip-permissions.*)",
+    "write_file(~/.gemini/**)", "write_file(~/.config/aiw/**)",
+]
 
 
 # ------------------------------------------------------------------------------------------------------- helpers
@@ -98,6 +129,157 @@ def clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n * 3 // 4] + f" …[{len(s) - n} chars]… " + s[-n // 4:]
 
 
+
+# ------------------------------------------------------------------------------------------------------- settings
+def rule_action(rule: str) -> str:
+    m = re.match(r"\s*([A-Za-z_]+)\s*\(", rule or "")
+    return m.group(1) if m else ""
+
+
+def lint_rules(perm: dict) -> list:
+    """Rules agy ignores (unknown action): AIW reports them instead of trusting them."""
+    bad = []
+    for k in ("allow", "deny", "ask"):
+        for r in (perm or {}).get(k) or []:
+            if rule_action(str(r)) not in VALID_ACTIONS:
+                bad.append(f"{k}: {r}")
+    return bad
+
+
+def settings_state() -> dict:
+    cur = read_json(SETTINGS, None)
+    perm = (cur or {}).get("permissions") or {}
+    return {"path": SETTINGS, "exists": cur is not None, "managed": bool((cur or {}).get("aiwManaged")),
+            "allow": len(perm.get("allow") or []), "deny": len(perm.get("deny") or []),
+            "ignored_rules": lint_rules(perm)[:20],
+            "skip_all": bool((cur or {}).get("dangerouslySkipPermissions"))}
+
+
+def op_settings(reset: bool):
+    cur = read_json(SETTINGS, None)
+    want = {"allow": DEFAULT_ALLOW, "deny": DEFAULT_DENY}
+    action = "kept"
+    if reset or cur is None or (cur.get("aiwManaged") and cur.get("permissions") != want):
+        new = dict(cur or {})
+        if cur is not None:
+            bak = f"{SETTINGS}.bak-aiw-{time.strftime('%Y%m%d%H%M%S')}"
+            shutil.copy2(SETTINGS, bak)
+        new["permissions"] = want
+        new["aiwManaged"] = True
+        new.setdefault("artifactReviewPolicy", "always-proceed")
+        new.pop("dangerouslySkipPermissions", None)
+        os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+        write_json(SETTINGS, new)
+        action = "reset" if reset else ("written" if cur is None else "updated")
+    out({"ok": True, "action": action, **settings_state()})
+
+
+def newest_cli_log(since: float) -> str | None:
+    d = os.path.expanduser("~/.gemini/antigravity-cli/log")
+    try:
+        cands = [os.path.join(d, n) for n in os.listdir(d) if n.startswith("cli-") and n.endswith(".log")]
+    except OSError:
+        return None
+    cands = [c for c in cands if os.path.getmtime(c) >= since - 5]
+    return max(cands, key=os.path.getmtime) if cands else None
+
+
+# ------------------------------------------------------------------------------------------------------- staging
+PATH_RE = re.compile(r"(?:~|\$HOME|/home/[\w.-]+|/root|/tmp|/opt|/srv|/data)(?:/[^\s`'\"<>()\[\]{}，。；：、（）《》“”‘’!?|*]+)+")
+
+
+def _size(path: str) -> int:
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    n = 0
+    for d, ds, fs in os.walk(path):
+        ds[:] = [x for x in ds if x not in SKIP_DIRS]
+        for f in fs:
+            try:
+                n += os.path.getsize(os.path.join(d, f))
+            except OSError:
+                pass
+    return n
+
+
+def _copy(src: str, dst: str):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.isdir(src):
+        shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=False,
+                        ignore=shutil.ignore_patterns(*SKIP_DIRS))
+    else:
+        shutil.copy2(src, dst)
+
+
+def stage(text: str, job: dict) -> tuple:
+    """v3.9.56: agy only reads freely inside its workspace (the worktree): a read_file of
+    /home/aiw/workspace/ldok-rebuild/mirror/... or ~/.claude/skills/... was soft-denied in headless mode, even with
+    read_file(**) allowed (jobs agy-11200120-3f7d, -9524, -72a8). So every absolute path in a prompt is pointed into
+    the worktree: paths in the main checkout map to the same file in the worktree; files that exist only outside it
+    (untracked files, skills) are copied into <worktree>/.aiw-context/ (ignored by git) and the prompt names the copy.
+    Returns (new text, [mapping lines])."""
+    home = os.path.expanduser("~")
+    top, wt = job["repo"].rstrip("/"), job["worktree"].rstrip("/")
+    ctx = os.path.join(wt, CTX)
+    staged = dict(job.get("staged") or {})
+    used = sum(int(v.get("bytes") or 0) for v in staged.values())
+    notes = []
+
+    def norm(p: str) -> str:
+        p = p.rstrip(".,;:")
+        if p.startswith("~"):
+            p = home + p[1:]
+        elif p.startswith("$HOME"):
+            p = home + p[5:]
+        return os.path.normpath(p)
+
+    def ensure_ctx():
+        os.makedirs(ctx, exist_ok=True)
+        gi = os.path.join(ctx, ".gitignore")
+        if not os.path.exists(gi):
+            with open(gi, "w") as f:
+                f.write("*\n")
+
+    def mapped(raw: str) -> str:
+        nonlocal used
+        p = norm(raw)
+        if p == wt or p.startswith(wt + "/"):
+            return raw
+        if p == top or p.startswith(top + "/"):
+            rel = os.path.relpath(p, top)
+            in_wt = os.path.normpath(os.path.join(wt, rel))
+            if os.path.exists(in_wt) or not os.path.exists(p):
+                return in_wt                     # tracked file, or an output path to create inside the worktree
+            src, dst = p, os.path.join(ctx, "repo", rel)
+        else:
+            if not os.path.exists(p):
+                return raw                       # nothing to copy; a write there will be denied and reported
+            src = p
+            m = re.match(re.escape(home) + r"/\.(?:claude|codex|agents|gemini)/skills/[^/]+", p)
+            if m:
+                src = m.group(0)                 # a skill: copy the whole skill folder (references/, scripts/)
+            dst = os.path.join(ctx, "ext", src.lstrip("/"))
+        if src not in staged:
+            sz = _size(src)
+            if used + sz > CTX_MAX_BYTES:
+                notes.append(f"NOT copied (too big, {sz // 1024} KB): {src}")
+                return raw
+            ensure_ctx()
+            _copy(src, dst)
+            used += sz
+            staged[src] = {"to": dst, "bytes": sz}
+            notes.append(f"{src} -> {dst}")
+        dst = staged[src]["to"]
+        return dst + p[len(src):]
+
+    new = PATH_RE.sub(lambda m: mapped(m.group(0)), text or "")
+    job["staged"] = staged
+    if notes:
+        new += ("\n\n[AIW] Files from outside this worktree were copied into ./" + CTX +
+                "/ (read them there; it is not committed). Write only inside the worktree.\n" +
+                "\n".join("- " + n for n in notes))
+    return new, notes
+
 # ------------------------------------------------------------------------------------------------------- check
 def op_check(probe: bool):
     b = agy_bin()
@@ -112,7 +294,8 @@ def op_check(probe: bool):
         ver = f"? ({type(e).__name__})"
     res = {"ok": True, "installed": True, "path": b, "version": ver, "bridge": AGYV,
            "git": bool(shutil.which("git")),
-           "proxy": bool(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"))}
+           "proxy": bool(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")),
+           "settings": settings_state()}
     if probe:
         try:
             r = subprocess.run([b, "-p", "Reply with exactly: ok", "--output-format", "json", "--print-timeout", "90s"],
@@ -161,6 +344,10 @@ def op_start(job_b64: str):
         out({"ok": False, "error": f"git worktree add failed: {(r.stderr or r.stdout).strip()[:300]}"})
     job.update({"id": jid, "repo": top, "worktree": wt, "branch": branch, "base": base_sha, "agy": b,
                 "created": time.time()})
+    try:
+        job["prompt"], _ = stage(job.get("prompt") or "", job)
+    except Exception as e:  # noqa: BLE001  (staging is a help, never a reason not to start)
+        job["stage_error"] = f"{type(e).__name__}: {e}"[:300]
     write_json(os.path.join(d, "job.json"), job)
     write_json(os.path.join(d, "state.json"), {"status": "starting", "turn": 0, "events": 0, "ts": time.time()})
     with open(os.path.join(d, "inbox", f"{time.time():.6f}.json"), "w", encoding="utf-8") as f:
@@ -175,7 +362,9 @@ def op_start(job_b64: str):
         time.sleep(0.25)
     st = read_json(os.path.join(d, "state.json"), {}) or {}
     out({"ok": st.get("status") not in ("error",), "job": jid, "worktree": wt, "branch": branch, "base": base_sha[:12],
-         "pid": p.pid, "status": st.get("status"), "error": st.get("error")})
+         "pid": p.pid, "status": st.get("status"), "error": st.get("error"),
+         "staged": [f"{k} -> {v['to']}" for k, v in (job.get("staged") or {}).items()][:20],
+         "settings": settings_state()})
 
 
 # ------------------------------------------------------------------------------------------------------- daemon
@@ -192,6 +381,8 @@ class Daemon:
         self.started = time.time()
         self.idle_since = time.time()
         self.resp: list[str] = []
+        self.pending_denial: str | None = None
+        self.turn_denied = False
 
     def save(self, **kw):
         self.state.update(kw, ts=time.time(), pid=os.getpid())
@@ -250,11 +441,10 @@ class Daemon:
             self.err.write(s + "\n")
             self.err.flush()
             if re.search(r"denied|not allowed|permission|requires approval|permissions\.allow", s, re.I):
-                den = self.state.setdefault("denied", [])
-                if s[:300] not in den:
-                    den.append(s[:300])
-                    del den[:-20]
-                self.record({"kind": "denied", "text": s[:500]})
+                m = re.search(r'the "([\w-]+)" permission', s)
+                self.pending_denial = m.group(1) if m else "?"
+                self.turn_denied = True
+                self.record({"kind": "denied", "text": s[:500], "action": self.pending_denial})
             elif re.search(r"authentication required|sign in|login", s, re.I):
                 self.state["auth_error"] = s[:300]
             return
@@ -287,6 +477,10 @@ class Daemon:
                        "out": clip(str(ti.get("output") or ""), MAX_TOOL_OUT)}
                 if ti.get("error"):
                     rec["error"] = clip(str((ti["error"] or {}).get("message") or ti["error"]), 300)
+                if self.pending_denial and not rec["out"]:
+                    self.add_denied(self.pending_denial, rec["tool"], params)
+                    rec["error"] = rec.get("error") or f"DENIED ({self.pending_denial} permission)"
+                    self.pending_denial = None
                 self.record(rec)
                 self.state["tools"] = int(self.state.get("tools") or 0) + 1
             if s.get("subagent_info"):
@@ -295,6 +489,9 @@ class Daemon:
                                                            for x in subs][:8]})
             self.save()
         elif kind == "result":
+            if self.pending_denial:              # a denial with no tool step after it
+                self.add_denied(self.pending_denial, "?", {})
+                self.pending_denial = None
             r = e.get("result") or {}
             text = (r.get("response") or "".join(self.resp)).strip()
             self.resp = []
@@ -303,10 +500,36 @@ class Daemon:
             turns = int(self.state.get("turn") or 0)
             self.record({"kind": "result", "status": r.get("status"), "text": clip(text, MAX_RESP),
                          "error": r.get("error")})
-            self.save(status="turn_done" if r.get("status") == "SUCCESS" else "turn_failed",
+            blocked = self.turn_denied
+            self.turn_denied = False
+            if blocked and not text:
+                d0 = (self.state.get("denied") or [{}])[-1]
+                text = (f"(agy produced no report: its step {d0.get('tool')} {d0.get('target') or ''} was denied "
+                        f"by the {d0.get('action')} permission, and headless mode cannot ask)")
+            self.save(status="blocked" if blocked else ("turn_done" if r.get("status") == "SUCCESS" else "turn_failed"),
                       last_status=r.get("status"), last_error=r.get("error"), response=clip(text, MAX_RESP),
                       usage=r.get("usage"), num_turns=r.get("num_turns"), turn=turns,
                       conversation_id=r.get("conversation_id") or self.state.get("conversation_id"))
+
+    def add_denied(self, action: str, tool, params: dict):
+        """v3.9.56: say which step was denied, on what, and why (the old list only had agy's generic text)."""
+        target = ""
+        for k in ("Path", "AbsolutePath", "TargetFile", "File", "CommandLine", "Command"):
+            if params.get(k):
+                target = str(params[k])
+                break
+        wt = self.job.get("worktree") or ""
+        outside = bool(target.startswith("/") and wt and not (target == wt or target.startswith(wt.rstrip("/") + "/")))
+        if outside:
+            why = "the path is outside the job's worktree; agy only reads/writes freely inside it"
+        elif action == "command":
+            why = "the command matches no allow rule in agy settings.json (AIW defaults)"
+        else:
+            why = f"no {action} allow rule covers it"
+        rec = {"action": action, "tool": tool, "target": clip(target, 300), "outside_worktree": outside, "why": why}
+        den = self.state.setdefault("denied", [])
+        den.append(rec)
+        del den[:-20]
 
     def run(self):
         j = self.job
@@ -323,7 +546,7 @@ class Daemon:
         except Exception as e:  # noqa: BLE001
             self.save(status="error", error=f"cannot start agy: {e}")
             return
-        self.save(status="running", agy_pid=proc.pid)
+        self.save(status="running", agy_pid=proc.pid, settings=settings_state())
         threading.Thread(target=self.pump, args=(proc.stdout, "out"), daemon=True).start()
         threading.Thread(target=self.pump, args=(proc.stderr, "err"), daemon=True).start()
         stop_file = os.path.join(self.d, "STOP")
@@ -336,7 +559,8 @@ class Daemon:
                 end_reason = "timeout"
             elif self.turn_active and now - self.last_io > idle_s:
                 end_reason = "idle"
-            elif not self.turn_active and now - self.idle_since > keep_s:
+            elif not self.turn_active and now - self.idle_since > (
+                    min(keep_s, 600) if self.state.get("status") == "blocked" else keep_s):
                 end_reason = "expired"
             if end_reason:
                 break
@@ -431,7 +655,9 @@ def summary(jid: str, cursor: int, with_diff: bool = True) -> dict:
            "said": [e.get("text") for e in evs if e.get("kind") == "say"][-3:],
            "response": st.get("response"), "last_status": st.get("last_status"), "error": st.get("error") or st.get("last_error"),
            "denied": st.get("denied") or [], "usage": st.get("usage"), "worktree": job.get("worktree"),
-           "branch": job.get("branch"), "note": st.get("note"), "auth_error": st.get("auth_error")}
+           "branch": job.get("branch"), "note": st.get("note"), "auth_error": st.get("auth_error"),
+           "ignored_rules": ((st.get("settings") or {}).get("ignored_rules") or [])[:8],
+           "staged": len(job.get("staged") or {})}
     if st.get("status") in ("running", "starting") and st.get("pid") and not alive(st.get("pid")):
         res["status"] = "error"
         res["error"] = "the bridge daemon is gone (computer restarted?)"
@@ -471,11 +697,18 @@ def op_wait(jid: str, seconds: float, cursor: int):
 def op_send(jid: str, text_b64: str):
     d = jdir(jid)
     st = read_json(os.path.join(d, "state.json"), {}) or {}
-    if st.get("status") not in ("running", "starting", "turn_done", "turn_failed") or not alive(st.get("pid")):
+    if st.get("status") not in ("running", "starting", "turn_done", "turn_failed", "blocked") or not alive(st.get("pid")):
         out({"ok": False, "job": jid, "status": st.get("status"),
              "error": "the agy session has ended; start a new job (pass conversation to keep its context)",
              "conversation_id": st.get("conversation_id")})
     text = base64.b64decode(text_b64).decode("utf-8")
+    job = read_json(os.path.join(d, "job.json"), {}) or {}
+    if job.get("worktree"):
+        try:
+            text, _ = stage(text, job)
+            write_json(os.path.join(d, "job.json"), job)
+        except Exception:  # noqa: BLE001
+            pass
     with open(os.path.join(d, "inbox", f"{time.time():.6f}.json"), "w", encoding="utf-8") as f:
         json.dump({"text": text}, f, ensure_ascii=False)
     out({"ok": True, "job": jid, "queued": True, "status": st.get("status")})
@@ -522,6 +755,7 @@ def main():
     ap.add_argument("--cursor", type=int, default=0)
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--reset", action="store_true")
     a = ap.parse_args()
     os.makedirs(JOBS, exist_ok=True)
     if a.op == "check":
@@ -545,6 +779,8 @@ def main():
         op_diff(a.job, a.full)
     elif a.op == "list":
         op_list()
+    elif a.op == "settings":
+        op_settings(a.reset)
     else:
         out({"ok": False, "error": f"unknown op {a.op}"}, 2)
 

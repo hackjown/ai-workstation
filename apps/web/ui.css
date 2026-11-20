@@ -330,6 +330,10 @@ body{font-family:var(--sans)}
 .plusmenu b{font-size:14px;font-weight:600;color:var(--text)}
 .plusmenu small{grid-column:2;font-size:12px;color:var(--dim);line-height:17px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .plusmenu .ck{grid-row:span 2;color:var(--acc);opacity:0}
+.plusmenu .pm-pack summary{list-style:none;display:grid;grid-template-columns:28px minmax(0,1fr);gap:2px 10px;align-items:center;padding:8px 10px;border-radius:var(--r-md);cursor:pointer}
+.plusmenu .pm-pack summary::-webkit-details-marker{display:none}
+.plusmenu .pm-pack summary:hover{background:var(--panel2)}
+.plusmenu .pm-pack[open] > button{padding-left:24px}
 .plusmenu button.on .ck{opacity:1}
 .plusmenu .sep{height:1px;background:var(--line);margin:6px 4px}
 .skillchips{display:flex;gap:6px;flex-wrap:wrap;padding:0 4px 6px}

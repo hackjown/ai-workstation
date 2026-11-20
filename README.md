@@ -93,6 +93,13 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.56 Antigravity 权限修复：不再被拒后空等、AIW 不许绕过
+
+- agy 只能自由读写自己的 worktree：任务里写的仓库绝对路径自动改成 worktree 里的同一文件；技能目录、未提交文件复制到 worktree 的 `.aiw-context/`（不进 git）。
+- 被拒的一步会写清：哪个工具、读写什么、为什么被拒；任务状态变成 `blocked`，不再空等 1 小时。
+- 默认规则只用 agy 认的 `read_file / write_file / command`；`check` 会列出 agy 忽略的规则。
+- AIW 禁止：在 shell 里直接跑 `agy`、加 `--dangerously-skip-permissions`、改 `~/.gemini` 设置。`git commit -qm` 不再被当成 Proxmox 命令拦下。详见 `docs/v3.9.56.md`。
+
 ## v3.9.55 代码任务一律在本地 VM 执行
 
 - 写程序、修 bug、调试、编译打包、部署、git/仓库、`.py` 等代码相关的新任务，一律分到本地 VM（装了 Antigravity），不再因为提到图片 / UI / logo 被分到「设计制图」云电脑。本地忙时在本地排队。

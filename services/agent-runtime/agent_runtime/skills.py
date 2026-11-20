@@ -461,5 +461,6 @@ def listing(custom: Optional[list[dict]] = None) -> list[dict]:
         if s.get("id") and not any(x["id"] == s["id"] for x in out):
             out.append({"id": s["id"], "title": s.get("title") or s["id"], "icon": "spark",
                         "desc": s.get("desc", ""), "path": s.get("path", ""), "setup": s.get("setup", ""), "builtin": False,
-                        "source": s.get("source", ""), "machines": s.get("machines", [])})
+                        "source": s.get("source", ""), "machines": s.get("machines", []),
+                        **({"pack": s["pack"]} if s.get("pack") else {})})
     return out

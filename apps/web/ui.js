@@ -428,8 +428,9 @@ async function togglePlus(e) {
     <div class="sep"></div><div class="pm-h">技能</div><div id="pmSkills"><div class="small" style="padding:6px 10px">加载中…</div></div>`;
   m.classList.add("open");
   const list = await loadSkillList();
-  $("pmSkills").innerHTML = list.map((s) => `<button role="menuitemcheckbox" class="${S.skills.includes(s.id) ? "on" : ""}" onclick="pickSkill('${esc(s.id)}')">
-      <span class="pi">${icon(IC[s.icon] ? s.icon : "spark")}</span><b>${esc(s.title)}</b><span class="ck">${icon("check")}</span><small>${esc(s.desc || s.path || "")}</small></button>`).join("")
+  const btn = (s) => `<button role="menuitemcheckbox" class="${S.skills.includes(s.id) ? "on" : ""}" onclick="pickSkill('${esc(s.id)}')">
+      <span class="pi">${icon(IC[s.icon] ? s.icon : "spark")}</span><b>${esc(s.title)}</b><span class="ck">${icon("check")}</span><small>${esc(s.desc || s.path || "")}</small></button>`;
+  $("pmSkills").innerHTML = skillGroups(list).map((g) => g.items ? `<details class="pm-pack"><summary><span class="pi">${icon("spark")}</span><b>${esc(g.title)}</b><small>${g.items.length} 个技能</small></summary>${g.items.map(btn).join("")}</details>` : btn(g)).join("")
     + `<button onclick="$('plusMenu').classList.remove('open');go('settings');setTimeout(()=>{const g=document.getElementById('g-skill');g&&g.scrollIntoView()},400)"><span class="pi">${icon("settings")}</span><b>管理技能</b><span class="ck"></span><small>添加你自己装在电脑上的技能</small></button>`;
 }
 function pickSkill(id) {
@@ -471,8 +472,9 @@ function skillSection(list) {
         `<button class="btn sm primary" ${job && !job.done ? "disabled" : ""}>${job && !job.done ? "安装中…" : "安装"}</button>`, "top")}</form>
       <div id="skJob">${skillJobHtml(job)}</div>
       <div id="skUpd" class="skupd"><span class="small">正在读取技能版本…</span></div>
-      ${(list || []).map((s) => `<div class="rw"><div class="k">${esc(s.title)}<small>${esc(s.id)}</small></div><div class="v"><span class="small">${esc(s.desc || "")}</span>${s.path ? `<span class="mono">${esc(s.path)}</span>` : ""}${s.builtin ? "" : `<span class="skm" data-sk="${esc(s.id)}"><span class="small">正在检查各电脑…</span></span>`}</div>
-        <div class="t">${s.builtin ? '<span class="tag">内置</span>' : `${s.source ? `<button class="btn sm ghost" onclick="syncSkill('${esc(s.source)}')" title="${esc(s.source)}">同步</button>` : ""}<button class="btn sm ghost" style="color:var(--bad)" onclick="delSkill('${esc(s.id)}')">删除</button>`}</div></div>`).join("")}
+      ${skillGroups(list).map((g) => g.items ? `<div class="rw"><div class="k">${esc(g.title)}<small>${esc(g.pack)} · ${g.items.length} 个</small></div><div class="v"><details><summary class="small">包含的技能</summary><span class="small mono">${g.items.map((s) => esc(s.id)).join("<br>")}</span></details></div>
+        <div class="t"><button class="btn sm ghost" style="color:var(--bad)" onclick="delSkillPack('${esc(g.pack)}', '${esc(g.title)}')">删除整包</button></div></div>` : [g].map((s) => `<div class="rw"><div class="k">${esc(s.title)}<small>${esc(s.id)}</small></div><div class="v"><span class="small">${esc(s.desc || "")}</span>${s.path ? `<span class="mono">${esc(s.path)}</span>` : ""}${s.builtin ? "" : `<span class="skm" data-sk="${esc(s.id)}"><span class="small">正在检查各电脑…</span></span>`}</div>
+        <div class="t">${s.builtin ? '<span class="tag">内置</span>' : `${s.source ? `<button class="btn sm ghost" onclick="syncSkill('${esc(s.source)}')" title="${esc(s.source)}">同步</button>` : ""}<button class="btn sm ghost" style="color:var(--bad)" onclick="delSkill('${esc(s.id)}')">删除</button>`}</div></div>`).join("")).join("")}
       <details class="skmanual"><summary class="small">已经手动装好了？只登记文件夹</summary>
       <form onsubmit="addSkill(event)">${row("登记技能", "默认 ~/.claude/skills/名字", `<div class="inl"><input name="id" placeholder="名字，如 pdf-tools" required style="flex:.6" /><input name="path" placeholder="留空 = ~/.claude/skills/名字" /></div><input name="desc" placeholder="一句话说明它能做什么（可选）" />`, `<button class="btn sm">登记</button>`, "top")}</form></details>
     </div></section>`;
@@ -524,7 +526,12 @@ function renderSkillUpdates() {
   const when = u.checked_at ? new Date(u.checked_at * 1000).toLocaleString() : "";
   const mname = (id) => ((u.machines || {})[id] || {}).name || id;
   const off = Object.values(u.machines || {}).filter((m) => !m.online).map((m) => m.name);
-  const rows = (u.items || []).filter((i) => i.state !== "ok" || i.kind === "self").map((i) => {
+  const packRows = Object.values(u.packs || {}).map((p) => `<div class="skm-row"><b>${esc(p.title)}<small> 技能包 · ${p.ids.length} 个</small></b>
+      <span class="chip ${p.state === "ok" ? "ok" : "warn"}">${p.state === "ok" ? "已装齐" : "不完整"}</span>
+      <span class="small">${esc(p.detail || (p.source ? "来自 " + p.source : ""))} ${Object.entries(p.machines || {}).map(([m, n]) => `<span class="chip ${n === p.ids.length ? "ok" : ""}">${esc(mname(m))} ${n}/${p.ids.length}</span>`).join("")}
+      ${!job ? `<button class="btn sm ghost" style="color:var(--bad)" onclick="delSkillPack('${esc(p.id)}', '${esc(p.title)}')">删除整包</button>` : ""}</span>
+      <details><summary class="small">包含的技能</summary><div class="small mono">${p.ids.map(esc).join("<br>")}</div></details></div>`).join("");
+  const rows = packRows + (u.items || []).filter((i) => i.kind !== "pack" && (i.state !== "ok" || i.kind === "self")).map((i) => {
     const st = SKU_ST[i.state] || [i.state, ""]; const js = job && job.items && job.items[i.id];
     const up = i.upstream && i.upstream.ahead ? `<details><summary class="small">上游 ${esc(i.upstream.repo)} 新 ${i.upstream.ahead} 个提交</summary><div class="small">${(i.upstream.msgs || []).map(esc).join("<br>")}</div></details>` : "";
     return `<div class="skm-row"><b>${esc(i.title || i.id)}<small> ${SKU_KIND[i.kind] || ""}</small></b>
@@ -539,6 +546,21 @@ function renderSkillUpdates() {
       <button class="btn sm ghost" ${job ? "disabled" : ""} onclick="loadSkillUpdates(true)">检查更新</button>
       <button class="btn sm primary" ${job || !act.length ? "disabled" : ""} onclick="runSkillUpdate()">${job ? "更新中…" : act.length ? `一键更新（${act.length}）` : "一键更新"}</button></div>
     ${rows || `<div class="small">${when ? "所有技能都是最新的。" : ""}</div>`}`;
+}
+async function delSkillPack(owner, title) {   /* v3.9.56 */
+  if (!confirm(`把「${title}」的全部技能从每台开着的电脑上移走？（会先放进 ~/.claude/.aiw-skill-backup/，可以找回）`)) return;
+  try { const r = await api("DELETE", "/api/skills/pack?owner=" + encodeURIComponent(owner)); toast(`已移走 ${(r.removed || []).length} 个技能` + ((r.offline || []).length ? `；没开机的：${r.offline.join("、")}` : "")); await loadSkillList(); loadSkillUpdates(true); if (typeof render === "function" && S.view === "settings") render(); }
+  catch (e) { toast(e.message); }
+}
+/* v3.9.56: skills of one pack (front matter owner: system-pack/…) are shown together */
+function skillGroups(list) {
+  const out = [], packs = {};
+  for (const s of list || []) {
+    if (!s.pack) { out.push(s); continue; }
+    if (!packs[s.pack]) { packs[s.pack] = { pack: s.pack, title: ((S.skUpd && S.skUpd.packs && S.skUpd.packs[s.pack]) || {}).title || s.pack.split("/").pop() + " 技能包", items: [] }; out.push(packs[s.pack]); }
+    packs[s.pack].items.push(s);
+  }
+  return out;
 }
 async function runSkillUpdate(ids) {
   try { const j = await api("POST", "/api/skills/update", ids ? { ids } : {}); S.skUpd = { ...(S.skUpd || {}), job: j }; renderSkillUpdates(); pollSkillUpdate(); }

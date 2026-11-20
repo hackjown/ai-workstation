@@ -678,6 +678,7 @@ class AgentLoop:
             pass
 
     def _finish(self, status: TaskStatus, result: str):
+        result = _agy.with_report(result, getattr(self, "_agy_report", None))   # v3.9.56
         self.task.status, self.task.result = status, result
         if self._intent == _in.DEV_FIX:   # v3.9.30: the working memory survives into a 继续 run
             self._persist("devmem", self.lp.snapshot())
@@ -3212,16 +3213,22 @@ class AgentLoop:
             self._agy_jobs = list(getattr(self, "_agy_jobs", []) or []) + [res["job"]]
         if res.get("job") and res.get("cursor") is not None:
             self._agy_cursor = {**(getattr(self, "_agy_cursor", {}) or {}), res["job"]: int(res["cursor"])}
-        ok = bool(res.get("ok", True)) and res.get("status") not in ("error", "stuck", "timed_out", "turn_failed")
+        ok = bool(res.get("ok", True)) and res.get("status") not in ("error", "stuck", "timed_out", "turn_failed",
+                                                                       "blocked")
         if op in ("start", "send") and res.get("ok"):
             self._acted = True
         ch = res.get("changes") or {}
+        if res.get("response") and res.get("job"):   # v3.9.56: agy's own summary reaches the user with the result
+            self._agy_report = {"job": res["job"], "branch": res.get("branch") or "", "status": res.get("status"),
+                                "text": str(res["response"]).strip(), "changes": ch.get("stat") or ""}
         await self.emit(EventType.ACTION_RESULT, tool="antigravity", success=ok, error=None if ok else str(
             res.get("error") or res.get("status"))[:200],
                         result=_short({"op": op, "job": res.get("job"), "status": res.get("status"),
                                        "branch": res.get("branch"), "turn": res.get("turn"),
                                        "tools": res.get("tools_total"), "changes": ch.get("stat") or res.get("stat"),
                                        "denied": len(res.get("denied") or []),
+                                       "denied_steps": [f"{d.get('tool')} {d.get('target') or ''}: {d.get('why')}"
+                                                        for d in (res.get("denied") or [])[-3:] if isinstance(d, dict)],
                                        "report": str(res.get("response") or "")[:500]}),
                         tool_ms=int((time.monotonic() - t0) * 1000))
         text = _agy.render(op, res)

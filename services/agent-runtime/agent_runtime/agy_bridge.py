@@ -37,7 +37,7 @@ import threading
 import time
 import uuid
 
-AGYV = "2"
+AGYV = "3"
 ROOT = os.path.expanduser("~/.config/aiw/agy")
 JOBS = os.path.join(ROOT, "jobs")
 MAX_TOOL_OUT = 600
@@ -319,6 +319,8 @@ def op_start(job_b64: str):
     b = agy_bin()
     if not b:
         out({"ok": False, "installed": False, "error": "agy not found on PATH"})
+    if job.get("plain"):   # v3.9.57: a chat session (AIW 的 agy 对话) runs in a folder, no worktree or branch
+        return start_plain(job, b)
     repo = os.path.abspath(os.path.expanduser(job.get("repo") or "~/workspace"))
     r = git(["rev-parse", "--show-toplevel"], repo)
     if r.returncode != 0:
@@ -364,6 +366,39 @@ def op_start(job_b64: str):
     out({"ok": st.get("status") not in ("error",), "job": jid, "worktree": wt, "branch": branch, "base": base_sha[:12],
          "pid": p.pid, "status": st.get("status"), "error": st.get("error"),
          "staged": [f"{k} -> {v['to']}" for k, v in (job.get("staged") or {}).items()][:20],
+         "settings": settings_state()})
+
+
+def start_plain(job: dict, b: str):
+    """v3.9.57: the folder is the session's workspace (made when missing). agy edits it in place, so AIW's chat shows
+    `git status` there when it is a repository; nothing is branched, pushed or reset."""
+    wd = os.path.abspath(os.path.expanduser(job.get("workdir") or "~/workspace/agy-chat"))
+    os.makedirs(wd, exist_ok=True)
+    jid = job.get("id") or ("agyc-" + time.strftime("%m%d%H%M") + "-" + uuid.uuid4().hex[:4])
+    d = jdir(jid)
+    if os.path.exists(d):
+        out({"ok": False, "error": f"job {jid} exists"})
+    os.makedirs(os.path.join(d, "inbox"), exist_ok=True)
+    job.update({"id": jid, "repo": wd, "worktree": wd, "branch": "", "base": "", "agy": b, "created": time.time()})
+    try:
+        job["prompt"], _ = stage(job.get("prompt") or "", job)
+    except Exception as e:  # noqa: BLE001
+        job["stage_error"] = f"{type(e).__name__}: {e}"[:300]
+    write_json(os.path.join(d, "job.json"), job)
+    write_json(os.path.join(d, "state.json"), {"status": "starting", "turn": 0, "events": 0, "ts": time.time()})
+    with open(os.path.join(d, "inbox", f"{time.time():.6f}.json"), "w", encoding="utf-8") as f:
+        json.dump({"text": job.get("prompt") or ""}, f, ensure_ascii=False)
+    log = open(os.path.join(d, "daemon.log"), "ab")
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "daemon", jid], stdin=subprocess.DEVNULL,
+                         stdout=log, stderr=log, start_new_session=True, cwd=wd)
+    for _ in range(40):
+        st = read_json(os.path.join(d, "state.json"), {}) or {}
+        if st.get("status") not in (None, "starting") or not alive(p.pid):
+            break
+        time.sleep(0.25)
+    st = read_json(os.path.join(d, "state.json"), {}) or {}
+    out({"ok": st.get("status") not in ("error",), "job": jid, "worktree": wd, "branch": "", "base": "",
+         "pid": p.pid, "status": st.get("status"), "error": st.get("error"), "plain": True,
          "settings": settings_state()})
 
 
@@ -668,6 +703,14 @@ def summary(jid: str, cursor: int, with_diff: bool = True) -> dict:
 
 def changes(job: dict, full: bool = False) -> dict:
     wt, base = job["worktree"], job["base"]
+    if not base:   # v3.9.57 plain session: what changed in the folder (when it is a git repository)
+        if git(["rev-parse", "--git-dir"], wt).returncode != 0:
+            return {"files": [], "stat": "not a git repository", "commits": []}
+        names = git(["status", "--short"], wt).stdout.strip().splitlines()
+        r = {"files": names[:80], "stat": f"{len(names)} changed" if names else "no changes", "commits": []}
+        if full:
+            r["diff"] = clip(git(["diff"], wt, 120).stdout, 60000)
+        return r
     git(["add", "-A", "-N"], wt)   # untracked files show in the diff without staging content
     stat = git(["diff", "--stat", base], wt).stdout.strip().splitlines()
     names = git(["diff", "--name-status", base], wt).stdout.strip().splitlines()
@@ -731,7 +774,7 @@ def op_diff(jid: str, full: bool):
     job = read_json(os.path.join(jdir(jid), "job.json"), None)
     if not job:
         out({"ok": False, "error": f"no job {jid}"})
-    out({"ok": True, "job": jid, "worktree": job["worktree"], "branch": job["branch"], "base": job["base"][:12],
+    out({"ok": True, "job": jid, "worktree": job["worktree"], "branch": job["branch"], "base": (job["base"] or "")[:12],
          **changes(job, full)})
 
 

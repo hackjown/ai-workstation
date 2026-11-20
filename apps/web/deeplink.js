@@ -27,6 +27,10 @@
         if (kind === "takeover" && typeof toggleTakeover === "function") setTimeout(() => { if (!S.take) toggleTakeover(); }, 1200);
         return;
       }
+      if (kind === "bots") {   // v3.9.57 bots?c=<conversation>
+        if (q.get("c")) { BT.cid = q.get("c"); localStorage.setItem("aiw_bot_conv", q.get("c")); }
+        go("bots"); return;
+      }
       if (kind === "monitor") {
         go("tracking");
         const id = parts[1];

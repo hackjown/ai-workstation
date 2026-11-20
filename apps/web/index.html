@@ -20,6 +20,7 @@
 <link rel="stylesheet" href="mdview.css" />
 <link rel="stylesheet" href="approval.css" />
 <link rel="stylesheet" href="home.css" />
+<link rel="stylesheet" href="bots.css" />
 <link rel="stylesheet" href="shop.css" />
 <link rel="stylesheet" href="search.css" />
 <link rel="stylesheet" href="call.css" />
@@ -38,6 +39,7 @@
     <div class="navs">
       <button data-view="home" onclick="go('home')"><i data-i="chat"></i>聊天<span class="badge" id="chatBadge"></span></button>
       <button data-view="tasks" onclick="go('tasks')"><i data-i="bolt"></i>任务</button>
+      <button data-view="bots" onclick="go('bots')"><i data-i="monitor"></i>引擎对话</button>
       <button data-view="activity" onclick="go('activity')"><i data-i="activity"></i>活动<span class="badge" id="needBadge"></span></button>
       <button data-view="tracking" onclick="go('tracking')"><i data-i="target"></i>追踪</button>
       <button data-view="routines" onclick="go('routines')"><i data-i="clock"></i>例程</button>
@@ -120,6 +122,25 @@
           <input id="tkSearch" class="grow" placeholder="搜索任务…" oninput="renderTasksPage()" />
         </div>
         <div id="tkList" class="list"></div>
+      </div>
+    </div>
+
+    <!-- v3.9.57 引擎对话 (bots.js): conversations with Antigravity / Codex on the computer, AIW 管家 can take over -->
+    <div class="view" id="v-bots">
+      <div class="bt-wrap">
+        <aside id="btList" class="bt-list scroll"></aside>
+        <section class="bt-conv">
+          <div id="btHead" class="bt-top"></div>
+          <div id="btTake"></div>
+          <div id="btMsgs" class="scroll bt-msgs"><div class="muted pad center">选一个对话，或新建一个</div></div>
+          <div class="composer-wrap">
+            <div id="btQuote" class="hquote-bar" hidden></div>
+            <form class="composer" onsubmit="btSend(event)">
+              <textarea id="btPrompt" rows="1" placeholder="对它说…（管家接管时也可以插话）" oninput="autoGrow(this)" onkeydown="btKey(event)"></textarea>
+              <button class="send" aria-label="发送"><i data-i="up"></i></button>
+            </form>
+          </div>
+        </section>
       </div>
     </div>
 
@@ -247,6 +268,7 @@
   <nav id="tabs">
     <button data-view="home" onclick="go('home')"><i data-i="chat"></i><span>聊天</span></button>
     <button data-view="tasks" onclick="go('tasks')"><i data-i="bolt"></i><span>任务</span></button>
+    <button data-view="bots" onclick="go('bots')"><i data-i="bolt"></i><span>引擎</span></button>
     <button data-view="activity" onclick="go('activity')"><i data-i="activity"></i><span>活动</span></button>
     <button data-view="computer" onclick="go('computer')"><i data-i="monitor"></i><span>电脑</span></button>
     <button data-view="settings" onclick="go('settings')"><i data-i="settings"></i><span>更多</span></button>
@@ -276,6 +298,7 @@
 <script src="mate.js"></script>
 <script src="travel.js"></script>
 <script src="home.js"></script>
+<script src="bots.js"></script>
 <script src="memory.js"></script>
 <script src="lessons.js"></script>
 <script src="deeplink.js"></script>

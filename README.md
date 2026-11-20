@@ -93,6 +93,13 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.57 引擎对话：直接和 Antigravity 聊，也能交给 AIW 管家；聊天可以引用
+
+- 新页面「引擎对话」：每个对话绑定电脑上一个 Antigravity 会话和一个工作文件夹（原地修改，不建分支、不推送）。进程空闲 2 小时退出后，下一句话用 `--conversation` 接上原会话。
+- 「交给管家」：写下目标和验收标准，AIW 读 agy 每一轮的回复、步骤、被拒操作和改动，决定下一句；完成、需要你决定或轮数用完就交还给你并推送。你随时可以插话。
+- 引用：主聊天和引擎对话里每条消息都能「引用」，被引用的那条和它前后的对话会一起带进下一轮；引擎的回复可以「问小秘」带到主聊天里讨论。
+- Codex 已列出，下一版接入（同一套接口）。详见 `docs/v3.9.57.md`。
+
 ## v3.9.56 Antigravity 权限修复：不再被拒后空等、AIW 不许绕过
 
 - agy 只能自由读写自己的 worktree：任务里写的仓库绝对路径自动改成 worktree 里的同一文件；技能目录、未提交文件复制到 worktree 的 `.aiw-context/`（不进 git）。

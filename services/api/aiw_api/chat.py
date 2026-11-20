@@ -338,6 +338,26 @@ class Chat:
         r = self.store._x("SELECT * FROM chat_messages WHERE id=?", (mid,))
         return _row(r[0]) if r else None
 
+    def quote(self, mid: str) -> Optional[dict]:
+        """v3.9.57: a quoted chat message with the two messages before it and the one after (rendered as the model
+        reads them), so a quote of something said long ago brings its context back into the next turn."""
+        m = self.get(mid)
+        if not m:
+            return None
+        before = self.store._x("SELECT * FROM chat_messages WHERE conv=? AND seq<? ORDER BY seq DESC LIMIT 2",
+                               (CONV, m["seq"]))
+        after = self.store._x("SELECT * FROM chat_messages WHERE conv=? AND seq>? ORDER BY seq LIMIT 1", (CONV, m["seq"]))
+        name = self.agent_name()
+
+        def item(r: dict) -> dict:
+            body = self.render({**r, "data": {k: v for k, v in (r.get("data") or {}).items() if k != "quote"}}) or ""
+            return {"who": "用户" if r["role"] == "user" else name, "text": body[:400]}
+        ctx = [item(_row(r)) for r in reversed(before)] + [item(_row(r)) for r in after]
+        me = item(m)
+        return {"id": m["id"], "src": "chat", "who": me["who"], "text": (self.render(
+            {**m, "data": {k: v for k, v in (m.get("data") or {}).items() if k != "quote"}}) or "")[:1500],
+            "context": ctx}
+
     def update(self, mid: str, text: Optional[str] = None, data: Optional[dict] = None, task_id: Optional[str] = None,
                push: bool = True) -> Optional[dict]:
         m = self.get(mid)
@@ -646,6 +666,9 @@ class Chat:
         d, k = m.get("data") or {}, m["kind"]
         if k == "text":
             t = m.get("text") or ""
+            if d.get("quote"):   # v3.9.57
+                from .bots import quote_block
+                t = quote_block(d["quote"]) + "\n\n" + t
             att = d.get("attachments") or []
             if att:
                 t += "\n（附件：" + "、".join(a.get("name") or os.path.basename(a.get("vm_path") or "") for a in att) + "）"
@@ -794,7 +817,8 @@ class Chat:
 
     # ------------------------------------------------------------------ the exchange
     async def send(self, text: str, attachments: Optional[list] = None, machine_id: Optional[str] = None,
-                   mode: str = "auto", on_event: Optional[Callable[[str, Any], Awaitable[None]]] = None) -> dict:
+                   mode: str = "auto", on_event: Optional[Callable[[str, Any], Awaitable[None]]] = None,
+                   quote: Optional[dict] = None) -> dict:
         async def say(kind: str, data):
             if on_event:
                 try:
@@ -805,7 +829,10 @@ class Chat:
         attachments = [a for a in (attachments or []) if isinstance(a, dict)][:10]
         async with self._lock:
             self._stop_next = False
-            user = self.add("user", "text", text, {"attachments": attachments} if attachments else {})
+            ud = {"attachments": attachments} if attachments else {}
+            if quote:   # v3.9.57: the quoted message (and the turns around it) rides on this one, see render()
+                ud["quote"] = quote
+            user = self.add("user", "text", text, ud)
             await say("user", user)
             if self.memory:   # 记住… / 忘掉… act at once, no model reply needed
                 try:
@@ -1835,6 +1862,7 @@ class ChatIn(BaseModel):
     machine_id: Optional[str] = None
     mode: str = "auto"          # auto | chat | task (新建任务 / a forced route)
     stream: bool = True
+    quote: Optional[str] = None  # v3.9.57: id of the message being quoted (main chat or an engine conversation)
 
 class DeviceResultIn(BaseModel):   # v3.9.28
     tool: str
@@ -1898,7 +1926,11 @@ def mount(app, chat: Chat, auth) -> None:
 
         async def run():
             try:
-                return await chat.send(body.text, body.attachments, body.machine_id, body.mode, on_event)
+                quote = None
+                if body.quote:   # v3.9.57
+                    bots = getattr(app.state, "bots", None)
+                    quote = bots.quote(body.quote, chat) if bots else chat.quote(body.quote)
+                return await chat.send(body.text, body.attachments, body.machine_id, body.mode, on_event, quote=quote)
             except Exception as e:  # noqa: BLE001  never silent
                 log.exception("chat send")
                 m = chat.add("assistant", "text", f"出错了：{type(e).__name__}: {str(e)[:160]}", {"error": True})

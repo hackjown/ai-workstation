@@ -240,7 +240,7 @@ function hMsg(m) {
   const d = m.data || {};
   if (m.role === "user") {
     const att = hAttPreview(d.attachments || []);
-    return `<div class="u hrow" data-id="${m.id}"><div><div class="bubble">${hUserText(m.text)}</div>${att}<div class="meta">${m.tmp ? "发送中…" : hTime(m.created_at)}</div></div></div>`;
+    return `<div class="u hrow" data-id="${m.id}"><div>${hQuoteShow(d.quote)}<div class="bubble">${hUserText(m.text)}</div>${att}<div class="meta">${m.tmp ? "发送中…" : hTime(m.created_at)}</div></div></div>`;
   }
   if (m.kind === "task") return hTaskCard(m);
   if (m.kind === "ask") return hAsk(m);
@@ -305,6 +305,12 @@ function hDelBtns(root) {
     b.className = "hdel"; b.type = "button"; b.title = "删除这条消息"; b.textContent = "删除";
     b.onclick = (e) => { e.stopPropagation(); hDelete(id); };
     row.appendChild(b);
+    if (m.kind !== "task" || (m.data || {}).result) {   // v3.9.57 引用
+      const q = document.createElement("button");
+      q.className = "hdel hquo"; q.type = "button"; q.title = "引用这条，接着它说"; q.textContent = "引用";
+      q.onclick = (e) => { e.stopPropagation(); row.classList.remove("hdel-on"); hQuoteSet(m); };
+      row.appendChild(q);
+    }
     row.oncontextmenu = (e) => { if (window.getSelection && String(window.getSelection())) return; e.preventDefault(); hDelete(id); };
     let t = null;
     row.addEventListener("touchstart", () => { t = setTimeout(() => { t = null; row.classList.add("hdel-on"); }, 550); }, { passive: true });
@@ -501,17 +507,18 @@ async function hSend(e) {
   const skills = HS.skills.slice();
   const text = skills.length ? `【技能：${skills.join("、")}】\n${body}` : body;   // the old + menu's marker (agent_runtime/skills.py)
   const attachments = HS.attach.map(({ up, pct, uid, ...a }) => a), mode = HS.mode;
+  const quote = HS.quote ? HS.quote.id : null; HS.quote = null; hQuoteRender();
   if (hStaged()) { HS.stageOff = true; hStage(false); }
   box.value = ""; autoGrow(box); localStorage.removeItem("aiw_hdraft"); HS.attach = []; hRenderAttach(); hSetMode("auto");
   HS.skills = []; hRenderTokens();
-  if (HS.sending) { HS.outbox.push({ id: "q-" + Date.now(), text, attachments, mode }); hRender(); hScrollLatest(); hKeys(); return; }
-  await hSendNow(text, attachments, mode, { raw, skills });
+  if (HS.sending) { HS.outbox.push({ id: "q-" + Date.now(), text, attachments, mode, quote }); hRender(); hScrollLatest(); hKeys(); return; }
+  await hSendNow(text, attachments, mode, { raw, skills }, quote);
   await hFlush();
 }
 async function hFlush() {   // queued messages, oldest first, one after the other
   while (!HS.sending && HS.outbox.length) {
     const q = HS.outbox.shift();
-    if (!(await hSendNow(q.text, q.attachments, q.mode))) { HS.outbox.unshift(q); hRender(); break; }
+    if (!(await hSendNow(q.text, q.attachments, q.mode, undefined, q.quote))) { HS.outbox.unshift(q); hRender(); break; }
   }
 }
 function hQueued(q) {
@@ -525,14 +532,14 @@ async function hQueuedNow(id) {
   if (HS.sending) await hStop(); else await hFlush();
 }
 function hQueuedDrop(id) { HS.outbox = HS.outbox.filter((q) => q.id !== id); hRender(); hKeys(); }
-async function hSendNow(text, attachments, mode, undo) {
+async function hSendNow(text, attachments, mode, undo, quote) {
   HS.sending = true; hSendKey(true);
   hUpsert({ id: "tmp-" + Date.now(), role: "user", kind: "text", text: text || "（附件）", data: { attachments }, tmp: true }, { stick: true });
   hStreamShow("", "正在想…");
   let gotReply = false;
   let openTaskAfterHandoff = null;   // 3.9.10: a phone opens the task the message was handed to
   try {
-    const res = await fetch("/api/chat/send", { method: "POST", headers: H(), body: JSON.stringify({ text, attachments, machine_id: MID, mode, stream: true }) });
+    const res = await fetch("/api/chat/send", { method: "POST", headers: H(), body: JSON.stringify({ text, attachments, machine_id: MID, mode, stream: true, quote: quote || null }) });
     if (!res.ok) throw new Error((await res.text()).slice(0, 200) || res.status);
     const rd = res.body.getReader(), dec = new TextDecoder();
     let buf = "", acc = "";
@@ -1133,3 +1140,29 @@ window.aiwFastResult = async function (cid, json) {
     await new Promise((ok) => setTimeout(ok, 1500 * (i + 1)));
   }
 };
+
+
+/* ---------------------------------------------------------------- v3.9.57 引用: quote a message (here or from an engine
+   conversation); the server sends the quoted text and the turns around it with the next message */
+function hQuoteShow(q) {
+  if (!q || !q.text) return "";
+  return `<div class="hquote" title="${esc(q.text.slice(0, 300))}"><b>${esc(q.who || "")}</b>${esc(q.text.replace(/\s+/g, " ").slice(0, 90))}</div>`;
+}
+function hQuoteSet(m, who) {
+  const name = who || (m.role === "user" ? "我" : (HS.agent || "小秘"));
+  const text = (m.text || (m.data && m.data.title) || "").trim();
+  HS.quote = { id: m.id, who: name, text: text || "（卡片）" };
+  hQuoteRender();
+  const el = $("hprompt"); if (el) el.focus();
+}
+function hQuoteRender() {
+  let box = $("hquoteBar");
+  if (!box) {
+    const at = $("hattach"); if (!at) return;
+    box = document.createElement("div"); box.id = "hquoteBar"; box.className = "hquote-bar"; at.parentNode.insertBefore(box, at);
+  }
+  const q = HS.quote;
+  box.hidden = !q;
+  box.innerHTML = q ? `<div class="hquote"><b>${esc(q.who)}</b>${esc(q.text.replace(/\s+/g, " ").slice(0, 120))}</div>
+    <button type="button" class="link" aria-label="取消引用" onclick="HS.quote=null;hQuoteRender()">×</button>` : "";
+}

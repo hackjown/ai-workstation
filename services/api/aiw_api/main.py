@@ -332,6 +332,10 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     chat = _chat.Chat(store, sessions, notifier, settings, secrets)
     app.state.chat = chat
     _chat.mount(app, chat, auth)
+    from . import bots as _bots   # v3.9.57 引擎对话: agy (then Codex) sessions the user or AIW 管家 talks to
+    app.state.bots = _bots.Bots(store, sessions, notifier, llm=lambda: chat.llm("chat"),
+                                default_machine=lambda: settings.machines[0].id if settings.machines else "ai-linux-001")
+    _bots.mount(app, app.state.bots, auth, chat)
     from . import memory as _memory   # long-term memory: profile / facts / decisions for the chat and every task
     mem = _memory.Memory(store, sessions, llm=chat.llm)
     chat.memory = mem

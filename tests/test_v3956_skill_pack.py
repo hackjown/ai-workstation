@@ -90,3 +90,19 @@ def test_ui_groups_packs():
     assert "function skillGroups" in ui and "删除整包" in ui and "/api/skills/pack?owner=" in ui
     assert "_agy_report" in (Path(__file__).resolve().parents[1] /
                              "services/agent-runtime/agent_runtime/loop.py").read_text(encoding="utf-8")
+
+
+async def test_quick_check_replaces_a_cached_check_from_before_packs(tmp_path):
+    f = Fleet(tmp_path)
+    write_pack_skill(f.skill("a", "istoreos-app-search"))
+    f.kv["skills_updates"] = {"checked_at": 1, "items": [], "counts": {}}   # what v3.9.55 kept
+    await f.updater().check(github=False)
+    assert "system-pack/istoreos" in f.kv["skills_updates"]["packs"]
+
+
+def test_slash_picker_and_endpoints_know_packs():
+    root = Path(__file__).resolve().parents[1]
+    home = (root / "apps/web/home.js").read_text(encoding="utf-8")
+    assert "skillGroups(list)" in home and 'startsWith("pack:")' in home
+    main = (root / "services/api/aiw_api/main.py").read_text(encoding="utf-8")
+    assert '"packs" not in cur' in main

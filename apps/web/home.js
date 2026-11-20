@@ -618,7 +618,7 @@ function hSetMode(m) {
 function newTaskMode() { go("home"); hSetMode("task"); setTimeout(() => $("hprompt").focus(), 30); }
 
 /* ---------------------------------------------------------------- "/" skill picker (the skills the old + menu listed: GET /api/skills) */
-const HK = { list: null, open: false, sel: 0, q: "", start: -1, rows: [] };
+const HK = { list: null, open: false, sel: 0, q: "", start: -1, rows: [], pack: null };
 async function hSkillList() { if (!HK.list) { HK.list = await loadSkillList(); } return HK.list || []; }
 function hSlashCheck(el) {
   const pos = el.selectionStart == null ? el.value.length : el.selectionStart;
@@ -629,6 +629,14 @@ function hSlashCheck(el) {
 }
 async function hSkOpen() {
   const list = await hSkillList(), q = HK.q;
+  if (!q && !HK.pack) {   // v3.9.56: a skill pack is one row; choosing it lists its skills
+    HK.rows = skillGroups(list).map((g) => g.items ? { id: "pack:" + g.pack, title: g.title, desc: `技能包 · ${g.items.length} 个技能，回车展开`, pack: g.pack } : g).slice(0, 40);
+    HK.sel = Math.min(HK.sel, Math.max(0, HK.rows.length - 1)); HK.open = true; hSkRender(); return;
+  }
+  if (HK.pack) {
+    HK.rows = [{ id: "pack:", title: "← 返回", desc: "" }].concat(list.filter((s) => s.pack === HK.pack && (!q || [s.id, s.title, s.desc].some((v) => String(v || "").toLowerCase().includes(q)))));
+    HK.sel = Math.min(HK.sel, Math.max(0, HK.rows.length - 1)); HK.open = true; hSkRender(); return;
+  }
   HK.rows = list.filter((s) => !q || [s.id, s.title, s.desc].some((v) => String(v || "").toLowerCase().includes(q)))
     .sort((a, b) => (String(a.id).toLowerCase().startsWith(q) ? 0 : 1) - (String(b.id).toLowerCase().startsWith(q) ? 0 : 1)).slice(0, 30);
   HK.sel = Math.min(HK.sel, Math.max(0, HK.rows.length - 1));
@@ -640,13 +648,14 @@ function hSkRender() {
   if (!HK.open) return;
   box.innerHTML = `<div class="hsk-hd">技能${HK.q ? ` · “${esc(HK.q)}”` : ""}<span>↑↓ 选择 · 回车确定 · Esc 关闭</span></div>`
     + (HK.rows.map((s, i) => `<div class="hsk-r ${i === HK.sel ? "on" : ""}" role="option" aria-selected="${i === HK.sel}" data-id="${esc(s.id)}"
-        onmousedown="event.preventDefault()" onclick="hSkChoose(this.dataset.id)"><span class="n">/${esc(s.id)}</span><span class="g"><b>${esc(s.title || s.id)}</b><small>${esc(s.desc || "")}</small></span></div>`).join("")
+        onmousedown="event.preventDefault()" onclick="hSkChoose(this.dataset.id)"><span class="n">${s.pack ? "▸ " + esc(s.pack.split("/").pop()) : s.id === "pack:" ? "←" : "/" + esc(s.id)}</span><span class="g"><b>${esc(s.title || s.id)}</b><small>${esc(s.desc || "")}</small></span></div>`).join("")
     || `<div class="hsk-none">没有匹配的技能 · <button class="link" onmousedown="event.preventDefault()" onclick="hSkClose();go('settings');setTimeout(()=>{const g=document.getElementById('g-skill');g&&g.scrollIntoView()},400)">管理技能</button></div>`);
   const on = box.querySelector(".hsk-r.on"); if (on) on.scrollIntoView({ block: "nearest" });
 }
 function hSkMove(d) { if (!HK.rows.length) return; HK.sel = (HK.sel + d + HK.rows.length) % HK.rows.length; hSkRender(); }
-function hSkClose() { if (!HK.open) return; HK.open = false; HK.sel = 0; hSkRender(); }
+function hSkClose() { HK.pack = null; if (!HK.open) return; HK.open = false; HK.sel = 0; hSkRender(); }
 function hSkChoose(id) {
+  if (String(id).startsWith("pack:")) { HK.pack = id.slice(5) || null; HK.sel = 0; hSkOpen(); $("hprompt").focus(); return; }   // v3.9.56
   const el = $("hprompt"), pos = el.selectionStart == null ? el.value.length : el.selectionStart;
   if (HK.start >= 0 && el.value[HK.start] === "/") { el.value = el.value.slice(0, HK.start) + el.value.slice(pos); el.selectionStart = el.selectionEnd = HK.start; }
   if (!HS.skills.includes(id)) HS.skills.push(id);

@@ -1588,6 +1588,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     @app.get("/api/skills", dependencies=[Depends(auth)])
     async def get_skills():
         from agent_runtime import skills as _skills
+        cur = store.kv_get("skills_updates", None) or {}
+        if "packs" not in cur and not skillupd.lock.locked():   # v3.9.56: the first check marks the pack members
+            asyncio.create_task(skillupd.check(github=False))
         return _skills.listing(store.kv_get("skills_custom", []) or [])
 
     @app.put("/api/skills/custom", dependencies=[Depends(auth)])
@@ -1727,6 +1730,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     async def skill_updates(refresh: int = 0):
         """检查更新: cached result, or a fresh check of every running computer (paused cloud ones are not woken)."""
         cur = store.kv_get("skills_updates", None)
+        if cur and "packs" not in cur:   # v3.9.56: a check from before skill packs groups nothing
+            cur = None
         if refresh or not cur:
             if skillupd.lock.locked():
                 raise HTTPException(409, "正在更新技能，稍后再查")

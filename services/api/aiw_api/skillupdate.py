@@ -407,7 +407,7 @@ class SkillUpdater:
         res = {"checked_at": time.time(), "machines": ms, "items": items, "packs": packs,
                "counts": {k: sum(1 for i in items if i["state"] == k)
                           for k in ("update", "sync", "conflict", "upstream", "record")}}
-        if gh or not self.kv_get("skills_updates", None):   # a quick (no GitHub) auto run keeps the full check shown
+        if gh or "packs" not in (self.kv_get("skills_updates", None) or {}):   # v3.9.56: or the kept one predates packs   # a quick (no GitHub) auto run keeps the full check shown
             self.kv_set("skills_updates", res)
         return res
 

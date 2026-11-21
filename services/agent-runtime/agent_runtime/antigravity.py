@@ -134,6 +134,9 @@ def command(op: str, a: dict, job: dict | None = None) -> tuple[str, int]:
     if op == "send":
         b = base64.b64encode(str(a.get("message") or "").encode()).decode()
         return f"{py} send {jid} --text-b64 {b}", 30
+    if op == "allow":                    # v3.9.67: a rule the user approved in the app
+        b = base64.b64encode(str(a.get("rule") or "").encode()).decode()
+        return f"{py} allow --rule-b64 {b}", 30
     if op == "diff":
         return f"{py} diff {jid}" + (" --full" if a.get("full") else ""), 150
     if op == "stop":

@@ -641,6 +641,12 @@ struct HomeChatView: View {
                 .contextMenu { deleteItem(msg) }
             case "confirm": withAvatar(meta: false) { ConfirmRow(msg: msg, model: m, open: { open(msg, takeover: false) }) }
                 .contextMenu { deleteItem(msg) }
+            case "engine_permit": withAvatar(meta: false) {   // v3.9.68: an engine step the permission rules stopped
+                EnginePermitRow(msg: msg, model: m, open: {
+                    UserDefaults.standard.set(d.s("conv"), forKey: "aiw_open_engine_conv"); openSheet(.engine)
+                })
+            }
+                .contextMenu { deleteItem(msg) }
             case "task_result": resultRow(msg)
             default: textRow(msg)
             }
@@ -1134,6 +1140,56 @@ struct ConfirmRow: View {
         .padding(.trailing, 20)
     }
     func go(_ ok: Bool) { busy = true; Task { _ = await model.answer(msg.s("id"), ["approve": ok]); busy = false } }
+}
+
+/// v3.9.68: an engine (agy) step its permission rules stopped, as a confirm card: 允许这类命令 (adds the suggested
+/// rule) / 只这一轮全放开 / 拒绝. POST /api/bots/convs/{id}/permit; the card updates through the chat stream.
+struct EnginePermitRow: View {
+    let msg: JSON
+    @ObservedObject var model: HomeChat
+    let open: () -> Void
+    @State private var busy = false
+    @State private var confirmOnce = false
+    @Environment(\.colorScheme) private var cs
+    var body: some View {
+        let d = msg.o("data")
+        let resolved = d.o("resolved")
+        let done = !resolved.isEmpty, stale = d.b("stale") && !done
+        VStack(alignment: .leading, spacing: 8) {
+            Text((d.s("engine").isEmpty ? "引擎" : d.s("engine")) + " 需要你确认" + (d.s("title").isEmpty ? "" : " · " + d.s("title")))
+                .font(.caption.weight(.bold)).foregroundColor(done || stale ? Color.secondary : hStrong(cs))
+            Text(d.s("command").isEmpty ? "被权限拦下了（没抓到具体命令）" : "想运行：" + d.s("command"))
+                .font(.callout.weight(.semibold)).foregroundColor(hBubbleText(cs)).textSelection(.enabled)
+            if !d.s("rule").isEmpty { Text("允许后加的规则：" + d.s("rule")).font(.footnote).foregroundColor(.secondary) }
+            if d.b("takeover") { Text("管家在接管，你选了它接着做").font(.footnote).foregroundColor(.secondary) }
+            if done {
+                Label(resolved.s("text").isEmpty ? "已处理" : resolved.s("text"), systemImage: "checkmark").font(.footnote).foregroundColor(okGreen)
+            } else if stale {
+                Text("已过期（对话已经往下走了）").font(.footnote).foregroundColor(.secondary)
+            } else {
+                HStack {
+                    if !d.s("rule").isEmpty { Button("允许这类命令") { go("allow") }.buttonStyle(.borderedProminent).tint(amber) }
+                    Button("只这一轮全放开") { confirmOnce = true }.buttonStyle(.bordered).tint(amber)
+                    Button("拒绝") { go("deny") }.buttonStyle(.bordered)
+                }.controlSize(.small).disabled(busy)
+            }
+            Button("打开对话 ›", action: open).font(.caption).tint(hStrong(cs))
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .askCardStyle(cs, settled: done || stale)
+        .padding(.trailing, 20)
+        .confirmationDialog("只这一轮全放开？", isPresented: $confirmOnce, titleVisibility: .visible) {
+            Button("放开这一轮") { go("once") }
+        } message: { Text("这一轮不做权限检查（它能运行任何命令），下一轮恢复原来的规则。") }
+    }
+    func go(_ mode: String) {
+        busy = true
+        Task {
+            do { _ = try await API.shared.obj("POST", "/api/bots/convs/\(msg.o("data").s("conv"))/permit", ["mode": mode]) }
+            catch { await MainActor.run { model.err = error.localizedDescription } }
+            busy = false
+        }
+    }
 }
 
 /// 3.8.2: a row of the home chat keyed by its message id, with its index into the current array.

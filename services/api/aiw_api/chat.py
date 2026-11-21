@@ -691,6 +691,9 @@ class Chat:
             return f"［任务在问用户：{(m.get('text') or '')[:200]}］"
         if k == "confirm":
             return f"［任务请用户确认：{(m.get('text') or '')[:200]}］"
+        if k == "engine_permit":   # v3.9.68
+            st = (d.get("resolved") or {}).get("text") or ("已过期" if d.get("stale") else "等用户选")
+            return f"［引擎对话「{d.get('title') or ''}」被权限拦下，请用户确认：{(m.get('text') or '')[:200]}（{st}）］"
         return m.get("text") or None
 
     def summary(self) -> dict:

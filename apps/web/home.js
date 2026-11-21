@@ -160,6 +160,28 @@ function htcResult(r) {
   if (r.cards && typeof hTravelCards === "function") h += hTravelCards(r.cards);   // v3.9.40 订餐厅 / 机票比价
   return h + `</div>`;
 }
+// v3.9.68: an engine step the permission rules stopped, as a confirm card (允许这类命令 / 只这一轮全放开 / 拒绝)
+function hEnginePermit(m) {
+  const d = m.data || {}, done = d.resolved, stale = d.stale && !done;
+  let body = `<div class="hq-k">${esc(d.engine || "引擎")} 需要你确认${d.title ? " · " + esc(d.title) : ""}</div>
+    <div class="hq-q">${d.command ? "想运行：" + esc(d.command) : "被权限拦下了（没抓到具体命令）"}</div>`;
+  if (d.rule) body += `<div class="small hq-d">允许后加的规则：${esc(d.rule)}</div>`;
+  if (d.takeover) body += `<div class="small hq-d">管家在接管，你选了它接着做</div>`;
+  if (done) body += `<div class="hq-done">${icon("check")}${esc(done.text || "已处理")}</div>`;
+  else if (stale) body += `<div class="hq-done muted">已过期（对话已经往下走了）</div>`;
+  else body += `<div class="opts">${d.rule ? `<button class="btn sm primary" onclick="hEPermit('${esc(d.conv)}','allow')">允许这类命令</button>` : ""}<button class="btn sm ${d.rule ? "" : "primary"}" onclick="hEPermit('${esc(d.conv)}','once')">只这一轮全放开</button><button class="btn sm" onclick="hEPermit('${esc(d.conv)}','deny')">拒绝</button></div>`;
+  body += `<button class="link small hq-open" onclick="hOpenBotConv('${esc(d.conv)}')">打开对话 ›</button>`;
+  return hA(m, `<div class="hq confirm ${done || stale ? "off" : ""}">${body}</div>`, "nm");
+}
+async function hEPermit(cid, mode) {
+  if (mode === "once" && !confirm("这一轮不受权限限制（它能运行任何命令），下一轮恢复原来的规则。确定？")) return;
+  try { await api("POST", `/api/bots/convs/${cid}/permit`, { mode }); toast(mode === "deny" ? "已拒绝" : "好的，它接着做"); }
+  catch (e) { toast(e.message); }
+}
+function hOpenBotConv(cid) {
+  BT.cid = cid; localStorage.setItem("aiw_bot_conv", cid);
+  go("bots");
+}
 function hTaskCard(m) {
   const d = m.data || {};
   const phone = d.fast_path === "device";   // v3.9.28 手机快通道: no computer bar / 接管, a 手机 label ("escalated" = normal)
@@ -245,6 +267,7 @@ function hMsg(m) {
   if (m.kind === "task") return hTaskCard(m);
   if (m.kind === "ask") return hAsk(m);
   if (m.kind === "confirm") return hConfirm(m);
+  if (m.kind === "engine_permit") return hEnginePermit(m);   // v3.9.68
   if (m.kind === "task_result") {
     const ok = d.status === "succeeded";
     return hA(m, `<div class="hres ${ok ? "ok" : "bad"}"><div class="bubble hmd">${hMd(m.text)}</div>${hFiles(d.files)}${d.cards && typeof hTravelCards === "function" ? hTravelCards(d.cards) : ""}

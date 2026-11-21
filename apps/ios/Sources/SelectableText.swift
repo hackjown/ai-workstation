@@ -69,6 +69,7 @@ func foldedText(_ s: String, limit: Int) -> (String, Bool) {
 final class AiwTextView: UITextView, UITextViewDelegate {
     var whole: String = ""
     var onDelete: (() -> Void)? = nil   // 3.8.2: 删除 this chat message (set from the environment)
+    var onFile: ((String) -> Void)? = nil   // v3.9.67: a file:// link (an engine's output on the computer) opens in the app
     private var storage: NSTextStorage?
     /// An explicit TextKit 1 stack: the same layout boundingRect measures (iOS 16 would pick TextKit 2 by default).
     convenience init() {
@@ -97,6 +98,16 @@ final class AiwTextView: UITextView, UITextViewDelegate {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
+    /// v3.9.67: file:///home/aiw/workspace/… links are on the computer, not this phone: hand them to the app.
+    func textView(_ textView: UITextView, shouldInteractWith URL: URL, in characterRange: NSRange,
+                  interaction: UITextItemInteraction) -> Bool {
+        if URL.isFileURL, let f = onFile {
+            if interaction == .invokeDefaultAction { f(URL.path) }
+            return false
+        }
+        return true
+    }
+
     /// The system edit menu (long-press / selection) gets 复制全文 next to 复制 and 全选.
     @available(iOS 16.0, *)
     func textView(_ textView: UITextView, editMenuForTextIn range: NSRange, suggestedActions: [UIMenuElement]) -> UIMenu? {
@@ -121,6 +132,7 @@ struct SelectableText: UIViewRepresentable {
         v.attributedText = text
         v.whole = whole
         v.onDelete = context.environment.aiwDeleteMessage
+        v.onFile = context.environment.aiwOpenFile
         if let l = link { v.linkTextAttributes = [.foregroundColor: l, .underlineStyle: NSUnderlineStyle.single.rawValue] }
         return v
     }
@@ -128,6 +140,7 @@ struct SelectableText: UIViewRepresentable {
         if !(v.attributedText?.isEqual(to: text) ?? false) { v.attributedText = text }
         v.whole = whole
         v.onDelete = context.environment.aiwDeleteMessage
+        v.onFile = context.environment.aiwOpenFile
         if let l = link { v.linkTextAttributes = [.foregroundColor: l, .underlineStyle: NSUnderlineStyle.single.rawValue] }
     }
     @available(iOS 16.0, *)
@@ -160,6 +173,14 @@ extension EnvironmentValues {
     var aiwDeleteMessage: (() -> Void)? {
         get { self[AiwDeleteMessageKey.self] }
         set { self[AiwDeleteMessageKey.self] = newValue }
+    }
+}
+/// v3.9.67: the engine conversation sets this; a file:// link in a reply opens the file (copied from the computer).
+private struct AiwOpenFileKey: EnvironmentKey { static let defaultValue: ((String) -> Void)? = nil }
+extension EnvironmentValues {
+    var aiwOpenFile: ((String) -> Void)? {
+        get { self[AiwOpenFileKey.self] }
+        set { self[AiwOpenFileKey.self] = newValue }
     }
 }
 extension View {

@@ -70,7 +70,8 @@ def ensure_tables(store) -> None:
              "conv TEXT, role TEXT, text TEXT, data TEXT, created_at REAL, updated_at REAL)")
     store._x("CREATE INDEX IF NOT EXISTS ix_botmsg_conv ON bot_messages(conv, seq)")
     for col in ("cursor INTEGER DEFAULT 0", "model TEXT", "effort TEXT", "job_model TEXT",   # v3.9.58: model, effort
-                "grp TEXT", "origin TEXT", "branch TEXT"):   # v3.9.61: group member / sent from the main chat
+                "grp TEXT", "origin TEXT", "branch TEXT",   # v3.9.61: group member / sent from the main chat
+                "permit_card TEXT"):                        # v3.9.68: the open permission card in the AIW chat
         try:
             store._x(f"ALTER TABLE bot_convs ADD COLUMN {col}")
         except Exception:  # noqa: BLE001  already there
@@ -194,6 +195,64 @@ def turn_text(r: dict, bot: str = "agy") -> str:
     return said[-1] if said else "（这一轮没有文字回复）"
 
 
+# v3.9.67: a step the engine's permission rules stopped (headless mode cannot ask). The user decides in the app:
+# 「允许这类命令再试」 adds one allow rule to agy's settings.json, 「这一轮放开权限重跑」 reruns one turn with permissions off.
+# AIW itself never widens them (tool-router policy since v3.9.56).
+RISKY_HEAD = {"sudo", "su", "rm", "curl", "wget", "bash", "sh", "zsh", "env", "eval", "exec", "ssh", "scp", "dd",
+              "chmod", "chown", "git", "agy", "python", "python3", "node"}
+
+
+def suggest_rule(den: dict) -> str:
+    """The allow rule offered for one denied step: the command's program (and its flag) for a plain program,
+    the exact command for a risky one; the exact path for a file step."""
+    act = den.get("action") or ""
+    cmd = (den.get("command") or (den.get("target") if act == "command" else "") or "").strip()
+    if cmd:
+        first = cmd.splitlines()[0].strip()
+        toks = first.split()
+        head = toks[0] if toks else ""
+        if head and re.fullmatch(r"[\w.+-]+", head) and head not in RISKY_HEAD and len(cmd.splitlines()) == 1 \
+                and not re.search(r"[;&|`$<>]", first):
+            if len(toks) > 1 and re.fullmatch(r"-{1,2}[\w-]+", toks[1]):
+                return f"command(regex:{re.escape(head)} {re.escape(toks[1])}( .*)?)"
+            return f"command(regex:{re.escape(head)}( .*)?)"
+        return f"command({cmd})"
+    if act in ("read_file", "write_file") and den.get("target"):
+        return f"{act}({den['target']})"
+    return ""
+
+
+FILE_MAX = 40 * 1024 * 1024                              # vm-agent files.read(binary) cap
+
+
+def vm_file_path(raw: str, workdir: str) -> str:
+    """v3.9.67: a file an engine names in its reply (file:///home/aiw/workspace/…, ~/workspace/…, or relative to its
+    folder) as the path vm-agent files.read takes (its root is ~/workspace)."""
+    from urllib.parse import unquote
+    p = (raw or "").strip().strip("<>`'\"")
+    if p.startswith("file://"):
+        p = unquote(p[7:])
+    p = unquote(p) if "%" in p else p
+    if not p:
+        raise ValueError("没有文件路径")
+    if not p.startswith(("/", "~")):
+        p = (workdir or "~/workspace").rstrip("/") + "/" + p
+    if p.startswith("~/workspace/"):
+        p = p[len("~/workspace/"):]
+    elif p.startswith("~"):
+        raise ValueError("只能打开 ~/workspace 里的文件")
+    if ".." in p.split("/"):
+        raise ValueError("路径不对")
+    return p
+
+
+def blocked_text(den: dict, title: str) -> str:
+    what = (den.get("command") or den.get("target") or "").strip()
+    what = clip(re.sub(r"\s+", " ", what), 160)
+    return (f"（{title} 这一步被权限拦下了" + (f"：{what}" if what else "，没抓到具体是哪条命令") +
+            "。后台模式没法弹窗问你：可以点「允许这类命令再试」，或「这一轮放开权限重跑」。）")
+
+
 # --------------------------------------------------------------------------------------------- engines
 class AgyEngine:
     """Antigravity through agy_bridge.py (plain mode). All ops are one shell call on the computer."""
@@ -217,20 +276,25 @@ class AgyEngine:
             raise RuntimeError(f"agy {op} 没有结果：" + clip(out, 300))
         return r
 
-    def job(self, conv: dict, prompt: str) -> dict:
+    def job(self, conv: dict, prompt: str, skip: bool = False) -> dict:
         from agent_runtime import antigravity as agy
         j = agy.job_from_args({"conversation": conv.get("session") or ""}, prompt)
         j.update({"plain": True, "workdir": conv.get("workdir") or "~/workspace/agy-chat",
                   "max_turns": 1000, "timeout_min": 24 * 60, "keep_min": 120, "idle_min": 20})
         model, effort = model_flags(conv)
         j["model"], j["effort"] = model, effort
+        if skip:                                          # v3.9.67: the user's 「这一轮放开权限重跑」, one turn only
+            j["skip_permissions"] = True
         return j
+
+    async def allow(self, mid: str, rule: str) -> dict:
+        return await self.op(mid, "allow", {"rule": rule})
 
     async def models(self, mid: str) -> dict:
         return await self.op(mid, "models", {})
 
-    async def start(self, mid: str, conv: dict, prompt: str) -> dict:
-        return await self.op(mid, "start", {}, self.job(conv, prompt))
+    async def start(self, mid: str, conv: dict, prompt: str, skip: bool = False) -> dict:
+        return await self.op(mid, "start", {}, self.job(conv, prompt, skip))
 
     async def send(self, mid: str, job: str, text: str) -> dict:
         return await self.op(mid, "send", {"job": job, "message": text})
@@ -273,8 +337,8 @@ class CliEngine:
     async def models(self, mid: str) -> dict:
         return await self.op(mid, "models", {})
 
-    async def start(self, mid: str, conv: dict, prompt: str) -> dict:
-        return await self.op(mid, "start", {}, self.job(conv, prompt))
+    async def start(self, mid: str, conv: dict, prompt: str, skip: bool = False) -> dict:
+        return await self.op(mid, "start", {}, self.job(conv, prompt))   # v3.9.67: permits are agy-only
 
     async def send(self, mid: str, job: str, text: str) -> dict:
         return await self.op(mid, "send", {"job": job, "message": text})
@@ -292,6 +356,7 @@ class Bots:
                  default_machine: Optional[Callable[[], str]] = None, shell=None):
         self.store, self.sessions, self.notifier = store, sessions, notifier
         self.llm = llm                                   # () -> router with .complete(system, user, max_tokens)
+        self.chat = None                                 # v3.9.68: the AIW chat (set by mount) for permission cards
         self.default_machine = default_machine or (lambda: "ai-linux-001")
         ensure_tables(store)
         sh = shell or self._shell
@@ -553,6 +618,8 @@ class Bots:
             pass
         parts = [quote_block(quote) if quote else "", skills_block(skills, custom), files_block(attachments), text]
         prompt = "\n\n".join(p for p in parts if p)
+        if role == "user":
+            self.close_permit_card(cid, stale=True)       # v3.9.68: the conversation moved on
         self.queues.setdefault(cid, []).append({"msg": m["id"], "prompt": prompt})
         self._kick(cid)
         return m
@@ -573,7 +640,7 @@ class Bots:
                 item = q.pop(0)
                 if item.get("msg"):
                     self.update(item["msg"], data={"queued": False})
-                await self._turn(cid, item["prompt"])
+                await self._turn(cid, item["prompt"], skip=bool(item.get("skip")), fresh=bool(item.get("fresh")))
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -584,14 +651,21 @@ class Bots:
             if c and c.get("status") == "running":
                 self.set_conv(cid, status="idle")
 
-    async def _turn(self, cid: str, prompt: str) -> dict:
+    async def _turn(self, cid: str, prompt: str, skip: bool = False, fresh: bool = False) -> dict:
         c = self.conv(cid)
         eng = self.engines[c["bot"]]
         mid = c["machine_id"]
         self.set_conv(cid, status="running")
-        reply = self.add(cid, "bot", "", {"status": "running", "steps": [], "started": _now()})
+        reply = self.add(cid, "bot", "", {"status": "running", "steps": [], "started": _now(),
+                                          **({"unrestricted": True} if skip else {})})
         r: dict = {}
         job = c.get("job")
+        if job and (skip or fresh):                       # v3.9.67: a new rule or no rules: restart, resuming the session
+            try:
+                await eng.stop(mid, job)
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s restart for permit: %s", c["bot"], e)
+            job = None
         if job and (c.get("job_model") or "|") != model_key(c):
             try:                                          # v3.9.58: the model changed: restart, resuming the session
                 await eng.stop(mid, job)
@@ -606,7 +680,7 @@ class Bots:
             if not r.get("ok"):
                 job = None                                # the session ended: start one that resumes it
         if not job:
-            r = await eng.start(mid, c, prompt)
+            r = await eng.start(mid, c, prompt, skip) if skip else await eng.start(mid, c, prompt)
             if not r.get("ok"):
                 title = ENGINES.get(c["bot"], {}).get("title", c["bot"])
                 if r.get("installed") is False:
@@ -646,12 +720,76 @@ class Bots:
                 "steps": steps, "denied": (res.get("denied") or [])[-5:], "said": [],
                 "changes": res.get("changes"), "usage": res.get("usage"), "ended": _now()}
         text = turn_text(res, c["bot"])
+        if data["status"] == "blocked":
+            den = (data["denied"] or [{}])[-1]
+            for x in data["denied"]:
+                x["rule"] = suggest_rule(x)
+            if not (res.get("response") or "").strip() or "produced no report" in text[:60]:
+                text = blocked_text(den, ENGINES.get(c["bot"], {}).get("title", c["bot"]))
+        if skip:
+            data["unrestricted"] = True
         self.update(reply["id"], text, data)
+        if skip and alive:                                # the unrestricted process does not carry over to the next turn
+            try:
+                await eng.stop(mid, job)
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s stop after unrestricted turn: %s", c["bot"], e)
+            alive = False
         self.set_conv(cid, status="idle", job=job if alive else None, cursor=cursor,
                       session=res.get("conversation_id") or c.get("session"))
         if not self.conv(cid).get("takeover"):
-            await self._notify(cid, text)
+            if data["status"] == "blocked" and c["bot"] == "agy":
+                await self.permit_card(cid, data["denied"])    # v3.9.68: an approval card in the chat + a push
+            else:
+                await self._notify(cid, text)
         return {"status": data["status"], "text": text, "result": res}
+
+    # ------------------------------------------------------------------ v3.9.68 permission card in the AIW chat
+    async def permit_card(self, cid: str, denied: list) -> Optional[dict]:
+        """A step agy's rules stopped becomes a confirm card in the AIW chat (允许这类命令 / 只这一轮全放开 / 拒绝)
+        with a push, like a task's 需要你确认. One open card per conversation: a newer one replaces it."""
+        c = self.conv(cid) or {}
+        den = (denied or [{}])[-1]
+        cmd = clip(re.sub(r"\s+", " ", den.get("command") or den.get("target") or ""), 300)
+        rule = den.get("rule") or suggest_rule(den)
+        eng = ENGINES.get(c.get("bot"), {}).get("title", "Agent")
+        self.close_permit_card(cid, stale=True)
+        card = None
+        chat = getattr(self, "chat", None)
+        if chat is not None:
+            try:
+                card = chat.add("assistant", "engine_permit", f"{eng} 想运行：{cmd or '（没抓到具体命令）'}", {
+                    "conv": cid, "bot": c.get("bot"), "title": c.get("title") or "", "engine": eng,
+                    "command": cmd, "rule": rule, "why": clip(den.get("why") or den.get("detail") or "", 200),
+                    "takeover": bool(c.get("takeover"))})
+                self.set_conv(cid, permit_card=card["id"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("permit card: %s", e)
+        if self.notifier:
+            try:
+                await self.notifier.notify("confirm", f"{eng} 需要你确认", f"{c.get('title') or ''}：想运行 "
+                                           f"{cmd or '一条命令'}（被权限拦下了）",
+                                           deep=f"chat?m={card['id']}" if card else f"bots?c={cid}",
+                                           message_id=card["id"] if card else None)
+            except Exception as e:  # noqa: BLE001
+                log.debug("permit push: %s", e)
+        return card
+
+    def close_permit_card(self, cid: str, text: str = "", stale: bool = False, by: str = "app"):
+        """The open card for this conversation gets its answer (or 已过期 when the conversation moved on)."""
+        c = self.conv(cid) or {}
+        mid = c.get("permit_card")
+        chat = getattr(self, "chat", None)
+        if not mid or chat is None:
+            return
+        try:
+            m = chat.get(mid)
+            if m and not (m["data"].get("resolved") or m["data"].get("stale")):
+                chat.update(mid, data={"stale": True} if stale else
+                            {"resolved": {"text": text, "by": by, "at": time.time()}})
+        except Exception as e:  # noqa: BLE001
+            log.debug("permit card close: %s", e)
+        self.set_conv(cid, permit_card=None)
 
     async def _notify(self, cid: str, text: str):
         if not self.notifier:
@@ -694,7 +832,7 @@ class Bots:
         """After an engine turn, under takeover: decide. True when a next message was queued."""
         c = self.conv(cid)
         tk = (c or {}).get("takeover")
-        if not tk:
+        if not tk or tk.get("waiting"):
             return False
         msgs = self.messages(cid, limit=12)
         last = next((m for m in reversed(msgs) if m["role"] == "bot"), None)
@@ -704,6 +842,31 @@ class Bots:
             return False                                 # already judged (a release / re-takeover in between)
         self.update(last["id"], data={"managed": True})
         eng = ENGINES.get(c["bot"], {}).get("title", "Agent")
+        if last["data"].get("status") == "blocked":     # v3.9.67: reroute once, then the user decides the permission
+            den = (last["data"].get("denied") or [{}])[-1]
+            what = clip(re.sub(r"\s+", " ", den.get("command") or den.get("target") or "那条命令"), 160)
+            if not tk.get("rerouted"):
+                tk["rerouted"] = True
+                tk["rounds"] += 1
+                self.set_conv(cid, takeover=tk)
+                nxt = (f"上一步被权限拦下了（{what}），后台模式不能批准它。换一种做法继续：把要做的事写进工作目录里的一个脚本"
+                       "文件（例如 aiw_step.py 或 aiw_step.sh），再用 python3 aiw_step.py 或 bash aiw_step.sh 运行；"
+                       "不要装软件包、不要 sudo、不要读写工作目录以外的路径。实在绕不开，就说明还缺哪条命令、为什么。")
+                m = self.add(cid, "aiw", nxt, {"report": "被权限拦下，换个做法"})
+                self.queues.setdefault(cid, []).append({"msg": m["id"], "prompt": nxt})
+                return True
+            if c["bot"] != "agy":
+                self.add(cid, "aiw", f"它又被权限拦下了：{what}。这个引擎还不能在这里放开权限，先交还给你。",
+                         {"report": True, "ask": True})
+                self.release(cid, "管家停下了（被权限拦下）")
+                await self._notify(cid, f"管家：{eng} 被权限拦下了，需要你看一下")
+                return False
+            tk["waiting"] = "permit"
+            self.set_conv(cid, takeover=tk)
+            self.add(cid, "aiw", f"它又被权限拦下了：{what}。在它那条回复下面点「允许这类命令再试」或「这一轮放开权限重跑」，"
+                                 "我接着管；不想放开就点「收回」。", {"report": True, "ask": True, "permit": True})
+            await self.permit_card(cid, last["data"].get("denied") or [])
+            return False
         if tk["rounds"] >= tk["max"]:
             self.add(cid, "aiw", f"已经来回 {tk['max']} 轮还没完成，先停在这里。看一下它最后的回复，告诉我接下来怎么做，"
                                  "或者再交给我一次。", {"report": True})
@@ -748,6 +911,82 @@ class Bots:
         self.queues.setdefault(cid, []).append({"msg": m["id"], "prompt": dec["next"]})
         return True
 
+    async def fetch_file(self, cid: str, raw: str, out_dir: str) -> dict:
+        """v3.9.67: copy a file the engine made on the computer to the API host, for preview / download in the app."""
+        import base64
+        import hashlib
+        c = self.conv(cid)
+        if not c:
+            raise KeyError(cid)
+        rel = vm_file_path(raw, c.get("workdir") or "")
+        r = await self.sessions.computer(c["machine_id"]).execute("files.read", {"path": rel, "binary": True},
+                                                                  observe=False, timeout=300)
+        if not getattr(r, "success", False):
+            raise ValueError("电脑上读不到这个文件：" + clip(getattr(r, "error", "") or rel, 200))
+        res = getattr(r, "result", None) or {}
+        data = base64.b64decode(res.get("content_b64") or "")
+        if res.get("size") is not None and int(res["size"]) > len(data):
+            raise ValueError("文件超过 40 MB，没法在这里打开")
+        name = os.path.basename(rel.rstrip("/")) or "file"
+        d = os.path.join(out_dir, "engine-files", cid)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, hashlib.sha1(rel.encode()).hexdigest()[:8] + "-" + name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return {"path": path, "name": name, "size": len(data)}
+
+    async def permit(self, cid: str, mode: str, rule: str = "") -> dict:
+        """v3.9.67: the user's answer to a step the permission rules stopped. allow: add `rule` (or the suggested one)
+        to agy's settings and retry; once: retry this one turn with permissions off. Either restarts the engine
+        process, resuming its session, and continues where it stopped (under takeover the 管家 carries on)."""
+        c = self.conv(cid)
+        if not c:
+            raise KeyError(cid)
+        if c["bot"] != "agy":
+            raise ValueError("目前只有 Antigravity（agy）能在这里放开权限")
+        if mode not in ("allow", "once", "deny"):
+            raise ValueError("mode 只能是 allow、once 或 deny")
+        if self.busy(cid):
+            raise ValueError("它还在跑，等这一轮结束再点")
+        last = next((m for m in reversed(self.messages(cid, limit=20)) if m["role"] == "bot"), None)
+        if not last or last["data"].get("status") != "blocked":
+            raise ValueError("最近一轮没有被权限拦下")
+        den = (last["data"].get("denied") or [{}])[-1]
+        what = clip(re.sub(r"\s+", " ", den.get("command") or den.get("target") or ""), 160)
+        if mode == "deny":                                # v3.9.68: 拒绝 — nothing is widened, nothing reruns
+            self.update(last["id"], data={"permitted": "deny", "managed": True})
+            self.close_permit_card(cid, "已拒绝")
+            self.add(cid, "system", f"你拒绝了：{what or '这一步'}（没有放开权限）", {"permit": "deny"})
+            if (c.get("takeover") or {}).get("waiting"):
+                self.release(cid, "管家停下了（你拒绝了被拦的那一步）")
+            return self.conv(cid)
+        if mode == "allow":
+            rule = (rule or "").strip() or den.get("rule") or suggest_rule(den)
+            if not rule:
+                raise ValueError("没抓到被拦的具体命令，没法加规则：用「这一轮放开权限重跑」")
+            r = await self.engines["agy"].allow(c["machine_id"], rule)
+            if not r.get("ok"):
+                raise ValueError("没能加上规则：" + clip(r.get("error"), 200))
+            self.add(cid, "system", f"你允许了：{clip(rule, 300)}（写进了 agy 的权限设置，以后也算数）",
+                     {"permit": "allow", "rule": rule})
+            prompt = f"刚才被权限拦下的那一步（{what or '上一步'}）现在允许了。从被拦的地方接着做完，最后给一个简短报告。"
+        else:
+            self.add(cid, "system", "你放开了这一轮的权限（只这一轮，下一轮恢复原来的规则）", {"permit": "once"})
+            prompt = (f"这一轮已经放开权限，刚才被拦下的那一步（{what or '上一步'}）可以做了。从被拦的地方接着做完，"
+                      "最后给一个简短报告。")
+        self.update(last["id"], data={"permitted": mode, "managed": True})
+        self.close_permit_card(cid, "已允许这类命令" if mode == "allow" else "已放开这一轮")
+        tk = c.get("takeover")
+        if tk and tk.get("waiting"):
+            tk.pop("waiting", None)
+            tk["rerouted"] = False
+            self.set_conv(cid, takeover=tk)
+        m = self.add(cid, "user", prompt, {"permit": mode})
+        self.queues.setdefault(cid, []).append({"msg": m["id"], "prompt": prompt, "fresh": mode == "allow",
+                                               "skip": mode == "once"})
+        self._kick(cid)
+        return self.conv(cid)
+
     async def stop(self, cid: str) -> dict:
         c = self.conv(cid)
         if not c:
@@ -774,6 +1013,10 @@ try:
     from pydantic import BaseModel
 except ImportError:  # pragma: no cover  (the bridge tests import this module without the API's dependencies)
     BaseModel = object
+try:
+    from fastapi import Request          # v3.9.67: a module global, so the string annotation resolves
+except ImportError:  # pragma: no cover
+    Request = object
 
 class ConvIn(BaseModel):
     bot: str = "agy"
@@ -793,6 +1036,10 @@ class TakeIn(BaseModel):
     goal: str
     rounds: int = MAX_ROUNDS
 
+class PermitIn(BaseModel):
+    mode: str = "once"
+    rule: str = ""
+
 class PatchIn(BaseModel):
     title: Optional[str] = None
     model: Optional[str] = None
@@ -803,6 +1050,8 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     from fastapi import Depends, HTTPException
 
     dep = [Depends(auth)]
+    if chat is not None:
+        bots.chat = chat                                 # v3.9.68: permission cards go to the AIW chat
 
     def need(cid: str) -> dict:
         c = bots.conv(cid)
@@ -884,6 +1133,29 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
         need(cid)
         try:
             return bots.takeover(cid, body.goal, body.rounds)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/api/bots/convs/{cid}/file", dependencies=dep)
+    async def bots_file(cid: str, path: str, request: Request):
+        """v3.9.67: a file the engine made (a link in its reply) -> a copy on the API host; the app previews or
+        downloads it through /api/artifacts like any other output."""
+        need(cid)
+        st = getattr(request.app.state, "settings", None)
+        out_dir = getattr(st, "artifacts_dir", None) or os.environ.get("AIW_ARTIFACTS") or "workspace/artifacts"
+        try:
+            return await bots.fetch_file(cid, path, out_dir)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, "读不到这个文件：" + clip(e, 200))
+
+    @app.post("/api/bots/convs/{cid}/permit", dependencies=dep)
+    async def bots_permit(cid: str, body: PermitIn):
+        """v3.9.67: 「允许这类命令再试」 (mode=allow, rule optional) / 「这一轮放开权限重跑」 (mode=once)."""
+        need(cid)
+        try:
+            return await bots.permit(cid, body.mode, body.rule)
         except ValueError as e:
             raise HTTPException(400, str(e))
 

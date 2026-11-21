@@ -88,6 +88,39 @@ function btSchedule() {
 function btStopPoll() { if (BT.poll) { clearTimeout(BT.poll); BT.poll = null; } }
 function btScroll() { const b = $("btMsgs"); if (b) b.scrollTop = b.scrollHeight; }
 
+// v3.9.67: files an engine made on the computer (file:///home/aiw/workspace/…, ~/workspace/…): a link the phone can
+// open. The API copies the file over (GET …/file) and it opens like any other output (preview, or download).
+const BT_PATH_RE = /file:\/\/(\/[^\s)\]<>"'`]+)|((?:~|\/home\/[\w.-]+)\/workspace\/[^\s)\]<>"'`，。；]+\.[A-Za-z0-9]{1,6})/g;
+function btPaths(text) {
+  const out = [];
+  for (const m of String(text || "").matchAll(BT_PATH_RE)) {
+    let p = m[1] || m[2]; try { p = decodeURI(p); } catch (e) { /* keep */ }
+    p = p.replace(/[.,;:]+$/, "");
+    if (/\.[A-Za-z0-9]{1,6}$/.test(p) && !out.includes(p)) out.push(p);
+  }
+  return out.slice(0, 8);
+}
+const btFileLinks = (t) => String(t || "").replace(/\]\((file:\/\/[^)\s]+)\)/g, (_, u) => `](#aiwfile=${encodeURIComponent(u)})`);
+function btFileCards(text) {
+  return btPaths(text).map((p) => `<a class="bt-file" href="#aiwfile=${encodeURIComponent(p)}">${icon("file")}<span>${esc(p.split("/").pop())}</span><i>预览 / 下载</i></a>`).join("");
+}
+async function btFile(raw) {
+  if (!BT.cid) return;
+  toast("正在从电脑取文件…");
+  try {
+    const r = await api("GET", `/api/bots/convs/${BT.cid}/file?path=${encodeURIComponent(raw)}`);
+    const a = document.createElement("a");
+    a.className = "filecard"; a.href = artUrl(r.path, true); a.setAttribute("download", r.name);
+    a.innerHTML = `<b>${esc(r.name)}</b>`; a.style.display = "none";
+    document.body.appendChild(a); a.click(); setTimeout(() => a.remove(), 1000);
+  } catch (e) { toast(e.message); }
+}
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest('a[href^="#aiwfile="]');
+  if (!a) return;
+  e.preventDefault(); e.stopPropagation();
+  btFile(decodeURIComponent(a.getAttribute("href").slice(9)));
+}, true);
 function btMsg(m) {
   const d = m.data || {}, eng = btEngine((BT.conv || {}).bot);
   const q = typeof hQuoteShow === "function" ? hQuoteShow(d.quote) : "";
@@ -107,20 +140,26 @@ function btMsg(m) {
   const stepHtml = steps.length ? `<details class="bt-steps" ${running ? "open" : ""}><summary>${running ? "正在做" : "做了"} ${steps.length} 步</summary>
     ${steps.slice(-15).map((s) => `<div class="bt-step ${s.error ? "bad" : ""}"><b>${esc(s.tool || "")}</b> ${esc(s.arg || "")}${s.error ? ` <i>${esc(s.error)}</i>` : ""}</div>`).join("")}</details>` : "";
   const den = (d.denied || []).length ? `<div class="bt-denied">被拒绝的操作：${d.denied.map((x) => `${esc(x.tool || "")} ${esc(x.target || "")}（${esc(x.why || x.action || "")}）`).join("；")}</div>` : "";
+  // v3.9.67: the newest reply stopped by agy's permission rules: the user decides (AIW never widens them itself)
+  const lastBot = [...BT.msgs].reverse().find((x) => x.role === "bot");
+  const permit = d.status === "blocked" && !d.permitted && lastBot && lastBot.id === m.id && (BT.conv || {}).bot === "agy"
+    && !(BT.conv.busy || BT.conv.status === "running")
+    ? `<div class="bt-permit"><button class="btn sm primary" onclick="btPermit('allow')">允许这类命令再试</button><button class="btn sm" onclick="btPermit('once')">这一轮放开权限重跑</button><button class="btn sm" onclick="btPermit('deny')">拒绝</button></div>` : "";
   const ch = d.changes && (d.changes.files || []).length ? `<div class="small muted">改动：${esc(d.changes.files.slice(0, 8).join("，"))}${d.changes.files.length > 8 ? " …" : ""}</div>` : "";
   const body = running && !m.text
     ? `<div class="bubble hdots-b"><span class="hdots"><i></i><i></i><i></i></span><span class="hnote">${esc(((d.said || [])[0] || "").slice(0, 80) || "在电脑上干活…")}</span></div>`
-    : `<div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text)}</div>`;
+    : `<div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(btFileLinks(m.text))}</div>`;
+  const files = running ? "" : btFileCards(m.text);
   return `<div class="bt-row bot"><span class="bt-av ${esc((BT.conv || {}).bot || "agy")}">${esc((eng.short || eng.title).slice(0, 3))}</span><div class="bt-col">
     <div class="bt-name ${esc((BT.conv || {}).bot || "agy")}">${esc(eng.title)}${d.status === "blocked" ? " · 被权限挡住" : d.status === "stopped" ? " · 已停止" : ""}</div>
-    ${body}${stepHtml}${den}${ch}<div class="meta">${hTime(m.created_at)}${running ? "" : acts}</div></div></div>`;
+    ${body}${files ? `<div class="bt-files">${files}</div>` : ""}${stepHtml}${den}${permit}${ch}<div class="meta">${hTime(m.created_at)}${running ? "" : acts}</div></div></div>`;
 }
 function btRenderConv() {
   const c = BT.conv; if (!c) return;
   const eng = btEngine(c.bot), tk = c.takeover, live = c.busy || c.status === "running";
   $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
     <div class="grow"><div class="heading" onclick="btRename()" title="点一下改名">${esc(c.title)}</div>
-      <div class="small muted">${esc(eng.title)} · ${esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</div></div>
+      <div class="small muted bt-sub">${esc(eng.title)}<span class="bt-wd"> · ${esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</span></div></div>
     <button class="btn sm bt-model" onclick="btModelEdit()" title="换模型和强度">${esc(btModelName(c))}</button>
     ${tk ? `<button class="btn sm" onclick="btRelease()">收回</button>` : `<button class="btn sm primary" onclick="btTake()">交给管家</button>`}
     ${live ? `<button class="btn sm" onclick="btStop()">停止</button>` : ""}
@@ -128,7 +167,7 @@ function btRenderConv() {
   $("btTake").innerHTML = tk ? `<div class="bt-tk"><b>AIW 管家接管中</b>（第 ${tk.rounds}/${tk.max} 轮）：${esc(tk.goal)}<br><span class="small muted">你随时可以插话，它会先发你的话再继续；点「收回」自己接手。</span></div>` : "";
   $("btMsgs").innerHTML = BT.msgs.length ? BT.msgs.map(btMsg).join("")
     : `<div class="muted pad center">直接说要它做什么。它在电脑的 ${esc(c.workdir || "")} 里干活，改动不会自动推送。</div>`;
-  $("btPrompt").placeholder = "对它说，或输入 / 选技能…（管家接管时也可以插话）";
+  $("btPrompt").placeholder = matchMedia("(max-width: 760px)").matches ? "对它说，或输入 / 选技能…" : "对它说，或输入 / 选技能…（管家接管时也可以插话）";
   btQuoteRender();
   paintIcons($("btHead"));
 }
@@ -266,6 +305,18 @@ async function btTakeGo(ev) {
   ev.preventDefault();
   try { await api("POST", `/api/bots/convs/${BT.cid}/takeover`, { goal: ev.target.goal.value, rounds: +ev.target.rounds.value || 8 }); closeOverlays(); btRefresh(true); }
   catch (e) { toast("没能交给管家：" + e.message); }
+}
+async function btPermit(mode) {
+  let rule = "";
+  if (mode === "allow") {
+    const last = [...BT.msgs].reverse().find((x) => x.role === "bot") || {};
+    const den = ((last.data || {}).denied || []).slice(-1)[0] || {};
+    if (!den.rule) { toast("没抓到被拦的具体命令，用「这一轮放开权限重跑」"); return; }
+    const r = prompt("把这条规则加进 agy 的权限设置（以后也算数，可以改窄一点）：", den.rule);
+    if (!r) return; rule = r.trim();
+  } else if (mode === "once" && !confirm("这一轮不做权限检查，让它把被拦的那一步做完？下一轮恢复原来的规则。")) return;
+  try { await api("POST", `/api/bots/convs/${BT.cid}/permit`, { mode, rule }); toast(mode === "allow" ? "已允许，接着做" : mode === "deny" ? "已拒绝" : "这一轮已放开，接着做"); btRefresh(true); }
+  catch (e) { toast(e.message); }
 }
 async function btRelease() { try { await api("DELETE", `/api/bots/convs/${BT.cid}/takeover`); btRefresh(true); } catch (e) { toast(e.message); } }
 async function btStop() { try { await api("POST", `/api/bots/convs/${BT.cid}/stop`); toast("已停止"); btRefresh(true); } catch (e) { toast("停止失败：" + e.message); } }

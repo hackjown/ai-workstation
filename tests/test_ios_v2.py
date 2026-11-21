@@ -9,7 +9,7 @@ SRC = IOS / "Sources"
 
 def test_version_and_camera_permissions():
     p = plistlib.loads((IOS / "Info.plist").read_bytes())
-    assert p["CFBundleShortVersionString"] == "3.9.64" and p["CFBundleVersion"] == "38"   # bumped in v3.9.64 (chat finds engine conversations)
+    assert p["CFBundleShortVersionString"] == "3.9.68" and p["CFBundleVersion"] == "42"   # bumped in v3.9.68 (engine permission card in the chat)
     for k in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription", "NSPhotoLibraryUsageDescription"):
         assert p.get(k), k
 
@@ -106,7 +106,7 @@ def test_37_fixes_are_wired():
     assert "environment(\\.colorScheme, .dark)" not in home
     # 3. answered cards never print the raw answer
     assert "resolvedText(resolved)" in home and "<null>" in card and "func answerText" not in home
-    assert home.count(".askCardStyle(cs, settled: done || stale)") == 2
+    assert home.count(".askCardStyle(cs, settled: done || stale)") == 3   # v3.9.68: + EnginePermitRow
     # 4. the pill floats in the safe area above the composer, amber border; chat and task view
     for src in (home, chat):
         assert ".overlay(alignment: .bottomTrailing)" in src and "alignmentGuide(VerticalAlignment.top)" not in src

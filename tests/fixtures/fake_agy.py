@@ -27,6 +27,26 @@ for line in sys.stdin:
         time.sleep(3600)
     with open("seen_prompts.log", "a") as f:
         f.write(msg + "\n----\n")
+    if "DENYCMD" in msg:    # v3.9.67: a command no allow rule covers; the tool step is announced but never DONE (a guess)
+        cmd = msg.split("DENYCMD", 1)[1].strip().splitlines()[0]
+        try:
+            allow = json.load(open(os.path.expanduser("~/.gemini/antigravity-cli/settings.json")))["permissions"]["allow"]
+        except Exception:
+            allow = []
+        import re as _re
+        ok = "--dangerously-skip-permissions" in sys.argv or any(
+            r == f"command({cmd})" or (r.startswith("command(regex:") and _re.fullmatch(r[len("command(regex:"):-1], cmd)) for r in allow)
+        emit({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": 1, "state": "WAITING", "step_type": "tool", "tool_name": "run_command",
+              "tool_info": {"name": "run_command", "parameters": {"CommandLine": cmd}}}})
+        if ok:
+            emit({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": 1, "state": "DONE", "step_type": "tool", "tool_name": "run_command",
+                  "tool_info": {"name": "run_command", "parameters": {"CommandLine": cmd}, "output": "converted"}}})
+            emit({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": f"ran {cmd}\n", "num_turns": turn}})
+            continue
+        sys.stderr.write('jetski: no output produced \u2014 a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.\n'); sys.stderr.flush()
+        time.sleep(0.3)
+        emit({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": "", "num_turns": turn}})
+        continue
     if "DENYREAD" in msg:   # what the real agy 2026-11 did on a read outside its workspace (job agy-11200131-72a8)
         path = msg.split("DENYREAD", 1)[1].split()[0]
         emit({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": 1, "state": "DONE", "step_type": "agent_response", "text_delta": ""}})

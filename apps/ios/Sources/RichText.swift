@@ -77,8 +77,27 @@ func inlineMD(_ s: String, leadBold: Bool = false) -> AttributedString {
        (1...10).contains(t.distance(from: t.startIndex, to: r.lowerBound)), !t[..<r.lowerBound].contains("`") {
         t = "**" + String(t[..<r.lowerBound]) + "**" + String(t[r.lowerBound...])
     }
+    t = escapeTildes(t)
     let opt = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
     return (try? AttributedString(markdown: t, options: opt)) ?? AttributedString(t)
+}
+
+/// v3.9.65: a single "~" is a range in Chinese text ("19~22°C"), but Apple's Markdown reads "~…~" as strikethrough.
+/// Single tildes outside `code` are escaped; "~~删除线~~" keeps its meaning.
+func escapeTildes(_ s: String) -> String {
+    guard s.contains("~") else { return s }
+    let cs = Array(s)
+    var out = "", inCode = false, i = 0
+    while i < cs.count {
+        let c = cs[i]
+        if c == "`" { inCode.toggle(); out.append(c); i += 1; continue }
+        if c == "~" && !inCode {
+            if i + 1 < cs.count && cs[i + 1] == "~" { out += "~~"; i += 2; continue }
+            out += "\\~"; i += 1; continue
+        }
+        out.append(c); i += 1
+    }
+    return out
 }
 
 /// A whole reply, rendered block by block. 3.8: every text block is a SelectableText (partial selection + 复制 /
@@ -136,19 +155,22 @@ struct RichText: View {
         case .heading(let s, let lvl):
             sel(s, style: lvl <= 2 ? .headline : .subheadline, weight: .semibold).padding(.top, 2)
         case .bullet(let s, let lvl):
+            // v3.9.65: the text takes the whole rest of the row. Without the frame an HStack split the width with the
+            // marker and the UIKit text view wrapped at about half the bubble ("文字没有顶到两边").
             HStack(alignment: .top, spacing: 7) {   // .top: a UIKit text view has no SwiftUI text baseline
                 Text(lvl == 0 ? "•" : "◦").fontWeight(.heavy).foregroundColor(lvl == 0 ? amber : .secondary)
-                sel(s, leadBold: true)
+                    .fixedSize()
+                sel(s, leadBold: true).frame(maxWidth: .infinity, alignment: .leading).layoutPriority(1)
             }.padding(.leading, lvl == 0 ? 2 : 16)
         case .number(let n, let s):
             HStack(alignment: .top, spacing: 6) {
-                Text(n).foregroundColor(amber).fontWeight(.semibold).monospacedDigit()
-                sel(s, leadBold: true)
+                Text(n).foregroundColor(amber).fontWeight(.semibold).monospacedDigit().fixedSize()
+                sel(s, leadBold: true).frame(maxWidth: .infinity, alignment: .leading).layoutPriority(1)
             }
         case .quote(let s):
             HStack(spacing: 8) {
                 RoundedRectangle(cornerRadius: 1.5).fill(amber.opacity(0.6)).frame(width: 3)
-                sel(s, tint: .secondaryLabel)
+                sel(s, tint: .secondaryLabel).frame(maxWidth: .infinity, alignment: .leading).layoutPriority(1)
             }
         case .code(let s):
             SelectableText(text: NSAttributedString(string: s, attributes: [

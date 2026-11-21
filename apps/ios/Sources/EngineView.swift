@@ -8,6 +8,40 @@ import UniformTypeIdentifiers
 // their steps, quote (long press › 引用), the chat's "+" (拍照 / 照片 / 文件 / 技能) and "/" skills, model and strength,
 // 交给管家 / 收回 / 停止. Like the web page it polls the conversation (2 s while it runs, 8 s otherwise).
 
+/// v3.9.66: each engine's own colour, the same as the web page (bots.css, v3.9.63): its name above its replies.
+func engineColor(_ bot: String, _ cs: ColorScheme) -> Color {
+    switch bot {
+    case "agy": return Color(red: 0xc0 / 255, green: 0x26 / 255, blue: 0xd3 / 255)     // #c026d3
+    case "codex": return Color(red: 0x10 / 255, green: 0xa3 / 255, blue: 0x7f / 255)   // #10a37f
+    case "claude": return Color(red: 0xd9 / 255, green: 0x77 / 255, blue: 0x57 / 255)  // #d97757
+    case "codebuddy": return Color(red: 0x2b / 255, green: 0x6c / 255, blue: 0xff / 255) // #2b6cff
+    case "grok": return cs == .dark ? Color(white: 0xe9 / 255) : Color(white: 0x11 / 255)
+    default: return .secondary
+    }
+}
+
+/// v3.9.67: files an engine names in its reply (file:///home/aiw/workspace/…, ~/workspace/…), at most 8, in order.
+func engineFilePaths(_ text: String) -> [String] {
+    let rx = try? NSRegularExpression(pattern: #"file://(/[^\s)\]<>"'`]+)|((?:~|/home/[\w.-]+)/workspace/[^\s)\]<>"'`，。；]+\.[A-Za-z0-9]{1,6})"#)
+    let ns = text as NSString
+    var out: [String] = []
+    for m in rx?.matches(in: text, range: NSRange(location: 0, length: ns.length)) ?? [] {
+        let r = m.range(at: 1).location != NSNotFound ? m.range(at: 1) : m.range(at: 2)
+        var p = ns.substring(with: r)
+        p = p.removingPercentEncoding ?? p
+        while let l = p.last, ".,;:".contains(l) { p.removeLast() }
+        if p.range(of: #"\.[A-Za-z0-9]{1,6}$"#, options: .regularExpression) != nil, !out.contains(p) { out.append(p) }
+        if out.count >= 8 { break }
+    }
+    return out
+}
+
+/// v3.9.66: what you send in an engine conversation or group, as the chat draws it: select part of it and 复制.
+func engineUserText(_ text: String) -> some View {
+    SelectableText(text: uiAttributed(inlineMD(text), style: .callout, weight: .medium, color: UIColor(hInk), lineSpacing: 2),
+                   whole: text, link: UIColor(hInk))
+}
+
 let engineEffortName: [String: String] = ["minimal": "最低", "low": "低", "medium": "中", "high": "高", "xhigh": "超高", "max": "最高"]
 let engineEffortOrder = ["minimal", "low", "medium", "high", "xhigh", "max"]
 
@@ -226,6 +260,11 @@ struct EngineSheet: View {
         } catch let e { self.error = "读不到引擎对话：\(e.localizedDescription)" }
         if let r = try? await API.shared.obj("GET", "/api/bots/groups") { groups = r.a("groups") }
         loaded = true
+        // v3.9.68: 打开对话 on a permission card in the chat opens that conversation
+        if let want = UserDefaults.standard.string(forKey: "aiw_open_engine_conv"), !want.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "aiw_open_engine_conv")
+            if convs.contains(where: { $0.s("id") == want }) { open = want }
+        }
         await EngineModels.shared.load()
     }
 }
@@ -314,6 +353,11 @@ struct EngineConvView: View {
     @State private var newTitle = ""
     @State private var confirmDelete = false
     @State private var lastCount = 0
+    @State private var showAllow = false        // v3.9.67: 允许这类命令再试 (the rule, editable)
+    @State private var allowRule = ""
+    @State private var confirmOnce = false      // v3.9.67: 这一轮放开权限重跑
+    @State private var preview: Preview? = nil  // v3.9.67: a file the engine made, copied from the computer
+    @State private var fetching = ""
 
     var engine: JSON { engines.first { $0.s("id") == conv.s("bot") } ?? ["title": "Antigravity", "short": "agy"] }
     var takeover: JSON { (conv["takeover"] as? JSON) ?? [:] }
@@ -386,6 +430,20 @@ struct EngineConvView: View {
                 } catch { return "没改成：\(error.localizedDescription)" }
             }
         }
+        .environment(\.aiwOpenFile, { p in Task { await openFile(p) } })
+        .sheet(item: $preview) { p in
+            if isHtmlFile(p.url) { HtmlPreviewView(url: p.url, serverPath: p.path) }
+            else if !textPreviewKind(p.url).isEmpty, textPreviewPage() != nil { FilePreviewView(url: p.url, kind: textPreviewKind(p.url)) }
+            else { QuickLookView(url: p.url).ignoresSafeArea() }
+        }
+        .alert("允许这类命令", isPresented: $showAllow) {
+            TextField("规则", text: $allowRule)
+            Button("允许并再试") { Task { await act("POST", "/permit", ["mode": "allow", "rule": allowRule]) } }
+            Button("取消", role: .cancel) {}
+        } message: { Text("这条规则会写进 agy 的权限设置，以后也算数。可以改得更窄一点。") }
+        .confirmationDialog("这一轮放开权限重跑？", isPresented: $confirmOnce, titleVisibility: .visible) {
+            Button("放开这一轮") { Task { await act("POST", "/permit", ["mode": "once"]) } }
+        } message: { Text("这一轮不做权限检查，让它把被拦的那一步做完；下一轮恢复原来的规则。") }
         .alert("对话名称", isPresented: $showRename) {
             TextField("名称", text: $newTitle)
             Button("保存") { Task { await act("PATCH", "", ["title": newTitle]); changed() } }
@@ -447,7 +505,7 @@ struct EngineConvView: View {
             }
             if !m.s("text").isEmpty {
                 Group {
-                    if d.b("report") { RichText(text: m.s("text")) } else { Text(m.s("text")).textSelection(.enabled) }
+                    if d.b("report") { RichText(text: m.s("text")) } else { engineUserText(m.s("text")) }
                 }
                 .font(.callout).foregroundColor(aiw ? .primary : hInk)
                 .padding(.horizontal, 12).padding(.vertical, 8)
@@ -470,7 +528,7 @@ struct EngineConvView: View {
         let said = ((d["said"] as? [String]) ?? []).first ?? ""
         return VStack(alignment: .leading, spacing: 5) {
             Text(engine.s("title") + (st == "blocked" ? " · 被权限挡住" : st == "stopped" ? " · 已停止" : ""))
-                .font(.caption2.weight(.semibold)).foregroundColor(.secondary)
+                .font(.caption2.weight(.semibold)).foregroundColor(engineColor(conv.s("bot").isEmpty ? "agy" : conv.s("bot"), cs))
             if running && m.s("text").isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
@@ -498,6 +556,37 @@ struct EngineConvView: View {
                 Text("被拒绝的操作：" + denied.map { "\($0.s("tool")) \($0.s("target"))（\($0.s("why").isEmpty ? $0.s("action") : $0.s("why"))）" }.joined(separator: "；"))
                     .font(.caption2).foregroundColor(.orange)
             }
+            if !running {                           // v3.9.67: files it made on the computer: tap to preview / share
+                let paths = engineFilePaths(m.s("text"))
+                if !paths.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(paths, id: \.self) { p in
+                            Button { Task { await openFile(p) } } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: fetching == p ? "hourglass" : fileIcon(p)).foregroundColor(amber)
+                                    Text((p as NSString).lastPathComponent).lineLimit(1).truncationMode(.middle)
+                                    Text("预览 / 下载").foregroundColor(.secondary)
+                                }.font(.caption)
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemBackground)))
+                            }.buttonStyle(.plain).disabled(!fetching.isEmpty)
+                        }
+                    }
+                }
+            }
+            if canPermit(m) {                       // v3.9.67: the user decides; AIW never widens the rules itself
+                HStack(spacing: 8) {
+                    Button {
+                        allowRule = (denied.last ?? [:]).s("rule")
+                        if allowRule.isEmpty { err = "没抓到被拦的具体命令，用「这一轮放开权限重跑」" } else { showAllow = true }
+                    } label: { Text("允许这类命令再试").font(.caption.weight(.semibold)) }
+                        .buttonStyle(.borderedProminent).tint(amber)
+                    Button { confirmOnce = true } label: { Text("这一轮放开权限重跑").font(.caption.weight(.semibold)) }
+                        .buttonStyle(.bordered).tint(amber)
+                    Button { Task { await act("POST", "/permit", ["mode": "deny"]) } } label: { Text("拒绝").font(.caption.weight(.semibold)) }
+                        .buttonStyle(.bordered)        // v3.9.68
+                }.controlSize(.small)
+            }
             if !files.isEmpty {
                 Text("改动：" + files.prefix(8).joined(separator: "，") + (files.count > 8 ? " …" : "")).font(.caption2).foregroundColor(.secondary)
             }
@@ -505,6 +594,27 @@ struct EngineConvView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(.trailing, 24)
         .contextMenu { if !running { msgMenu(m) } }
+    }
+    /// v3.9.67: copy the file from the computer (GET …/file), download it, preview it (QuickLook shares / saves)
+    @MainActor func openFile(_ raw: String) async {
+        guard fetching.isEmpty else { return }
+        fetching = raw; defer { fetching = "" }
+        do {
+            let q = raw.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? raw
+            let r = (try await API.shared.call("GET", "/api/bots/convs/\(cid)/file?path=\(q)", nil, timeout: 300) as? JSON) ?? [:]
+            guard let u = API.shared.artifactURL(r.s("path")) else { return }
+            let (tmp, _) = try await URLSession.shared.download(from: u)
+            let dest = FileManager.default.temporaryDirectory.appendingPathComponent(previewFileName(r.s("name"), path: r.s("path")))
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.moveItem(at: tmp, to: dest)
+            preview = Preview(url: dest, path: r.s("path"))
+        } catch { err = "打不开这个文件：\(error.localizedDescription)" }
+    }
+    /// v3.9.67: the newest agy reply that the permission rules stopped, not yet answered, nothing running
+    func canPermit(_ m: JSON) -> Bool {
+        let d = m.o("data")
+        guard d.s("status") == "blocked", d.s("permitted").isEmpty, !live, (conv.s("bot").isEmpty ? "agy" : conv.s("bot")) == "agy" else { return false }
+        return msgs.last(where: { $0.s("role") == "bot" })?.s("id") == m.s("id")
     }
     @ViewBuilder func msgMenu(_ m: JSON) -> some View {
         Button { setQuote(m) } label: { Label("引用", systemImage: "quote.bubble") }
@@ -854,6 +964,7 @@ struct EngineGroupView: View {
     let engines: [JSON]
     let changed: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var cs
     @State private var group: JSON = [:]
     @State private var msgs: [JSON] = []
     @State private var text = ""
@@ -952,7 +1063,7 @@ struct EngineGroupView: View {
             VStack(alignment: .trailing, spacing: 4) {
                 if role == "aiw" { Text("AIW 管家").font(.caption2.weight(.semibold)).foregroundColor(.secondary) }
                 Group {
-                    if role == "aiw" { RichText(text: m.s("text")) } else { Text(m.s("text")).textSelection(.enabled) }
+                    if role == "aiw" { RichText(text: m.s("text")) } else { engineUserText(m.s("text")) }
                 }
                 .font(.callout).foregroundColor(role == "aiw" ? .primary : hInk)
                 .padding(.horizontal, 12).padding(.vertical, 8)
@@ -964,7 +1075,7 @@ struct EngineGroupView: View {
             let bad = ["error", "failed", "blocked"].contains(d.s("status"))
             let files = (d.o("changes")["files"] as? [String]) ?? []
             VStack(alignment: .leading, spacing: 4) {
-                Text(title(m.s("who")) + (bad ? " · 没做成" : "")).font(.caption2.weight(.semibold)).foregroundColor(.secondary)
+                Text(title(m.s("who")) + (bad ? " · 没做成" : "")).font(.caption2.weight(.semibold)).foregroundColor(engineColor(m.s("who"), cs))
                 RichText(text: m.s("text").isEmpty ? "（没有文字）" : m.s("text"))
                     .font(.callout).padding(.horizontal, 12).padding(.vertical, 8)
                     .background(RoundedRectangle(cornerRadius: 16, style: .continuous)

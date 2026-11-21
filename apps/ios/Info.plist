@@ -8,8 +8,8 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>AIW</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>3.9.64</string>
-  <key>CFBundleVersion</key><string>38</string>
+  <key>CFBundleShortVersionString</key><string>3.9.68</string>
+  <key>CFBundleVersion</key><string>42</string>
   <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
   <key>MinimumOSVersion</key><string>16.0</string>
   <key>LSRequiresIPhoneOS</key><true/>

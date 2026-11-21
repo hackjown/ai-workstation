@@ -55,7 +55,7 @@ SHELL_L4 = [
     (r"(?:^|[;&|(`]\s*|\b(?:nohup|exec|timeout\s+\S+|env(?:\s+\w+=\S+)*|setsid|script\s+-\S+)\s+)"
      r"(?:[\w.~$/{}-]*/)?agy(?=\s|$|[;&|)])", "runs Antigravity directly (use the antigravity tool)"),
     (r"--dangerously-skip-permissions|dangerouslySkipPermissions", "turns off Antigravity's permission checks"),
-    (r"\.gemini/[^\s'\"]*(?:settings|permission|grant)|agy_bridge\.py['\"]?\s+settings\s+--reset",
+    (r"\.gemini/[^\s'\"]*(?:settings|permission|grant)|agy_bridge\.py['\"]?\s+(?:settings\s+--reset|allow\b)",
      "changes Antigravity's permission settings (only the user does that)"),
     (r"\bmkfs\b|\bdd\s+.*of=/dev/|>\s*/dev/sd", "raw disk write"),
     (r"\b(shutdown|poweroff|halt|reboot)\b", "power control belongs to VM Runtime"),

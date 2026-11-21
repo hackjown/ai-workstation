@@ -13,6 +13,8 @@ one shell call per op. Every op prints exactly one line `AGYRESULT {json}` as it
   diff  JOB [--full]       git status / diff of the worktree against the base commit
   stop  JOB                end the agy process (the worktree and branch stay for review)
   list                     jobs on this computer
+  allow --rule-b64 B64     v3.9.67: add one allow rule the USER approved in the app (「允许这条再试」); kept across
+                           `settings` runs (aiwUserAllow) when AIW manages the file
   settings [--reset]       v3.9.56: write AIW's permission rules into agy's settings.json when it has none (or AIW
                            manages it), report rules agy ignores; --reset (run by the user in a terminal) puts the
                            AIW defaults back after a backup
@@ -157,7 +159,8 @@ def settings_state() -> dict:
 
 def op_settings(reset: bool):
     cur = read_json(SETTINGS, None)
-    want = {"allow": DEFAULT_ALLOW, "deny": DEFAULT_DENY}
+    extra = [] if reset else [r for r in ((cur or {}).get("aiwUserAllow") or []) if isinstance(r, str)]
+    want = {"allow": DEFAULT_ALLOW + [r for r in extra if r not in DEFAULT_ALLOW], "deny": DEFAULT_DENY}
     action = "kept"
     if reset or cur is None or (cur.get("aiwManaged") and cur.get("permissions") != want):
         new = dict(cur or {})
@@ -166,12 +169,65 @@ def op_settings(reset: bool):
             shutil.copy2(SETTINGS, bak)
         new["permissions"] = want
         new["aiwManaged"] = True
+        if reset:
+            new.pop("aiwUserAllow", None)
         new.setdefault("artifactReviewPolicy", "always-proceed")
         new.pop("dangerouslySkipPermissions", None)
         os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
         write_json(SETTINGS, new)
         action = "reset" if reset else ("written" if cur is None else "updated")
     out({"ok": True, "action": action, **settings_state()})
+
+
+ALLOW_RULE = re.compile(r"(command|read_file|write_file)\((.{1,600})\)", re.S)
+
+
+def op_allow(rule_b64: str):
+    """v3.9.67: one rule the user approved for a denied step. Never a catch-all, never one that a deny rule covers by
+    name (agy settings, AIW config, skip-permissions): those stay the user's to edit in a terminal."""
+    try:
+        rule = base64.b64decode(rule_b64 or "").decode().strip()
+    except (ValueError, UnicodeDecodeError):
+        out({"ok": False, "error": "bad rule"})
+    m = ALLOW_RULE.fullmatch(rule)
+    if not m:
+        out({"ok": False, "error": f"规则格式不对：{rule[:80]}"})
+    body = m.group(2).strip()
+    if body in ("**", "*", "regex:.*", "regex:.+", "") or re.search(r"\.gemini|\.config/aiw|dangerously-skip-permissions", body):
+        out({"ok": False, "error": "这条规则太宽或碰到了受保护的设置，只能你在终端里自己改"})
+    cur = read_json(SETTINGS, None) or {}
+    new = dict(cur)
+    perm = dict(new.get("permissions") or {})
+    allow = [r for r in (perm.get("allow") or []) if isinstance(r, str)]
+    if cur:
+        bak = f"{SETTINGS}.bak-aiw-{time.strftime('%Y%m%d%H%M%S')}"
+        try:
+            shutil.copy2(SETTINGS, bak)
+        except OSError:
+            pass
+    if rule not in allow:
+        allow.append(rule)
+    perm["allow"] = allow
+    perm.setdefault("deny", DEFAULT_DENY if not cur else perm.get("deny") or [])
+    new["permissions"] = perm
+    if new.get("aiwManaged") or not cur:
+        new["aiwManaged"] = True
+        ua = [r for r in (new.get("aiwUserAllow") or []) if isinstance(r, str)]
+        if rule not in ua:
+            ua.append(rule)
+        new["aiwUserAllow"] = ua[-200:]
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    write_json(SETTINGS, new)
+    out({"ok": True, "rule": rule, **settings_state()})
+
+
+def denied_target(text: str) -> str:
+    """v3.9.67: the command agy's denial line quotes in backticks, if it ever does (the 2026-11 line names only the
+    permission: 'a tool required the "command" permission that headless mode cannot prompt for')."""
+    for q in re.findall(r"`([^`]{2,400})`", text or ""):
+        if re.search(r"[\s/]", q.strip()) and "permission" not in q:
+            return q.strip()
+    return ""
 
 
 def newest_cli_log(since: float) -> str | None:
@@ -417,7 +473,9 @@ class Daemon:
         self.idle_since = time.time()
         self.resp: list[str] = []
         self.pending_denial: str | None = None
+        self.pending_text = ""
         self.turn_denied = False
+        self.last_tool: tuple = ("", {})     # v3.9.67: the newest tool step agy announced, DONE or not
 
     def save(self, **kw):
         self.state.update(kw, ts=time.time(), pid=os.getpid())
@@ -478,6 +536,7 @@ class Daemon:
             if re.search(r"denied|not allowed|permission|requires approval|permissions\.allow", s, re.I):
                 m = re.search(r'the "([\w-]+)" permission', s)
                 self.pending_denial = m.group(1) if m else "?"
+                self.pending_text = s[:500]
                 self.turn_denied = True
                 self.record({"kind": "denied", "text": s[:500], "action": self.pending_denial})
             elif re.search(r"authentication required|sign in|login", s, re.I):
@@ -503,7 +562,10 @@ class Daemon:
                     self.resp.append(s["text_delta"])
                 if s.get("state") == "DONE":
                     self.record({"kind": "say", "text": clip("".join(self.resp).strip(), 1200)})
-            elif st == "tool" and s.get("state") == "DONE":
+            if st == "tool" and s.get("state") != "DONE" and (s.get("tool_info") or {}).get("parameters"):
+                self.last_tool = (s.get("tool_name") or (s.get("tool_info") or {}).get("name") or "",
+                                  (s.get("tool_info") or {}).get("parameters") or {})
+            if st == "tool" and s.get("state") == "DONE":
                 ti = s.get("tool_info") or {}
                 params = ti.get("parameters") or {}
                 arg = (params.get("CommandLine") or params.get("TargetFile") or params.get("AbsolutePath")
@@ -517,6 +579,7 @@ class Daemon:
                     rec["error"] = rec.get("error") or f"DENIED ({self.pending_denial} permission)"
                     self.pending_denial = None
                 self.record(rec)
+                self.last_tool = ("", {})        # it ran (or was denied and named): not the step a later denial hit
                 self.state["tools"] = int(self.state.get("tools") or 0) + 1
             if s.get("subagent_info"):
                 subs = (s["subagent_info"] or {}).get("subagents") or []
@@ -525,7 +588,12 @@ class Daemon:
             self.save()
         elif kind == "result":
             if self.pending_denial:              # a denial with no tool step after it
-                self.add_denied(self.pending_denial, "?", {})
+                # v3.9.67: name the step from the newest tool agy announced, or the command its denial line quotes
+                tool, params = self.last_tool
+                if not params:
+                    q = denied_target(self.pending_text)
+                    tool, params = ("run_command", {"CommandLine": q}) if q else ("?", {})
+                self.add_denied(self.pending_denial, tool or "?", params)
                 self.pending_denial = None
             r = e.get("result") or {}
             text = (r.get("response") or "".join(self.resp)).strip()
@@ -561,7 +629,12 @@ class Daemon:
             why = "the command matches no allow rule in agy settings.json (AIW defaults)"
         else:
             why = f"no {action} allow rule covers it"
-        rec = {"action": action, "tool": tool, "target": clip(target, 300), "outside_worktree": outside, "why": why}
+        if action == "?" and (params.get("CommandLine") or params.get("Command")):
+            action = "command"
+            if not outside:
+                why = "the command matches no allow rule in agy settings.json (AIW defaults)"
+        rec = {"action": action, "tool": tool, "target": clip(target, 300), "outside_worktree": outside, "why": why,
+               "detail": clip(self.pending_text, 300), "command": str(params.get("CommandLine") or params.get("Command") or "")[:1000]}
         den = self.state.setdefault("denied", [])
         den.append(rec)
         del den[:-20]
@@ -869,6 +942,7 @@ def main():
     ap.add_argument("job", nargs="?")
     ap.add_argument("--job-b64")
     ap.add_argument("--text-b64")
+    ap.add_argument("--rule-b64")
     ap.add_argument("--seconds", type=float, default=600)
     ap.add_argument("--cursor", type=int, default=0)
     ap.add_argument("--full", action="store_true")
@@ -897,6 +971,8 @@ def main():
         op_diff(a.job, a.full)
     elif a.op == "list":
         op_list()
+    elif a.op == "allow":
+        op_allow(a.rule_b64 or "")
     elif a.op == "settings":
         op_settings(a.reset)
     elif a.op == "models":

@@ -11,6 +11,13 @@ import json, os, sys, uuid
 a = sys.argv[1:]
 if "--version" in a:
     print("fake-cli 1.0.0"); sys.exit(0)
+if a[:2] == ["debug", "models"]:   # codex's model catalog (v3.9.62)
+    print(json.dumps({"models": [
+        {"slug": "gpt-6-sol", "display_name": "GPT-6 Sol", "visibility": "list",
+         "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}, {"effort": "xhigh"}]},
+        {"slug": "gpt-6-mini", "display_name": "GPT-6 mini", "visibility": "list", "supported_reasoning_levels": [{"effort": "low"}]},
+        {"slug": "internal-x", "visibility": "hide"}]}))
+    sys.exit(0)
 if a[:1] == ["models"]:
     print(json.dumps({"models": [{"id": "grok-4.6", "label": "Grok 4.6"}, {"id": "grok-code-fast-2", "label": "Grok Code Fast 2"}]}))
     sys.exit(0)

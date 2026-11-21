@@ -93,6 +93,11 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.62 引擎：表单排版、按引擎读取模型
+
+- 引擎的表单改回 AIW 的表单样式（名称在上、输入框在下）。
+- 新对话换引擎时模型列表跟着换成该引擎的模型；Codex 读 `codex debug models`，Grok 读 `grok models` 和配置，CodeBuddy 读配置；列表外的模型可以手动填。版本 3.9.62 (36)。详见 `docs/v3.9.62.md`。
+
 ## v3.9.61 引擎群聊；主聊天直接派活给引擎
 
 - 引擎「新群聊」：几个引擎在同一个仓库并行开发，每个引擎一个 worktree 和分支 `aiw/<群id>/<引擎>`；AIW 管家拆分任务，完成后合并到 `aiw/<群id>/merge`，冲突交回引擎解决（最多 2 次）。不推送、不动原分支。

@@ -144,6 +144,13 @@ async def test_models_and_efforts_per_engine(tmp_path):
     assert [x["id"] for x in cl["groups"]] == ["opus", "sonnet", "haiku"] and cl["efforts"] == []
     cx = await b.models("codex", "vm1")
     assert "xhigh" in cx["efforts"] and "max" not in cx["efforts"]
+    # v3.9.62: codex's own catalog (`codex debug models`), hidden ones left out, each model with its own strengths
+    assert [x["id"] for x in cx["groups"]][:2] == ["gpt-6-sol", "gpt-6-mini"]
+    assert "internal-x" not in [x["id"] for x in cx["groups"]]
+    assert cx["groups"][0]["efforts"] == ["low", "medium", "high", "xhigh"] and cx["groups"][1]["efforts"] == ["low"]
+    # CodeBuddy has no `models` subcommand: the bridge must not run one (it would start a chat), so no grok list here
+    cb = await b.models("codebuddy", "vm1")
+    assert "grok-4.6" not in [x["id"] for x in cb["groups"]]
 
 
 async def test_missing_cli_says_how_to_install(tmp_path):

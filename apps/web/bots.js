@@ -36,16 +36,16 @@ function btRenderList() {
 }
 function btNew() {
   const opts = BT.engines.map((e) => `<option value="${esc(e.id)}" ${e.available ? "" : "disabled"}>${esc(e.title)}${e.available ? "" : "（即将支持）"}</option>`).join("");
-  modal(`<div class="heading">新对话</div>
-    <form class="col gap" onsubmit="btCreate(event)">
-      <label class="small muted">引擎</label><select name="bot" onchange="btModelsFill('', '', false, this.value)">${opts}</select>
-      <label class="small muted">标题</label><input name="title" placeholder="例如 ldok 重建" />
-      <label class="small muted">工作文件夹（电脑上，它就在这里改文件；空着就新建一个）</label>
-      <input name="workdir" placeholder="~/workspace/ldok-rebuild" />
+  const first = (BT.engines.find((e) => e.available) || { id: "agy" }).id;
+  modal(`<form class="callnote bt-form" onsubmit="btCreate(event)"><h3>新对话</h3>
+      <label>引擎<select name="bot" onchange="btModelsFill('', '', false, this.value)">${opts}</select></label>
+      <label>标题<input name="title" placeholder="例如 ldok 重建" /></label>
+      <label>工作文件夹<input name="workdir" placeholder="~/workspace/ldok-rebuild" /><small>电脑上的文件夹，引擎就在这里改文件；空着就新建一个。</small></label>
       ${btModelFields()}
       <div class="row gap"><button class="btn primary">开始</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
-  btModelsFill("", "", false, "agy");
+  const sel = document.querySelector("#modal select[name=bot]"); if (sel) sel.value = first;
+  btModelsFill("", "", false, first);
 }
 async function btCreate(ev) {
   ev.preventDefault();
@@ -255,11 +255,10 @@ function btToChat(id) {   // quote an engine reply in the main chat: 小秘 sees
   go("home"); hQuoteSet(m, btEngine(BT.conv.bot).title);
 }
 function btTake() {
-  modal(`<div class="heading">交给 AIW 管家</div>
-    <div class="small muted">管家会替你和 ${esc(btEngine(BT.conv.bot).title)} 来回沟通，直到目标完成、需要你决定或轮数用完。它不会让对方推送、合并或删除东西。</div>
-    <form class="col gap" onsubmit="btTakeGo(event)">
-      <textarea name="goal" rows="4" placeholder="目标和验收标准，例如：把首页加载改成懒加载，跑通 npm test，给我改动摘要" required></textarea>
-      <label class="small muted">最多来回几轮</label><input name="rounds" type="number" min="1" max="30" value="8" />
+  modal(`<form class="callnote bt-form" onsubmit="btTakeGo(event)"><h3>交给 AIW 管家</h3>
+      <div class="muted">管家会替你和 ${esc(btEngine(BT.conv.bot).title)} 来回沟通，直到目标完成、需要你决定或轮数用完。它不会让对方推送、合并或删除东西。</div>
+      <label>目标和验收标准<textarea name="goal" rows="4" placeholder="例如：把首页加载改成懒加载，跑通 npm test，给我改动摘要" required></textarea></label>
+      <label>最多来回几轮<input name="rounds" type="number" min="1" max="30" value="8" /></label>
       <div class="row gap"><button class="btn primary">交给管家</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
 }
@@ -310,49 +309,60 @@ function btModelName(c) {
   return name + (eff ? " · " + (BT_EFF[eff] || eff) : "");
 }
 function btModelFields() {
-  return `<label class="small muted">模型 <button type="button" class="link small" onclick="btModelsFill(null,null,true)">刷新</button></label>
-    <select name="mgroup" id="btMG" onchange="btEffFill()"><option value="">读取中…</option></select>
-    <label class="small muted">强度（越高越慢、越仔细）</label><select name="meff" id="btME"><option value="">默认</option></select>
-    <div class="small muted" id="btMNote"></div>`;
+  return `<label><span class="bt-lh">模型<button type="button" class="link small" onclick="btModelsFill(null,null,true)">刷新列表</button></span>
+      <select name="mgroup" id="btMG" onchange="btEffFill()"><option value="">读取中…</option></select>
+      <input name="mcustom" id="btMC" placeholder="模型名，例如 gpt-5-codex、opus、hy4-preview" style="display:none" />
+      <small id="btMNote"></small></label>
+    <label id="btMEL">强度<select name="meff" id="btME"><option value="">默认</option></select><small>越高越慢、越仔细。</small></label>`;
 }
 async function btModelsFill(model, effort, refresh, bot) {
   const sel = $("btMG"); if (!sel) return;
-  if (bot) sel.dataset.bot = bot;
+  if (bot && bot !== sel.dataset.bot) {   // another engine: drop the old engine's list at once, the new one may take a while
+    sel.dataset.bot = bot;
+    const hit = BM.cache[bot];
+    if (!hit || refresh) { sel.innerHTML = `<option value="">读取 ${esc(btEngine(bot).title)} 的模型…</option>`; sel.disabled = true; $("btMNote").textContent = ""; btEffFill(""); }
+  }
   bot = sel.dataset.bot || BM.bot;
+  if (refresh) { sel.innerHTML = `<option value="">读取 ${esc(btEngine(bot).title)} 的模型…</option>`; sel.disabled = true; }
   if (model === null) { model = sel.dataset.model || ""; effort = sel.dataset.effort || ""; }
   sel.dataset.model = model || ""; sel.dataset.effort = effort || "";
   let groups = [];
   try { groups = await btModels(refresh, bot); $("btMNote").textContent = ""; }
-  catch (e) { $("btMNote").textContent = "读不到模型列表（" + e.message + "），先用 " + bot + " 的默认模型"; }
+  catch (e) { $("btMNote").textContent = "读不到模型列表（" + e.message + "），可以先用默认，或选「其他」手动填"; }
   if ((sel.dataset.bot || BM.bot) !== bot) return;           // the engine changed while this list loaded
-  const hit = model ? btGroupOf(model) : null;
-  sel.innerHTML = `<option value="">默认（${esc(bot)} 自己的设置）</option>` + groups.map((g) => `<option value="${esc(g.id)}">${esc(g.label)}</option>`).join("")
-    + (model && !hit ? `<option value="${esc(model)}">${esc(model)}</option>` : "");
+  const hit = model ? btGroupOf(model) : null, title = btEngine(bot).title;
+  sel.disabled = false;
+  sel.innerHTML = `<option value="">默认（${esc(title)} 自己的设置）</option>` + groups.map((g) => `<option value="${esc(g.id)}">${esc(g.label)}</option>`).join("")
+    + (model && !hit ? `<option value="${esc(model)}">${esc(model)}</option>` : "") + `<option value="__custom">其他（手动填模型名）</option>`;
   sel.value = hit ? hit.g.id : (model || "");
+  if (!groups.length && !$("btMNote").textContent) $("btMNote").textContent = `${title} 没有给出模型列表，用默认或手动填。`;
   btEffFill((hit && hit.eff) || effort || "");
 }
 function btEffFill(want) {
   const sel = $("btMG"), es = $("btME"); if (!sel || !es) return;
-  const g = (BM.groups || []).find((x) => x.id === sel.value);
-  const own = BM.bot === "agy" ? Object.keys(BT_EFF).filter((e) => e !== "minimal") : (BM.efforts || []);
+  const bot = sel.dataset.bot || BM.bot, cached = BM.cache[bot];
+  const mc = $("btMC"); if (mc) mc.style.display = sel.value === "__custom" ? "" : "none";
+  const g = (cached ? cached.groups : []).find((x) => x.id === sel.value);
+  const own = bot === "agy" ? Object.keys(BT_EFF).filter((e) => e !== "minimal") : (cached ? cached.efforts : []);
   const effs = g && (g.efforts || []).length ? g.efforts : own;
   if (want === undefined) want = es.value;
-  es.parentElement && es.previousElementSibling && (es.previousElementSibling.style.display = es.style.display = effs.length ? "" : "none");
+  const box = $("btMEL"); if (box) box.style.display = effs.length ? "" : "none";
   const plain = !g || !(g.efforts || []).length || g.plain;
   es.innerHTML = (plain ? `<option value="">默认</option>` : "") + effs.map((e) => `<option value="${e}">${BT_EFF[e] || e}（${e}）</option>`).join("");
   es.value = effs.includes(want) ? want : plain ? "" : (effs.includes("high") ? "high" : effs[effs.length - 1]);
 }
 function btModelValue(f) {
-  const gid = f.mgroup ? f.mgroup.value : "", eff = f.meff ? f.meff.value : "";
+  let gid = f.mgroup ? f.mgroup.value : "";
+  const eff = f.meff && $("btMEL") && $("btMEL").style.display !== "none" ? f.meff.value : "";
+  if (gid === "__custom") gid = f.mcustom ? f.mcustom.value.trim() : "";
   const g = (BM.groups || []).find((x) => x.id === gid);
   if (g && eff && (g.slugs || {})[eff]) return { model: g.slugs[eff], effort: "" };   // the slug names its strength
   return { model: gid, effort: eff };
 }
 function btModelEdit() {
   const c = BT.conv; if (!c) return;
-  modal(`<div class="heading">模型和强度</div>
-    <div class="small muted">从下一句起生效：引擎会带着原会话接着聊，前面聊的都还在。</div>
-    <form class="col gap" onsubmit="btModelSave(event)">${btModelFields()}
+  modal(`<form class="callnote bt-form" onsubmit="btModelSave(event)"><h3>模型和强度</h3>
+      <div class="muted">从下一句起生效：引擎会带着原会话接着聊，前面聊的都还在。</div>${btModelFields()}
       <div class="row gap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
   btModelsFill(c.model || "", c.effort || "", false, c.bot || "agy");
@@ -391,16 +401,15 @@ function btGroupItems() {
   }).join("") + `<div class="small muted pad" style="padding-bottom:0">对话</div>`;
 }
 function btGroupNew() {
-  const boxes = BT.engines.filter((e) => e.available).map((e) => `<label class="row gap small"><input type="checkbox" name="m" value="${esc(e.id)}" ${["codex", "claude"].includes(e.id) ? "checked" : ""}/>${esc(e.title)}</label>`).join("");
-  modal(`<div class="heading">新群聊</div>
-    <div class="small muted">选几个引擎，各在自己的分支和工作树里并行干，做完由 AIW 管家合并到一个新分支。不推送，也不动你的基线分支。</div>
-    <form class="col gap" onsubmit="btGroupCreate(event)">
-      <label class="small muted">成员</label><div class="col">${boxes}</div>
-      <label class="small muted">标题</label><input name="title" placeholder="例如 登录页改版" />
-      <label class="small muted">git 仓库（电脑上；空着就新建一个）</label><input name="repo" placeholder="~/workspace/ldok" />
-      <label class="small muted">基线分支（空着用仓库当前分支）</label><input name="base" placeholder="main" />
-      <label class="row gap small"><input type="checkbox" name="auto" checked />都做完后管家自动合并</label>
-      <label class="small muted">要做什么（可以先空着，进群再说）</label><textarea name="goal" rows="3" placeholder="例如：做一个登录页，后端加接口，前端做页面，跑通测试"></textarea>
+  const boxes = BT.engines.filter((e) => e.available).map((e) => `<label class="bt-chk"><input type="checkbox" name="m" value="${esc(e.id)}" ${["codex", "claude"].includes(e.id) ? "checked" : ""}/>${esc(e.title)}</label>`).join("");
+  modal(`<form class="callnote bt-form" onsubmit="btGroupCreate(event)"><h3>新群聊</h3>
+      <div class="muted">选几个引擎，各在自己的分支和工作树里并行干，做完由 AIW 管家合并到一个新分支。不推送，也不动你的基线分支。</div>
+      <div class="bt-fl">成员<div class="bt-chks">${boxes}</div></div>
+      <label>标题<input name="title" placeholder="例如 登录页改版" /></label>
+      <label>git 仓库<input name="repo" placeholder="~/workspace/ldok" /><small>电脑上的仓库；空着就新建一个。</small></label>
+      <label>基线分支<input name="base" placeholder="main" /><small>空着用仓库当前分支。</small></label>
+      <label class="bt-chk"><input type="checkbox" name="auto" checked />都做完后管家自动合并</label>
+      <label>要做什么<textarea name="goal" rows="3" placeholder="例如：做一个登录页，后端加接口，前端做页面，跑通测试"></textarea><small>可以先空着，进群再说。</small></label>
       <div class="row gap"><button class="btn primary">建群</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
 }

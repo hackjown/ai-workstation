@@ -65,3 +65,14 @@
 @media (max-width: 760px) { .bt-model { max-width:120px; } }
 .bt-av.grp { background:#8a5cf6; }
 .bt-av.sm { width:22px; height:22px; border-radius:6px; font-size:9px; display:inline-grid; vertical-align:middle; }
+
+/* v3.9.62: engine forms in AIW's form layout (.callnote: title, each field a label over its control) */
+.bt-form label:not(.bt-chk), .bt-form .bt-fl { display:flex; flex-direction:column; gap:6px; font-size:13px; color:var(--mute); }
+.bt-form label:not(.bt-chk) > input, .bt-form label:not(.bt-chk) > select, .bt-form label:not(.bt-chk) > textarea { color:var(--text); font-size:14px; width:100%; box-sizing:border-box; }
+.bt-form small { color:var(--dim); font-size:12px; }
+.bt-form small:empty { display:none; }
+.bt-form .bt-lh { display:flex; align-items:center; justify-content:space-between; }
+.bt-form .bt-chk { display:flex; align-items:center; gap:10px; font-size:14px; color:var(--text); }
+.bt-form .bt-chks { display:flex; flex-wrap:wrap; gap:10px 18px; }
+.bt-form > .row { margin-top:4px; }
+.bt-form .bt-lh .link { color:var(--acc); font-size:12px; }

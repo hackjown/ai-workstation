@@ -9,7 +9,7 @@ SRC = IOS / "Sources"
 
 def test_version_and_camera_permissions():
     p = plistlib.loads((IOS / "Info.plist").read_bytes())
-    assert p["CFBundleShortVersionString"] == "3.9.61" and p["CFBundleVersion"] == "35"   # bumped in v3.9.61 (engine groups)
+    assert p["CFBundleShortVersionString"] == "3.9.62" and p["CFBundleVersion"] == "36"   # bumped in v3.9.62 (engine model lists)
     for k in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription", "NSPhotoLibraryUsageDescription"):
         assert p.get(k), k
 

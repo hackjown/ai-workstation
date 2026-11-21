@@ -440,6 +440,38 @@ def parse_models(stdout: str) -> list:
     return res[:60]
 
 
+def codex_rows(d) -> list:
+    """Codex's model catalog ({models:[{slug, display_name, visibility, supported_reasoning_levels:[{effort}]}]}):
+    the models its picker shows, each with the strengths it takes."""
+    lst = d.get("models") if isinstance(d, dict) else d
+    res = []
+    for m in lst or []:
+        if not isinstance(m, dict) or not m.get("slug") or m.get("visibility") in ("hide", "hidden"):
+            continue
+        effs = [str(e.get("effort") if isinstance(e, dict) else e) for e in (m.get("supported_reasoning_levels") or [])]
+        res.append({"id": str(m["slug"]), "label": str(m.get("display_name") or m["slug"]), "efforts": [e for e in effs if e]})
+    return res[:40]
+
+
+def codex_models(b: str) -> list:
+    """`codex debug models` (this login's catalog, no model call), else the cache Codex keeps, else the bundled list."""
+    for args in ([b, "debug", "models"], [b, "debug", "models", "--bundled"]):
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=30, env=run_env(), stdin=subprocess.DEVNULL)
+            if r.returncode == 0:
+                rows = codex_rows(json.loads(r.stdout))
+                if rows:
+                    return rows
+        except Exception:  # noqa: BLE001
+            pass
+        if args[-1] == "models":
+            home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+            rows = codex_rows(read_json(os.path.join(home, "models_cache.json"), {}) or {})
+            if rows:
+                return rows
+    return []
+
+
 def config_models(engine: str) -> list:
     """Models named in the CLI's own config file (the default, profiles)."""
     files = {"codex": "~/.codex/config.toml", "grok": "~/.grok/config.toml"}.get(engine)
@@ -467,10 +499,12 @@ def op_models(engine: str):
     if not b:
         out({"ok": False, "installed": False, "error": f"{engine} not found on PATH", "install": ENGINES[engine]["install"]})
     ms: list = []
-    if engine in ("grok", "codebuddy"):
-        for args in ([b, "models", "--json"], [b, "models"]):
+    if engine == "codex":
+        ms = codex_models(b)
+    elif engine == "grok":   # `grok models` lists them; CodeBuddy has no such subcommand (`codebuddy models` would start
+        for args in ([b, "models", "--json"], [b, "models"]):   # a chat with the prompt "models"), so it is not run
             try:
-                r = subprocess.run(args, capture_output=True, text=True, timeout=45, env=run_env(), stdin=subprocess.DEVNULL)
+                r = subprocess.run(args, capture_output=True, text=True, timeout=25, env=run_env(), stdin=subprocess.DEVNULL)
             except Exception:  # noqa: BLE001
                 continue
             if r.returncode == 0:
@@ -486,7 +520,7 @@ def op_models(engine: str):
         if x.strip() and x.strip() not in seen:
             ms.append({"id": x.strip(), "label": x.strip()})
             seen.add(x.strip())
-    groups = [{"id": m["id"], "label": m["label"], "efforts": [], "slugs": {}, "plain": True} for m in ms]
+    groups = [{"id": m["id"], "label": m["label"], "efforts": m.get("efforts") or [], "slugs": {}, "plain": True} for m in ms]
     out({"ok": True, "engine": engine, "models": ms, "groups": groups, "efforts": ENGINES[engine]["efforts"]})
 
 

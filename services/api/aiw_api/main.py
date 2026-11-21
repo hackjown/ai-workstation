@@ -336,6 +336,11 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     app.state.bots = _bots.Bots(store, sessions, notifier, llm=lambda: chat.llm("chat"),
                                 default_machine=lambda: settings.machines[0].id if settings.machines else "ai-linux-001")
     _bots.mount(app, app.state.bots, auth, chat)
+    from . import bot_groups as _groups   # v3.9.61 引擎群聊 (worktree per engine, 管家 merges) + 派活 from the chat
+    app.state.bot_groups = _groups.Groups(app.state.bots, chat)
+    chat.engines = _groups.Dispatch(app.state.bots, app.state.bot_groups, chat)
+    _groups.report_takeover(app.state.bots, chat)
+    _groups.mount(app, app.state.bot_groups, auth)
     from . import memory as _memory   # long-term memory: profile / facts / decisions for the chat and every task
     mem = _memory.Memory(store, sessions, llm=chat.llm)
     chat.memory = mem

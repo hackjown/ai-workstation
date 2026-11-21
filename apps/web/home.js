@@ -257,7 +257,13 @@ function hMsg(m) {
   if (d.offer_task) offer = d.task_started
     ? `<div class="opts"><button class="btn sm" disabled>${icon("check")}已交给电脑</button></div>`
     : `<div class="opts"><button class="btn sm primary" onclick="hToTask('${m.id}', this)">${icon("monitor")}交给电脑去做</button></div>`;
+  if (d.bot_conv || d.bot_group) offer += `<div class="opts"><button class="btn sm" onclick="hOpenBot('${esc(d.bot_group ? "g:" + d.bot_group : d.bot_conv)}')">${icon("monitor")}${d.bot_group ? "打开群聊" : "打开引擎对话"}</button></div>`;   // v3.9.61 派活
   return hA(m, `<div class="hbody"><div class="bubble hmd ${d.error ? "err" : ""}">${hMd(m.text)}</div>${hFiles(d.files)}${offer}<div class="meta">${m.stream ? "" : hTime(m.created_at)}</div></div>`);
+}
+function hOpenBot(ref) {   // v3.9.61: a message from an engine (or a group) opens it in 引擎
+  localStorage.setItem("aiw_bot_conv", ref);
+  if (typeof BT !== "undefined") { BT.cid = null; BT.gid = null; }
+  go("bots");
 }
 function hEmpty() {
   return `<div class="welcome hwelcome"><div class="avatar" style="background:${AVATAR_BG[(S.profile || {}).avatar] || AVATAR_BG.amber}">${avatarSVG()}</div>

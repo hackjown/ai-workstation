@@ -135,12 +135,12 @@ def test_quote_block_and_decision_parsing():
     assert B.parse_decision("not json")["done"] is False
 
 
-def test_codex_listed_but_not_creatable(tmp_path):
-    b, _ = make(tmp_path)
+def test_unknown_engine_and_bad_workdir_refused(tmp_path):
+    b, _ = make(tmp_path)   # v3.9.60: codex is an engine now (tests/test_v3960_cli_engines.py); unknown ones are refused
     try:
-        b.create("codex")
-    except ValueError as e:
-        assert "还没接入" in str(e)
+        b.create("nosuch")
+    except ValueError:
+        pass
     else:
         raise AssertionError
     try:
@@ -168,10 +168,10 @@ def test_endpoints_and_main_chat_quote(tmp_path):
     with TestClient(app) as cl:
         h = {"Authorization": "Bearer t"}
         r = cl.get("/api/bots", headers=h).json()
-        assert {e["id"] for e in r["engines"]} == {"agy", "codex"} and r["convs"] == []
+        assert {e["id"] for e in r["engines"]} == {"agy", "codex", "claude", "codebuddy", "grok"} and r["convs"] == []
         c = cl.post("/api/bots/convs", json={"bot": "agy", "title": "t", "workdir": "~/workspace/x"}, headers=h).json()
         assert c["workdir"] == "~/workspace/x" and c["status"] == "idle"
-        assert cl.post("/api/bots/convs", json={"bot": "codex"}, headers=h).status_code == 400
+        assert cl.post("/api/bots/convs", json={"bot": "nosuch"}, headers=h).status_code == 400
         assert cl.get(f"/api/bots/convs/{c['id']}", headers=h).json()["messages"] == []
         assert cl.patch(f"/api/bots/convs/{c['id']}", json={"title": "新名字"}, headers=h).json()["title"] == "新名字"
         # a quote in the main chat: the user message keeps it and the model reads it with its context

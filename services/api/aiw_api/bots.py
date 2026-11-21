@@ -2,8 +2,9 @@
 
 Each conversation (bot_convs) is bound to one native session of an engine CLI on one computer. Phase 1 has
 Antigravity (`agy`, through agy_bridge.py's plain mode: no worktree, the folder is edited in place, the session is
-resumed with `--conversation <id>` when its process has ended). Codex is listed and comes next (`codex exec --json`,
-`codex exec resume <id>`), behind the same Engine interface.
+resumed with `--conversation <id>` when its process has ended). v3.9.60 adds Codex, Claude Code, CodeBuddy (the CLI
+of WorkBuddy) and Grok Build through cli_bridge.py, behind the same Engine interface: one CLI call per turn, the
+engine's own session id resumed on the next one.
 
 Who speaks in a conversation:
   user  the person, typing in the 引擎对话 page (or quoting an earlier message: its text and the turns around it
@@ -31,8 +32,15 @@ log = logging.getLogger("aiw.bots")
 ENGINES = {
     "agy": {"id": "agy", "title": "Antigravity", "short": "agy", "available": True,
             "desc": "Google Antigravity CLI，在电脑上的一个文件夹里写代码"},
-    "codex": {"id": "codex", "title": "Codex", "short": "codex", "available": False,
-              "desc": "OpenAI Codex CLI（下一版接入）"},
+    # v3.9.60: one-shot CLIs through cli_bridge.py (one process per turn, resuming the engine's own session id)
+    "codex": {"id": "codex", "title": "Codex", "short": "codex", "available": True,
+              "desc": "OpenAI Codex CLI（codex exec，工作区沙箱）", "login": "codex"},
+    "claude": {"id": "claude", "title": "Claude Code", "short": "claude", "available": True,
+               "desc": "Anthropic Claude Code（claude -p）", "login": "claude"},
+    "codebuddy": {"id": "codebuddy", "title": "CodeBuddy", "short": "cbc", "available": True,
+                  "desc": "腾讯 CodeBuddy Code，WorkBuddy 的命令行版，同一个账号", "login": "codebuddy"},
+    "grok": {"id": "grok", "title": "Grok Build", "short": "grok", "available": True,
+             "desc": "xAI Grok Build（grok -p）", "login": "grok login --device-auth"},
 }
 LIVE = ("running", "starting")
 TURN_DONE = ("turn_done", "turn_failed", "blocked")
@@ -46,7 +54,7 @@ MANAGER = """你是 AIW 管家，代替用户和编程 Agent（{engine}）对话
 规则：
 - 目标的验收点都满足了才算 done；Agent 只说"完成了"不算，让它给出验证结果（跑过的测试、命令输出）。
 - next 要具体：指出没满足的点、要它做的下一步、怎么验证；一次一件事，用中文。
-- 不许让 Agent git push、合并、删分支、重置、删用户文件、改 ~/.gemini 或 ~/.config/aiw；需要这些就 ask_user。
+- 不许让 Agent git push、合并、删分支、重置、删用户文件、改 ~/.gemini ~/.codex ~/.claude ~/.codebuddy ~/.grok 或 ~/.config/aiw；需要这些就 ask_user。
 - Agent 的操作被拒绝（权限）时，让它换在工作文件夹里能完成的做法；做不到就 ask_user，说明被拒的是什么。
 - 花钱、对外发消息、删除数据、不确定用户意图的决定，都 ask_user。"""
 
@@ -61,7 +69,8 @@ def ensure_tables(store) -> None:
     store._x("CREATE TABLE IF NOT EXISTS bot_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, "
              "conv TEXT, role TEXT, text TEXT, data TEXT, created_at REAL, updated_at REAL)")
     store._x("CREATE INDEX IF NOT EXISTS ix_botmsg_conv ON bot_messages(conv, seq)")
-    for col in ("cursor INTEGER DEFAULT 0", "model TEXT", "effort TEXT", "job_model TEXT"):   # v3.9.58: model, effort
+    for col in ("cursor INTEGER DEFAULT 0", "model TEXT", "effort TEXT", "job_model TEXT",   # v3.9.58: model, effort
+                "grp TEXT", "origin TEXT", "branch TEXT"):   # v3.9.61: group member / sent from the main chat
         try:
             store._x(f"ALTER TABLE bot_convs ADD COLUMN {col}")
         except Exception:  # noqa: BLE001  already there
@@ -171,13 +180,14 @@ def parse_decision(out: str) -> dict:
             "report": str(d.get("report") or "").strip(), "ask_user": str(d.get("ask_user") or "").strip()}
 
 
-def turn_text(r: dict) -> str:
+def turn_text(r: dict, bot: str = "agy") -> str:
     """The reply shown for one engine turn (the final response; a short note when there is none)."""
     t = (r.get("response") or "").strip()
     if t:
         return t
     if r.get("auth_error"):
-        return "（agy 需要重新登录：在电脑终端运行一次 agy 完成登录）"
+        login = ENGINES.get(bot, {}).get("login") or bot
+        return f"（{ENGINES.get(bot, {}).get('title', bot)} 需要重新登录：在电脑终端运行一次 {login} 完成登录）"
     if r.get("error"):
         return f"（这一轮没完成：{clip(r['error'], 300)}）"
     said = [s for s in r.get("said") or [] if s]
@@ -232,6 +242,50 @@ class AgyEngine:
         return await self.op(mid, "stop", {"job": job})
 
 
+class CliEngine:
+    """v3.9.60: Codex / Claude Code / CodeBuddy / Grok Build through cli_bridge.py. Same ops as AgyEngine."""
+
+    def __init__(self, engine: str, shell: Callable[[str, str, int], Any], installed: Optional[set] = None):
+        self.id = engine
+        self.shell = shell
+        self._installed = installed if installed is not None else set()   # shared: one bridge file per computer
+
+    async def op(self, mid: str, op: str, a: dict, job: Optional[dict] = None) -> dict:
+        from agent_runtime import cli_engines as ce
+        if mid not in self._installed:
+            out = await self.shell(mid, ce.install_command(), 60)
+            if "CLI_BRIDGE_OK" not in (out or ""):
+                raise RuntimeError("没能把引擎桥接脚本写到电脑上：" + clip(out, 200))
+            self._installed.add(mid)
+        cmd, to = ce.command(op, {"engine": self.id, **a}, job)
+        out = await self.shell(mid, cmd, to)
+        r = ce.parse(out)
+        if r is None:
+            raise RuntimeError(f"{self.id} {op} 没有结果：" + clip(out, 300))
+        return r
+
+    def job(self, conv: dict, prompt: str) -> dict:
+        model, effort = model_flags(conv)
+        return {"engine": self.id, "prompt": prompt, "session": conv.get("session") or "",
+                "workdir": conv.get("workdir") or f"~/workspace/{self.id}-chat", "model": model, "effort": effort,
+                "max_turns": 1000, "timeout_min": 24 * 60, "keep_min": 120, "idle_min": 20}
+
+    async def models(self, mid: str) -> dict:
+        return await self.op(mid, "models", {})
+
+    async def start(self, mid: str, conv: dict, prompt: str) -> dict:
+        return await self.op(mid, "start", {}, self.job(conv, prompt))
+
+    async def send(self, mid: str, job: str, text: str) -> dict:
+        return await self.op(mid, "send", {"job": job, "message": text})
+
+    async def wait(self, mid: str, job: str, cursor: int, seconds: int = POLL_S) -> dict:
+        return await self.op(mid, "wait", {"job": job, "cursor": cursor, "seconds": seconds})
+
+    async def stop(self, mid: str, job: str) -> dict:
+        return await self.op(mid, "stop", {"job": job})
+
+
 # --------------------------------------------------------------------------------------------- the service
 class Bots:
     def __init__(self, store, sessions=None, notifier=None, llm: Optional[Callable[[], Any]] = None,
@@ -240,7 +294,11 @@ class Bots:
         self.llm = llm                                   # () -> router with .complete(system, user, max_tokens)
         self.default_machine = default_machine or (lambda: "ai-linux-001")
         ensure_tables(store)
-        self.engines = {"agy": AgyEngine(shell or self._shell)}
+        sh = shell or self._shell
+        self.sh = sh                                     # v3.9.61: groups run git on the computer with it
+        shared: set = set()
+        self.engines = {"agy": AgyEngine(sh), **{e: CliEngine(e, sh, shared)
+                                                 for e in ("codex", "claude", "codebuddy", "grok")}}
         self.queues: dict[str, list] = {}
         self.runners: dict[str, asyncio.Task] = {}
         self.listeners: list = []
@@ -257,8 +315,10 @@ class Bots:
         return str(res.get("stdout") or "") + ("\n" + str(res.get("stderr")) if res.get("stderr") else "")
 
     # ------------------------------------------------------------------ storage
-    def convs(self) -> list[dict]:
-        rows = self.store._x("SELECT * FROM bot_convs ORDER BY updated_at DESC")
+    def convs(self, members: bool = False) -> list[dict]:
+        """v3.9.61: a group's members live in its group view, not in the list (members=True lists them too)."""
+        rows = self.store._x("SELECT * FROM bot_convs " + ("" if members else "WHERE grp IS NULL OR grp='' ")
+                             + "ORDER BY updated_at DESC")
         out = []
         for r in rows:
             c = conv_row(r)
@@ -283,14 +343,14 @@ class Bots:
         return c
 
     def create(self, bot: str, title: str = "", workdir: str = "", machine_id: str = "", model: str = "",
-               effort: str = "") -> dict:
+               effort: str = "", grp: str = "", origin: str = "", branch: str = "") -> dict:
         eng = ENGINES.get(bot)
         if not eng:
             raise ValueError(f"没有这个引擎：{bot}")
         if not eng["available"]:
             raise ValueError(f"{eng['title']} 还没接入")
         cid = f"bc-{uuid.uuid4().hex[:10]}"
-        wd = (workdir or "").strip() or f"~/workspace/agy-chat/{cid}"
+        wd = (workdir or "").strip() or f"~/workspace/{bot}-chat/{cid}"
         if not re.fullmatch(r"[~\w./ \-\u4e00-\u9fff]{1,200}", wd) or ".." in wd.split("/"):
             raise ValueError("工作文件夹路径不合法")
         now = _now()
@@ -298,6 +358,9 @@ class Bots:
                       "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                       (cid, bot, (title or "").strip()[:60] or f"{eng['title']} 对话", machine_id or self.default_machine(),
                        wd, None, None, "idle", None, now, now))
+        if grp or origin or branch:
+            self.store._x("UPDATE bot_convs SET grp=?, origin=?, branch=? WHERE id=?",
+                          (grp or None, origin or None, branch or None, cid))
         if model or effort:
             self.set_model(cid, model, effort, announce=False)
         return self.conv(cid)
@@ -307,7 +370,7 @@ class Bots:
         next turn restarts it with --conversation (same session, new model); see _turn."""
         model = (model or "").strip()[:80]
         effort = (effort or "").strip().lower()
-        if model and not re.fullmatch(r"[\w.\- ()]{1,80}", model):
+        if model and not re.fullmatch(r"[\w.\- ():/@\[\]]{1,80}", model):
             raise ValueError("模型名不合法")
         if effort and effort not in EFFORTS:
             raise ValueError("强度只能是 " + "/".join(EFFORTS))
@@ -390,8 +453,10 @@ class Bots:
             return hit[1]
         r = await self.engines[bot].models(mid)
         if not r.get("ok"):
-            raise RuntimeError(r.get("error") or "agy models 失败")
-        res = {"groups": r.get("groups") or [], "efforts": list(EFFORTS)}
+            if r.get("installed") is False:
+                raise RuntimeError(f"电脑上没装 {bot}" + (f"（{r['install']}）" if r.get("install") else ""))
+            raise RuntimeError(r.get("error") or f"{bot} models 失败")
+        res = {"groups": r.get("groups") or [], "efforts": list(r["efforts"] if "efforts" in r else EFFORTS)}
         self._models[key] = (_now(), res)
         return res
 
@@ -494,7 +559,7 @@ class Bots:
             try:                                          # v3.9.58: the model changed: restart, resuming the session
                 await eng.stop(mid, job)
             except Exception as e:  # noqa: BLE001
-                log.warning("agy restart for model: %s", e)
+                log.warning("%s restart for model: %s", c["bot"], e)
             job = None
         if job:
             try:
@@ -506,10 +571,12 @@ class Bots:
         if not job:
             r = await eng.start(mid, c, prompt)
             if not r.get("ok"):
+                title = ENGINES.get(c["bot"], {}).get("title", c["bot"])
                 if r.get("installed") is False:
-                    msg = "电脑上没装 agy（Antigravity CLI），装好并登录后再试"
+                    msg = (f"电脑上没装 {title}，装好并登录后再试" + (f"：{r['install']}" if r.get("install") else "")
+                           if c["bot"] != "agy" else "电脑上没装 agy（Antigravity CLI），装好并登录后再试")
                 else:
-                    msg = "agy 没能启动：" + clip(r.get("error"), 300)
+                    msg = f"{title} 没能启动：" + clip(r.get("error"), 300)
                 self.update(reply["id"], msg, {"status": "error"})
                 self.set_conv(cid, status="idle", job=None)
                 return {"status": "error", "error": msg}
@@ -524,7 +591,7 @@ class Bots:
             try:
                 res = await eng.wait(mid, job, cursor)
             except Exception as e:  # noqa: BLE001  one slow poll is not the end of the turn
-                log.warning("agy wait %s: %s", job, e)
+                log.warning("%s wait %s: %s", c["bot"], job, e)
                 await asyncio.sleep(5)
                 continue
             cursor = int(res.get("cursor") or cursor)
@@ -541,12 +608,13 @@ class Bots:
                                                             ("failed" if st == "turn_failed" else st)),
                 "steps": steps, "denied": (res.get("denied") or [])[-5:], "said": [],
                 "changes": res.get("changes"), "usage": res.get("usage"), "ended": _now()}
-        self.update(reply["id"], turn_text(res), data)
+        text = turn_text(res, c["bot"])
+        self.update(reply["id"], text, data)
         self.set_conv(cid, status="idle", job=job if alive else None, cursor=cursor,
                       session=res.get("conversation_id") or c.get("session"))
         if not self.conv(cid).get("takeover"):
-            await self._notify(cid, turn_text(res))
-        return {"status": data["status"], "text": turn_text(res), "result": res}
+            await self._notify(cid, text)
+        return {"status": data["status"], "text": text, "result": res}
 
     async def _notify(self, cid: str, text: str):
         if not self.notifier:
@@ -738,7 +806,8 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
 
     @app.get("/api/bots/engines/{bot}/models", dependencies=dep)
     async def bots_models(bot: str, machine_id: str = "", refresh: int = 0):
-        """v3.9.58: the models this computer's agy account can use (`agy models`), grouped with their strengths."""
+        """v3.9.58: the models this computer's engine account can use (`agy models`; v3.9.60: the other CLIs' own
+        list or config), grouped with their strengths, plus the strengths the engine takes (`efforts`)."""
         if bot not in bots.engines:
             raise HTTPException(404, "这个引擎还没接入")
         try:

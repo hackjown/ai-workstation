@@ -845,6 +845,19 @@ class Chat:
                     await say("route", {"route": "memory"})
                     await say("message", m)
                     return {"route": "memory", "user": user, "messages": [m]}
+            disp = getattr(self, "engines", None)   # v3.9.61 派活: "让 codex 修一下登录" goes straight to the engine
+            p = disp.parse(text) if disp is not None and mode == "auto" and not SKILL_RE.match(text) else None
+            if p:
+                await say("route", {"route": "engine"})
+                try:
+                    r = await disp.run(p, attachments, origin=user["id"])
+                except Exception as e:  # noqa: BLE001  never silent
+                    log.warning("engine dispatch: %s", e)
+                    r = {"text": f"没能交给引擎：{str(e)[:200]}", "data": {"error": True}}
+                m = self.add("assistant", "text", r["text"], r["data"])
+                await say("message", m)
+                self.background(self.after_exchange(user, [m]))
+                return {"route": "engine", "user": user, "messages": [m]}
             cands = self.recent_tasks() if mode == "auto" and not SKILL_RE.match(text) else []
             if cands:   # 3.8.5: a follow-up about an earlier task goes to THAT task, never to a new one
                 fu = await self.followup(text, attachments, user, cands)
@@ -1044,6 +1057,28 @@ class Chat:
                                       "path": {"type": "string", "description": "要改的图片：附件的文件名或路径"},
                                       "prompt": {"type": "string", "description": "只写要改什么，其余保持不变"}},
                                       "required": ["path", "prompt"]}}, self._edit_image)
+        disp = getattr(self, "engines", None)
+        if disp is not None:   # v3.9.61: hand coding work to an engine on the computer (agy, Codex, Claude Code, …)
+            async def _engine_task(a, _d=disp):
+                bots = [str(x).lower() for x in (a.get("engines") or []) if str(x).lower() in
+                        ("agy", "codex", "claude", "codebuddy", "grok")]
+                task = str(a.get("task") or "").strip()
+                if not bots or not task:
+                    return "需要 engines 和 task"
+                wd = str(a.get("workdir") or "").strip()
+                r = await _d.run({"bots": bots, "task": task, "workdir": wd, "manage": bool(a.get("manage")),
+                                  "cont": False}, origin="chat")
+                return r["text"]
+            out["engine_task"] = ({"name": "engine_task", "description": "把编程/改代码的活交给电脑上的编程引擎去做"
+                                   "（agy=Antigravity、codex、claude=Claude Code、codebuddy、grok）。用户点名要某个引擎做事时用；"
+                                   "点名多个引擎就建群聊，各开分支并行干，管家合并。结果稍后自动回到聊天里",
+                                   "parameters": {"type": "object", "properties": {
+                                       "engines": {"type": "array", "items": {"type": "string"},
+                                                   "description": "agy / codex / claude / codebuddy / grok，一个或多个"},
+                                       "task": {"type": "string", "description": "交给它的任务，原话加上必要的上下文"},
+                                       "workdir": {"type": "string", "description": "电脑上的项目文件夹（~/… 或 /home/…），不知道就留空"},
+                                       "manage": {"type": "boolean", "description": "true：AIW 管家盯着它直到做完"}},
+                                       "required": ["engines", "task"]}}, _engine_task)
         srch = getattr(self, "search", None)
         if srch is not None:   # v3.9.14: earlier chats, tasks and files
             out["session_search"] = srch.tool()
@@ -1083,7 +1118,7 @@ class Chat:
             return "正在搜索…"
         return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…",
                 "session_search": "正在翻以前的记录…", "generate_image": "正在画图…",
-                "edit_image": "正在改图…", "doc_ask": "正在读文档…"}.get(name, "正在查…")
+                "edit_image": "正在改图…", "doc_ask": "正在读文档…", "engine_task": "正在交给引擎…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:

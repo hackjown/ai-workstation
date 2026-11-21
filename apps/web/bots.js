@@ -1,4 +1,4 @@
-/* v3.9.57 引擎 (Bot; was 引擎对话): talk to Antigravity (then Codex) on the computer directly, or hand the talking to AIW 管家.
+/* v3.9.57 引擎 (Bot; was 引擎对话): talk to Antigravity (v3.9.60: also Codex, Claude Code, CodeBuddy, Grok Build) on the computer directly, or hand the talking to AIW 管家.
    GET /api/bots, POST /api/bots/convs, GET|PATCH|DELETE /api/bots/convs/{id}, POST …/send|stop|takeover. */
 const BT = { engines: [], convs: [], cid: null, conv: null, msgs: [], quote: null, poll: null, last: 0, sending: false, attach: [], skills: [] };
 const BT_WHO = { user: "我", aiw: "AIW 管家", system: "" };
@@ -6,8 +6,15 @@ const BT_WHO = { user: "我", aiw: "AIW 管家", system: "" };
 async function btLoad() {
   try { const r = await api("GET", "/api/bots"); BT.engines = r.engines || []; BT.convs = r.convs || []; }
   catch (e) { toast("引擎加载失败：" + e.message); return; }
+  await btLoadGroups();
   btRenderList();
-  btModels().then(() => { if (BT.conv) btRenderConv(); }).catch(() => {});   // v3.9.58: names for the model chip
+  const saved = BT.gid ? "g:" + BT.gid : localStorage.getItem("aiw_bot_conv") || "";
+  if (saved.startsWith("g:")) {   // v3.9.61: the last thing open was a group
+    if (BT.groups.some((g) => g.id === saved.slice(2))) { btGroupOpen(saved.slice(2), true); return; }
+    localStorage.removeItem("aiw_bot_conv");
+  }
+  const cur = BT.convs.find((c) => c.id === (BT.cid || localStorage.getItem("aiw_bot_conv")));
+  btModels(false, cur ? cur.bot : "agy").then(() => { if (BT.conv) btRenderConv(); }).catch(() => {});   // v3.9.58: names for the model chip
   const want = BT.cid || localStorage.getItem("aiw_bot_conv");
   if (want && BT.convs.some((c) => c.id === want)) btOpen(want, true);
   else btShowConv(false);
@@ -21,8 +28,9 @@ function btRenderList() {
       <span class="bt-av ${esc(c.bot)}">${esc((e.short || e.title).slice(0, 3))}</span>
       <span class="grow"><span class="t1">${esc(c.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${c.last ? esc(c.last.text) : esc(e.title)}</span></span></button>`;
   }).join("");
-  box.innerHTML = `<div class="bt-head"><div class="heading">引擎</div><button class="btn sm primary" onclick="btNew()">${icon("plus")}新对话</button></div>`
-    + (items || `<div class="muted pad">还没有对话。新建一个，直接和电脑上的 Antigravity 说话；也可以把目标交给 AIW 管家，让它替你和 Antigravity 来回沟通。</div>`)
+  box.innerHTML = `<div class="bt-head"><div class="heading">引擎</div><button class="btn sm" onclick="btGroupNew()" title="几个引擎各开一个分支并行干，管家合并">${icon("plus")}群聊</button><button class="btn sm primary" onclick="btNew()">${icon("plus")}新对话</button></div>`
+    + btGroupItems()
+    + (items || `<div class="muted pad">还没有对话。新建一个，直接和电脑上的 Antigravity、Codex、Claude Code、CodeBuddy 或 Grok 说话；也可以把目标交给 AIW 管家，让它替你来回沟通。</div>`)
     + `<div class="small muted pad">${BT.engines.filter((e) => !e.available).map((e) => esc(e.title) + "：下一版接入").join(" · ")}</div>`;
   paintIcons(box);
 }
@@ -30,14 +38,14 @@ function btNew() {
   const opts = BT.engines.map((e) => `<option value="${esc(e.id)}" ${e.available ? "" : "disabled"}>${esc(e.title)}${e.available ? "" : "（即将支持）"}</option>`).join("");
   modal(`<div class="heading">新对话</div>
     <form class="col gap" onsubmit="btCreate(event)">
-      <label class="small muted">引擎</label><select name="bot">${opts}</select>
+      <label class="small muted">引擎</label><select name="bot" onchange="btModelsFill('', '', false, this.value)">${opts}</select>
       <label class="small muted">标题</label><input name="title" placeholder="例如 ldok 重建" />
       <label class="small muted">工作文件夹（电脑上，它就在这里改文件；空着就新建一个）</label>
       <input name="workdir" placeholder="~/workspace/ldok-rebuild" />
       ${btModelFields()}
       <div class="row gap"><button class="btn primary">开始</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
-  btModelsFill("", "");
+  btModelsFill("", "", false, "agy");
 }
 async function btCreate(ev) {
   ev.preventDefault();
@@ -49,14 +57,17 @@ async function btCreate(ev) {
 }
 function btShowConv(on) { const v = $("v-bots"); if (v) v.classList.toggle("bt-open", !!on); }
 async function btOpen(id, quiet) {
+  BT.gid = null; BT.group = null;
   if (BT.cid !== id) { BT.msgs = []; BT.last = 0; BT.quote = null; BT.attach = []; BT.skills = []; btRenderAttach(); btRenderTokens(); }
   BT.cid = id; localStorage.setItem("aiw_bot_conv", id);
   btShowConv(true); btRenderList();
   await btRefresh(true);
+  if (BT.conv && (BT.conv.bot || "agy") !== BM.bot) btModels(false, BT.conv.bot || "agy").then(() => btRenderConv()).catch(() => {});
   if (!quiet) { const el = $("btPrompt"); if (el && matchMedia("(hover:hover)").matches) el.focus(); }
 }
-function btBack() { btShowConv(false); BT.cid = null; localStorage.removeItem("aiw_bot_conv"); btRenderList(); btStopPoll(); }
+function btBack() { btShowConv(false); BT.cid = null; BT.gid = null; BT.group = null; localStorage.removeItem("aiw_bot_conv"); btRenderList(); btStopPoll(); }
 async function btRefresh(scroll) {
+  if (BT.gid) return btGroupRefresh(scroll);
   if (!BT.cid) return;
   let r;
   try { r = await api("GET", `/api/bots/convs/${BT.cid}?after=0`); } catch (e) { return; }
@@ -70,8 +81,8 @@ async function btRefresh(scroll) {
 }
 function btSchedule() {
   btStopPoll();
-  if (S.view !== "bots" || !BT.cid) return;
-  const live = BT.conv && (BT.conv.busy || BT.conv.takeover || BT.conv.status === "running" || BT.conv.queued);
+  if (S.view !== "bots" || !(BT.cid || BT.gid)) return;
+  const live = BT.gid ? BT.group && (BT.group.busy || BT.group.status !== "idle") : BT.conv && (BT.conv.busy || BT.conv.takeover || BT.conv.status === "running" || BT.conv.queued);
   BT.poll = setTimeout(() => btRefresh(false), live ? 2000 : 8000);
 }
 function btStopPoll() { if (BT.poll) { clearTimeout(BT.poll); BT.poll = null; } }
@@ -117,20 +128,22 @@ function btRenderConv() {
   $("btTake").innerHTML = tk ? `<div class="bt-tk"><b>AIW 管家接管中</b>（第 ${tk.rounds}/${tk.max} 轮）：${esc(tk.goal)}<br><span class="small muted">你随时可以插话，它会先发你的话再继续；点「收回」自己接手。</span></div>` : "";
   $("btMsgs").innerHTML = BT.msgs.length ? BT.msgs.map(btMsg).join("")
     : `<div class="muted pad center">直接说要它做什么。它在电脑的 ${esc(c.workdir || "")} 里干活，改动不会自动推送。</div>`;
+  $("btPrompt").placeholder = "对它说，或输入 / 选技能…（管家接管时也可以插话）";
   btQuoteRender();
   paintIcons($("btHead"));
 }
 async function btSend(ev) {
   if (ev) ev.preventDefault();
   const el = $("btPrompt"), text = el.value.trim();
-  if (!BT.cid || BT.sending) return;
+  if (!(BT.cid || BT.gid) || BT.sending) return;
   if (BT.attach.some((a) => a.up)) { toast("附件还在上传，传完再发"); return; }
   if (!text && !BT.attach.length) { if (BT.skills.length) toast("说说要用这个技能做什么"); return; }
   BT.sending = true;
   const quote = BT.quote ? BT.quote.id : null, skills = BT.skills.slice();
   const attachments = BT.attach.map(({ up, pct, uid, ...a }) => a);
   try {
-    await api("POST", `/api/bots/convs/${BT.cid}/send`, { text, quote, attachments, skills });
+    if (BT.gid) await api("POST", `/api/bots/groups/${BT.gid}/send`, { text, attachments });
+    else await api("POST", `/api/bots/convs/${BT.cid}/send`, { text, quote, attachments, skills });
     el.value = ""; autoGrow(el); BT.quote = null; BT.attach = []; BT.skills = []; btRenderAttach(); btRenderTokens();
     await btRefresh(true);
   } catch (e) { toast("没发出去：" + e.message); }
@@ -269,12 +282,18 @@ async function btRename() {
 /* v3.9.58: model and strength. GET /api/bots/engines/agy/models runs `agy models` on the computer (this account's
    models), grouped: gemini-4-neon-high/-low… is one model with strengths; a model without variants takes --effort.
    Changing it mid-conversation restarts agy on the next turn with --conversation, so the session carries on. */
-const BM = { groups: null, loading: null };
+const BM = { bot: "agy", groups: null, efforts: null, loading: null, cache: {} };   // v3.9.60: one list per engine
 const BT_EFF = { minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "超高", max: "最高" };
-async function btModels(refresh) {
+async function btModels(refresh, bot) {
+  bot = bot || BM.bot;
+  if (bot !== BM.bot) { BM.bot = bot; BM.loading = null; const hit = BM.cache[bot]; BM.groups = hit ? hit.groups : null; BM.efforts = hit ? hit.efforts : null; }
   if (BM.groups && !refresh) return BM.groups;
-  if (!BM.loading || refresh) BM.loading = api("GET", "/api/bots/engines/agy/models" + (refresh ? "?refresh=1" : ""))
-    .then((r) => (BM.groups = r.groups || [])).catch((e) => { BM.loading = null; throw e; });
+  if (!BM.loading || refresh) BM.loading = api("GET", `/api/bots/engines/${encodeURIComponent(bot)}/models` + (refresh ? "?refresh=1" : ""))
+    .then((r) => {
+      BM.cache[bot] = { groups: r.groups || [], efforts: r.efforts || Object.keys(BT_EFF) };
+      if (BM.bot === bot) { BM.groups = BM.cache[bot].groups; BM.efforts = BM.cache[bot].efforts; }
+      return BM.cache[bot].groups;
+    }).catch((e) => { BM.loading = null; throw e; });
   return BM.loading;
 }
 function btGroupOf(model) {
@@ -296,15 +315,18 @@ function btModelFields() {
     <label class="small muted">强度（越高越慢、越仔细）</label><select name="meff" id="btME"><option value="">默认</option></select>
     <div class="small muted" id="btMNote"></div>`;
 }
-async function btModelsFill(model, effort, refresh) {
+async function btModelsFill(model, effort, refresh, bot) {
   const sel = $("btMG"); if (!sel) return;
+  if (bot) sel.dataset.bot = bot;
+  bot = sel.dataset.bot || BM.bot;
   if (model === null) { model = sel.dataset.model || ""; effort = sel.dataset.effort || ""; }
   sel.dataset.model = model || ""; sel.dataset.effort = effort || "";
   let groups = [];
-  try { groups = await btModels(refresh); $("btMNote").textContent = ""; }
-  catch (e) { $("btMNote").textContent = "读不到模型列表（" + e.message + "），先用 agy 的默认模型"; }
+  try { groups = await btModels(refresh, bot); $("btMNote").textContent = ""; }
+  catch (e) { $("btMNote").textContent = "读不到模型列表（" + e.message + "），先用 " + bot + " 的默认模型"; }
+  if ((sel.dataset.bot || BM.bot) !== bot) return;           // the engine changed while this list loaded
   const hit = model ? btGroupOf(model) : null;
-  sel.innerHTML = `<option value="">默认（agy 自己的设置）</option>` + groups.map((g) => `<option value="${esc(g.id)}">${esc(g.label)}</option>`).join("")
+  sel.innerHTML = `<option value="">默认（${esc(bot)} 自己的设置）</option>` + groups.map((g) => `<option value="${esc(g.id)}">${esc(g.label)}</option>`).join("")
     + (model && !hit ? `<option value="${esc(model)}">${esc(model)}</option>` : "");
   sel.value = hit ? hit.g.id : (model || "");
   btEffFill((hit && hit.eff) || effort || "");
@@ -312,8 +334,10 @@ async function btModelsFill(model, effort, refresh) {
 function btEffFill(want) {
   const sel = $("btMG"), es = $("btME"); if (!sel || !es) return;
   const g = (BM.groups || []).find((x) => x.id === sel.value);
-  const effs = g && (g.efforts || []).length ? g.efforts : Object.keys(BT_EFF).filter((e) => e !== "minimal");
+  const own = BM.bot === "agy" ? Object.keys(BT_EFF).filter((e) => e !== "minimal") : (BM.efforts || []);
+  const effs = g && (g.efforts || []).length ? g.efforts : own;
   if (want === undefined) want = es.value;
+  es.parentElement && es.previousElementSibling && (es.previousElementSibling.style.display = es.style.display = effs.length ? "" : "none");
   const plain = !g || !(g.efforts || []).length || g.plain;
   es.innerHTML = (plain ? `<option value="">默认</option>` : "") + effs.map((e) => `<option value="${e}">${BT_EFF[e] || e}（${e}）</option>`).join("");
   es.value = effs.includes(want) ? want : plain ? "" : (effs.includes("high") ? "high" : effs[effs.length - 1]);
@@ -327,11 +351,11 @@ function btModelValue(f) {
 function btModelEdit() {
   const c = BT.conv; if (!c) return;
   modal(`<div class="heading">模型和强度</div>
-    <div class="small muted">从下一句起生效：agy 会带着原会话重新启动，前面聊的都还在。</div>
+    <div class="small muted">从下一句起生效：引擎会带着原会话接着聊，前面聊的都还在。</div>
     <form class="col gap" onsubmit="btModelSave(event)">${btModelFields()}
       <div class="row gap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
-  btModelsFill(c.model || "", c.effort || "");
+  btModelsFill(c.model || "", c.effort || "", false, c.bot || "agy");
 }
 async function btModelSave(ev) {
   ev.preventDefault();
@@ -347,3 +371,107 @@ go = function (view) {
   if (view === "bots") btLoad(); else btStopPoll();
   return r;
 };
+
+/* v3.9.61 引擎群聊: several engines on one git repository, each on its own branch (aiw/<group>/<engine>) in its own
+   worktree; @codex sends to one member, no @ (or @管家) lets AIW 管家 split the work; when they are done 管家 merges
+   the branches into aiw/<group>/merge (nothing pushed, the base branch untouched).
+   GET|POST /api/bots/groups, GET|DELETE /api/bots/groups/{id}, POST …/send|merge|stop. */
+BT.groups = []; BT.gid = null; BT.group = null; BT.gmsgs = [];
+const BT_GST = { working: "在干活", merging: "管家在合并", fixing: "在解决冲突", idle: "" };
+async function btLoadGroups() {
+  try { BT.groups = (await api("GET", "/api/bots/groups")).groups || []; } catch (e) { BT.groups = []; }
+}
+function btGroupItems() {
+  if (!BT.groups.length) return "";
+  return `<div class="small muted pad" style="padding-bottom:0">群聊</div>` + BT.groups.map((g) => {
+    const st = BT_GST[g.status] || "";
+    return `<button class="bt-it ${g.id === BT.gid ? "on" : ""}" onclick="btGroupOpen('${g.id}')">
+      <span class="bt-av grp">${g.members.length}</span>
+      <span class="grow"><span class="t1">${esc(g.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${g.last ? esc((g.last.role === "bot" ? btEngine(g.last.who).title + "：" : "") + g.last.text) : esc(g.members.map((m) => btEngine(m.bot).title).join("、"))}</span></span></button>`;
+  }).join("") + `<div class="small muted pad" style="padding-bottom:0">对话</div>`;
+}
+function btGroupNew() {
+  const boxes = BT.engines.filter((e) => e.available).map((e) => `<label class="row gap small"><input type="checkbox" name="m" value="${esc(e.id)}" ${["codex", "claude"].includes(e.id) ? "checked" : ""}/>${esc(e.title)}</label>`).join("");
+  modal(`<div class="heading">新群聊</div>
+    <div class="small muted">选几个引擎，各在自己的分支和工作树里并行干，做完由 AIW 管家合并到一个新分支。不推送，也不动你的基线分支。</div>
+    <form class="col gap" onsubmit="btGroupCreate(event)">
+      <label class="small muted">成员</label><div class="col">${boxes}</div>
+      <label class="small muted">标题</label><input name="title" placeholder="例如 登录页改版" />
+      <label class="small muted">git 仓库（电脑上；空着就新建一个）</label><input name="repo" placeholder="~/workspace/ldok" />
+      <label class="small muted">基线分支（空着用仓库当前分支）</label><input name="base" placeholder="main" />
+      <label class="row gap small"><input type="checkbox" name="auto" checked />都做完后管家自动合并</label>
+      <label class="small muted">要做什么（可以先空着，进群再说）</label><textarea name="goal" rows="3" placeholder="例如：做一个登录页，后端加接口，前端做页面，跑通测试"></textarea>
+      <div class="row gap"><button class="btn primary">建群</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
+    </form>`);
+}
+async function btGroupCreate(ev) {
+  ev.preventDefault();
+  const f = ev.target, members = [...f.querySelectorAll("input[name=m]:checked")].map((x) => x.value);
+  if (!members.length) { toast("至少选一个引擎"); return; }
+  const btn = f.querySelector(".btn.primary"); btn.disabled = true; btn.textContent = "正在建工作树…";
+  try {
+    const g = await api("POST", "/api/bots/groups", { title: f.title.value, repo: f.repo.value, base: f.base.value, members, auto_merge: f.auto.checked, goal: f.goal.value });
+    closeOverlays(); BT.groups.unshift(g); btGroupOpen(g.id);
+  } catch (e) { toast("没能建群：" + e.message); btn.disabled = false; btn.textContent = "建群"; }
+}
+async function btGroupOpen(id, quiet) {
+  if (BT.gid !== id) { BT.gmsgs = []; BT.quote = null; BT.attach = []; BT.skills = []; btRenderAttach(); btRenderTokens(); }
+  BT.cid = null; BT.conv = null; BT.gid = id; localStorage.setItem("aiw_bot_conv", "g:" + id);
+  btShowConv(true); btRenderList();
+  await btGroupRefresh(true);
+  if (!quiet) { const el = $("btPrompt"); if (el && matchMedia("(hover:hover)").matches) el.focus(); }
+}
+async function btGroupRefresh(scroll) {
+  if (!BT.gid) return;
+  let r;
+  try { r = await api("GET", `/api/bots/groups/${BT.gid}?after=0`); } catch (e) { return; }
+  if (r.group.id !== BT.gid) return;
+  BT.group = r.group; BT.gmsgs = r.messages || [];
+  const i = BT.groups.findIndex((g) => g.id === r.group.id);
+  if (i >= 0) BT.groups[i] = { ...BT.groups[i], ...r.group };
+  const box = $("btMsgs"), near = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 160;
+  btGroupRender();
+  if (scroll || near) btScroll();
+  btSchedule();
+}
+function btGroupRender() {
+  const g = BT.group; if (!g) return;
+  const st = BT_GST[g.status] || "", live = g.busy || g.status !== "idle";
+  const chips = g.members.map((m) => `<button class="link small" onclick="btOpen('${m.conv}')" title="打开 ${esc(btEngine(m.bot).title)} 的对话（分支 ${esc(m.branch)}）"><span class="bt-av ${esc(m.bot)} sm">${esc((btEngine(m.bot).short || m.bot).slice(0, 3))}</span>${m.busy ? "…" : ""}</button>`).join(" ");
+  $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
+    <div class="grow"><div class="heading">${esc(g.title)}</div>
+      <div class="small muted">${esc(g.repo)} · 基线 ${esc(g.base)}${st ? " · <b>" + st + "</b>" : ""}</div></div>
+    <span class="row gap">${chips}</span>
+    <button class="btn sm primary" onclick="btGroupMerge()" ${g.status === "merging" ? "disabled" : ""} title="提交各分支的改动，合并到 aiw/${esc(g.id)}/merge">合并</button>
+    ${live ? `<button class="btn sm" onclick="btGroupStop()">停止</button>` : ""}
+    <button class="icon" onclick="btGroupDelete()" aria-label="删除群聊" title="删除群聊">${icon("x")}</button>`;
+  $("btTake").innerHTML = (g.pending || []).length ? `<div class="bt-tk"><b>${st || "在干活"}</b>：等 ${esc(g.pending.map((b) => btEngine(b).title).join("、"))} 回复${g.auto_merge ? "，都回复后管家自动合并" : ""}</div>` : "";
+  $("btMsgs").innerHTML = BT.gmsgs.length ? BT.gmsgs.map(btGMsg).join("")
+    : `<div class="muted pad center">说要做什么：不 @ 就由 AIW 管家分工；@codex 只发给它。每个引擎在自己的分支上改，做完管家合并。</div>`;
+  $("btPrompt").placeholder = "说要做什么，@codex @claude @grok @cbc @agy 指定谁做，@管家 分工…";
+  btQuoteRender();
+  paintIcons($("btHead"));
+}
+function btGMsg(m) {
+  const d = m.data || {};
+  if (m.role === "system") return `<div class="bt-sys">${esc(m.text)}</div>`;
+  if (m.role === "user" || m.role === "aiw") {
+    return `<div class="bt-row me ${m.role}"><div class="bt-col">${m.role === "aiw" ? `<div class="bt-name">AIW 管家</div>` : ""}
+      <div class="bubble ${m.role === "aiw" ? "bt-aiw hmd" : ""}">${m.role === "aiw" ? hMd(m.text) : esc(m.text)}</div>
+      ${(d.attachments || []).length && typeof hAttPreview === "function" ? hAttPreview(d.attachments) : ""}
+      <div class="meta">${hTime(m.created_at)}</div></div></div>`;
+  }
+  const eng = btEngine(m.who);
+  const ch = d.changes && (d.changes.files || []).length ? `<div class="small muted">改动：${esc(d.changes.files.slice(0, 8).join("，"))}${d.changes.files.length > 8 ? " …" : ""}</div>` : "";
+  const den = (d.denied || []).length ? `<div class="bt-denied">被拒绝的操作：${d.denied.map((x) => `${esc(x.tool || "")} ${esc(x.target || "")}`).join("；")}</div>` : "";
+  return `<div class="bt-row bot"><span class="bt-av ${esc(m.who)}">${esc((eng.short || eng.title).slice(0, 3))}</span><div class="bt-col">
+    <div class="bt-name">${esc(eng.title)}${["error", "failed", "blocked"].includes(d.status) ? " · 没做成" : d.status === "stopped" ? " · 已停止" : ""}</div>
+    <div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text || "（没有文字）")}</div>${ch}${den}
+    <div class="meta">${hTime(m.created_at)}${d.conv ? ` · <button class="link" onclick="btOpen('${d.conv}')">看它的对话 ›</button>` : ""}</div></div></div>`;
+}
+async function btGroupMerge() { try { await api("POST", `/api/bots/groups/${BT.gid}/merge`); toast("管家开始合并"); setTimeout(() => btGroupRefresh(true), 800); } catch (e) { toast("合并失败：" + e.message); } }
+async function btGroupStop() { try { await api("POST", `/api/bots/groups/${BT.gid}/stop`); toast("已停止"); btGroupRefresh(true); } catch (e) { toast("停止失败：" + e.message); } }
+async function btGroupDelete() {
+  if (!confirm("删除这个群聊和成员的对话？（电脑上的仓库、分支和工作树不会删）")) return;
+  try { await api("DELETE", `/api/bots/groups/${BT.gid}`); BT.groups = BT.groups.filter((g) => g.id !== BT.gid); btBack(); } catch (e) { toast(e.message); }
+}

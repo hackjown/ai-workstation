@@ -93,6 +93,17 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.61 引擎群聊；主聊天直接派活给引擎
+
+- 引擎「新群聊」：几个引擎在同一个仓库并行开发，每个引擎一个 worktree 和分支 `aiw/<群id>/<引擎>`；AIW 管家拆分任务，完成后合并到 `aiw/<群id>/merge`，冲突交回引擎解决（最多 2 次）。不推送、不动原分支。
+- 主聊天说「让 codex 修一下登录」直接派给引擎，多个引擎自动开群聊，结果回到聊天；主模型也能用 `engine_task` 工具派活。
+- 网页和 iOS 都有群聊页面；修复多个引擎同时安装桥接的冲突。版本 3.9.61 (35)。详见 `docs/v3.9.61.md`。
+
+## v3.9.60 引擎：Codex、Claude Code、CodeBuddy、Grok
+
+- 「引擎」新增 Codex、Claude Code、CodeBuddy（cbc）、Grok 四个命令行引擎，统一桥接 `cli_bridge.py`，各自的模型列表和强度。
+- 修复 iOS 编译错误（`EngineView.swift`）。版本 3.9.60 (34)。详见 `docs/v3.9.60.md`。
+
 ## v3.9.59 iOS：引擎
 
 - 首页右上角 ＋ 菜单，「电脑」下面多了「引擎」：对话列表（右上角新建），点进去和电脑上的 agy 对话，接口和网页的引擎页相同（`/api/bots*`）。

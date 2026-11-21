@@ -29,6 +29,7 @@
       }
       if (kind === "bots") {   // v3.9.57 bots?c=<conversation>
         if (q.get("c")) { BT.cid = q.get("c"); localStorage.setItem("aiw_bot_conv", q.get("c")); }
+        if (q.get("g")) { BT.cid = null; BT.gid = null; localStorage.setItem("aiw_bot_conv", "g:" + q.get("g")); }   // v3.9.61 群聊
         go("bots"); return;
       }
       if (kind === "monitor") {

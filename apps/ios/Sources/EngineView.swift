@@ -3,28 +3,38 @@ import UIKit
 import PhotosUI
 import UniformTypeIdentifiers
 
-// v3.9.59 引擎 on iOS: the web page's 引擎 (bots.js, /api/bots*) as a sheet from the top-right "+" menu, next to
-// 任务 / 电脑. The list of engine conversations (agy now, Codex later) -> one conversation: the engine's replies with
+// v3.9.59 引擎 on iOS (v3.9.61: 群聊 at the end of this file): the web page's 引擎 (bots.js, /api/bots*) as a sheet from the top-right "+" menu, next to
+// 任务 / 电脑. The list of engine conversations (agy; v3.9.60 also Codex, Claude Code, CodeBuddy, Grok) -> one conversation: the engine's replies with
 // their steps, quote (long press › 引用), the chat's "+" (拍照 / 照片 / 文件 / 技能) and "/" skills, model and strength,
 // 交给管家 / 收回 / 停止. Like the web page it polls the conversation (2 s while it runs, 8 s otherwise).
 
 let engineEffortName: [String: String] = ["minimal": "最低", "low": "低", "medium": "中", "high": "高", "xhigh": "超高", "max": "最高"]
 let engineEffortOrder = ["minimal", "low", "medium", "high", "xhigh", "max"]
 
-/// The models this computer's agy account can use (GET /api/bots/engines/agy/models: groups of a model and its strengths)
+/// The models this computer's engine account can use (GET /api/bots/engines/<bot>/models: groups of a model and its
+/// strengths, plus the strengths the engine takes). v3.9.60: one list per engine; `bot` is the one on screen.
 final class EngineModels: ObservableObject {
     static let shared = EngineModels()
+    @Published var bot = "agy"
     @Published var groups: [JSON] = []
+    @Published var engineEfforts: [String] = engineEffortOrder
     @Published var error = ""
     @Published var loading = false
-    private var loaded = false
-    @MainActor func load(refresh: Bool = false) async {
-        if loaded && !refresh { return }
+    private var cache: [String: ([JSON], [String])] = [:]
+    @MainActor func load(bot: String? = nil, refresh: Bool = false) async {
+        let b = bot ?? self.bot
+        if b != self.bot { self.bot = b; error = "" }
+        if let hit = cache[b], !refresh { groups = hit.0; engineEfforts = hit.1; return }
+        if !refresh { groups = []; engineEfforts = b == "agy" ? engineEffortOrder : [] }
         loading = true; defer { loading = false }
         do {
-            let r = try await API.shared.obj("GET", "/api/bots/engines/agy/models" + (refresh ? "?refresh=1" : ""))
-            groups = r.a("groups"); error = ""; loaded = true
-        } catch { self.error = "读不到模型列表（\(error.localizedDescription)），先用 agy 的默认模型" }
+            let r = try await API.shared.obj("GET", "/api/bots/engines/\(b)/models" + (refresh ? "?refresh=1" : ""))
+            let effs = (r["efforts"] as? [String]) ?? engineEffortOrder
+            cache[b] = (r.a("groups"), effs)
+            if self.bot == b { groups = r.a("groups"); engineEfforts = effs; error = "" }
+        } catch let e {
+            if self.bot == b { self.error = "读不到模型列表（\(e.localizedDescription)），先用 \(b) 的默认模型" }
+        }
     }
     /// (group, strength) for a stored model: a group id, or a slug that names its strength
     func find(_ model: String) -> (JSON, String)? {
@@ -47,7 +57,7 @@ final class EngineModels: ObservableObject {
         let g = groups.first { $0.s("id") == gid }
         let own = (g?["efforts"] as? [String]) ?? []
         if let g = g, !own.isEmpty { return (own, g.b("plain")) }
-        return (engineEffortOrder.filter { $0 != "minimal" }, true)
+        return (bot == "agy" ? engineEffortOrder.filter { $0 != "minimal" } : engineEfforts, true)
     }
     /// what create / PATCH take: a slug that names its strength goes alone
     func value(_ gid: String, _ eff: String) -> JSON {
@@ -68,9 +78,9 @@ struct EngineModelSection: View {
         Section(header: HStack {
             Text("模型和强度"); Spacer()
             Button("刷新") { Task { await models.load(refresh: true) } }.font(.caption)
-        }.textCase(nil), footer: Text(models.error.isEmpty ? "强度越高越慢、越仔细。选「默认」就用 agy 自己的设置。" : models.error)) {
+        }.textCase(nil), footer: Text(models.error.isEmpty ? "强度越高越慢、越仔细。选「默认」就用 \(models.bot) 自己的设置。" : models.error)) {
             Picker("模型", selection: $group) {
-                Text("默认（agy 自己的设置）").tag("")
+                Text("默认（\(models.bot) 自己的设置）").tag("")
                 ForEach(models.groups.indices, id: \.self) { i in
                     let g = models.groups[i]
                     Text(g.s("label").isEmpty ? g.s("id") : g.s("label")).tag(g.s("id"))
@@ -78,17 +88,21 @@ struct EngineModelSection: View {
                 if !group.isEmpty && !models.groups.contains(where: { $0.s("id") == group }) { Text(group).tag(group) }
             }
             let ep = models.efforts(group)
-            Picker("强度", selection: $effort) {
-                if ep.1 { Text("默认").tag("") }
-                ForEach(ep.0, id: \.self) { e in Text("\(engineEffortName[e] ?? e)（\(e)）").tag(e) }
+            if !ep.0.isEmpty {
+                Picker("强度", selection: $effort) {
+                    if ep.1 { Text("默认").tag("") }
+                    ForEach(ep.0, id: \.self) { e in Text("\(engineEffortName[e] ?? e)（\(e)）").tag(e) }
+                }
             }
             if models.loading { HStack { ProgressView(); Text("读取模型…").font(.footnote).foregroundColor(.secondary) } }
         }
         .onChange(of: group) { _ in fixEffort() }
         .onChange(of: models.groups.count) { _ in fixEffort() }
+        .onChange(of: models.engineEfforts) { _ in fixEffort() }
     }
     func fixEffort() {
         let (effs, plain) = models.efforts(group)
+        if effs.isEmpty { effort = ""; return }
         if effs.contains(effort) || (plain && effort.isEmpty) { return }
         effort = plain ? "" : (effs.contains("high") ? "high" : (effs.last ?? ""))
     }
@@ -109,9 +123,15 @@ struct EngineSheet: View {
     @State private var showNew = false
     @State private var open: String? = nil
     @State private var loaded = false
+    @State private var groups: [JSON] = []          // v3.9.61 引擎群聊
+    @State private var openGroup: String? = nil
+    @State private var showNewGroup = false
     var body: some View {
         SheetChrome("引擎", close: close, trailing: {
-            Button { showNew = true } label: { Image(systemName: "square.and.pencil").font(.system(size: 17)) }.accessibilityLabel("新对话")
+            Menu {
+                Button { showNew = true } label: { Label("新对话", systemImage: "square.and.pencil") }
+                Button { showNewGroup = true } label: { Label("新群聊（几个引擎并行）", systemImage: "person.3") }
+            } label: { Image(systemName: "square.and.pencil").font(.system(size: 17)) }.accessibilityLabel("新建")
         }) {
             List {
                 if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
@@ -122,7 +142,17 @@ struct EngineSheet: View {
                         Button { showNew = true } label: { Label("新对话", systemImage: "plus") }.foregroundColor(amber)
                     }
                 }
-                Section(footer: Text(soon)) {
+                if !groups.isEmpty {
+                    Section(header: Text("群聊")) {
+                        ForEach(groups.indices, id: \.self) { i in
+                            let g = groups[i]
+                            NavigationLink(tag: g.s("id"), selection: $openGroup) {
+                                EngineGroupView(gid: g.s("id"), engines: engines) { Task { await load() } }
+                            } label: { groupRow(g) }
+                        }
+                    }
+                }
+                Section(header: groups.isEmpty ? nil : Text("对话"), footer: Text(soon)) {
                     ForEach(convs.indices, id: \.self) { i in
                         let c = convs[i]
                         NavigationLink(tag: c.s("id"), selection: $open) {
@@ -135,6 +165,13 @@ struct EngineSheet: View {
             .refreshable { await load() }
         }
         .task { await load() }
+        .sheet(isPresented: $showNewGroup) {
+            EngineGroupNewSheet(engines: engines) { g in
+                showNewGroup = false
+                groups.insert(g, at: 0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { openGroup = g.s("id") }
+            }
+        }
         .sheet(isPresented: $showNew) {
             EngineNewSheet(engines: engines) { c in
                 showNew = false
@@ -166,11 +203,28 @@ struct EngineSheet: View {
             }
         }.padding(.vertical, 2)
     }
+    func groupRow(_ g: JSON) -> some View {
+        let names = g.a("members").map { m in engines.first { $0.s("id") == m.s("bot") }?.s("title") ?? m.s("bot") }
+        let last = g.o("last")
+        let st = engineGroupStatus[g.s("status")] ?? ""
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.3").font(.caption).foregroundColor(amber)
+                Text(g.s("title")).font(.subheadline.weight(.semibold)).lineLimit(1)
+                if g.b("busy") { ProgressView().controlSize(.mini) }
+                Spacer()
+                Text(when(g.d("updated_at"))).font(.caption2).foregroundColor(.secondary)
+            }
+            Text(names.joined(separator: "、") + (st.isEmpty ? "" : " · " + st)).font(.caption).foregroundColor(.secondary).lineLimit(1)
+            if !last.isEmpty { Text(last.s("text")).font(.caption).foregroundColor(.secondary).lineLimit(2) }
+        }.padding(.vertical, 2)
+    }
     @MainActor func load() async {
         do {
             let r = try await API.shared.obj("GET", "/api/bots")
             engines = r.a("engines"); convs = r.a("convs"); error = ""
-        } catch { error = "读不到引擎对话：\(error.localizedDescription)" }
+        } catch let e { self.error = "读不到引擎对话：\(e.localizedDescription)" }
+        if let r = try? await API.shared.obj("GET", "/api/bots/groups") { groups = r.a("groups") }
         loaded = true
         await EngineModels.shared.load()
     }
@@ -213,7 +267,8 @@ struct EngineNewSheet: View {
                 }
             }
         }
-        .task { await EngineModels.shared.load() }
+        .task { await EngineModels.shared.load(bot: bot) }
+        .onChange(of: bot) { b in group = ""; effort = ""; Task { await EngineModels.shared.load(bot: b) } }
     }
     @MainActor func create() async {
         if let e = engines.first(where: { $0.s("id") == bot }), !e.b("available") { error = "\(e.s("title")) 还没接入"; return }
@@ -571,7 +626,8 @@ struct EngineConvView: View {
         } catch { err = "读不到这个对话：\(error.localizedDescription)" }
     }
     @MainActor func poll() async {
-        await EngineModels.shared.load()
+        await load()
+        await EngineModels.shared.load(bot: conv.s("bot").isEmpty ? "agy" : conv.s("bot"))
         while !Task.isCancelled {
             await load()
             let busy = live || !takeover.isEmpty || conv.d("queued") > 0
@@ -711,7 +767,7 @@ struct EngineModelSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section { Text("从下一句起生效：agy 会带着原会话重新启动，前面聊的都还在。").font(.footnote).foregroundColor(.secondary) }
+                Section { Text("从下一句起生效：引擎会带着原会话接着聊，前面聊的都还在。").font(.footnote).foregroundColor(.secondary) }
                 EngineModelSection(group: $group, effort: $effort)
                 if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
             }
@@ -732,5 +788,223 @@ struct EngineModelSheet: View {
                 }
             }
         }
+    }
+}
+
+
+// MARK: - v3.9.61 引擎群聊: several engines on one git repository, each on its own branch; AIW 管家 splits and merges
+
+let engineGroupStatus: [String: String] = ["working": "在干活", "merging": "管家在合并", "fixing": "在解决冲突"]
+
+struct EngineGroupNewSheet: View {
+    let engines: [JSON]
+    let done: (JSON) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var picked: Set<String> = ["codex", "claude"]
+    @State private var title = ""
+    @State private var repo = ""
+    @State private var base = ""
+    @State private var autoMerge = true
+    @State private var goal = ""
+    @State private var busy = false
+    @State private var error = ""
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(header: Text("成员"), footer: Text("每个引擎在自己的分支和工作树里并行干，做完由 AIW 管家合并到一个新分支。不推送，也不动基线分支。")) {
+                    ForEach(engines.filter { $0.b("available") }.indices, id: \.self) { i in
+                        let e = engines.filter { $0.b("available") }[i]
+                        let id = e.s("id")
+                        Toggle(e.s("title"), isOn: Binding(get: { picked.contains(id) },
+                                                            set: { on in if on { picked.insert(id) } else { picked.remove(id) } }))
+                    }
+                }
+                Section(header: Text("标题")) { TextField("例如 登录页改版", text: $title) }
+                Section(header: Text("git 仓库"), footer: Text("电脑上的文件夹；空着就新建一个仓库。")) {
+                    TextField("~/workspace/ldok", text: $repo).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    TextField("基线分支（空着用当前分支）", text: $base).textInputAutocapitalization(.never).autocorrectionDisabled()
+                }
+                Section { Toggle("都做完后管家自动合并", isOn: $autoMerge) }
+                Section(header: Text("要做什么（可以先空着）")) {
+                    TextField("例如：做一个登录页，后端加接口，前端做页面，跑通测试", text: $goal, axis: .vertical).lineLimit(2...6)
+                }
+                if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
+            }
+            .navigationTitle("新群聊").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    if busy { ProgressView() } else { Button("建群") { Task { await create() } }.bold() }
+                }
+            }
+        }
+    }
+    @MainActor func create() async {
+        if picked.isEmpty { error = "至少选一个引擎"; return }
+        busy = true; defer { busy = false }
+        let order = engines.map { $0.s("id") }.filter { picked.contains($0) }
+        let req: JSON = ["title": title, "repo": repo, "base": base, "members": order, "auto_merge": autoMerge, "goal": goal]
+        do { done(try await API.shared.obj("POST", "/api/bots/groups", req)) }
+        catch let e { error = "没能建群：\(e.localizedDescription)" }
+    }
+}
+
+struct EngineGroupView: View {
+    let gid: String
+    let engines: [JSON]
+    let changed: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var group: JSON = [:]
+    @State private var msgs: [JSON] = []
+    @State private var text = ""
+    @State private var err = ""
+    @State private var sending = false
+    @State private var confirmDelete = false
+    @State private var openConv: String? = nil
+
+    var live: Bool { group.b("busy") || (!group.s("status").isEmpty && group.s("status") != "idle") }
+    func title(_ bot: String) -> String { engines.first { $0.s("id") == bot }?.s("title") ?? bot }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    if msgs.isEmpty && !group.isEmpty {
+                        Text("说要做什么：不 @ 就由 AIW 管家分工；@codex 只发给它。每个引擎在自己的分支上改，做完管家合并。")
+                            .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
+                    }
+                    ForEach(msgs.indices, id: \.self) { i in row(msgs[i]) }
+                    if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red) }
+                    Color.clear.frame(height: 1).id("end")
+                }.padding(.horizontal, 14).padding(.vertical, 10)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .safeAreaInset(edge: .top) { statusBar }
+            .safeAreaInset(edge: .bottom) { composer }
+            .onChange(of: msgs.count) { _ in withAnimation { proxy.scrollTo("end", anchor: .bottom) } }
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 0) {
+                    Text(group.s("title").isEmpty ? "群聊" : group.s("title")).font(.subheadline.weight(.bold)).lineLimit(1)
+                    Text(group.s("repo") + " · " + group.s("base")).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                }
+            }
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Menu {
+                    Button { Task { await act("POST", "/merge") } } label: { Label("合并", systemImage: "arrow.triangle.merge") }
+                    if live { Button { Task { await act("POST", "/stop") } } label: { Label("停止", systemImage: "stop.circle") } }
+                    ForEach(group.a("members").indices, id: \.self) { i in
+                        let m = group.a("members")[i]
+                        Button { openConv = m.s("conv") } label: { Label("\(title(m.s("bot"))) 的对话", systemImage: "bubble.left") }
+                    }
+                    Button(role: .destructive) { confirmDelete = true } label: { Label("删除群聊", systemImage: "trash") }
+                } label: { Image(systemName: "ellipsis.circle").font(.system(size: 18)) }.accessibilityLabel("更多")
+            }
+        }
+        .navigationDestination(isPresented: Binding(get: { openConv != nil }, set: { on in if !on { openConv = nil } })) {
+            EngineConvView(cid: openConv ?? "", engines: engines) { changed() }
+        }
+        .confirmationDialog("删除这个群聊？", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("删除", role: .destructive) {
+                Task {
+                    do { _ = try await API.shared.call("DELETE", "/api/bots/groups/\(gid)"); changed(); dismiss() }
+                    catch let e { err = e.localizedDescription }
+                }
+            }
+        } message: { Text("电脑上的仓库、分支和工作树不会删。") }
+        .task { await poll() }
+    }
+
+    @ViewBuilder var statusBar: some View {
+        let pending = (group["pending"] as? [String]) ?? []
+        if !pending.isEmpty || group.s("status") == "merging" {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(engineGroupStatus[group.s("status")] ?? "在干活").font(.caption.weight(.bold)).foregroundColor(amber)
+                if !pending.isEmpty {
+                    Text("等 " + pending.map { title($0) }.joined(separator: "、") + " 回复" + (group.b("auto_merge") ? "，都回复后管家自动合并" : ""))
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12).padding(.vertical, 8).background(amber.opacity(0.1)).background(.bar)
+        }
+    }
+
+    var composer: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            TextField("说要做什么，@codex @claude @grok @cbc @agy 指定谁做…", text: $text, axis: .vertical)
+                .lineLimit(1...5).padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemBackground)))
+            Button { Task { await send() } } label: {
+                Image(systemName: sending ? "hourglass" : "arrow.up.circle.fill").font(.system(size: 30)).foregroundColor(amber)
+            }.disabled(sending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8).background(.bar)
+    }
+
+    @ViewBuilder func row(_ m: JSON) -> some View {
+        let role = m.s("role")
+        if role == "system" {
+            Text(m.s("text")).font(.caption).foregroundColor(.secondary).multilineTextAlignment(.center).frame(maxWidth: .infinity)
+        } else if role == "user" || role == "aiw" {
+            VStack(alignment: .trailing, spacing: 4) {
+                if role == "aiw" { Text("AIW 管家").font(.caption2.weight(.semibold)).foregroundColor(.secondary) }
+                Group {
+                    if role == "aiw" { RichText(text: m.s("text")) } else { Text(m.s("text")).textSelection(.enabled) }
+                }
+                .font(.callout).foregroundColor(role == "aiw" ? .primary : hInk)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(role == "aiw" ? amber.opacity(0.15) : hAmber))
+                Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .trailing)
+        } else {
+            let d = m.o("data")
+            let bad = ["error", "failed", "blocked"].contains(d.s("status"))
+            let files = (d.o("changes")["files"] as? [String]) ?? []
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title(m.s("who")) + (bad ? " · 没做成" : "")).font(.caption2.weight(.semibold)).foregroundColor(.secondary)
+                RichText(text: m.s("text").isEmpty ? "（没有文字）" : m.s("text"))
+                    .font(.callout).padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(bad ? Color.red.opacity(0.12) : Color(.secondarySystemBackground)))
+                if !files.isEmpty {
+                    Text("改动：" + files.prefix(8).joined(separator: "，")).font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                }
+                HStack(spacing: 8) {
+                    Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+                    if !d.s("conv").isEmpty { Button("看它的对话 ›") { openConv = d.s("conv") }.font(.caption2) }
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @MainActor func load() async {
+        do {
+            let r = try await API.shared.obj("GET", "/api/bots/groups/\(gid)?after=0")
+            group = r.o("group"); msgs = r.a("messages")
+            if err.hasPrefix("读不到") { err = "" }
+        } catch let e { err = "读不到这个群聊：\(e.localizedDescription)" }
+    }
+    @MainActor func poll() async {
+        while !Task.isCancelled {
+            await load()
+            try? await Task.sleep(nanoseconds: (live ? 2 : 8) * 1_000_000_000)
+        }
+    }
+    @MainActor func send() async {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.isEmpty { return }
+        sending = true; defer { sending = false }
+        do {
+            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/send", ["text": body])
+            text = ""; err = ""
+            await load()
+        } catch let e { err = "没发出去：\(e.localizedDescription)" }
+    }
+    @MainActor func act(_ method: String, _ path: String) async {
+        do { _ = try await API.shared.obj(method, "/api/bots/groups/\(gid)\(path)"); await load(); changed() }
+        catch let e { err = e.localizedDescription }
     }
 }

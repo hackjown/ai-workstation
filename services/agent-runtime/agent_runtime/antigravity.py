@@ -61,7 +61,7 @@ def install_command() -> str:
     digest = hashlib.sha1(src).hexdigest()
     return (f'mkdir -p "$HOME/.config/aiw/agy" && f="{REMOTE}" && '
             f'if [ "$(sha1sum "$f" 2>/dev/null | cut -d" " -f1)" != "{digest}" ]; then '
-            f"echo '{b64}' | base64 -d > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; fi && "
+            f"echo '{b64}' | base64 -d > \"$f.$$.tmp\" && mv -f \"$f.$$.tmp\" \"$f\"; fi && "
             f"python3 \"$f\" settings >/dev/null 2>&1; "
             f"[ \"$(sha1sum \"$f\" | cut -d' ' -f1)\" = \"{digest}\" ] && echo AGY_BRIDGE_OK")
 

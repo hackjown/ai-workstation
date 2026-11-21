@@ -19,13 +19,20 @@ async function btLoad() {
   if (want && BT.convs.some((c) => c.id === want)) btOpen(want, true);
   else btShowConv(false);
 }
+// v3.9.69: round avatar — amber ring like AIW's, the engine's real logo inside (apps/web/engines/<id>.svg)
+const BT_LOGOS = ["agy", "codex", "claude", "codebuddy", "grok"];
+function btAv(bot, extra) {
+  const id = bot || "agy", eng = btEngine(id);
+  const inner = BT_LOGOS.includes(id) ? `<img src="engines/${id}.svg" alt="${esc(eng.title)}" draggable="false">` : esc((eng.short || eng.title || id).slice(0, 3));
+  return `<span class="bt-av ${esc(id)}${extra ? " " + extra : ""}" title="${esc(eng.title)}">${inner}</span>`;
+}
 function btEngine(id) { return BT.engines.find((e) => e.id === id) || { title: id, short: id }; }
 function btRenderList() {
   const box = $("btList"); if (!box) return;
   const items = BT.convs.map((c) => {
     const e = btEngine(c.bot), st = c.takeover ? "管家接管中" : (c.busy || c.status === "running") ? "回复中…" : "";
     return `<button class="bt-it ${esc(c.bot || "agy")} ${c.id === BT.cid ? "on" : ""}" onclick="btOpen('${c.id}')">
-      <span class="bt-av ${esc(c.bot || "agy")}">${esc((e.short || e.title).slice(0, 3))}</span>
+      ${btAv(c.bot)}
       <span class="grow"><span class="t1">${esc(c.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${c.last ? esc(c.last.text) : esc(e.title)}</span></span></button>`;
   }).join("");
   box.innerHTML = `<div class="bt-head"><div class="heading">引擎</div><button class="btn sm" onclick="btGroupNew()" title="几个引擎各开一个分支并行干，管家合并">${icon("plus")}群聊</button><button class="btn sm primary" onclick="btNew()">${icon("plus")}新对话</button></div>`
@@ -150,7 +157,7 @@ function btMsg(m) {
     ? `<div class="bubble hdots-b"><span class="hdots"><i></i><i></i><i></i></span><span class="hnote">${esc(((d.said || [])[0] || "").slice(0, 80) || "在电脑上干活…")}</span></div>`
     : `<div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(btFileLinks(m.text))}</div>`;
   const files = running ? "" : btFileCards(m.text);
-  return `<div class="bt-row bot"><span class="bt-av ${esc((BT.conv || {}).bot || "agy")}">${esc((eng.short || eng.title).slice(0, 3))}</span><div class="bt-col">
+  return `<div class="bt-row bot">${btAv((BT.conv || {}).bot)}<div class="bt-col">
     <div class="bt-name ${esc((BT.conv || {}).bot || "agy")}">${esc(eng.title)}${d.status === "blocked" ? " · 被权限挡住" : d.status === "stopped" ? " · 已停止" : ""}</div>
     ${body}${files ? `<div class="bt-files">${files}</div>` : ""}${stepHtml}${den}${permit}${ch}<div class="meta">${hTime(m.created_at)}${running ? "" : acts}</div></div></div>`;
 }
@@ -497,7 +504,7 @@ async function btGroupRefresh(scroll) {
 function btGroupRender() {
   const g = BT.group; if (!g) return;
   const st = BT_GST[g.status] || "", live = g.busy || g.status !== "idle";
-  const chips = g.members.map((m) => `<button class="link small" onclick="btOpen('${m.conv}')" title="打开 ${esc(btEngine(m.bot).title)} 的对话（分支 ${esc(m.branch)}）"><span class="bt-av ${esc(m.bot)} sm">${esc((btEngine(m.bot).short || m.bot).slice(0, 3))}</span>${m.busy ? "…" : ""}</button>`).join(" ");
+  const chips = g.members.map((m) => `<button class="link small" onclick="btOpen('${m.conv}')" title="打开 ${esc(btEngine(m.bot).title)} 的对话（分支 ${esc(m.branch)}）">${btAv(m.bot, "sm")}${m.busy ? "…" : ""}</button>`).join(" ");
   $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
     <div class="grow"><div class="heading">${esc(g.title)}</div>
       <div class="small muted">${esc(g.repo)} · 基线 ${esc(g.base)}${st ? " · <b>" + st + "</b>" : ""}</div></div>
@@ -524,7 +531,7 @@ function btGMsg(m) {
   const eng = btEngine(m.who);
   const ch = d.changes && (d.changes.files || []).length ? `<div class="small muted">改动：${esc(d.changes.files.slice(0, 8).join("，"))}${d.changes.files.length > 8 ? " …" : ""}</div>` : "";
   const den = (d.denied || []).length ? `<div class="bt-denied">被拒绝的操作：${d.denied.map((x) => `${esc(x.tool || "")} ${esc(x.target || "")}`).join("；")}</div>` : "";
-  return `<div class="bt-row bot"><span class="bt-av ${esc(m.who)}">${esc((eng.short || eng.title).slice(0, 3))}</span><div class="bt-col">
+  return `<div class="bt-row bot">${btAv(m.who)}<div class="bt-col">
     <div class="bt-name ${esc(m.who)}">${esc(eng.title)}${["error", "failed", "blocked"].includes(d.status) ? " · 没做成" : d.status === "stopped" ? " · 已停止" : ""}</div>
     <div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text || "（没有文字）")}</div>${ch}${den}
     <div class="meta">${hTime(m.created_at)}${d.conv ? ` · <button class="link" onclick="btOpen('${d.conv}')">看它的对话 ›</button>` : ""}</div></div></div>`;

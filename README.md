@@ -93,6 +93,14 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.70 引擎头像外圈加粗
+
+- 琥珀黄外圈改成和 AIW 头像一样粗（网页和 iOS）。详见 docs/v3.9.70.md。版本 3.9.70 (44)。
+
+## v3.9.69 引擎头像用真实图标
+
+- 网页和 iOS 的引擎头像改成圆形、琥珀黄外圈，里面是 Gemini / Codex / Claude / CodeBuddy / Grok 的真实图标；iOS 引擎列表和回复也有头像了。详见 docs/v3.9.69.md。版本 3.9.69 (43)。
+
 ## v3.9.68 引擎权限请求变成聊天里的确认卡片
 
 - agy 被权限拦下时，AIW 聊天里出「需要你确认」卡片并推送：允许这类命令 / 只这一轮全放开 / 拒绝，和任务确认一样在卡片上点。详见 docs/v3.9.68.md。版本 3.9.68 (42)。

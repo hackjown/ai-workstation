@@ -20,6 +20,34 @@ func engineColor(_ bot: String, _ cs: ColorScheme) -> Color {
     }
 }
 
+/// v3.9.69: the engine's round avatar, the same as the web page: an amber ring like AIW's own, its real logo on white
+/// (engines/eng-<id>.png in the bundle, copied by build-ipa.sh; LobeHub Icons, MIT). Unknown ids show their first letters.
+struct EngineAvatar: View {
+    let bot: String
+    var size: CGFloat = 32
+    static var cache: [String: UIImage] = [:]
+    static func logo(_ id: String) -> UIImage? {
+        if let i = cache[id] { return i }
+        guard let p = Bundle.main.path(forResource: "eng-" + id, ofType: "png", inDirectory: "engines"),
+              let i = UIImage(contentsOfFile: p) else { return nil }
+        cache[id] = i; return i
+    }
+    var body: some View {
+        let id = bot.isEmpty ? "agy" : bot
+        ZStack {
+            Circle().fill(Color.white)
+            if let img = EngineAvatar.logo(id) {
+                Image(uiImage: img).resizable().interpolation(.high).scaledToFit().frame(width: size * 0.56, height: size * 0.56)
+            } else {
+                Text(String(id.prefix(3))).font(.system(size: size * 0.32, weight: .bold)).foregroundColor(.black)
+            }
+        }
+        .frame(width: size, height: size)
+        .overlay(Circle().strokeBorder(amber, lineWidth: max(2.5, size * 0.125)))   // v3.9.70: as thick as AIW's own ring
+        .accessibilityLabel(id)
+    }
+}
+
 /// v3.9.67: files an engine names in its reply (file:///home/aiw/workspace/…, ~/workspace/…), at most 8, in order.
 func engineFilePaths(_ text: String) -> [String] {
     let rx = try? NSRegularExpression(pattern: #"file://(/[^\s)\]<>"'`]+)|((?:~|/home/[\w.-]+)/workspace/[^\s)\]<>"'`，。；]+\.[A-Za-z0-9]{1,6})"#)
@@ -220,7 +248,9 @@ struct EngineSheet: View {
     func row(_ c: JSON) -> some View {
         let eng = engines.first { $0.s("id") == c.s("bot") }
         let last = c.o("last")
-        return VStack(alignment: .leading, spacing: 3) {
+        return HStack(alignment: .top, spacing: 10) {
+        EngineAvatar(bot: c.s("bot"), size: 36).padding(.top, 2)
+        VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Text(c.s("title")).font(.subheadline.weight(.semibold)).lineLimit(1)
                 if c.b("busy") || c.s("status") == "running" { ProgressView().controlSize(.mini) }
@@ -235,6 +265,7 @@ struct EngineSheet: View {
             if !last.isEmpty {
                 Text((last.s("role") == "user" ? "我：" : "") + last.s("text")).font(.caption).foregroundColor(.secondary).lineLimit(2)
             }
+        }
         }.padding(.vertical, 2)
     }
     func groupRow(_ g: JSON) -> some View {
@@ -287,7 +318,7 @@ struct EngineNewSheet: View {
                     Picker("引擎", selection: $bot) {
                         ForEach(engines.indices, id: \.self) { i in
                             let e = engines[i]
-                            Text(e.s("title") + (e.b("available") ? "" : "（即将支持）")).tag(e.s("id"))
+                            Label { Text(e.s("title") + (e.b("available") ? "" : "（即将支持）")) } icon: { EngineAvatar(bot: e.s("id"), size: 22) }.tag(e.s("id"))
                         }
                     }
                 }
@@ -526,7 +557,9 @@ struct EngineConvView: View {
         let d = m.o("data"), st = d.s("status"), running = st == "running"
         let steps = d.a("steps"), denied = d.a("denied"), files = (d.o("changes")["files"] as? [String]) ?? []
         let said = ((d["said"] as? [String]) ?? []).first ?? ""
-        return VStack(alignment: .leading, spacing: 5) {
+        return HStack(alignment: .top, spacing: 8) {
+        EngineAvatar(bot: conv.s("bot"), size: 30)
+        VStack(alignment: .leading, spacing: 5) {
             Text(engine.s("title") + (st == "blocked" ? " · 被权限挡住" : st == "stopped" ? " · 已停止" : ""))
                 .font(.caption2.weight(.semibold)).foregroundColor(engineColor(conv.s("bot").isEmpty ? "agy" : conv.s("bot"), cs))
             if running && m.s("text").isEmpty {
@@ -591,6 +624,7 @@ struct EngineConvView: View {
                 Text("改动：" + files.prefix(8).joined(separator: "，") + (files.count > 8 ? " …" : "")).font(.caption2).foregroundColor(.secondary)
             }
             Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+        }
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(.trailing, 24)
         .contextMenu { if !running { msgMenu(m) } }
@@ -1074,6 +1108,8 @@ struct EngineGroupView: View {
             let d = m.o("data")
             let bad = ["error", "failed", "blocked"].contains(d.s("status"))
             let files = (d.o("changes")["files"] as? [String]) ?? []
+            HStack(alignment: .top, spacing: 8) {
+            EngineAvatar(bot: m.s("who"), size: 30)
             VStack(alignment: .leading, spacing: 4) {
                 Text(title(m.s("who")) + (bad ? " · 没做成" : "")).font(.caption2.weight(.semibold)).foregroundColor(engineColor(m.s("who"), cs))
                 RichText(text: m.s("text").isEmpty ? "（没有文字）" : m.s("text"))
@@ -1087,6 +1123,7 @@ struct EngineGroupView: View {
                     Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
                     if !d.s("conv").isEmpty { Button("看它的对话 ›") { openConv = d.s("conv") }.font(.caption2) }
                 }
+            }
             }.frame(maxWidth: .infinity, alignment: .leading)
         }
     }

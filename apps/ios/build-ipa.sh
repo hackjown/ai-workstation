@@ -19,6 +19,8 @@ mkdir -p $APP/mate/vendor/emotionball && cp ../web/mate.html ../web/mate-map.js 
 mkdir -p $APP/takeover && cp ../web/takeover.html ../web/takeover.js $APP/takeover/
 # file preview page (MarkdownPreview.swift): the web app's renderer (markdown-it + DOMPurify, vendored) and styles
 mkdir -p $APP/mdview/vendor/markdown && cp ../web/mdview.html ../web/mdview.js ../web/mdview.css $APP/mdview/ && cp ../web/vendor/markdown/*.js ../web/vendor/markdown/LICENSE-* $APP/mdview/vendor/markdown/
+# v3.9.69 engine avatars (EngineView.swift EngineAvatar): the real logos, PNG
+mkdir -p $APP/engines && cp engines/eng-*.png engines/LICENSE $APP/engines/
 # App icon (the 球球 face): loose PNGs from the 1024 master for CFBundleIconFiles, then Assets.car via actool when it works
 python3 - "$APP" <<'PY'
 import sys; from PIL import Image

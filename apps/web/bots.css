@@ -19,6 +19,12 @@
 html[data-theme=dark] .bt-av.grok { background:#e9e9e9; color:#111; }
 .bt-name.agy { color:#c026d3; } .bt-name.codex { color:#10a37f; } .bt-name.claude { color:#d97757; }
 .bt-name.codebuddy { color:#2b6cff; } .bt-name.grok { color:var(--text); }
+/* v3.9.69: round, amber ring (AIW's own avatar), real engine logo on white */
+.bt-av { border-radius:50%; background:#fff !important; color:#111 !important; border:4px solid var(--amber); box-sizing:border-box; overflow:hidden; }   /* v3.9.70: ring as thick as AIW's (~1/8 of the size) */
+.bt-av img { width:72%; height:72%; display:block; pointer-events:none; }
+.bt-av.sm { width:22px; height:22px; font-size:9px; border-width:2.5px; vertical-align:middle; }
+.bt-av.grp { background:var(--accBg) !important; color:var(--acc) !important; }
+.bt-row.bot > .bt-av { margin-top:2px; }
 .bt-it.on { box-shadow:inset 3px 0 0 var(--bt-c, var(--acc)); }
 .bt-it.agy { --bt-c:#c026d3; } .bt-it.codex { --bt-c:#10a37f; } .bt-it.claude { --bt-c:#d97757; }
 .bt-it.codebuddy { --bt-c:#2b6cff; } .bt-it.grok { --bt-c:#555; }
@@ -73,7 +79,7 @@ html[data-theme=dark] .bt-av.grok { background:#e9e9e9; color:#111; }
 .bt-model { max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 @media (max-width: 760px) { .bt-model { max-width:120px; } }
 .bt-av.grp { background:#8a5cf6; }
-.bt-av.sm { width:22px; height:22px; border-radius:6px; font-size:9px; display:inline-grid; vertical-align:middle; }
+.bt-av.sm { width:22px; height:22px; font-size:9px; display:inline-grid; vertical-align:middle; }
 
 /* v3.9.62: engine forms in AIW's form layout (.callnote: title, each field a label over its control) */
 .bt-form label:not(.bt-chk), .bt-form .bt-fl { display:flex; flex-direction:column; gap:6px; font-size:13px; color:var(--mute); }

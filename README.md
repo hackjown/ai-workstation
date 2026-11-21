@@ -93,6 +93,12 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.64 聊天里查引擎对话、接着做
+
+- 聊天新增 `engine_convs` 工具：按标题、文件夹和内容搜各引擎（agy、Codex、Claude、CodeBuddy、Grok）的对话，或读某个对话最近几轮。
+- `engine_task` 可带 `conv`：在找到的那个对话里接着做（同一会话、同一文件夹），`manage` 为 true 时交给管家盯到做完，结果回到聊天。
+- 「让 codex 完成 ldok后端对接的任务」这类话里出现了该引擎已有对话的标题，就接着那个对话做，不再新开。版本 3.9.64 (38)。详见 `docs/v3.9.64.md`。
+
 ## v3.9.63 引擎：CodeBuddy 模型和强度、引擎颜色
 
 - CodeBuddy 没有列模型的命令行（只在交互界面 `/model` 里），模型列表改为：`~/.codebuddy/settings.json` 的 model、`~/.codebuddy/models.json`（models 和 availableModels），再加 WorkBuddy 账号常见模型（hy4std、hy4flash-free、glm-5.3、kimi-k3.1-pro 等）；其他模型仍可手动填。

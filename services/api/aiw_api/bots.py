@@ -328,6 +328,43 @@ class Bots:
             out.append(c)
         return out
 
+    def find_convs(self, q: str = "", bot: str = "", limit: int = 8) -> list[dict]:
+        """v3.9.64: engine conversations (group members too) whose title or messages match every word of q, newest
+        first, each with where it matched; the main chat's engine_convs tool."""
+        words = [w for w in re.split(r"[\s,，。、;；:：]+", (q or "").strip()) if w][:6]
+        where, args = [], []
+        for w in words:
+            like = f"%{w}%"
+            where.append("(c.title LIKE ? OR c.workdir LIKE ? OR EXISTS (SELECT 1 FROM bot_messages m "
+                         "WHERE m.conv=c.id AND m.text LIKE ?))")
+            args += [like, like, like]
+        if bot:
+            where.append("c.bot=?")
+            args.append(bot)
+        rows = self.store._x("SELECT c.* FROM bot_convs c " + ("WHERE " + " AND ".join(where) + " " if where else "")
+                             + "ORDER BY c.updated_at DESC LIMIT ?", (*args, max(1, min(int(limit or 8), 20))))
+        out = []
+        for r in rows:
+            c = conv_row(r)
+            hit = None
+            for w in words:
+                if w.lower() in (c.get("title") or "").lower():
+                    continue
+                m = self.store._x("SELECT text FROM bot_messages WHERE conv=? AND text LIKE ? ORDER BY seq DESC LIMIT 1",
+                                  (c["id"], f"%{w}%"))
+                if m:
+                    t = m[0]["text"]
+                    i = t.lower().find(w.lower())
+                    hit = clip(t[max(0, i - 60):], 160)
+                    break
+            last = self.store._x("SELECT role, text FROM bot_messages WHERE conv=? ORDER BY seq DESC LIMIT 1", (c["id"],))
+            n = self.store._x("SELECT COUNT(*) AS n FROM bot_messages WHERE conv=?", (c["id"],))[0]["n"]
+            out.append({"id": c["id"], "bot": c["bot"], "title": c["title"], "workdir": c["workdir"],
+                        "updated_at": c["updated_at"], "busy": self.busy(c["id"]), "takeover": bool(c.get("takeover")),
+                        "group": c.get("grp") or "", "messages": n, "match": hit,
+                        "last": {"role": last[0]["role"], "text": clip(last[0]["text"], 160)} if last else None})
+        return out
+
     def conv(self, cid: str) -> Optional[dict]:
         r = self.store._x("SELECT * FROM bot_convs WHERE id=?", (cid,))
         return conv_row(r[0]) if r else None

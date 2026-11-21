@@ -9,7 +9,7 @@ SRC = IOS / "Sources"
 
 def test_version_and_camera_permissions():
     p = plistlib.loads((IOS / "Info.plist").read_bytes())
-    assert p["CFBundleShortVersionString"] == "3.9.63" and p["CFBundleVersion"] == "37"   # bumped in v3.9.63 (CodeBuddy models and strengths)
+    assert p["CFBundleShortVersionString"] == "3.9.64" and p["CFBundleVersion"] == "38"   # bumped in v3.9.64 (chat finds engine conversations)
     for k in ("NSCameraUsageDescription", "NSMicrophoneUsageDescription", "NSPhotoLibraryUsageDescription"):
         assert p.get(k), k
 

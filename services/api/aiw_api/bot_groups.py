@@ -579,8 +579,17 @@ class Dispatch:
                     "data": {"bot_group": g["id"], "bots": [{"bot": b} for b in bots]}}
         bot = bots[0]
         c = None
-        if p.get("cont") and not p.get("workdir"):
-            c = next((x for x in self.bots.convs() if x["bot"] == bot), None)
+        if p.get("conv"):   # v3.9.64: an existing conversation the chat found (engine_convs): carry on in it
+            c = self.bots.conv(p["conv"])
+            if not c:
+                raise ValueError(f"没有这个引擎对话：{p['conv']}")
+            bot = c["bot"]
+        elif not p.get("workdir"):
+            if p.get("cont"):
+                c = next((x for x in self.bots.convs() if x["bot"] == bot), None)
+            else:   # "让 agy 完成 ldok后端对接" names an existing conversation by its title: that one, not a new one
+                c = next((x for x in self.bots.convs() if x["bot"] == bot and len(x["title"] or "") >= 4
+                          and x["title"].lower() in task.lower()), None)
         if not c:
             c = self.bots.create(bot, title, p.get("workdir") or "", machine_id, origin=origin or "chat")
         elif not c.get("origin"):
@@ -592,12 +601,14 @@ class Dispatch:
             except Exception as e:  # noqa: BLE001
                 log.warning("dispatch files: %s", e)
         eng = B.ENGINES[bot]["title"]
+        where = f"「{c['title']}」" if p.get("conv") or p.get("cont") or c["created_at"] < time.time() - 5 else ""
         if p.get("manage"):
             self.bots.takeover(c["id"], task)
-            text = f"交给 {eng} 了，AIW 管家盯着它做完，结果回到这里。"
+            text = f"交给 {eng}{where} 了，AIW 管家盯着它做完，结果回到这里。"
         else:
             self.bots.send(c["id"], task, "user", attachments=att)
-            text = f"交给 {eng} 了（在电脑的 {c['workdir']} 里），它回复后结果回到这里。"
+            text = (f"在 {eng} 的对话{where}里接着做了，它回复后结果回到这里。" if where else
+                    f"交给 {eng} 了（在电脑的 {c['workdir']} 里），它回复后结果回到这里。")
         return {"text": text, "data": {"bot_conv": c["id"], "bots": [{"bot": bot, "conv": c["id"]}]}}
 
     def _on_bot(self, kind: str, obj):

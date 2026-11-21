@@ -14,7 +14,7 @@ WEB = ROOT / "apps" / "web"
 def test_version_is_3_8_9_build_30_for_app_and_share():
     for p in (IOS / "Info.plist", IOS / "Share" / "Info.plist"):
         d = plistlib.loads(p.read_bytes())
-        assert d["CFBundleShortVersionString"] == "3.9.63" and d["CFBundleVersion"] == "37", p   # bumped in v3.9.63 (CodeBuddy models and strengths)
+        assert d["CFBundleShortVersionString"] == "3.9.64" and d["CFBundleVersion"] == "38", p   # bumped in v3.9.64 (chat finds engine conversations)
 
 
 async def test_thinking_patch_changes_only_thinking(stack):

@@ -1063,22 +1063,61 @@ class Chat:
                 bots = [str(x).lower() for x in (a.get("engines") or []) if str(x).lower() in
                         ("agy", "codex", "claude", "codebuddy", "grok")]
                 task = str(a.get("task") or "").strip()
+                conv = str(a.get("conv") or "").strip()
+                if conv:   # v3.9.64: carry on in a conversation engine_convs found
+                    c = _d.bots.conv(conv)
+                    if not c:
+                        return f"没有这个引擎对话：{conv}，先用 engine_convs 找"
+                    bots = [c["bot"]]
                 if not bots or not task:
-                    return "需要 engines 和 task"
-                wd = str(a.get("workdir") or "").strip()
+                    return "需要 engines（或 conv）和 task"
+                wd = "" if conv else str(a.get("workdir") or "").strip()
                 r = await _d.run({"bots": bots, "task": task, "workdir": wd, "manage": bool(a.get("manage")),
-                                  "cont": False}, origin="chat")
+                                  "cont": False, "conv": conv}, origin="chat")
                 return r["text"]
+
+            async def _engine_convs(a, _d=disp):
+                from . import bots as _B
+                cid = str(a.get("conv") or "").strip()
+                if cid:   # one conversation: its latest turns
+                    c = _d.bots.conv(cid)
+                    if not c:
+                        return f"没有这个引擎对话：{cid}"
+                    n = max(2, min(int(a.get("turns") or 8), 30))
+                    ms = _d.bots.messages(cid, limit=n)
+                    eng = _B.ENGINES.get(c["bot"], {}).get("title", c["bot"])
+                    head = (f"{eng} 对话「{c['title']}」id={cid} 文件夹={c['workdir']}"
+                            f"{' · 管家接管中' if c.get('takeover') else ''}{' · 正在回复' if _d.bots.busy(cid) else ''}")
+                    body = "\n\n".join(f"[{_B.who(m['role'], eng)}] {_B.clip(m['text'], 1500)}" for m in ms)
+                    return head + "\n\n" + (body or "（还没有消息）")
+                eng = str(a.get("engine") or "").strip().lower()
+                rows = _d.bots.find_convs(str(a.get("query") or ""), eng if eng in _B.ENGINES else "",
+                                          int(a.get("limit") or 8))
+                if not rows:
+                    return "引擎里没有找到相关的对话"
+                return json.dumps(rows, ensure_ascii=False)
+            out["engine_convs"] = ({"name": "engine_convs", "description": "查电脑上编程引擎（agy、codex、claude、codebuddy、grok）"
+                                    "的对话记录：给 query 按标题、文件夹和内容搜，返回对话列表（id、引擎、标题、匹配片段、最后一条）；"
+                                    "给 conv 读这个对话最近几轮。用户提到引擎里已有的对话或任务（如「agy 的 ldok 后端对接」）时先用它找，"
+                                    "再用 engine_task 带 conv 在那个对话里接着做",
+                                    "parameters": {"type": "object", "properties": {
+                                        "query": {"type": "string", "description": "关键词，空格分开，都要匹配"},
+                                        "engine": {"type": "string", "description": "只看某个引擎：agy / codex / claude / codebuddy / grok"},
+                                        "conv": {"type": "string", "description": "对话 id（bc-…），读它最近几轮"},
+                                        "turns": {"type": "integer", "description": "读几条，默认 8"},
+                                        "limit": {"type": "integer", "description": "最多几个对话，默认 8"}}}}, _engine_convs)
             out["engine_task"] = ({"name": "engine_task", "description": "把编程/改代码的活交给电脑上的编程引擎去做"
                                    "（agy=Antigravity、codex、claude=Claude Code、codebuddy、grok）。用户点名要某个引擎做事时用；"
-                                   "点名多个引擎就建群聊，各开分支并行干，管家合并。结果稍后自动回到聊天里",
+                                   "点名多个引擎就建群聊，各开分支并行干，管家合并。要接着引擎里已有的对话做，先用 engine_convs 找到它，"
+                                   "再把它的 id 填进 conv（不用填 engines）。结果稍后自动回到聊天里",
                                    "parameters": {"type": "object", "properties": {
                                        "engines": {"type": "array", "items": {"type": "string"},
                                                    "description": "agy / codex / claude / codebuddy / grok，一个或多个"},
                                        "task": {"type": "string", "description": "交给它的任务，原话加上必要的上下文"},
                                        "workdir": {"type": "string", "description": "电脑上的项目文件夹（~/… 或 /home/…），不知道就留空"},
+                                       "conv": {"type": "string", "description": "已有的引擎对话 id（engine_convs 找到的），在它里面接着做"},
                                        "manage": {"type": "boolean", "description": "true：AIW 管家盯着它直到做完"}},
-                                       "required": ["engines", "task"]}}, _engine_task)
+                                       "required": ["task"]}}, _engine_task)
         srch = getattr(self, "search", None)
         if srch is not None:   # v3.9.14: earlier chats, tasks and files
             out["session_search"] = srch.tool()
@@ -1118,7 +1157,8 @@ class Chat:
             return "正在搜索…"
         return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…",
                 "session_search": "正在翻以前的记录…", "generate_image": "正在画图…",
-                "edit_image": "正在改图…", "doc_ask": "正在读文档…", "engine_task": "正在交给引擎…"}.get(name, "正在查…")
+                "edit_image": "正在改图…", "doc_ask": "正在读文档…", "engine_task": "正在交给引擎…",
+                "engine_convs": "正在翻引擎的对话…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:

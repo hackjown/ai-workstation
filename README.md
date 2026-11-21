@@ -93,6 +93,12 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.63 引擎：CodeBuddy 模型和强度、引擎颜色
+
+- CodeBuddy 没有列模型的命令行（只在交互界面 `/model` 里），模型列表改为：`~/.codebuddy/settings.json` 的 model、`~/.codebuddy/models.json`（models 和 availableModels），再加 WorkBuddy 账号常见模型（hy4std、hy4flash-free、glm-5.3、kimi-k3.1-pro 等）；其他模型仍可手动填。
+- 每个引擎一种颜色：agy 紫红、Codex 绿、Claude 橙、CodeBuddy 蓝、Grok 黑（深色模式为浅灰）；头像、回复上的名字、列表里打开的对话左侧色条都用它。
+- CodeBuddy 强度：最低到最高六档（minimal / low / medium / high / xhigh / max），用 `--settings '{"reasoningEffort":…}'` 传给 CodeBuddy。版本 3.9.63 (37)。详见 `docs/v3.9.63.md`。
+
 ## v3.9.62 引擎：表单排版、按引擎读取模型
 
 - 引擎的表单改回 AIW 的表单样式（名称在上、输入框在下）。

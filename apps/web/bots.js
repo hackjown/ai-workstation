@@ -24,8 +24,8 @@ function btRenderList() {
   const box = $("btList"); if (!box) return;
   const items = BT.convs.map((c) => {
     const e = btEngine(c.bot), st = c.takeover ? "管家接管中" : (c.busy || c.status === "running") ? "回复中…" : "";
-    return `<button class="bt-it ${c.id === BT.cid ? "on" : ""}" onclick="btOpen('${c.id}')">
-      <span class="bt-av ${esc(c.bot)}">${esc((e.short || e.title).slice(0, 3))}</span>
+    return `<button class="bt-it ${esc(c.bot || "agy")} ${c.id === BT.cid ? "on" : ""}" onclick="btOpen('${c.id}')">
+      <span class="bt-av ${esc(c.bot || "agy")}">${esc((e.short || e.title).slice(0, 3))}</span>
       <span class="grow"><span class="t1">${esc(c.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${c.last ? esc(c.last.text) : esc(e.title)}</span></span></button>`;
   }).join("");
   box.innerHTML = `<div class="bt-head"><div class="heading">引擎</div><button class="btn sm" onclick="btGroupNew()" title="几个引擎各开一个分支并行干，管家合并">${icon("plus")}群聊</button><button class="btn sm primary" onclick="btNew()">${icon("plus")}新对话</button></div>`
@@ -111,8 +111,8 @@ function btMsg(m) {
   const body = running && !m.text
     ? `<div class="bubble hdots-b"><span class="hdots"><i></i><i></i><i></i></span><span class="hnote">${esc(((d.said || [])[0] || "").slice(0, 80) || "在电脑上干活…")}</span></div>`
     : `<div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text)}</div>`;
-  return `<div class="bt-row bot"><span class="bt-av ${esc((BT.conv || {}).bot || "")}">${esc((eng.short || eng.title).slice(0, 3))}</span><div class="bt-col">
-    <div class="bt-name">${esc(eng.title)}${d.status === "blocked" ? " · 被权限挡住" : d.status === "stopped" ? " · 已停止" : ""}</div>
+  return `<div class="bt-row bot"><span class="bt-av ${esc((BT.conv || {}).bot || "agy")}">${esc((eng.short || eng.title).slice(0, 3))}</span><div class="bt-col">
+    <div class="bt-name ${esc((BT.conv || {}).bot || "agy")}">${esc(eng.title)}${d.status === "blocked" ? " · 被权限挡住" : d.status === "stopped" ? " · 已停止" : ""}</div>
     ${body}${stepHtml}${den}${ch}<div class="meta">${hTime(m.created_at)}${running ? "" : acts}</div></div></div>`;
 }
 function btRenderConv() {
@@ -474,7 +474,7 @@ function btGMsg(m) {
   const ch = d.changes && (d.changes.files || []).length ? `<div class="small muted">改动：${esc(d.changes.files.slice(0, 8).join("，"))}${d.changes.files.length > 8 ? " …" : ""}</div>` : "";
   const den = (d.denied || []).length ? `<div class="bt-denied">被拒绝的操作：${d.denied.map((x) => `${esc(x.tool || "")} ${esc(x.target || "")}`).join("；")}</div>` : "";
   return `<div class="bt-row bot"><span class="bt-av ${esc(m.who)}">${esc((eng.short || eng.title).slice(0, 3))}</span><div class="bt-col">
-    <div class="bt-name">${esc(eng.title)}${["error", "failed", "blocked"].includes(d.status) ? " · 没做成" : d.status === "stopped" ? " · 已停止" : ""}</div>
+    <div class="bt-name ${esc(m.who)}">${esc(eng.title)}${["error", "failed", "blocked"].includes(d.status) ? " · 没做成" : d.status === "stopped" ? " · 已停止" : ""}</div>
     <div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text || "（没有文字）")}</div>${ch}${den}
     <div class="meta">${hTime(m.created_at)}${d.conv ? ` · <button class="link" onclick="btOpen('${d.conv}')">看它的对话 ›</button>` : ""}</div></div></div>`;
 }

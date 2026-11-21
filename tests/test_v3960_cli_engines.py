@@ -151,6 +151,35 @@ async def test_models_and_efforts_per_engine(tmp_path):
     # CodeBuddy has no `models` subcommand: the bridge must not run one (it would start a chat), so no grok list here
     cb = await b.models("codebuddy", "vm1")
     assert "grok-4.6" not in [x["id"] for x in cb["groups"]]
+    # v3.9.63: CodeBuddy's account models (static list) and its six strengths (settings.reasoningEffort)
+    ids = [x["id"] for x in cb["groups"]]
+    assert "hy4std" in ids and "hy4flash-free" in ids and "glm-5.3" in ids
+    assert cb["efforts"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
+
+
+def test_codebuddy_effort_goes_in_settings(tmp_path):
+    import json as _j
+    import importlib.util as _u
+    spec = _u.spec_from_file_location("cb_bridge", str(ROOT / "services/agent-runtime/agent_runtime/cli_bridge.py"))
+    m = _u.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    job = {"engine": "codebuddy", "bin": "codebuddy", "workdir": str(tmp_path), "model": "glm-5.3", "effort": "max"}
+    argv, stdin = m.build_cmd(job, "hi", "", str(tmp_path))
+    assert argv[argv.index("--model") + 1] == "glm-5.3"
+    assert _j.loads(argv[argv.index("--settings") + 1]) == {"reasoningEffort": "max"} and stdin == "hi"
+    job["effort"] = ""
+    assert "--settings" not in m.build_cmd(job, "hi", "", str(tmp_path))[0]
+
+
+def test_codebuddy_models_json_is_read(tmp_path, monkeypatch):
+    import importlib.util as _u
+    (tmp_path / ".codebuddy").mkdir()
+    (tmp_path / ".codebuddy/models.json").write_text('{"models":[{"id":"my-m","name":"Mine"}],"availableModels":["hy4std","x-1"]}')
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = _u.spec_from_file_location("cb_bridge2", str(ROOT / "services/agent-runtime/agent_runtime/cli_bridge.py"))
+    m = _u.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    assert [x["id"] for x in m.config_models("codebuddy")] == ["my-m", "hy4std", "x-1"]
 
 
 async def test_missing_cli_says_how_to_install(tmp_path):

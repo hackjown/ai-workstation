@@ -14,6 +14,14 @@
 .bt-av.claude { background:#d97757; }
 .bt-av.codebuddy { background:#2b6cff; }
 .bt-av.grok { background:#111; }
+/* v3.9.63: one colour per engine — avatar, sender name, and the bar on the open conversation */
+.bt-av.agy { background:#c026d3; }
+html[data-theme=dark] .bt-av.grok { background:#e9e9e9; color:#111; }
+.bt-name.agy { color:#c026d3; } .bt-name.codex { color:#10a37f; } .bt-name.claude { color:#d97757; }
+.bt-name.codebuddy { color:#2b6cff; } .bt-name.grok { color:var(--text); }
+.bt-it.on { box-shadow:inset 3px 0 0 var(--bt-c, var(--acc)); }
+.bt-it.agy { --bt-c:#c026d3; } .bt-it.codex { --bt-c:#10a37f; } .bt-it.claude { --bt-c:#d97757; }
+.bt-it.codebuddy { --bt-c:#2b6cff; } .bt-it.grok { --bt-c:#555; }
 .bt-conv { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
 .bt-top { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--line2); }
 .bt-top:empty { display:none; }

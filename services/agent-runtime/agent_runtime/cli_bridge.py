@@ -60,7 +60,7 @@ ENGINES = {
                "install": "npm i -g @anthropic-ai/claude-code，然后运行一次 claude 登录", "efforts": []},
     "codebuddy": {"title": "CodeBuddy", "bins": ("codebuddy", "cbc"), "env": "AIW_CODEBUDDY_BIN", "stdin": True,
                   "install": "npm i -g @tencent-ai/codebuddy-code，然后运行一次 codebuddy 用 WorkBuddy 账号登录",
-                  "efforts": []},
+                  "efforts": ["minimal", "low", "medium", "high", "xhigh", "max"]},   # settings.reasoningEffort
     "grok": {"title": "Grok Build", "bins": ("grok",), "env": "AIW_GROK_BIN", "stdin": False,
              "install": "curl -fsSL https://x.ai/cli/install.sh | bash，然后运行一次 grok login --device-auth",
              "efforts": ["low", "medium", "high"]},
@@ -73,6 +73,14 @@ DENY_SHELL = ["git push", "git reset --hard", "git clean", "git checkout .", "gi
 DENY_PATHS = ["~/.config/aiw/**", "~/.codex/**", "~/.claude/**", "~/.codebuddy/**", "~/.grok/**", "~/.gemini/**"]
 STATIC_MODELS = {   # shown when the CLI has no model list of its own; any model id the account has also works
     "claude": [("opus", "Opus（最新）"), ("sonnet", "Sonnet（最新）"), ("haiku", "Haiku（最新）")],
+    # v3.9.63: CodeBuddy only lists models inside its TUI (/model), per WorkBuddy account; this is the list a
+    # WorkBuddy account showed on 2026-11-21 (credits multiplier in the label). Others: 「其他（手动填模型名）」.
+    "codebuddy": [("hy4std", "hy4std（x0.29）"), ("hy4flash-free", "hy4flash-free（免费）"),
+                  ("hy4flash", "hy4flash（x0.03）"), ("deepseek-v4.1-flash", "deepseek-v4.1-flash（x0.11）"),
+                  ("glm-5.3", "glm-5.3（x0.69）"), ("glm-5.3-flash", "glm-5.3-flash（x0.08）"),
+                  ("glm-5.2", "glm-5.2（x0.79）"), ("space-bunny", "space-bunny（x0.08）"),
+                  ("minimax-m3.1-flash", "minimax-m3.1-flash（x0.08）"), ("minimax-m2.7", "minimax-m2.7（x0.19）"),
+                  ("kimi-k3.1-pro", "kimi-k3.1-pro（x0.97）"), ("kimi-k3-1", "kimi-k3-1（x1.62）")],
 }
 AUTH_RE = re.compile(r"not logged in|log ?in required|please (log|sign) ?in|authenticat|unauthori[sz]ed|\b401\b|"
                      r"api key|invalid x-api-key|credentials", re.I)
@@ -189,6 +197,8 @@ def build_cmd(job: dict, prompt: str, session: str, turn_dir: str) -> tuple:
         c += ["--disallowedTools", deny]
         if model:
             c += ["--model", model]
+        if effort and e == "codebuddy":   # no --effort flag; CodeBuddy reads it from settings
+            c += ["--settings", json.dumps({"reasoningEffort": effort})]
         if session:
             c += ["--resume", session]
         return c, prompt
@@ -489,6 +499,14 @@ def config_models(engine: str) -> list:
         s = read_json(os.path.expanduser("~/.codebuddy/settings.json"), {}) or {}
         if s.get("model"):
             res.append({"id": str(s["model"]), "label": str(s["model"]) + "（配置里的）"})
+        # ~/.codebuddy/models.json: custom models, and availableModels (the ids the account wants shown)
+        mj = read_json(os.path.expanduser("~/.codebuddy/models.json"), {}) or {}
+        for m in (mj.get("models") or []) if isinstance(mj, dict) else []:
+            if isinstance(m, dict) and m.get("id") and m["id"] not in [x["id"] for x in res]:
+                res.append({"id": str(m["id"]), "label": str(m.get("name") or m["id"]) + "（models.json）"})
+        for i in (mj.get("availableModels") or []) if isinstance(mj, dict) else []:
+            if i and str(i) not in [x["id"] for x in res]:
+                res.append({"id": str(i), "label": str(i)})
     return res
 
 

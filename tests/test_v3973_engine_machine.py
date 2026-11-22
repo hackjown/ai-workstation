@@ -42,3 +42,9 @@ def test_wiring():
     assert "btMachineOpts()" in js and "machine_id: f.machine" in js and "c.machine_label" in js
     sw = (ROOT / "apps/ios/Sources/EngineView.swift").read_text()
     assert '"machine_id": machine' in sw and 'Text("自动（按任务选）").tag("auto")' in sw
+
+
+def test_v3974_ios_body_type_checks():
+    sw = (ROOT / "apps/ios/Sources/EngineView.swift").read_text()
+    assert "Text(emptyHint)" in sw and "var emptyHint: String" in sw and "func machineName(_ m: JSON) -> String" in sw
+    assert 'conv.s("machine_label").isEmpty ? "电脑" : " " +' not in sw

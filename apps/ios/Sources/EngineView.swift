@@ -329,7 +329,7 @@ struct EngineNewSheet: View {
                     Picker("电脑", selection: $machine) {
                         Text("自动（按任务选）").tag("auto")
                         ForEach(machines.indices, id: \.self) { i in
-                            Text(machines[i].s("name").isEmpty ? machines[i].s("id") : machines[i].s("name")).tag(machines[i].s("id"))
+                            Text(machineName(machines[i])).tag(machines[i].s("id"))
                         }
                     }
                 }
@@ -352,6 +352,10 @@ struct EngineNewSheet: View {
             await EngineModels.shared.load(bot: bot)
         }
         .onChange(of: bot) { b in group = ""; effort = ""; Task { await EngineModels.shared.load(bot: b) } }
+    }
+    func machineName(_ m: JSON) -> String {
+        let n: String = m.s("name")
+        return n.isEmpty ? m.s("id") : n
     }
     @MainActor func create() async {
         if let e = engines.first(where: { $0.s("id") == bot }), !e.b("available") { error = "\(e.s("title")) 还没接入"; return }
@@ -407,13 +411,20 @@ struct EngineConvView: View {
     var takeover: JSON { (conv["takeover"] as? JSON) ?? [:] }
     var live: Bool { conv.b("busy") || conv.s("status") == "running" }
     var slashQ: String? { slashQuery(text) }
+    // v3.9.74: built outside body; the inline ternary made body too slow to type-check
+    var emptyHint: String {
+        let label: String = conv.s("machine_label")
+        let place: String = label.isEmpty ? "电脑" : " \(label) "
+        let wd: String = conv.s("workdir")
+        return "直接说要它做什么。它在\(place)的 \(wd) 里干活，改动不会自动推送。"
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     if msgs.isEmpty && !conv.isEmpty {
-                        Text("直接说要它做什么。它在\(conv.s("machine_label").isEmpty ? "电脑" : " " + conv.s("machine_label") + " ")的 \(conv.s("workdir")) 里干活，改动不会自动推送。")
+                        Text(emptyHint)
                             .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
                     }
                     ForEach(msgs.indices.map { HRowKey(i: $0, id: msgs[$0].s("id")) }, id: \.id) { k in row(msgs[k.i]) }

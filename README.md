@@ -93,6 +93,10 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.74 修 iOS 构建
+
+- 修 v3.9.73 的 iOS 编译超时（EngineView body 无法在合理时间内完成类型检查）。详见 docs/v3.9.74.md。版本 3.9.74 (48)。
+
 ## v3.9.73 引擎对话可以选电脑
 
 - 新建引擎对话可以选电脑，默认「自动」：CAD、渲染/剪辑视频交给云电脑，写代码留在本地。详见 docs/v3.9.73.md。版本 3.9.73 (47)。

@@ -41,3 +41,14 @@ def test_denial_target_never_blank():
 def test_manager_rules():
     src = (ROOT / "services/api/aiw_api/bots.py").read_text()
     assert "setsid nohup bash" in src and "几分钟内能交付结果" in src and "连续两轮没进展" in src
+
+
+def test_v3972_background_wait_is_not_idle_and_version_check():
+    import os, subprocess, time
+    assert b.agy_version_tuple("agy 1.5.9") < b.MIN_AGY <= b.agy_version_tuple("1.5.14")
+    p = subprocess.Popen(["python3", "-c", "import time\nt=time.time()\nwhile time.time()-t<1.2: pass"])
+    time.sleep(1.4)
+    assert b.tree_cpu(os.getpid()) > 0.5
+    p.wait()
+    src = (ROOT / "services/agent-runtime/agent_runtime/agy_bridge.py").read_text()
+    assert '"outdated": bool(vt) and vt < MIN_AGY' in src and "c - cpu_seen > 1.0" in src

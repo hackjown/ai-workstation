@@ -345,6 +345,46 @@ def stage(text: str, job: dict) -> tuple:
                 "\n".join("- " + n for n in notes))
     return new, notes
 
+MIN_AGY = (1, 5, 14)   # v3.9.72: 1.5.0 waits for background tasks; 1.5.14 auto mode reads outside the workspace
+
+
+def agy_version_tuple(ver: str) -> tuple:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", ver or "")
+    return tuple(int(x) for x in m.groups()) if m else ()
+
+
+def tree_cpu(root: int) -> float:
+    """v3.9.72: CPU seconds used by agy's descendants (a render, a build it runs in the background), from /proc.
+    agy itself is left out, so its own idle polling does not count. 0.0 where /proc is not there."""
+    kids: dict = {}
+    cpu: dict = {}
+    try:
+        tick = os.sysconf("SC_CLK_TCK")
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"/proc/{d}/stat") as f:
+                    st = f.read()
+            except OSError:
+                continue
+            rest = st[st.rfind(")") + 2:].split()
+            ppid = int(rest[1])
+            kids.setdefault(ppid, []).append(int(d))
+            cpu[int(d)] = (int(rest[11]) + int(rest[12]) + int(rest[13]) + int(rest[14])) / tick
+    except (OSError, ValueError, IndexError):
+        return 0.0
+    total, todo, seen = 0.0, list(kids.get(root, [])), set()
+    while todo:
+        p = todo.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        total += cpu.get(p, 0.0)
+        todo += kids.get(p, [])
+    return total
+
+
 # ------------------------------------------------------------------------------------------------------- check
 def op_check(probe: bool):
     b = agy_bin()
@@ -357,7 +397,9 @@ def op_check(probe: bool):
         ver = (r.stdout or r.stderr).strip().splitlines()[0][:80] if (r.stdout or r.stderr).strip() else ""
     except Exception as e:  # noqa: BLE001
         ver = f"? ({type(e).__name__})"
+    vt = agy_version_tuple(ver)
     res = {"ok": True, "installed": True, "path": b, "version": ver, "bridge": AGYV,
+           "outdated": bool(vt) and vt < MIN_AGY, "min_version": ".".join(map(str, MIN_AGY)),
            "git": bool(shutil.which("git")),
            "proxy": bool(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")),
            "settings": settings_state()}
@@ -670,8 +712,16 @@ class Daemon:
         threading.Thread(target=self.pump, args=(proc.stderr, "err"), daemon=True).start()
         stop_file = os.path.join(self.d, "STOP")
         end_reason = None
+        cpu_seen, cpu_at = 0.0, 0.0
         while True:
             now = time.time()
+            if self.turn_active and now - self.last_io > 60 and now - cpu_at > 30:
+                # v3.9.72: agy >= 1.5.0 waits quietly while its background task runs; a child still burning CPU
+                # (more than 1 s in the last 30 s) is work, not a stuck turn
+                c = tree_cpu(proc.pid)
+                if cpu_at and c - cpu_seen > 1.0:
+                    self.last_io = now
+                cpu_seen, cpu_at = c, now
             if os.path.exists(stop_file):
                 end_reason = "stopped"
             elif now - self.started > total_s:

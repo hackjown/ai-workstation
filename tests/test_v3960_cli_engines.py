@@ -197,7 +197,7 @@ async def test_missing_cli_says_how_to_install(tmp_path):
     b.send(c["id"], "hi")
     await settle(b, c["id"])
     bot = [m for m in b.messages(c["id"]) if m["role"] == "bot"][-1]
-    assert "电脑上没装 Grok Build" in bot["text"] and "x.ai/cli/install.sh" in bot["text"]
+    assert "上没装 Grok Build" in bot["text"]   # v3.9.73 names the computer and "x.ai/cli/install.sh" in bot["text"]
 
 
 def test_codex_sandbox_failure_is_listed_as_denied():

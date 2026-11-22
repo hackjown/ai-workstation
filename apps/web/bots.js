@@ -47,18 +47,25 @@ function btNew() {
   modal(`<form class="callnote bt-form" onsubmit="btCreate(event)"><h3>新对话</h3>
       <label>引擎<select name="bot" onchange="btModelsFill('', '', false, this.value)">${opts}</select></label>
       <label>标题<input name="title" placeholder="例如 ldok 重建" /></label>
+      <label>电脑<select name="machine">${btMachineOpts()}</select><small>自动：画 CAD、渲染或剪辑视频交给云电脑，写代码和其他事留在本地电脑。选云电脑时，它上面要装好并登录引擎。</small></label>
       <label>工作文件夹<input name="workdir" placeholder="~/workspace/ldok-rebuild" /><small>电脑上的文件夹，引擎就在这里改文件；空着就新建一个。</small></label>
       ${btModelFields()}
       <div class="row gap"><button class="btn primary">开始</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
+  if (!(S.machines || []).length) api("GET", "/api/machines").then((ms) => { S.machines = ms; const m = document.querySelector("#modal select[name=machine]"); if (m) m.innerHTML = btMachineOpts(); }).catch(() => {});
   const sel = document.querySelector("#modal select[name=bot]"); if (sel) sel.value = first;
   btModelsFill("", "", false, first);
+}
+/* v3.9.73: which computer the conversation runs on; 自动 decides from the first message (CAD / video -> cloud) */
+function btMachineOpts() {
+  return `<option value="auto">自动（按任务选）</option>` + (S.machines || []).map((m) =>
+    `<option value="${esc(m.id)}">${esc(m.name || m.id)}${m.provider === "instabox" && !/云/.test(m.name || "") ? "（云）" : ""}</option>`).join("");
 }
 async function btCreate(ev) {
   ev.preventDefault();
   const f = ev.target;
   try {
-    const c = await api("POST", "/api/bots/convs", { bot: f.bot.value, title: f.title.value, workdir: f.workdir.value, ...btModelValue(f) });
+    const c = await api("POST", "/api/bots/convs", { bot: f.bot.value, title: f.title.value, workdir: f.workdir.value, machine_id: f.machine ? f.machine.value : "", ...btModelValue(f) });
     closeOverlays(); BT.convs.unshift(c); btOpen(c.id);
   } catch (e) { toast("没能新建：" + e.message); }
 }
@@ -166,7 +173,7 @@ function btRenderConv() {
   const eng = btEngine(c.bot), tk = c.takeover, live = c.busy || c.status === "running";
   $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
     <div class="grow"><div class="heading" onclick="btRename()" title="点一下改名">${esc(c.title)}</div>
-      <div class="small muted bt-sub">${esc(eng.title)}<span class="bt-wd"> · ${esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</span></div></div>
+      <div class="small muted bt-sub">${esc(eng.title)}<span class="bt-wd">${c.machine_label ? " · " + esc(c.machine_label) : ""} · ${esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</span></div></div>
     <button class="btn sm bt-model" onclick="btModelEdit()" title="换模型和强度">${esc(btModelName(c))}</button>
     ${tk ? `<button class="btn sm" onclick="btRelease()">收回</button>` : `<button class="btn sm primary" onclick="btTake()">交给管家</button>`}
     ${live ? `<button class="btn sm" onclick="btStop()">停止</button>` : ""}

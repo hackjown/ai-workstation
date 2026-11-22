@@ -93,6 +93,10 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.73 引擎对话可以选电脑
+
+- 新建引擎对话可以选电脑，默认「自动」：CAD、渲染/剪辑视频交给云电脑，写代码留在本地。详见 docs/v3.9.73.md。版本 3.9.73 (47)。
+
 ## v3.9.72 适配 agy 1.5.14
 
 - agy 等后台任务（渲染等）时不再被 AIW 当成卡住中断：子进程还在用 CPU 就算在干活；检查时报告 agy 是否低于 1.5.14。详见 docs/v3.9.72.md。版本 3.9.72 (46)。

@@ -354,6 +354,9 @@ class CliEngine:
 
 
 # --------------------------------------------------------------------------------------------- the service
+AUTO_MACHINE = "auto"   # v3.9.73: pick the computer from the first message (CAD / video -> cloud)
+
+
 class Bots:
     def __init__(self, store, sessions=None, notifier=None, llm: Optional[Callable[[], Any]] = None,
                  default_machine: Optional[Callable[[], str]] = None, shell=None):
@@ -393,6 +396,7 @@ class Bots:
             last = self.store._x("SELECT role, text FROM bot_messages WHERE conv=? ORDER BY seq DESC LIMIT 1", (c["id"],))
             c["last"] = {"role": last[0]["role"], "text": clip(last[0]["text"], 80)} if last else None
             c["busy"] = self.busy(c["id"])
+            c["machine_label"] = self.machine_label(c.get("machine_id"))
             out.append(c)
         return out
 
@@ -435,7 +439,52 @@ class Bots:
 
     def conv(self, cid: str) -> Optional[dict]:
         r = self.store._x("SELECT * FROM bot_convs WHERE id=?", (cid,))
-        return conv_row(r[0]) if r else None
+        if not r:
+            return None
+        c = conv_row(r[0])
+        c["machine_label"] = self.machine_label(c.get("machine_id"))
+        return c
+
+    # ------------------------------------------------------------------ v3.9.73: which computer
+    def machine_label(self, mid: Optional[str]) -> str:
+        if not mid or mid == AUTO_MACHINE:
+            return "自动选电脑" if mid == AUTO_MACHINE else ""
+        try:
+            from . import roles as R
+            return R.label(self.sessions, mid) if self.sessions else mid
+        except Exception:  # noqa: BLE001
+            return mid
+
+    def pick_machine(self, text: str) -> str:
+        """v3.9.73: CAD / drawing goes to the cloud computer whose role is 设计制图, rendering and editing video to the one
+        whose role is 视频音频 (the user, 2026-11-22). Everything else, code above all, stays on the local computer."""
+        try:
+            from . import roles as R
+            if self.sessions and not R.is_code(text):
+                role = R.best_role(text)
+                if role in ("design", "media"):
+                    hits = sorted(m for m, r in R.roles_of(self.sessions).items() if r == role)
+                    if hits:
+                        return hits[0]
+        except Exception as e:  # noqa: BLE001
+            log.warning("bot machine pick: %r", e)
+        return self.default_machine()
+
+    def resolve_machine(self, cid: str, text: str = "") -> str:
+        """An 自动 conversation settles on a computer with its first message, and keeps it."""
+        c = self.conv(cid) or {}
+        mid = c.get("machine_id") or self.default_machine()
+        if mid != AUTO_MACHINE:
+            return mid
+        mid = self.pick_machine("\n".join(x for x in (c.get("title") or "", c.get("workdir") or "", text or "") if x))
+        self.set_conv(cid, machine_id=mid)
+        self.add(cid, "system", f"这件事在 {self.machine_label(mid) or mid} 上做。", {"machine": mid})
+        return mid
+
+    async def wake(self, mid: str):
+        cloud = getattr(self.sessions, "cloud", None) if self.sessions else None
+        if cloud and cloud.is_cloud(mid):
+            await cloud.wake(mid)
 
     def set_conv(self, cid: str, **kw) -> Optional[dict]:
         if "takeover" in kw:
@@ -454,6 +503,9 @@ class Bots:
             raise ValueError(f"没有这个引擎：{bot}")
         if not eng["available"]:
             raise ValueError(f"{eng['title']} 还没接入")
+        machine_id = (machine_id or "").strip()
+        if machine_id and machine_id != AUTO_MACHINE and hasattr(self.store, "machine") and not self.store.machine(machine_id):
+            raise ValueError(f"没有这台电脑：{machine_id}")
         cid = f"bc-{uuid.uuid4().hex[:10]}"
         wd = (workdir or "").strip() or f"~/workspace/{bot}-chat/{cid}"
         if not re.fullmatch(r"[~\w./ \-\u4e00-\u9fff]{1,200}", wd) or ".." in wd.split("/"):
@@ -657,11 +709,18 @@ class Bots:
     async def _turn(self, cid: str, prompt: str, skip: bool = False, fresh: bool = False) -> dict:
         c = self.conv(cid)
         eng = self.engines[c["bot"]]
-        mid = c["machine_id"]
+        mid = self.resolve_machine(cid, prompt) if c["machine_id"] == AUTO_MACHINE else c["machine_id"]
         self.set_conv(cid, status="running")
         reply = self.add(cid, "bot", "", {"status": "running", "steps": [], "started": _now(),
                                           **({"unrestricted": True} if skip else {})})
         r: dict = {}
+        try:
+            await self.wake(mid)                          # v3.9.73: a cloud computer may be asleep
+        except Exception as e:  # noqa: BLE001
+            msg = f"{self.machine_label(mid) or mid} 没能唤醒：{clip(e, 200)}"
+            self.update(reply["id"], msg, {"status": "error"})
+            self.set_conv(cid, status="idle")
+            return {"status": "error", "error": msg}
         job = c.get("job")
         if job and (skip or fresh):                       # v3.9.67: a new rule or no rules: restart, resuming the session
             try:
@@ -687,8 +746,8 @@ class Bots:
             if not r.get("ok"):
                 title = ENGINES.get(c["bot"], {}).get("title", c["bot"])
                 if r.get("installed") is False:
-                    msg = (f"电脑上没装 {title}，装好并登录后再试" + (f"：{r['install']}" if r.get("install") else "")
-                           if c["bot"] != "agy" else "电脑上没装 agy（Antigravity CLI），装好并登录后再试")
+                    msg = (f"{self.machine_label(mid) or '电脑'} 上没装 {title}，装好并登录后再试" + (f"：{r['install']}" if r.get("install") else "")
+                           if c["bot"] != "agy" else f"{self.machine_label(mid) or '电脑'} 上没装 agy（Antigravity CLI），装好并登录后再试")
                 else:
                     msg = f"{title} 没能启动：" + clip(r.get("error"), 300)
                 self.update(reply["id"], msg, {"status": "error"})
@@ -1116,6 +1175,7 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
         need(cid)
         q = bots.quote(body.quote, chat) if body.quote else None
         att = body.attachments or []
+        bots.resolve_machine(cid, body.text or "")          # v3.9.73: 自动 settles before files are copied over
         if att:
             att = await bots.push_files(cid, att, getattr(chat, "_allowed", None))
             bad = [a.get("name") or "" for a in att if not a.get("vm_path")]

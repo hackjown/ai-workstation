@@ -307,6 +307,8 @@ struct EngineNewSheet: View {
     @State private var bot = "agy"
     @State private var title = ""
     @State private var workdir = ""
+    @State private var machine = "auto"          // v3.9.73
+    @State private var machines: [JSON] = []
     @State private var group = ""
     @State private var effort = ""
     @State private var busy = false
@@ -323,6 +325,14 @@ struct EngineNewSheet: View {
                     }
                 }
                 Section(header: Text("标题")) { TextField("例如 ldok 重建", text: $title) }
+                Section(header: Text("电脑"), footer: Text("自动：画 CAD、渲染或剪辑视频交给云电脑，写代码和其他事留在本地电脑。选云电脑时，它上面要装好并登录引擎。")) {
+                    Picker("电脑", selection: $machine) {
+                        Text("自动（按任务选）").tag("auto")
+                        ForEach(machines.indices, id: \.self) { i in
+                            Text(machines[i].s("name").isEmpty ? machines[i].s("id") : machines[i].s("name")).tag(machines[i].s("id"))
+                        }
+                    }
+                }
                 Section(header: Text("工作文件夹"), footer: Text("电脑上的文件夹，它就在这里改文件；空着就新建一个。")) {
                     TextField("~/workspace/ldok-rebuild", text: $workdir).textInputAutocapitalization(.never).autocorrectionDisabled()
                 }
@@ -337,13 +347,16 @@ struct EngineNewSheet: View {
                 }
             }
         }
-        .task { await EngineModels.shared.load(bot: bot) }
+        .task {
+            machines = (try? await API.shared.list("/api/machines")) ?? []
+            await EngineModels.shared.load(bot: bot)
+        }
         .onChange(of: bot) { b in group = ""; effort = ""; Task { await EngineModels.shared.load(bot: b) } }
     }
     @MainActor func create() async {
         if let e = engines.first(where: { $0.s("id") == bot }), !e.b("available") { error = "\(e.s("title")) 还没接入"; return }
         busy = true; defer { busy = false }
-        var req: JSON = ["bot": bot, "title": title, "workdir": workdir]
+        var req: JSON = ["bot": bot, "title": title, "workdir": workdir, "machine_id": machine]
         for (k, v) in EngineModels.shared.value(group, effort) { req[k] = v }
         do { done(try await API.shared.obj("POST", "/api/bots/convs", req)) }
         catch { self.error = "没能新建：\(error.localizedDescription)" }
@@ -400,7 +413,7 @@ struct EngineConvView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     if msgs.isEmpty && !conv.isEmpty {
-                        Text("直接说要它做什么。它在电脑的 \(conv.s("workdir")) 里干活，改动不会自动推送。")
+                        Text("直接说要它做什么。它在\(conv.s("machine_label").isEmpty ? "电脑" : " " + conv.s("machine_label") + " ")的 \(conv.s("workdir")) 里干活，改动不会自动推送。")
                             .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
                     }
                     ForEach(msgs.indices.map { HRowKey(i: $0, id: msgs[$0].s("id")) }, id: \.id) { k in row(msgs[k.i]) }

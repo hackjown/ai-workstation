@@ -93,6 +93,9 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.75 agy 默认放开权限
+- agy 默认允许所有命令（拒绝清单除外），不再逐条弹窗；一轮静默停下时自动接着做，最多 3 次，并显示 agy 日志。详见 docs/v3.9.75.md。版本 3.9.75 (49)。
+
 ## v3.9.74 修 iOS 构建
 
 - 修 v3.9.73 的 iOS 编译超时（EngineView body 无法在合理时间内完成类型检查）。详见 docs/v3.9.74.md。版本 3.9.74 (48)。

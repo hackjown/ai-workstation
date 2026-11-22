@@ -51,8 +51,12 @@ SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv"}
 
 # v3.9.56: agy's permission grammar only knows these actions (cli logs of 2026-11-20: "unknown action" for bash,
 # shell, run_command, edit_file, apply_patch, glob, grep_search, list_directory: those rules were silently ignored).
-VALID_ACTIONS = ("read_file", "write_file", "command")
+VALID_ACTIONS = ("read_file", "write_file", "command", "read_url")
+_H = os.path.expanduser("~")
 DEFAULT_ALLOW = [
+    # v3.9.75: the user's call (2026-11-22): no more asking for every new command. Everything runs except what
+    # DEFAULT_DENY names; agy evaluates Deny > Ask > Allow (docs/permissions), so the deny list still wins.
+    "command(*)", "read_file(*)", "read_url(*)", "write_file(/tmp)",
     "command(git status)", "command(git diff)", "command(git log)", "command(git add)", "command(git commit)",
     "command(regex:git (status|diff|log|show|add|commit|branch|rev-parse|ls-files)( .*)?)",
     "command(regex:(ls|cat|head|tail|wc|grep|rg|find|tree|du|stat|file|diff|cmp|sort|uniq|cut|awk|jq|sha1sum|md5sum|"
@@ -80,6 +84,13 @@ DEFAULT_DENY = [
     "command(regex:.*\\.gemini/.*)", "command(regex:.*\\.config/aiw/.*)",
     "command(regex:.*--dangerously-skip-permissions.*)",
     "write_file(~/.gemini/**)", "write_file(~/.config/aiw/**)",
+    # v3.9.75: plain prefix rules too (agy matches them per segment of a && / | chain), now that command(*) is allowed
+    "command(sudo)", "command(su)", "command(git push)", "command(git reset --hard)", "command(git clean)",
+    "command(rm -rf /)", "command(rm -rf ~)", "command(rm -rf $HOME)", "command(rm -rf /*)", "command(rm -rf ~/*)",
+    "command(mkfs)", "command(dd)", "command(shutdown)", "command(reboot)", "command(poweroff)",
+    "command(agy)", "command(crontab)",
+    f"write_file({_H}/.gemini)", f"write_file({_H}/.config/aiw)", f"read_file({_H}/.ssh)",
+    f"write_file({_H}/.bashrc)", f"write_file({_H}/.profile)", f"write_file({_H}/.zshrc)",
 ]
 
 
@@ -527,6 +538,7 @@ class Daemon:
         self.pending_text = ""
         self.turn_denied = False
         self.last_tool: tuple = ("", {})     # v3.9.67: the newest tool step agy announced, DONE or not
+        self.turn_err: list[str] = []        # v3.9.75: agy's stderr during this turn (shown when a turn ends silent)
 
     def save(self, **kw):
         self.state.update(kw, ts=time.time(), pid=os.getpid())
@@ -584,6 +596,9 @@ class Daemon:
                 return
             self.err.write(s + "\n")
             self.err.flush()
+            if s.strip():
+                self.turn_err.append(s[:300])
+                del self.turn_err[:-8]
             if re.search(r"denied|not allowed|permission|requires approval|permissions\.allow", s, re.I):
                 m = re.search(r'the "([\w-]+)" permission', s)
                 self.pending_denial = m.group(1) if m else "?"
@@ -663,6 +678,7 @@ class Daemon:
             self.save(status="blocked" if blocked else ("turn_done" if r.get("status") == "SUCCESS" else "turn_failed"),
                       last_status=r.get("status"), last_error=r.get("error"), response=clip(text, MAX_RESP),
                       usage=r.get("usage"), num_turns=r.get("num_turns"), turn=turns,
+                      turn_stderr=self.turn_err[-5:] if not text else [],
                       conversation_id=r.get("conversation_id") or self.state.get("conversation_id"))
 
     def add_denied(self, action: str, tool, params: dict):
@@ -749,6 +765,7 @@ class Daemon:
                             end_reason = "crashed"
                             break
                         self.turn_active = True
+                        self.turn_err = []
                         self.last_io = time.time()
                         t = int(self.state.get("turn") or 0) + 1
                         self.record({"kind": "prompt", "turn": t, "text": clip(text, 800)})
@@ -826,7 +843,8 @@ def summary(jid: str, cursor: int, with_diff: bool = True) -> dict:
            "denied": st.get("denied") or [], "usage": st.get("usage"), "worktree": job.get("worktree"),
            "branch": job.get("branch"), "note": st.get("note"), "auth_error": st.get("auth_error"),
            "ignored_rules": ((st.get("settings") or {}).get("ignored_rules") or [])[:8],
-           "staged": len(job.get("staged") or {})}
+           "staged": len(job.get("staged") or {}),
+           "stderr_tail": st.get("turn_stderr") or []}
     if st.get("status") in ("running", "starting") and st.get("pid") and not alive(st.get("pid")):
         res["status"] = "error"
         res["error"] = "the bridge daemon is gone (computer restarted?)"

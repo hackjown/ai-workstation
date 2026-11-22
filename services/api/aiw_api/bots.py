@@ -195,12 +195,28 @@ def turn_text(r: dict, bot: str = "agy") -> str:
     if r.get("error"):
         return f"（这一轮没完成：{clip(r['error'], 300)}）"
     said = [s for s in r.get("said") or [] if s]
-    return said[-1] if said else "（这一轮没有文字回复）"
+    if said:
+        return said[-1]
+    tail = [x for x in r.get("stderr_tail") or [] if str(x).strip()]
+    if tail:                                              # v3.9.75: say what agy logged instead of a blank turn
+        return "（这一轮没有文字回复。agy 最后的日志：" + clip(" | ".join(tail[-3:]), 400) + "）"
+    return "（这一轮没有文字回复）"
+
+
+# v3.9.75: agy sometimes ends a turn right after a tool step with no reply (the task is plainly not done). AIW nudges
+# it to go on, a few times, instead of leaving the user with a silent stop.
+NUDGE = "继续把任务做完，不要停下来等我确认；全部完成后给一个简短报告（做了什么、产出文件在哪）。"
+MAX_NUDGES = 3
+
+
+def needs_nudge(res: dict, steps_this_turn: int) -> bool:
+    return (res.get("status") == "turn_done" and steps_this_turn > 0 and not (res.get("response") or "").strip()
+            and not [x for x in res.get("said") or [] if x] and not res.get("error"))
 
 
 # v3.9.67: a step the engine's permission rules stopped (headless mode cannot ask). The user decides in the app:
 # 「允许这类命令再试」 adds one allow rule to agy's settings.json, 「这一轮放开权限重跑」 reruns one turn with permissions off.
-# AIW itself never widens them (tool-router policy since v3.9.56).
+# v3.9.75: AIW's defaults now allow every command except the deny list (the user asked, 2026-11-22).
 RISKY_HEAD = {"sudo", "su", "rm", "curl", "wget", "bash", "sh", "zsh", "env", "eval", "exec", "ssh", "scp", "dd",
               "chmod", "chown", "git", "agy", "python", "python3", "node"}
 
@@ -760,21 +776,35 @@ class Bots:
             cursor = int(c.get("cursor") or 0)
         steps: list = []
         res: dict = {}
-        for _ in range(int(24 * 3600 / POLL_S)):
-            try:
-                res = await eng.wait(mid, job, cursor)
-            except Exception as e:  # noqa: BLE001  one slow poll is not the end of the turn
-                log.warning("%s wait %s: %s", c["bot"], job, e)
-                await asyncio.sleep(5)
-                continue
-            cursor = int(res.get("cursor") or cursor)
-            for t in res.get("tools") or []:
-                steps.append({k: clip(t.get(k), 240) for k in ("tool", "arg", "error") if t.get(k)})
-            steps = steps[-40:]
-            self.update(reply["id"], None, {"steps": steps, "said": (res.get("said") or [])[-1:],
-                                            "status": "running"})
-            if res.get("status") not in LIVE:
+        nudges = 0
+        while True:
+            seg_steps = 0
+            for _ in range(int(24 * 3600 / POLL_S)):
+                try:
+                    res = await eng.wait(mid, job, cursor)
+                except Exception as e:  # noqa: BLE001  one slow poll is not the end of the turn
+                    log.warning("%s wait %s: %s", c["bot"], job, e)
+                    await asyncio.sleep(5)
+                    continue
+                cursor = int(res.get("cursor") or cursor)
+                for t in res.get("tools") or []:
+                    steps.append({k: clip(t.get(k), 240) for k in ("tool", "arg", "error") if t.get(k)})
+                    seg_steps += 1
+                steps = steps[-40:]
+                self.update(reply["id"], None, {"steps": steps, "said": (res.get("said") or [])[-1:],
+                                                "status": "running", **({"nudges": nudges} if nudges else {})})
+                if res.get("status") not in LIVE:
+                    break
+            if nudges >= MAX_NUDGES or not needs_nudge(res, seg_steps):
                 break
+            try:                                          # v3.9.75: silent stop mid-task: tell it to go on
+                n = await eng.send(mid, job, NUDGE)
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s nudge: %s", c["bot"], e)
+                break
+            if not n.get("ok"):
+                break
+            nudges += 1
         st = res.get("status") or "error"
         alive = st in TURN_DONE
         data = {"status": "done" if st == "turn_done" else ("blocked" if st == "blocked" else

@@ -14,7 +14,7 @@ WEB = ROOT / "apps" / "web"
 def test_version_is_3_8_9_build_30_for_app_and_share():
     for p in (IOS / "Info.plist", IOS / "Share" / "Info.plist"):
         d = plistlib.loads(p.read_bytes())
-        assert d["CFBundleShortVersionString"] == "3.9.70" and d["CFBundleVersion"] == "44", p   # bumped in v3.9.70 (thicker avatar ring)
+        assert d["CFBundleShortVersionString"] == "3.9.71" and d["CFBundleVersion"] == "45", p   # bumped in v3.9.71 (engine long jobs)
 
 
 async def test_thinking_patch_changes_only_thinking(stack):

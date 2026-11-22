@@ -93,6 +93,10 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.71 引擎能跑长任务
+
+- agy 默认允许用 setsid/nohup 在后台跑工作文件夹里的脚本（带日志），AIW 重启会话也不会杀掉；允许 ffmpeg/ffprobe、ps/free 等查看命令，允许读已安装的技能和 npx 工具；被拒操作不再显示「?」；管家优先选几分钟能交付的方案，长任务后台跑看日志，同一卡点两轮没进展就换做法。详见 docs/v3.9.71.md。版本 3.9.71 (45)。
+
 ## v3.9.70 引擎头像外圈加粗
 
 - 琥珀黄外圈改成和 AIW 头像一样粗（网页和 iOS）。详见 docs/v3.9.70.md。版本 3.9.70 (44)。

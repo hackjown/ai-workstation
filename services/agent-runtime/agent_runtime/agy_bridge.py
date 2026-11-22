@@ -63,6 +63,15 @@ DEFAULT_ALLOW = [
     "command(regex:(python3?|uv run) -m (pytest|unittest|py_compile|ruff|mypy|http\\.server|json\\.tool)( .*)?)",
     "command(regex:(python3?|node|bash|sh) [\\w./-]+\\.(py|js|mjs|cjs|sh)( .*)?)",
     "command(regex:pytest( .*)?)",
+    # v3.9.71: long jobs (a video render, a batch convert) run detached from a script in the folder, with a log, so
+    # agy's own wait limit on one command and AIW restarting the session (killpg) do not kill them. A script was already
+    # runnable in the foreground (`bash x.sh`), so this only lets it outlive the turn.
+    "command(regex:(setsid (-f )?)?(nohup )?(bash|sh|python3?|node) [\\w./-]+\\.(sh|py|js|mjs|cjs)"
+    "( [^;&|`$<>]*)?( >>? ?[\\w./-]+)?( 2>(&1|>? ?[\\w./-]+))?( &)?)",
+    "command(regex:(ps|pgrep|nproc|free|uptime|df|top -bn1)( .*)?)",
+    "command(regex:(ffmpeg|ffprobe) .*)",
+    # v3.9.71: skills and npx-installed tools are read where they are installed (huashu-motion's SKILL.md, om.js)
+    "read_file(~/.claude/skills/**)", "read_file(~/.agents/skills/**)", "read_file(~/.npm/_npx/**)",
 ]
 DEFAULT_DENY = [
     "command(regex:.*git push.*)", "command(regex:.*git (reset --hard|clean|checkout \\.|restore \\.).*)",
@@ -621,6 +630,8 @@ class Daemon:
             if params.get(k):
                 target = str(params[k])
                 break
+        if not target:                                    # v3.9.71: never "?" — say what it touched, whatever the key
+            target = next((str(v) for v in (params or {}).values() if isinstance(v, str) and v.strip()), "")
         wt = self.job.get("worktree") or ""
         outside = bool(target.startswith("/") and wt and not (target == wt or target.startswith(wt.rstrip("/") + "/")))
         if outside:

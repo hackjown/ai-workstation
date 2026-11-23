@@ -176,7 +176,7 @@ function btMsg(m) {
   // bot reply
   const running = d.status === "running";
   const steps = d.steps || [];
-  const stepHtml = steps.length ? `<details class="bt-steps" ${running ? "open" : ""}><summary>${running ? "正在做" : "做了"} ${steps.length} 步</summary>
+  const stepHtml = steps.length ? `<details class="bt-steps" ${running ? "open" : ""}><summary>${running ? "正在做" : "做了"} ${Math.max(Number(d.step_count) || 0, steps.length)} 步${(Number(d.step_count) || 0) > 15 ? "（显示最近 15 步）" : ""}</summary>
     ${steps.slice(-15).map((s) => `<div class="bt-step ${s.error ? "bad" : ""}"><b>${esc(s.tool || "")}</b> ${esc(s.arg || "")}${s.error ? ` <i>${esc(s.error)}</i>` : ""}</div>`).join("")}</details>` : "";
   const den = (d.denied || []).length ? `<div class="bt-denied">被拒绝的操作：${d.denied.map((x) => `${esc(x.tool || "")} ${esc(x.target || "")}（${esc(x.why || x.action || "")}）`).join("；")}</div>` : "";
   // v3.9.67: the newest reply stopped by agy's permission rules: the user decides (AIW never widens them itself)

@@ -93,6 +93,9 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.77 引擎步数显示整轮总数
+- 「正在做 40 步」只是显示截断，引擎没有步数上限；现在显示整轮真实步数。详见 docs/v3.9.77.md。版本 3.9.77 (51)。
+
 ## v3.9.76 引擎大文件预览和下载
 - 引擎里超过 40 MB 的视频、图片、PDF 能预览和下载：先唤醒电脑，大文件分段取回；网页版直接预览媒体。详见 docs/v3.9.76.md。版本 3.9.76 (50)。
 

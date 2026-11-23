@@ -600,7 +600,7 @@ struct EngineConvView: View {
                         .fill(["error", "failed", "blocked"].contains(st) ? Color.red.opacity(0.1) : Color(.secondarySystemBackground)))
             }
             if !steps.isEmpty {
-                DisclosureGroup("\(running ? "正在做" : "做了") \(steps.count) 步") {
+                DisclosureGroup("\(running ? "正在做" : "做了") \(stepCount(d, steps.count)) 步") {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(Array(steps.suffix(15).enumerated()), id: \.offset) { _, s in
                             (Text(s.s("tool")).bold() + Text(" " + s.s("arg")) + Text(s.s("error").isEmpty ? "" : "  " + s.s("error")).foregroundColor(.red))
@@ -652,6 +652,11 @@ struct EngineConvView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(.trailing, 24)
         .contextMenu { if !running { msgMenu(m) } }
+    }
+    /// v3.9.77: the turn's whole step count (the message keeps only the newest 40 steps to show)
+    func stepCount(_ d: JSON, _ shown: Int) -> Int {
+        let n: Int = Int(d.s("step_count")) ?? 0
+        return max(n, shown)
     }
     /// v3.9.67: copy the file from the computer (GET …/file), download it, preview it (QuickLook shares / saves)
     @MainActor func openFile(_ raw: String) async {

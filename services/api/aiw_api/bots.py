@@ -241,9 +241,6 @@ def suggest_rule(den: dict) -> str:
     return ""
 
 
-FILE_MAX = 40 * 1024 * 1024                              # vm-agent files.read(binary) cap
-
-
 def vm_file_path(raw: str, workdir: str) -> str:
     """v3.9.67: a file an engine names in its reply (file:///home/aiw/workspace/…, ~/workspace/…, or relative to its
     folder) as the path vm-agent files.read takes (its root is ~/workspace)."""
@@ -833,6 +830,7 @@ class Bots:
         else:
             cursor = int(c.get("cursor") or 0)
         steps: list = []
+        step_count = 0     # v3.9.77: every step of the turn (steps keeps only the newest 40 to show; no step limit)
         res: dict = {}
         nudges = 0
         while True:
@@ -848,8 +846,9 @@ class Bots:
                 for t in res.get("tools") or []:
                     steps.append({k: clip(t.get(k), 240) for k in ("tool", "arg", "error") if t.get(k)})
                     seg_steps += 1
+                    step_count += 1
                 steps = steps[-40:]
-                self.update(reply["id"], None, {"steps": steps, "said": (res.get("said") or [])[-1:],
+                self.update(reply["id"], None, {"steps": steps, "step_count": step_count, "said": (res.get("said") or [])[-1:],
                                                 "status": "running", **({"nudges": nudges} if nudges else {})})
                 if res.get("status") not in LIVE:
                     break
@@ -867,7 +866,7 @@ class Bots:
         alive = st in TURN_DONE
         data = {"status": "done" if st == "turn_done" else ("blocked" if st == "blocked" else
                                                             ("failed" if st == "turn_failed" else st)),
-                "steps": steps, "denied": (res.get("denied") or [])[-5:], "said": [],
+                "steps": steps, "step_count": step_count, "denied": (res.get("denied") or [])[-5:], "said": [],
                 "changes": res.get("changes"), "usage": res.get("usage"), "ended": _now()}
         text = turn_text(res, c["bot"])
         if data["status"] == "blocked":

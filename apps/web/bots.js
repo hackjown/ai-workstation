@@ -123,11 +123,36 @@ async function btFile(raw) {
   toast("正在从电脑取文件…");
   try {
     const r = await api("GET", `/api/bots/convs/${BT.cid}/file?path=${encodeURIComponent(raw)}`);
+    if (btMediaPreview(r)) return;
     const a = document.createElement("a");
     a.className = "filecard"; a.href = artUrl(r.path, true); a.setAttribute("download", r.name);
     a.innerHTML = `<b>${esc(r.name)}</b>`; a.style.display = "none";
     document.body.appendChild(a); a.click(); setTimeout(() => a.remove(), 1000);
   } catch (e) { toast(e.message); }
+}
+// v3.9.76: a video, picture, PDF or sound the engine made opens in a viewer (any size; the server streams it with
+// Range), with a download button; other kinds keep downloading (Office / html / md go through mdpreview.js).
+function btMediaPreview(r) {
+  const n = String(r.name || "").toLowerCase();
+  const kind = /\.(mp4|m4v|mov|webm)$/.test(n) ? "video" : /\.(png|jpe?g|gif|webp|svg|bmp)$/.test(n) ? "img"
+    : /\.pdf$/.test(n) ? "pdf" : /\.(mp3|wav|m4a|aac|ogg|flac)$/.test(n) ? "audio" : "";
+  if (!kind) return false;
+  const src = artUrl(r.path), dl = artUrl(r.path, true);
+  const inner = kind === "video" ? `<video src="${esc(src)}" controls autoplay playsinline style="max-width:100%;max-height:78vh;background:#000"></video>`
+    : kind === "img" ? `<img src="${esc(src)}" alt="${esc(r.name)}" style="max-width:100%;max-height:78vh;object-fit:contain">`
+    : kind === "audio" ? `<audio src="${esc(src)}" controls autoplay style="width:min(560px,90vw)"></audio>`
+    : `<iframe src="${esc(src)}" title="${esc(r.name)}" style="width:min(1000px,94vw);height:80vh;border:0;background:#fff"></iframe>`;
+  const m = document.createElement("div");
+  m.className = "bt-media";
+  m.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.82);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:16px";
+  m.innerHTML = `${inner}<div style="display:flex;gap:10px;align-items:center;color:#fff;font-size:13px"><span>${esc(r.name)} · ${size(r.size || 0)}</span>
+    <a class="btn sm primary" href="${esc(dl)}" download="${esc(r.name)}">下载</a><button class="btn sm" type="button">关闭</button></div>`;
+  const close = () => { const v = m.querySelector("video,audio"); if (v) v.pause(); m.remove(); document.removeEventListener("keydown", key); };
+  const key = (e) => { if (e.key === "Escape") close(); };
+  m.addEventListener("click", (e) => { if (e.target === m || e.target.tagName === "BUTTON") close(); });
+  document.addEventListener("keydown", key);
+  document.body.appendChild(m);
+  return true;
 }
 document.addEventListener("click", (e) => {
   const a = e.target.closest && e.target.closest('a[href^="#aiwfile="]');

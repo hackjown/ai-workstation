@@ -93,6 +93,9 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.76 引擎大文件预览和下载
+- 引擎里超过 40 MB 的视频、图片、PDF 能预览和下载：先唤醒电脑，大文件分段取回；网页版直接预览媒体。详见 docs/v3.9.76.md。版本 3.9.76 (50)。
+
 ## v3.9.75 agy 默认放开权限
 - agy 默认允许所有命令（拒绝清单除外），不再逐条弹窗；一轮静默停下时自动接着做，最多 3 次，并显示 agy 日志。详见 docs/v3.9.75.md。版本 3.9.75 (49)。
 

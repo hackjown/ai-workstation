@@ -659,7 +659,7 @@ struct EngineConvView: View {
         fetching = raw; defer { fetching = "" }
         do {
             let q = raw.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? raw
-            let r = (try await API.shared.call("GET", "/api/bots/convs/\(cid)/file?path=\(q)", nil, timeout: 300) as? JSON) ?? [:]
+            let r = (try await API.shared.call("GET", "/api/bots/convs/\(cid)/file?path=\(q)", nil, timeout: 900) as? JSON) ?? [:]
             guard let u = API.shared.artifactURL(r.s("path")) else { return }
             let (tmp, _) = try await URLSession.shared.download(from: u)
             let dest = FileManager.default.temporaryDirectory.appendingPathComponent(previewFileName(r.s("name"), path: r.s("path")))

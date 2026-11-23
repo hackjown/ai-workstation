@@ -265,6 +265,64 @@ def vm_file_path(raw: str, workdir: str) -> str:
     return p
 
 
+ONE_SHOT = 30 * 1024 * 1024      # v3.9.76: vm-agent files.read sends at most 40 MB in one reply
+PIECE = 24 * 1024 * 1024         # base64 of a piece stays well under the 64 MB WebSocket frame
+FILE_MAX = 4 * 1024 * 1024 * 1024
+
+
+async def _remote_stat(comp, rel: str) -> tuple:
+    """(size, mtime) of a file under ~/workspace from files.list of its folder; (None, None) when unknown."""
+    folder, name = (rel.rsplit("/", 1) if "/" in rel else (".", rel))
+    try:
+        r = await comp.execute("files.list", {"path": folder or "."}, observe=False, timeout=30)
+    except Exception:  # noqa: BLE001
+        return None, None
+    if not getattr(r, "success", False):
+        raise ValueError("电脑上找不到这个文件：" + clip(getattr(r, "error", "") or rel, 200))
+    for e in (getattr(r, "result", None) or {}).get("entries") or []:
+        if e.get("name") == name and not e.get("dir"):
+            return int(e.get("size") or 0), float(e.get("mtime") or 0)
+    raise ValueError("电脑上找不到这个文件：" + rel)
+
+
+async def _read_piece(comp, rel: str) -> bytes:
+    import base64
+    r = await comp.execute("files.read", {"path": rel, "binary": True}, observe=False, timeout=300)
+    if not getattr(r, "success", False):
+        raise ValueError("电脑上读不到这个文件：" + clip(getattr(r, "error", "") or rel, 200))
+    return base64.b64decode((getattr(r, "result", None) or {}).get("content_b64") or "")
+
+
+async def _read_pieces(comp, rel: str, size: int, dest: str):
+    """A big file in PIECE-sized parts: dd cuts one part at a time into ~/workspace/.aiw-pieces, files.read sends it."""
+    import hashlib
+    import shlex
+    tag = hashlib.sha1(f"{rel}{size}".encode()).hexdigest()[:10]
+    part = f".aiw-pieces/{tag}.bin"
+    src = shlex.quote(rel)
+    got = 0
+    try:
+        with open(dest, "wb") as f:
+            while got < size:
+                n = min(PIECE, size - got)
+                cmd = (f"cd ~/workspace && mkdir -p .aiw-pieces && dd if={src} of={part} bs=4M iflag=skip_bytes,count_bytes "
+                       f"skip={got} count={n} status=none && stat -c %s {part}")
+                r = await comp.execute("shell.exec", {"command": cmd, "timeout": 120}, observe=False, timeout=130)
+                res = getattr(r, "result", None) or {}
+                if not getattr(r, "success", False) or res.get("exit_code"):
+                    raise ValueError("电脑上切不开这个文件：" + clip(res.get("stderr") or getattr(r, "error", "") or rel, 200))
+                data = await _read_piece(comp, part)
+                if len(data) != n:
+                    raise ValueError(f"取文件时少了数据（第 {got // PIECE + 1} 段）")
+                f.write(data)
+                got += n
+    finally:
+        try:
+            await comp.execute("shell.exec", {"command": f"rm -f ~/workspace/{part}", "timeout": 30}, observe=False, timeout=40)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def blocked_text(den: dict, title: str) -> str:
     what = (den.get("command") or den.get("target") or "").strip()
     what = clip(re.sub(r"\s+", " ", what), 160)
@@ -1004,28 +1062,52 @@ class Bots:
         return True
 
     async def fetch_file(self, cid: str, raw: str, out_dir: str) -> dict:
-        """v3.9.67: copy a file the engine made on the computer to the API host, for preview / download in the app."""
-        import base64
+        """v3.9.67: copy a file the engine made on the computer to the API host, for preview / download in the app.
+        v3.9.76: wake the computer first (a cloud one asleep answered the WebSocket with HTTP 409), and copy a file
+        over 30 MB in 24 MB pieces (vm-agent sends at most 40 MB in one reply), so a long video opens too."""
+        import contextlib
         import hashlib
         c = self.conv(cid)
         if not c:
             raise KeyError(cid)
         rel = vm_file_path(raw, c.get("workdir") or "")
-        r = await self.sessions.computer(c["machine_id"]).execute("files.read", {"path": rel, "binary": True},
-                                                                  observe=False, timeout=300)
-        if not getattr(r, "success", False):
-            raise ValueError("电脑上读不到这个文件：" + clip(getattr(r, "error", "") or rel, 200))
-        res = getattr(r, "result", None) or {}
-        data = base64.b64decode(res.get("content_b64") or "")
-        if res.get("size") is not None and int(res["size"]) > len(data):
-            raise ValueError("文件超过 40 MB，没法在这里打开")
+        mid = c.get("machine_id") or self.default_machine()
+        if mid == AUTO_MACHINE:
+            mid = self.resolve_machine(cid)
+        try:
+            await self.wake(mid)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"{self.machine_label(mid) or mid} 没能唤醒，取不到文件：{clip(e, 200)}")
+        comp = self.sessions.computer(mid)
         name = os.path.basename(rel.rstrip("/")) or "file"
         d = os.path.join(out_dir, "engine-files", cid)
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, hashlib.sha1(rel.encode()).hexdigest()[:8] + "-" + name)
-        with open(path, "wb") as f:
-            f.write(data)
-        return {"path": path, "name": name, "size": len(data)}
+        cloud = getattr(self.sessions, "cloud", None)
+        hold = cloud.hold(mid, "file") if cloud and cloud.is_cloud(mid) else contextlib.nullcontext()
+        async with hold:
+            size, mtime = await _remote_stat(comp, rel)
+            if size is not None and os.path.isfile(path) and os.path.getsize(path) == size \
+                    and os.path.getmtime(path) >= (mtime or 0):
+                return {"path": path, "name": name, "size": size, "cached": True}
+            if size is not None and size > FILE_MAX:
+                raise ValueError(f"文件有 {size // 1048576} MB，超过 {FILE_MAX // 1048576} MB，没法在这里打开")
+            tmp = path + ".part"
+            try:
+                if size is None or size <= ONE_SHOT:
+                    data = await _read_piece(comp, rel)
+                    if size is not None and len(data) < size:   # bigger than vm-agent's one-reply cap: go by pieces
+                        await _read_pieces(comp, rel, size, tmp)
+                    else:
+                        with open(tmp, "wb") as f:
+                            f.write(data)
+                else:
+                    await _read_pieces(comp, rel, size, tmp)
+                os.replace(tmp, path)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp)
+        return {"path": path, "name": name, "size": os.path.getsize(path)}
 
     async def permit(self, cid: str, mode: str, rule: str = "") -> dict:
         """v3.9.67: the user's answer to a step the permission rules stopped. allow: add `rule` (or the suggested one)

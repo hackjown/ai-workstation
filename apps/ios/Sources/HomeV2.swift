@@ -400,15 +400,15 @@ struct HomeStage: View {
 
 /// "+" sheet items.
 enum AttachKind: CaseIterable, Hashable {
-    case photo, video, library, file, task, link, skill
+    case photo, video, library, file, task, link, skill, engine   // v3.9.82: engine = 「引擎 @」
     /// SF Symbols, line style (WeChat-like panel, 3.6)
     var symbol: String {
         switch self { case .photo: return "camera"; case .video: return "video"; case .library: return "photo.on.rectangle"; case .file: return "folder"
-        case .task: return "desktopcomputer"; case .link: return "link"; case .skill: return "sparkles" }
+        case .task: return "desktopcomputer"; case .link: return "link"; case .skill: return "sparkles"; case .engine: return "at" }
     }
     var title: String {
         switch self { case .photo: return "拍照"; case .video: return "录视频"; case .library: return "照片/视频"; case .file: return "文件"
-        case .task: return "新建任务"; case .link: return "链接"; case .skill: return "技能 /" }
+        case .task: return "新建任务"; case .link: return "链接"; case .skill: return "技能 /"; case .engine: return "引擎 @" }
     }
 }
 
@@ -468,12 +468,15 @@ struct AttachSheet: View {
 struct SkillPicker: View {
     let rows: [JSON]
     let query: String
+    var heading = "技能"                              // v3.9.82: the same list picks engines after "@"
+    var prefix = "/"
+    var empty = "没有匹配的技能（设置 › 技能 可以添加）"
     let pick: (String) -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(query.isEmpty ? "技能" : "技能 · “\(query)”").font(.caption).foregroundColor(Color(white: 0.5)).padding(.horizontal, 8).padding(.top, 4)
+            Text(query.isEmpty ? heading : heading + " · “\(query)”").font(.caption).foregroundColor(Color(white: 0.5)).padding(.horizontal, 8).padding(.top, 4)
             if rows.isEmpty {
-                Text("没有匹配的技能（设置 › 技能 可以添加）").font(.footnote).foregroundColor(Color(white: 0.6)).padding(8)
+                Text(empty).font(.footnote).foregroundColor(Color(white: 0.6)).padding(8)
             } else {
                 ScrollView {
                     VStack(spacing: 2) {
@@ -481,7 +484,7 @@ struct SkillPicker: View {
                             let s = rows[i]
                             Button { pick(s.s("id")) } label: {
                                 HStack(spacing: 10) {
-                                    Text("/" + s.s("id")).font(.system(.footnote, design: .monospaced).weight(.bold)).foregroundColor(hHL)
+                                    Text(prefix + s.s("id")).font(.system(.footnote, design: .monospaced).weight(.bold)).foregroundColor(hHL)
                                         .lineLimit(1).frame(minWidth: 96, alignment: .leading)
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(s.s("title").isEmpty ? s.s("id") : s.s("title")).font(.subheadline).foregroundColor(.white).lineLimit(1)
@@ -509,10 +512,11 @@ struct SkillPicker: View {
 /// A chosen skill inside the input box (amber token with ×).
 struct SkillToken: View {
     let title: String
+    var icon = "✨ "
     let remove: () -> Void
     var body: some View {
         HStack(spacing: 3) {
-            Text("✨ " + title).font(.footnote.weight(.semibold)).lineLimit(1)
+            Text(icon + title).font(.footnote.weight(.semibold)).lineLimit(1)
             Button(action: remove) { Image(systemName: "xmark").font(.system(size: 10, weight: .bold)) }.accessibilityLabel("移除技能")
         }
         .foregroundColor(hHL)
@@ -562,6 +566,13 @@ struct HomeCamera: UIViewControllerRepresentable {
 }
 
 // A video from the photo library comes in as PickedMovie (ChatView.swift): a temp file, never Data in memory.
+
+/// v3.9.82: the engine name being typed after "@" at the end of the text, or nil.
+func atQuery(_ t: String) -> String? {
+    guard let r = t.range(of: "(^|\\s)[@＠][^\\s@＠]*$", options: .regularExpression) else { return nil }
+    let frag = t[r].trimmingCharacters(in: .whitespacesAndNewlines)
+    return String(frag.dropFirst())
+}
 
 /// "/" right before the cursor (start of the text or after a space): the query typed after it, else nil.
 func slashQuery(_ t: String) -> String? {

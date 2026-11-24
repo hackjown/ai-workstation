@@ -322,6 +322,8 @@ struct HomeChatView: View {
     @State private var linkText = ""
     @State private var skills: [JSON] = []
     @State private var picked: [String] = []
+    @State private var engines: [JSON] = []          // v3.9.82: GET /api/bots engines, for the "@" picker
+    @State private var pickedEng: [String] = []      // sent as 「@agy …」: only then does the message go to an engine
     @State private var pct: Double = 0
     @State private var showPhotos = false
     @State private var showFiles = false
@@ -542,6 +544,7 @@ struct HomeChatView: View {
         .onChange(of: inbox.tick) { _ in Task { await takeImports() } }
         .onDisappear { voice.stop() }
         .task { skills = (try? await API.shared.list("/api/skills")) ?? [] }
+        .task { await loadEngines() }
         .refreshable { await m.load() }
         .onReceive(hub.events) { e in m.onEvent(e) }
         // 3.9.10: 交给电脑 succeeded (the button, or a send routed to a task): straight to that task's page
@@ -758,12 +761,18 @@ struct HomeChatView: View {
     }
 
     // MARK: composer
-    var typing: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !picked.isEmpty }
+    var typing: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !picked.isEmpty || !pickedEng.isEmpty }
     var slashQ: String? { picked.count < 5 ? slashQuery(text) : nil }
-    var placeholder: String { mode == "task" ? "要电脑做什么？" : picked.isEmpty ? "和我聊聊，或输入 / 选技能…" : "说说要用它做什么…" }
+    var atQ: String? { pickedEng.count < 7 ? atQuery(text) : nil }
+    var placeholder: String {
+        mode == "task" ? "要电脑做什么？" : !pickedEng.isEmpty ? "发给引擎（说“新建任务”或“继续…任务”就走任务）…"
+            : picked.isEmpty ? "问 AIW，@ 发给引擎，/ 选技能…" : "说说要用它做什么…"
+    }
     var composer: some View {
         VStack(spacing: 8) {
-            if let q = slashQ { SkillPicker(rows: skillRows(q), query: q) { chooseSkill($0) } }
+            if let q = atQ {
+                SkillPicker(rows: engineRows(q), query: q, heading: "发给引擎（不选就是问 AIW）", prefix: "@", empty: "没有这个引擎") { chooseEngine($0) }
+            } else if let q = slashQ { SkillPicker(rows: skillRows(q), query: q) { chooseSkill($0) } }
             // 3.6: no quick-action chips above the input (tapping a briefing bubble already runs its action)
             if mode == "task" {
                 HStack(spacing: 6) {
@@ -795,6 +804,7 @@ struct HomeChatView: View {
                     Image(systemName: "plus").font(.system(size: 22, weight: .light)).foregroundColor(hAmber).frame(width: 36, height: 36)
                 }.accessibilityLabel("添加：拍照、视频、文件、技能")
                 HStack(spacing: 6) {
+                    ForEach(pickedEng, id: \.self) { id in SkillToken(title: engineTitle(id), icon: "@") { pickedEng.removeAll { $0 == id } } }
                     ForEach(picked, id: \.self) { id in SkillToken(title: skillTitle(id)) { picked.removeAll { $0 == id } } }
                     IMEField(placeholder: placeholder, text: $text, focused: $focused, maxLines: 6)   // v3.9.17 pinyin
                 }
@@ -846,7 +856,38 @@ struct HomeChatView: View {
     func onText(_ t: String) {
         guard t.hasSuffix("\n") else { return }
         let before = String(t.dropLast())
-        if let q = slashQuery(before), let first = skillRows(q).first { text = before; chooseSkill(first.s("id")) }
+        if let q = atQuery(before), let first = engineRows(q).first { text = before; chooseEngine(first.s("id")) }
+        else if let q = slashQuery(before), let first = skillRows(q).first { text = before; chooseSkill(first.s("id")) }
+    }
+    // MARK: v3.9.82 "@" engines: without one the message is for AIW itself (it can still read the engines' progress)
+    func loadEngines() async {
+        if let r = try? await API.shared.obj("GET", "/api/bots"), let e = r["engines"] as? [JSON] { engines = e }
+    }
+    func engineTitle(_ id: String) -> String {
+        let e = engines.first { $0.s("id") == id }
+        return (e?.s("title").isEmpty ?? true) ? id : e!.s("title")
+    }
+    func engineRows(_ q: String) -> [JSON] {
+        let k = q.lowercased()
+        return engines.filter { e in k.isEmpty || [e.s("id"), e.s("title")].contains { $0.lowercased().contains(k) } }.map { e -> JSON in
+            var r: JSON = ["id": e.s("id"), "title": e.s("title")]
+            let busy = (e["busy"] as? Int) ?? 0, cfg = e.o("cfg")
+            let cloud: Bool = (e["cloud"] as? Bool) ?? false
+            var parts: [String] = [cloud ? "云端" : "本地编程", busy > 0 ? "\(busy) 个在忙" : "空闲"]
+            if !cfg.s("model").isEmpty { parts.append("默认 " + cfg.s("model")) }
+            r["desc"] = parts.joined(separator: " · ")
+            return r
+        }
+    }
+    func chooseEngine(_ id: String) {
+        if let r = text.range(of: "[@＠][^\\s@＠]*$", options: .regularExpression) { text.removeSubrange(r) }
+        if !pickedEng.contains(id) { pickedEng.append(id) }
+        focused = true
+    }
+    func insertAt() {
+        text += (text.isEmpty || text.hasSuffix(" ") || text.hasSuffix("\n")) ? "@" : " @"
+        focused = true
+        if engines.isEmpty { Task { await loadEngines() } }
     }
     func insertSlash() {
         text += (text.isEmpty || text.hasSuffix(" ") || text.hasSuffix("\n")) ? "/" : " /"
@@ -898,6 +939,7 @@ struct HomeChatView: View {
             linkText = pb.isEmpty ? "https://" : pb
             showLink = true
         case .skill: insertSlash()
+        case .engine: insertAt()
         }
     }
     func addLink() {
@@ -913,17 +955,18 @@ struct HomeChatView: View {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.isEmpty && attach.isEmpty { if !picked.isEmpty { m.err = "说说要用这个技能做什么" }; return }
         // v3.9.28 手机快通道: a call / reminders / today's calendar is answered on the phone (PhoneFast.swift)
-        if mode == "auto", attach.isEmpty, picked.isEmpty, let intent = PhoneFast.match(body), await runFast(intent, body) {
+        if mode == "auto", attach.isEmpty, picked.isEmpty, pickedEng.isEmpty, let intent = PhoneFast.match(body), await runFast(intent, body) {
             text = ""; draft = ""
             pin.toEnd(follow: 2)
             return
         }
-        let sk = picked
-        let t = sk.isEmpty ? body : "【技能：\(sk.joined(separator: "、"))】\n" + body
+        let sk = picked, en = pickedEng
+        let at = en.isEmpty ? "" : en.map { "@" + $0 }.joined(separator: " ") + " "   // v3.9.82: 「@agy …」
+        let t = at + (sk.isEmpty ? body : "【技能：\(sk.joined(separator: "、"))】\n" + body)
         let files = attach, md = mode
-        text = ""; attach = []; mode = "auto"; draft = ""; picked = []
+        text = ""; attach = []; mode = "auto"; draft = ""; picked = []; pickedEng = []
         pin.toEnd(follow: 2)   // your own message: always to the end
-        if !(await m.send(t, attachments: files, mode: md)) { text = body; attach = files; mode = md; picked = sk }
+        if !(await m.send(t, attachments: files, mode: md)) { text = body; attach = files; mode = md; picked = sk; pickedEng = en }
     }
     func open(_ msg: JSON, takeover: Bool) {
         let tid = msg.o("data").s("thread_id")

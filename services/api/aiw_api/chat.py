@@ -848,7 +848,7 @@ class Chat:
                     await say("route", {"route": "memory"})
                     await say("message", m)
                     return {"route": "memory", "user": user, "messages": [m]}
-            disp = getattr(self, "engines", None)   # v3.9.61 派活: "让 codex 修一下登录" goes straight to the engine
+            disp = getattr(self, "engines", None)   # v3.9.82: only 「@codex 修一下登录」 goes straight to the engine
             p = disp.parse(text) if disp is not None and mode == "auto" and not SKILL_RE.match(text) else None
             if p:
                 await say("route", {"route": "engine"})
@@ -1211,30 +1211,16 @@ class Chat:
             out["engine_convs"] = ({"name": "engine_convs", "description": "查编程引擎和云端引擎（agy、codex、claude、codebuddy、grok、muse、cue）"
                                     "的对话记录：给 query 按标题、文件夹和内容搜，返回对话列表（id、引擎、标题、匹配片段、最后一条）；"
                                     "给 conv 读这个对话最近几轮。用户提到引擎里已有的对话或任务（如「agy 的 ldok 后端对接」）时先用它找，"
-                                    "再用 engine_task 带 conv 在那个对话里接着做",
+                                    "只查不下指令：用户想让引擎做事，要在消息开头 @ 引擎（如「@agy 继续 ldok 任务」）",
                                     "parameters": {"type": "object", "properties": {
                                         "query": {"type": "string", "description": "关键词，空格分开，都要匹配"},
                                         "engine": {"type": "string", "description": "只看某个引擎：agy / codex / claude / codebuddy / grok / muse / cue"},
                                         "conv": {"type": "string", "description": "对话 id（bc-…），读它最近几轮"},
                                         "turns": {"type": "integer", "description": "读几条，默认 8"},
                                         "limit": {"type": "integer", "description": "最多几个对话，默认 8"}}}}, _engine_convs)
-            out["engine_task"] = ({"name": "engine_task", "description": "把话或任务交给引擎"
-                                   "（agy=Antigravity、codex、claude=Claude Code、codebuddy、grok、muse=Meta Muse、cue=Cue by Manus）。用户点名某个引擎时用。"
-                                   "mode 三种，只看用户有没有说这几个词：new＝用户说了“新建任务”“开个任务”，或点名几个引擎一起做（群聊任务）；"
-                                   "continue＝用户说了“继续”“接着做”“完成…任务”，find 填任务的关键词（如 ldok），知道 id 就填 conv；"
-                                   "其余一律 chat＝发到这个引擎的单聊（带着单聊上下文，默认），哪怕内容提到某个项目。"
-                                   "引擎会用它的默认模型。结果稍后自动回到聊天里",
-                                   "parameters": {"type": "object", "properties": {
-                                       "engines": {"type": "array", "items": {"type": "string"},
-                                                   "description": "agy / codex / claude / codebuddy / grok / muse / cue，一个或多个"},
-                                       "task": {"type": "string", "description": "交给它的任务，原话加上必要的上下文"},
-                                       "workdir": {"type": "string", "description": "电脑上的项目文件夹（~/… 或 /home/…），不知道就留空"},
-                                       "conv": {"type": "string", "description": "已有的引擎对话 id（engine_convs 找到的），在它里面接着做"},
-                                       "mode": {"type": "string", "enum": ["chat", "new", "continue"],
-                                                "description": "chat 单聊（默认）/ new 新建任务 / continue 接着做已有任务"},
-                                       "find": {"type": "string", "description": "mode=continue 时：已有任务的关键词，如 ldok"},
-                                       "manage": {"type": "boolean", "description": "true：AIW 管家盯着它直到做完"}},
-                                       "required": ["task"]}}, _engine_task)
+            # v3.9.82: only a message that starts with @引擎 talks to an engine (Chat.send -> Dispatch); without it
+            # the main chat just answers and reads progress, so engine_task is no longer offered to the model.
+            self._engine_task = _engine_task
         srch = getattr(self, "search", None)
         if srch is not None:   # v3.9.14: earlier chats, tasks and files
             out["session_search"] = srch.tool()

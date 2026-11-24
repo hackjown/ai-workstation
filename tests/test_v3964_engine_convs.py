@@ -40,9 +40,9 @@ async def test_naming_the_conversation_title_reuses_it(tmp_path):
     b, g, d, chat, home, llm = make(tmp_path)
     try:
         c = b.create("codex", "ldok后端对接", str(tmp_path / "ldok"))
-        r = await d.run(G.parse_dispatch("让 codex 完成ldok后端对接的任务"), origin="m1")
+        r = await d.run(G.parse_dispatch("@codex 完成ldok后端对接的任务"), origin="m1")
         assert r["data"]["bot_conv"] == c["id"] and len(b.convs()) == 1
-        r2 = await d.run(G.parse_dispatch("让 codex 写个全新的东西"), origin="m2")
+        r2 = await d.run(G.parse_dispatch("@codex 写个全新的东西"), origin="m2")
         assert r2["data"]["bot_conv"] != c["id"]
         await until(lambda: sum("Codex 回复" in m["text"] for m in chat.msgs) >= 2)
     finally:
@@ -61,8 +61,7 @@ async def test_chat_tools(tmp_path):
     bots.add(c["id"], "user", "接后端")
     bots.add(c["id"], "bot", "接好了一半")
     tools = await chat.tools()
-    assert "engine_convs" in tools and "conv" in tools["engine_task"][0]["parameters"]["properties"]
-    assert tools["engine_task"][0]["parameters"]["required"] == ["task"]
+    assert "engine_convs" in tools and "engine_task" not in tools
     found = json.loads(await chat.run_tool(tools, "engine_convs", {"query": "ldok"}))
     assert found[0]["id"] == c["id"] and found[0]["title"] == "ldok后端对接"
     read = await chat.run_tool(tools, "engine_convs", {"conv": c["id"]})
@@ -74,6 +73,6 @@ async def test_chat_tools(tmp_path):
         got.append(p)
         return {"text": "ok", "data": {}}
     chat.engines.run = run
-    assert await chat.run_tool(tools, "engine_task", {"conv": c["id"], "task": "做完它", "manage": True}) == "ok"
+    assert await chat._engine_task({"conv": c["id"], "task": "做完它", "manage": True}) == "ok"
     assert got[0]["bots"] == ["agy"] and got[0]["conv"] == c["id"] and got[0]["manage"] is True
-    assert "没有这个引擎对话" in await chat.run_tool(tools, "engine_task", {"conv": "bc-x", "task": "y"})
+    assert "没有这个引擎对话" in await chat._engine_task({"conv": "bc-x", "task": "y"})

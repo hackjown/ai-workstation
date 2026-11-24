@@ -163,18 +163,18 @@ async def test_conflict_goes_back_then_reported(tmp_path):
 
 
 def test_parse_dispatch():
-    p = G.parse_dispatch("让 codex 修一下登录 bug，在 ~/workspace/ldok 里")
+    p = G.parse_dispatch("@codex 修一下登录 bug，在 ~/workspace/ldok 里")
     assert p["bots"] == ["codex"] and p["task"].startswith("修一下登录") and p["workdir"] == "~/workspace/ldok"
-    p = G.parse_dispatch("让codex和claude一起做一个登录页")
+    p = G.parse_dispatch("@codex和claude一起做一个登录页")
     assert p["bots"] == ["codex", "claude"] and p["task"] == "做一个登录页"
-    p = G.parse_dispatch("交给 grok、cbc、agy：写测试")
+    p = G.parse_dispatch("@grok、cbc、agy：写测试")
     assert p["bots"] == ["grok", "codebuddy", "agy"] and p["task"] == "写测试"
-    assert G.parse_dispatch("让 clade 盯着把测试跑通")["manage"] is True
-    assert G.parse_dispatch("让 workbuddy 继续")["cont"] is True and G.parse_dispatch("让 workbuddy 继续")["bots"] == ["codebuddy"]
+    assert G.parse_dispatch("@clade 盯着把测试跑通")["manage"] is True
+    assert G.parse_dispatch("@workbuddy 继续")["cont"] is True and G.parse_dispatch("@workbuddy 继续")["bots"] == ["codebuddy"]
     assert G.parse_dispatch("用claude的api写个脚本") is None
     assert G.parse_dispatch("codex 是什么") is None
     assert G.parse_dispatch("让我想想") is None
-    assert G.parse_dispatch("让所有引擎一起重构")["bots"] == ["agy", "codex", "claude", "codebuddy", "grok", "muse", "cue"]
+    assert G.parse_dispatch("@所有引擎一起重构")["bots"] == ["agy", "codex", "claude", "codebuddy", "grok", "muse", "cue"]
 
 
 def test_mentions():
@@ -188,7 +188,7 @@ def test_mentions():
 async def test_dispatch_from_chat_and_reply_comes_back(tmp_path):
     b, g, d, chat, home, llm = make(tmp_path)
     try:
-        r = await d.run(G.parse_dispatch(f"让 codex 写个 hello，在 {tmp_path}/solo"), origin="msg-1")
+        r = await d.run(G.parse_dispatch(f"@codex 写个 hello，在 {tmp_path}/solo"), origin="msg-1")
         cid = r["data"]["bot_conv"]
         assert "Codex" in r["text"] and b.conv(cid)["origin"] == "msg-1"
         await until(lambda: any("Codex 回复" in m["text"] for m in chat.msgs))
@@ -206,7 +206,7 @@ async def test_dispatch_two_engines_makes_a_group_and_reports_the_merge(tmp_path
     b, g, d, chat, home, llm = make(tmp_path, plan)
     repo = init_repo(tmp_path / "p4")
     try:
-        r = await d.run(G.parse_dispatch(f"让 codex 和 grok 一起做 X，仓库 {repo}"), origin="msg-2")
+        r = await d.run(G.parse_dispatch(f"@codex 和 grok 一起做 X，仓库 {repo}"), origin="msg-2")
         gid = r["data"]["bot_group"]
         assert g.group(gid)["repo"] == str(repo) and g.group(gid)["origin"] == "msg-2"
         await until(lambda: any("引擎群聊" in m["text"] for m in chat.msgs), 90)
@@ -238,7 +238,7 @@ def test_http_routes_and_chat_hook():
     main = (ROOT / "services/api/aiw_api/main.py").read_text(encoding="utf-8")
     assert "_groups.Groups(app.state.bots, chat)" in main and "chat.engines = _groups.Dispatch(" in main
     chat = (ROOT / "services/api/aiw_api/chat.py").read_text(encoding="utf-8")
-    assert "disp.parse(text)" in chat and '"engine_task"' in chat
+    assert "disp.parse(text)" in chat and 'out["engine_task"]' not in chat
     web = (ROOT / "apps/web/bots.js").read_text(encoding="utf-8")
     assert "/api/bots/groups" in web and "btGroupOpen" in web
 
@@ -260,8 +260,9 @@ async def test_chat_send_hands_off_before_routing(tmp_path):
             got.append((p, origin))
             return {"text": "交给 Codex 了", "data": {"bot_conv": "bc-1"}}
     chat.engines = Fake()
-    r = await chat.send("让 codex 修一下登录")
+    r = await chat.send("@codex 修一下登录")
     assert r["route"] == "engine" and got[0][0]["bots"] == ["codex"] and got[0][1] == r["user"]["id"]
     assert r["messages"][0]["data"]["bot_conv"] == "bc-1"
     tools = await chat.tools()
-    assert "engine_task" in tools
+    assert "engine_task" not in tools   # v3.9.82: only @引擎 talks to an engine
+    assert G.parse_dispatch("让 codex 修一下登录") is None and G.parse_dispatch("查询agy的ldok开发进度") is None

@@ -382,3 +382,4 @@ html[data-theme=light] .hhist { background:#fff; color:#b8680c; border-color:rgb
 .hquote-bar { display:flex; align-items:flex-start; gap:6px; max-width:760px; margin:0 auto 6px; width:100%; }
 .hquote-bar .hquote { flex:1; margin:0; }
 .hquote-bar .link { font-size:18px; line-height:1; padding:2px 6px; }
+.htok.heng { background:#0d2233; border-color:#3b9eea; color:#8cc8f5; } .htok.heng button { color:#8cc8f5; }

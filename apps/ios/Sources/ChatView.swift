@@ -430,7 +430,7 @@ struct ChatView: View {
         case .library: showPhotos = true
         case .file: showFiles = true
         case .skill: if skills.isEmpty { m.err = "没有可用技能" } else { showSkills = true }
-        case .task, .link: break
+        case .task, .link, .engine: break
         }
     }
     func toggleSkill(_ id: String) { if picked.contains(id) { picked.removeAll { $0 == id } } else { picked.append(id) } }

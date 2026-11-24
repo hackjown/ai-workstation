@@ -50,7 +50,7 @@ def test_v2_home_stage_picker_sheet_and_computer_button():
     html = (WEB / "index.html").read_text(encoding="utf-8")
     for needle in ('id="hstage"', 'id="hstOrb"', 'id="hbbs"', 'id="hskills"', 'id="htokens"', 'id="hsheet"',
                    'accept="image/*" capture="environment"', 'accept="video/*" capture="environment"', 'accept="image/*,video/*"',
-                   "拍照", "录视频", "照片/视频", "文件", "新建任务", "链接", "技能 /", 'placeholder="和我聊聊，或输入 / 选技能…"'):
+                   "拍照", "录视频", "照片/视频", "文件", "新建任务", "链接", "技能 /", 'placeholder="问 AIW，@ 发给引擎，/ 选技能…"'):
         assert needle in html, needle
     js = (WEB / "home.js").read_text(encoding="utf-8")
     for needle in ("/api/greeting", "HB_MS = 4500", "hStageTyping", "/api/chat/cancel", 'ev === "status"', "/api/uploads/raw",

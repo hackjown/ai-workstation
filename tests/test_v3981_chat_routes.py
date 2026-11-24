@@ -1,5 +1,5 @@
-"""v3.9.81: from the main chat — 「让 agy 查…」 goes to agy's own chat, 「让 agy 新建任务…」 makes a task,
-「让 agy 把 ldok 增加导出功能」 carries on the ldok task, and 「把 agy 默认模型设成 3.8 flash」 sets its default."""
+"""v3.9.81: from the main chat — 「@agy 查…」 goes to agy's own chat, 「@agy 新建任务…」 makes a task,
+「@agy 把 ldok 增加导出功能」 carries on the ldok task, and 「把 agy 默认模型设成 3.8 flash」 sets its default."""
 import asyncio
 import sys
 from pathlib import Path
@@ -31,33 +31,33 @@ def mk(tmp_path):
 
 
 def test_parse_modes():
-    p = G.parse_dispatch("让 agy 查一下北京天气的代码")
+    p = G.parse_dispatch("@agy 查一下北京天气的代码")
     assert p["mode"] == "chat" and p["bots"] == ["agy"]
-    p = G.parse_dispatch("让agy新建任务，完成 ldok 的登录页")
+    p = G.parse_dispatch("@agy新建任务，完成 ldok 的登录页")
     assert p["mode"] == "new" and p["task"].startswith("完成")
-    assert G.parse_dispatch("让 agy 继续做")["mode"] == "continue"
-    assert G.parse_dispatch("让 agy 完成 ldok 后端对接的任务")["mode"] == "continue"
-    assert G.parse_dispatch("让 agy 在 ~/workspace/x 里查一下")["mode"] == "chat"
-    assert G.parse_dispatch("让 codex 和 claude 一起做 ldok")["mode"] == "new"
+    assert G.parse_dispatch("@agy 继续做")["mode"] == "continue"
+    assert G.parse_dispatch("@agy 完成 ldok 后端对接的任务")["mode"] == "continue"
+    assert G.parse_dispatch("@agy 在 ~/workspace/x 里查一下")["mode"] == "chat"
+    assert G.parse_dispatch("@codex 和 claude 一起做 ldok")["mode"] == "new"
 
 
 def test_chat_goes_to_dm_and_named_task_wins(tmp_path):
     b, d, _ = mk(tmp_path)
     t = b.create("agy", "ldok 重建", "~/workspace/ldok")
-    r = asyncio.run(d.run(G.parse_dispatch("让 agy 查一下天气的代码")))
+    r = asyncio.run(d.run(G.parse_dispatch("@agy 查一下天气的代码")))
     assert b.conv(r["data"]["bot_conv"])["kind"] == "dm" and "单聊" in r["text"]
-    r = asyncio.run(d.run(G.parse_dispatch("让 agy 把 ldok 增加导出功能")))   # no 新建任务 / 继续: its own chat
+    r = asyncio.run(d.run(G.parse_dispatch("@agy 把 ldok 增加导出功能")))   # no 新建任务 / 继续: its own chat
     assert b.conv(r["data"]["bot_conv"])["kind"] == "dm"
-    r = asyncio.run(d.run(G.parse_dispatch("让 agy 继续 ldok，增加导出功能")))
+    r = asyncio.run(d.run(G.parse_dispatch("@agy 继续 ldok，增加导出功能")))
     assert r["data"]["bot_conv"] == t["id"]
-    r = asyncio.run(d.run(G.parse_dispatch("让 agy 新建任务，做一个天气小程序")))
+    r = asyncio.run(d.run(G.parse_dispatch("@agy 新建任务，做一个天气小程序")))
     c = b.conv(r["data"]["bot_conv"])
     assert c["id"] != t["id"] and c.get("kind") != "dm"
 
 
 def test_dm_reports_only_what_chat_asked(tmp_path):
     b, d, chat = mk(tmp_path)
-    r = asyncio.run(d.run(G.parse_dispatch("让 agy 查一下天气的代码")))
+    r = asyncio.run(d.run(G.parse_dispatch("@agy 查一下天气的代码")))
     cid = r["data"]["bot_conv"]
     m = b.add(cid, "bot", "天气代码在这里", {"status": "done"})
     d._on_bot("message", m)
@@ -94,10 +94,10 @@ async def test_chat_tools_config_and_continue(tmp_path):
         got.append(p)
         return {"text": "ok", "data": {}}
     chat.engines.run = run
-    await chat.run_tool(tools, "engine_task", {"mode": "continue", "find": "ldok", "task": "增加导出功能"})
+    await chat._engine_task({"mode": "continue", "find": "ldok", "task": "增加导出功能"})
     assert got[-1]["conv"] == t["id"] and got[-1]["bots"] == ["agy"]
-    await chat.run_tool(tools, "engine_task", {"mode": "continue", "task": "把 ldok 增加导出功能"})
+    await chat._engine_task({"mode": "continue", "task": "把 ldok 增加导出功能"})
     assert got[-1]["conv"] == t["id"]
-    await chat.run_tool(tools, "engine_task", {"engines": ["agy"], "task": "查一下天气的代码"})
+    await chat._engine_task({"engines": ["agy"], "task": "查一下天气的代码"})
     assert got[-1]["mode"] == "chat" and not got[-1]["conv"]
-    assert "没找到" in await chat.run_tool(tools, "engine_task", {"mode": "continue", "find": "不存在", "task": "x"})
+    assert "没找到" in await chat._engine_task({"mode": "continue", "find": "不存在", "task": "x"})

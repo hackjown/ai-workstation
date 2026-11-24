@@ -20,7 +20,7 @@
 "use strict";
 
 const HS = { msgs: [], outbox: [], hasMore: false, loading: false, loaded: false, stream: null, mode: "auto", attach: [], scroll: null,
-  sending: false, agent: "", lastRead: 0, tasks: [], tkFilter: "all", archived: [], skills: [], stageOff: false, liveAv: null };
+  sending: false, agent: "", lastRead: 0, tasks: [], tkFilter: "all", archived: [], skills: [], engines: [], stageOff: false, liveAv: null };
 const hBox = () => $("hmsgs");
 const hTime = (ts) => { const d = new Date(ts * 1000), n = new Date();
   return d.toDateString() === n.toDateString() ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : when(ts); };
@@ -524,7 +524,7 @@ async function hSend(e) {
   if (!body && !HS.attach.length) { if (HS.skills.length) toast("说说要用这个技能做什么"); return; }
   // v3.9.28 手机快通道 (Android app): 打电话给X / 今天日程 are answered by the phone itself (FastPath.kt); the
   // result comes back through window.aiwFastResult. false = not handled there -> the server, as before.
-  if (HS.mode === "auto" && !HS.attach.length && !HS.skills.length && window.AiwAndroid && typeof AiwAndroid.fastTry === "function") {
+  if (HS.mode === "auto" && !HS.attach.length && !HS.skills.length && !HS.engines.length && window.AiwAndroid && typeof AiwAndroid.fastTry === "function") {
     let took = false;
     try { took = AiwAndroid.fastTry(body) === true; } catch (err) { took = false; }
     if (took) {
@@ -534,12 +534,14 @@ async function hSend(e) {
     }
   }
   const skills = HS.skills.slice();
-  const text = skills.length ? `【技能：${skills.join("、")}】\n${body}` : body;   // the old + menu's marker (agent_runtime/skills.py)
+  // v3.9.82: only a message that starts with @引擎 goes to that engine (its 单聊; 新建任务 / 继续…任务 for tasks)
+  const at = HS.engines.length ? HS.engines.map((e) => "@" + e).join(" ") + " " : "";
+  const text = at + (skills.length ? `【技能：${skills.join("、")}】\n${body}` : body);   // the old + menu's marker (agent_runtime/skills.py)
   const attachments = HS.attach.map(({ up, pct, uid, ...a }) => a), mode = HS.mode;
   const quote = HS.quote ? HS.quote.id : null; HS.quote = null; hQuoteRender();
   if (hStaged()) { HS.stageOff = true; hStage(false); }
   box.value = ""; autoGrow(box); localStorage.removeItem("aiw_hdraft"); HS.attach = []; hRenderAttach(); hSetMode("auto");
-  HS.skills = []; hRenderTokens();
+  HS.skills = []; HS.engines = []; hRenderTokens();
   if (HS.sending) { HS.outbox.push({ id: "q-" + Date.now(), text, attachments, mode, quote }); hRender(); hScrollLatest(); hKeys(); return; }
   await hSendNow(text, attachments, mode, { raw, skills }, quote);
   await hFlush();
@@ -649,19 +651,37 @@ function hSetMode(m) {
   const el = $("hmode");
   el.hidden = m !== "task";
   el.innerHTML = m === "task" ? `${icon("monitor")}<span>新建任务：这条消息直接交给电脑去做</span><button class="link" onclick="hSetMode('auto')" aria-label="取消">${icon("x")}</button>` : "";
-  $("hprompt").placeholder = m === "task" ? "要电脑做什么？" : "和我聊聊，或输入 / 选技能…";
+  $("hprompt").placeholder = m === "task" ? "要电脑做什么？" : "问 AIW，@ 发给引擎，/ 选技能…";
 }
 function newTaskMode() { go("home"); hSetMode("task"); setTimeout(() => $("hprompt").focus(), 30); }
 
 /* ---------------------------------------------------------------- "/" skill picker (the skills the old + menu listed: GET /api/skills) */
-const HK = { list: null, open: false, sel: 0, q: "", start: -1, rows: [], pack: null };
+const HK = { list: null, open: false, sel: 0, q: "", start: -1, rows: [], pack: null, kind: "skill", engines: null };
 async function hSkillList() { if (!HK.list) { HK.list = await loadSkillList(); } return HK.list || []; }
 function hSlashCheck(el) {
   const pos = el.selectionStart == null ? el.value.length : el.selectionStart;
+  const a = el.value.slice(0, pos).match(/(^|\s)[@＠]([^\s@＠]*)$/);   // v3.9.82: "@" picks an engine
+  if (a) { HK.kind = "engine"; HK.start = pos - a[2].length - 1; HK.q = a[2].toLowerCase(); hAtOpen(); return; }
   const m = el.value.slice(0, pos).match(/(^|\s)\/([^\s/]*)$/);
   if (!m) { hSkClose(); return; }
-  HK.start = pos - m[2].length - 1; HK.q = m[2].toLowerCase();
+  HK.kind = "skill"; HK.start = pos - m[2].length - 1; HK.q = m[2].toLowerCase();
   hSkOpen();
+}
+/* v3.9.82 "@" engine picker: the chosen engines are tokens, sent as 「@agy …」; without one the message is for AIW itself */
+async function hEngineList() {
+  if (!HK.engines) {
+    try { const r = await api("GET", "/api/bots"); HK.engines = r.engines || []; } catch (e) { HK.engines = []; }
+    setTimeout(() => { HK.engines = null; }, 60000);
+  }
+  return HK.engines;
+}
+async function hAtOpen() {
+  const list = await hEngineList(), q = HK.q;
+  HK.rows = list.filter((e) => !q || [e.id, e.title].some((v) => String(v || "").toLowerCase().includes(q)))
+    .map((e) => ({ id: e.id, title: e.title || e.id, eng: true,
+      desc: [e.cloud ? "云端" : "本地编程", e.busy ? `${e.busy} 个在忙` : "空闲", e.cfg && e.cfg.model ? "默认 " + e.cfg.model : ""].filter(Boolean).join(" · ") }));
+  HK.sel = Math.min(HK.sel, Math.max(0, HK.rows.length - 1));
+  HK.open = true; hSkRender();
 }
 async function hSkOpen() {
   const list = await hSkillList(), q = HK.q;
@@ -682,15 +702,23 @@ function hSkRender() {
   const box = $("hskills");
   box.hidden = !HK.open;
   if (!HK.open) return;
-  box.innerHTML = `<div class="hsk-hd">技能${HK.q ? ` · “${esc(HK.q)}”` : ""}<span>↑↓ 选择 · 回车确定 · Esc 关闭</span></div>`
+  const eng = HK.kind === "engine";
+  box.innerHTML = `<div class="hsk-hd">${eng ? "发给引擎（不选就是问 AIW）" : "技能"}${HK.q ? ` · “${esc(HK.q)}”` : ""}<span>↑↓ 选择 · 回车确定 · Esc 关闭</span></div>`
     + (HK.rows.map((s, i) => `<div class="hsk-r ${i === HK.sel ? "on" : ""}" role="option" aria-selected="${i === HK.sel}" data-id="${esc(s.id)}"
-        onmousedown="event.preventDefault()" onclick="hSkChoose(this.dataset.id)"><span class="n">${s.pack ? "▸ " + esc(s.pack.split("/").pop()) : s.id === "pack:" ? "←" : "/" + esc(s.id)}</span><span class="g"><b>${esc(s.title || s.id)}</b><small>${esc(s.desc || "")}</small></span></div>`).join("")
-    || `<div class="hsk-none">没有匹配的技能 · <button class="link" onmousedown="event.preventDefault()" onclick="hSkClose();go('settings');setTimeout(()=>{const g=document.getElementById('g-skill');g&&g.scrollIntoView()},400)">管理技能</button></div>`);
+        onmousedown="event.preventDefault()" onclick="hSkChoose(this.dataset.id)"><span class="n">${s.eng ? "@" + esc(s.id) : s.pack ? "▸ " + esc(s.pack.split("/").pop()) : s.id === "pack:" ? "←" : "/" + esc(s.id)}</span><span class="g"><b>${esc(s.title || s.id)}</b><small>${esc(s.desc || "")}</small></span></div>`).join("")
+    || (eng ? `<div class="hsk-none">没有这个引擎</div>` : `<div class="hsk-none">没有匹配的技能 · <button class="link" onmousedown="event.preventDefault()" onclick="hSkClose();go('settings');setTimeout(()=>{const g=document.getElementById('g-skill');g&&g.scrollIntoView()},400)">管理技能</button></div>`));
   const on = box.querySelector(".hsk-r.on"); if (on) on.scrollIntoView({ block: "nearest" });
 }
 function hSkMove(d) { if (!HK.rows.length) return; HK.sel = (HK.sel + d + HK.rows.length) % HK.rows.length; hSkRender(); }
-function hSkClose() { HK.pack = null; if (!HK.open) return; HK.open = false; HK.sel = 0; hSkRender(); }
+function hSkClose() { HK.pack = null; HK.kind = "skill"; if (!HK.open) return; HK.open = false; HK.sel = 0; hSkRender(); }
 function hSkChoose(id) {
+  if (HK.kind === "engine") {   // v3.9.82
+    const el = $("hprompt"), pos = el.selectionStart == null ? el.value.length : el.selectionStart;
+    if (HK.start >= 0 && /[@＠]/.test(el.value[HK.start] || "")) { el.value = el.value.slice(0, HK.start) + el.value.slice(pos); el.selectionStart = el.selectionEnd = HK.start; }
+    if (!HS.engines.includes(id)) HS.engines.push(id);
+    HK.start = -1; hSkClose(); hRenderTokens(); autoGrow(el); el.focus(); localStorage.setItem("aiw_hdraft", el.value);
+    return;
+  }
   if (String(id).startsWith("pack:")) { HK.pack = id.slice(5) || null; HK.sel = 0; hSkOpen(); $("hprompt").focus(); return; }   // v3.9.56
   const el = $("hprompt"), pos = el.selectionStart == null ? el.value.length : el.selectionStart;
   if (HK.start >= 0 && el.value[HK.start] === "/") { el.value = el.value.slice(0, HK.start) + el.value.slice(pos); el.selectionStart = el.selectionEnd = HK.start; }
@@ -700,9 +728,20 @@ function hSkChoose(id) {
 }
 function hSkRemove(id) { HS.skills = HS.skills.filter((x) => x !== id); hRenderTokens(); $("hprompt").focus(); }
 function hClearSkills() { HS.skills = []; hRenderTokens(); }
+function hEnRemove(id) { HS.engines = HS.engines.filter((x) => x !== id); hRenderTokens(); $("hprompt").focus(); }
+function hEngineTitle(id) { const e = (HK.engines || []).find((x) => x.id === id); return e ? e.title : id; }
 function hRenderTokens() {
-  if (HS.mode !== "task") $("hprompt").placeholder = HS.skills.length ? "说说要用它做什么…" : "和我聊聊，或输入 / 选技能…";
-  $("htokens").innerHTML = HS.skills.map((id) => `<span class="htok">✨ ${esc(hSkillTitle(id))}<button type="button" aria-label="移除技能" onclick="hSkRemove('${esc(id)}')">×</button></span>`).join("");
+  if (HS.mode !== "task") $("hprompt").placeholder = HS.engines.length ? "发给引擎的话（说“新建任务”或“继续…任务”就走任务）…"
+    : HS.skills.length ? "说说要用它做什么…" : "问 AIW，@ 发给引擎，/ 选技能…";
+  $("htokens").innerHTML = HS.engines.map((id) => `<span class="htok heng">@${esc(hEngineTitle(id))}<button type="button" aria-label="移除引擎" onclick="hEnRemove('${esc(id)}')">×</button></span>`).join("")
+    + HS.skills.map((id) => `<span class="htok">✨ ${esc(hSkillTitle(id))}<button type="button" aria-label="移除技能" onclick="hSkRemove('${esc(id)}')">×</button></span>`).join("");
+}
+function hAt() {   // v3.9.82 引擎 @ in the + sheet: the same as typing "@"
+  const el = $("hprompt"); el.focus();
+  const pos = el.selectionStart == null ? el.value.length : el.selectionStart, pre = el.value.slice(0, pos);
+  const ins = (pre && !/\s$/.test(pre) ? " " : "") + "@";
+  el.value = pre + ins + el.value.slice(pos); el.selectionStart = el.selectionEnd = pos + ins.length;
+  hInput(el);
 }
 function hSlash() {   // 技能 / in the + sheet: the same as typing "/"
   const el = $("hprompt"); el.focus();
@@ -720,6 +759,7 @@ Object.assign(IC, {
   image: "M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM3 16l5-5 4 4 3-3 6 6M15.5 8.5h.01",
   folder: "M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
   link: "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1",
+  at: "M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM16 12v1.5a2.5 2.5 0 0 0 5 0V12a9 9 0 1 0-3.5 7.1",
   sparkle: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z",
 });
 document.querySelectorAll("#hsheet [data-hi]").forEach((el) => { el.innerHTML = icon(el.dataset.hi); });   // after IC has them (app.js paints <i data-i> first)

@@ -60,6 +60,8 @@ PLAN = """你是 AIW 管家，带一组 Agent 在群里协同工作：本地编�
 - 给本地编程成员的任务要能独立完成，尽量改不同的文件，减少合并冲突；写清要改什么、怎么验证（跑什么测试或命令）。
 - 给云端成员（标有“云端”）的任务只限讨论、调研、方案对比、代码/设计评审，不要让它写代码或跑本地命令。
 - 任务本身不可拆时，交给最合适的一个成员，或者让两个成员各做一版供比较（在 report 里说明）。
+- 写规范/验收标准的步骤要把口径一次钉死：输入范围（字符集、文件类型、要跳过的目录）、边界情况、输出格式、退出码、警告/错误的格式；没写清的地方不许留给实现的人自己决定。
+- 每一步只做自己那份：实现的人只写实现，不改规范和测试；规范或测试有问题时，加一步交回给负责它的成员。
 - 用中文。不许让 Agent push、切分支、合并别人的分支、删用户文件。"""
 
 
@@ -494,18 +496,21 @@ class Groups:
             size += len(line)
         return "\n\n".join(reversed(out))
 
-    def _brief(self, g: dict, m: dict, task: str, fix: bool = False, context: str = "") -> str:
+    def _brief(self, g: dict, m: dict, task: str, fix: bool = False, context: str = "", files: str = "") -> str:
         others = "、".join(B.ENGINES[x["bot"]]["title"] for x in g["members"] if x["bot"] != m["bot"]) or "（没有）"
         ctx = f"\n\n群里前面的成员已经给出的结果（以此为准）：\n{context}" if context else ""
         if m.get("cloud") or B.is_cloud_engine(m["bot"]):
             head = (f"［引擎群聊「{g['title']}」］你是群里的云端协作成员，和你一起协作的成员：{others}。\n"
                     "AIW 会把你这次的回复原样贴到群里，不需要你去找群聊、加入群或给群发消息，也不要打开链接或调用工具去确认身份。"
                     "请直接完成下面分配给你的任务（调研、方案、评审或回答问题），给出清晰、结构化的结论，不需要操作本地文件或 git。")
+            if files:   # v3.9.82: reviewers read the real files instead of guessing (「需核对」)
+                ctx += ("\n\n仓库里现在的文件（只读副本，由 AIW 提供，直接据此审查，引用时写文件名和行）：\n" + files)
             return head + ctx + "\n\n" + task
         head = (f"［引擎群聊「{g['title']}」］你在 git 仓库的独立工作树里干活：当前文件夹，分支 {m['branch']}"
                 f"（从 {g['base']} 开出" + ("，已经合入前面步骤的成果" if context else "") + f"）。其他成员：{others}；最后由 AIW 管家合并。\n"
                 "AIW 会把你的回复贴到群里。规则：只改当前文件夹里的文件；做完 git add 并 git commit（中文说明）；不要 push，不要切换分支，"
-                + ("" if fix else "不要合并别人的分支，") + "不要改仓库外的文件。最后用几句话说明改了什么、怎么验证的。")
+                + ("" if fix else "不要合并别人的分支，") + "不要改仓库外的文件。只做这一步要求的改动：前面步骤由其他成员负责的文件（规范、测试等）不要改，"
+                "发现它们有问题就在回复里写明，由 AIW 管家交回给负责的成员。最后用几句话说明改了什么、怎么验证的。")
         return head + ctx + "\n\n" + task
 
     async def send(self, gid: str, text: str, attachments: Optional[list] = None, by: str = "user") -> dict:
@@ -616,6 +621,11 @@ class Groups:
                          "让它自己先合并解决。")
                 s["task"] = (f"开始前先执行 git merge {' '.join(x['branch'] for x in g['members'] if x['bot'] in bad)}"
                              "，解决冲突后提交。\n\n" + s["task"])
+        files = ""
+        if m.get("cloud") or B.is_cloud_engine(m["bot"]):
+            files = await self._snapshot(g, done)
+        else:
+            m = await self._mark_start(g, m)
         self.set_group(gid, pending=[s["bot"]])
         att = []
         if s.get("attachments"):
@@ -624,7 +634,85 @@ class Groups:
             except Exception as e:  # noqa: BLE001
                 log.warning("group files: %s", e)
         self.add(gid, "aiw", "AIW 管家", f"第 {s['n']}/{s['of']} 步交给 {B.ENGINES[m['bot']]['title']}。")
-        self.bots.send(m["conv"], self._brief(g, m, s["task"], context=self._context(g, m)), "aiw", attachments=att)
+        self.bots.send(m["conv"], self._brief(g, m, s["task"], context=self._context(g, m), files=files), "aiw", attachments=att)
+
+    # ------------------------------------------------------------------ v3.9.82: who owns which file, read-only copies
+    def _put_member(self, gid: str, bot: str, **kw) -> dict:
+        g = self.group(gid)
+        mem = [dict(x, **kw) if x["bot"] == bot else x for x in g["members"]]
+        return next(x for x in self.set_group(gid, members=mem)["members"] if x["bot"] == bot)
+
+    async def _mark_start(self, g: dict, m: dict) -> dict:
+        """Remember where this member's step starts, so its own changes can be told from the earlier steps'."""
+        if not m.get("worktree"):
+            return m
+        try:
+            out = await self._sh(g["machine_id"], f"git -C {qp(m['worktree'])} rev-parse HEAD", 30)
+        except Exception as e:  # noqa: BLE001
+            log.warning("group start: %s", e)
+            return m
+        h = re.search(r"\b[0-9a-f]{40}\b", out or "")
+        return self._put_member(g["id"], m["bot"], start=h.group(0)) if h else m
+
+    async def _scope(self, gid: str, bot: str):
+        """After a step: the files this member changed, and a warning when it touched files an earlier member owns."""
+        g = self.group(gid)
+        m = self.member(g, bot) if g else None
+        if not m or not m.get("worktree") or not m.get("start"):
+            return
+        cmd = ('G="git -c user.name=AIW -c user.email=aiw@localhost"; '
+               f"W={qp(m['worktree'])}; "
+               'if [ -n "$(git -C "$W" status --porcelain)" ]; then git -C "$W" add -A && '
+               f'$G -C "$W" commit -q -m {shlex.quote("aiw(" + bot + "): " + g["title"])}; fi; '
+               f"git -C \"$W\" diff --name-only {shlex.quote(m['start'])} HEAD")
+        try:
+            out = await self._sh(g["machine_id"], cmd, 60)
+        except Exception as e:  # noqa: BLE001
+            log.warning("group scope: %s", e)
+            return
+        mine = [x.strip() for x in (out or "").splitlines() if x.strip() and not x.startswith(("fatal", "error"))]
+        owner = {}
+        for x in g["members"]:
+            if x["bot"] != bot:
+                for f in x.get("files") or []:
+                    owner.setdefault(f, x["bot"])
+        self._put_member(gid, bot, files=sorted(set((m.get("files") or []) + mine)))
+        hit = {}
+        for f in mine:
+            if f in owner:
+                hit.setdefault(owner[f], []).append(f)
+        if hit:
+            who = B.ENGINES.get(bot, {}).get("title", bot)
+            parts = "；".join(f"{B.ENGINES.get(o, {}).get('title', o)} 负责的 {'、'.join(fs[:6])}" for o, fs in hit.items())
+            self.add(gid, "aiw", "AIW 管家", f"注意：{who} 这一步改了 {parts}。这些改动建议让原负责人复核，确认没有为了通过而放宽。",
+                     {"scope": {"bot": bot, "touched": hit}})
+
+    async def _snapshot(self, g: dict, done: list, limit: int = 40000) -> str:
+        """What the earlier local steps produced, as text a cloud reviewer can read (it has no access to the computer)."""
+        prior = [x for x in g["members"] if x["bot"] in done and x.get("worktree") and x.get("files")]
+        if not prior:
+            return ""
+        src = prior[-1]
+        names = []
+        for x in prior:
+            names += [f for f in x["files"] if f not in names]
+        cat = " ".join(shlex.quote(f) for f in names[:40])
+        cmd = (f"cd {qp(src['worktree'])} && for f in {cat}; do [ -f \"$f\" ] || continue; "
+               'if grep -Iq . "$f" 2>/dev/null || [ ! -s "$f" ]; then echo "===== $f"; head -c 12000 "$f"; echo; '
+               'else echo "===== $f（二进制，$(wc -c <"$f") 字节）"; fi; done')
+        try:
+            out = await self._sh(g["machine_id"], cmd, 60)
+        except Exception as e:  # noqa: BLE001
+            log.warning("group snapshot: %s", e)
+            return ""
+        return B.clip(out or "", limit)
+
+    async def _after_step(self, gid: str, bot: str):
+        try:
+            await self._scope(gid, bot)
+        except Exception as e:  # noqa: BLE001
+            log.warning("group after step: %s", e)
+        await self._run_next(gid)
 
     VERIFY_OK = re.compile(r"^(python3? -m pytest|pytest|python3? [\w./-]+\.py|node [\w./-]+|npm (run )?test|go test|cargo test|ls|cat|wc)\b")
 
@@ -653,7 +741,8 @@ class Groups:
             mwt = f"~/workspace/.aiw-worktrees/{gid}/_merge"
             for c in self._verify_cmds(task):
                 try:
-                    out = await self._sh(g["machine_id"], f"cd {qp(mwt)} && timeout 300 {c} 2>&1 | tail -n 40; echo \"EXIT ${{PIPESTATUS[0]}}\"", 330)
+                    out = await self._sh(g["machine_id"], "bash -c " + shlex.quote(   # v3.9.82: PIPESTATUS is bash-only
+                        f"cd {qp(mwt)} && timeout 300 {c} 2>&1 | tail -n 40; echo \"EXIT ${{PIPESTATUS[0]}}\""), 330)
                 except Exception as e:  # noqa: BLE001
                     out = f"运行失败：{e}"
                 runs.append((c, out.strip()))
@@ -727,7 +816,7 @@ class Groups:
                              "处理好后说「@管家 继续」接着往下做。")
                     loop.create_task(self._tell_chat(g, f"{B.ENGINES.get(bot, {}).get('title', bot)} 没做成，分工暂停了。"))
                     return
-                self._bg(self._run_next(gid))
+                self._bg(self._after_step(gid, bot))
                 return
             has_local = any(m.get("branch") for m in g["members"])
             if g["auto_merge"] and has_local:
@@ -841,8 +930,8 @@ class Groups:
 
 
 # --------------------------------------------------------------------------------------------- 派活 from the main chat
-LEAD = r"^\s*(?:请|麻烦|帮我)?\s*(?:让|叫|派|交给|发给|安排给?|用|找|@)\s*"
-SEP = r"\s*(?:和|跟|与|、|,|，|/|\+|&|and)\s*"
+LEAD = r"^\s*[@＠]\s*"   # v3.9.82: only 「@agy …」 (typed, or picked with @ / + 引擎) talks to an engine
+SEP = r"\s*(?:(?:和|跟|与|、|,|，|/|\+|&|and)\s*[@＠]?|[@＠])\s*"
 
 
 def _alias_at(s: str) -> Optional[tuple]:
@@ -861,7 +950,7 @@ def _alias_at(s: str) -> Optional[tuple]:
 
 
 def parse_dispatch(text: str) -> Optional[dict]:
-    """"让 codex 修一下登录" -> {"bots": ["codex"], "task": "修一下登录", "workdir": "", "manage": False, "cont": False}."""
+    """"@codex 修一下登录" -> {"bots": ["codex"], "task": "修一下登录", "workdir": "", "manage": False, "cont": False}."""
     t = (text or "").strip()
     m = re.match(LEAD, t)
     if not m:
@@ -882,7 +971,7 @@ def parse_dispatch(text: str) -> Optional[dict]:
         if hit[0] not in bots:
             bots.append(hit[0])
         s = s[hit[1]:]
-    if not bots or re.match(r"\s*(?:的|是|怎么|吗|能不能|可以吗|有什么)", s):
+    if not bots:
         return None
     s = re.sub(r"^\s*(?:这几个引擎|几个引擎|引擎)?\s*(?:一起|分别|并行|都|各自)?\s*(?:去|来|帮我|帮忙|给我)?\s*[:：,，]?\s*",
                "", s, count=1)
@@ -930,7 +1019,8 @@ class Dispatch:
             if not c:
                 raise ValueError(f"没有这个引擎对话：{p['conv']}")
             bot = c["bot"]
-        elif p.get("mode") == "chat":   # v3.9.81: no 新建任务 / 继续 words: the engine's own chat, always
+        elif p.get("mode") == "chat" and not p.get("workdir"):   # v3.9.81: no 新建任务 / 继续 words: its own chat
+            # (v3.9.82: 「@codex 在 ~/workspace/x 里写个 hello」 names a folder: a task there, not the 单聊's folder)
             c = self.bots.dm(bot)
         elif p.get("mode") != "new" and not p.get("workdir"):
             c = self.named_task(bot, task)   # 「让 agy 继续 ldok 增加导出功能」: the ldok task, not a new one

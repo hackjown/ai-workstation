@@ -1442,3 +1442,16 @@ async function testWebTools(btn) {
   } catch (err) { if (out) out.textContent = "✕ " + (err.message || err); }
   finally { btn.disabled = false; }
 }
+
+/* v3.9.85: the desktop full screen (the frame, so the picture fills the screen; Esc or the button leaves it).
+   Full screen is for working on it, so it takes over the desktop first when only watching. */
+function deskFull(id) {
+  const fr = $(id); if (!fr) return;
+  const box = fr.closest(".deskframe") || fr;
+  const d = document;
+  if (d.fullscreenElement || d.webkitFullscreenElement) { (d.exitFullscreen || d.webkitExitFullscreen).call(d); return; }
+  const req = box.requestFullscreen || box.webkitRequestFullscreen;
+  if (!req) { toast("这个浏览器不支持全屏"); return; }
+  if (typeof S !== "undefined" && !S.take && typeof toggleTakeover === "function") { try { toggleTakeover(); } catch (e) { /* stays watching */ } }
+  Promise.resolve(req.call(box)).then(() => { try { fr.focus(); } catch (e) { /* ok */ } }, () => toast("没能全屏"));
+}

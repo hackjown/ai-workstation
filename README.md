@@ -93,6 +93,10 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.85
+
+「交给 @引擎」会发进 AIW 刚查过的那个任务或单聊；Cue 生成的图片/视频直接显示；网页电脑画面可全屏。详见 docs/v3.9.85.md。
+
 ## v3.9.84
 
 没加 @ 却让某个引擎动手时，AIW 不自己做，给「交给 @引擎」按钮（带上方案）；引擎对话框支持粘贴截图。详见 docs/v3.9.84.md。

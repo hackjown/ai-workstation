@@ -228,3 +228,9 @@ pre.code { background:#fff; border:1px solid var(--line); border-radius:16px; pa
 .cloudrow .grow { min-width: 180px; }
 .plan .plan-n{font-size:11px;color:var(--muted,#888);margin:0 0 4px 2px}
 .plan .st.cur .ck{color:var(--amber,#e8a33d);font-weight:700}
+
+/* v3.9.85: desktop full screen */
+.deskframe:fullscreen { width:100vw; height:100vh; max-height:none; aspect-ratio:auto; border-radius:0; background:#000; }
+.deskframe:-webkit-full-screen { width:100vw; height:100vh; max-height:none; aspect-ratio:auto; border-radius:0; background:#000; }
+.deskframe:fullscreen iframe { width:100%; height:100%; border:0; }
+.deskframe:-webkit-full-screen iframe { width:100%; height:100%; border:0; }

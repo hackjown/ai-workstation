@@ -120,6 +120,18 @@ def _read_assistant_text(ev: dict[str, Any]) -> str:
     return ""
 
 
+def _collect_media(am: dict[str, Any], sink: list) -> None:
+    """v3.9.85: assistant_message.attachments (type image|file|voice|slides, filename, url, path, content_type).
+    The url is a temporary signed link, so AIW copies the file right after the turn."""
+    for a in am.get("attachments") or []:
+        if not isinstance(a, dict) or not str(a.get("url") or "").startswith(("http://", "https://")):
+            continue
+        key = a.get("version_uid") or a.get("file_uid") or a.get("url")
+        if any((x.get("version_uid") or x.get("file_uid") or x.get("url")) == key for x in sink):
+            continue
+        sink.append({k: str(a.get(k) or "") for k in ("type", "filename", "url", "path", "content_type", "file_uid", "version_uid")})
+
+
 def _extract_error_reason(ev: dict[str, Any]) -> str:
     """Extract human-readable error details from Cue error_message or status_update events."""
     for container_key in ("error_message", "status_update", "error"):
@@ -204,6 +216,7 @@ class _CueJob:
     waiting_confirm: bool = False
     denied: list[dict[str, Any]] = field(default_factory=list)
     tools: list[dict[str, Any]] = field(default_factory=list)
+    media: list[dict[str, Any]] = field(default_factory=list)   # v3.9.85: images / videos / files Cue made
     created_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
     event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -531,6 +544,8 @@ class CueEngine:
                 out["waiting_confirm"] = True
             if job.denied:
                 out["denied"] = list(job.denied)
+            if job.media:
+                out["media"] = list(job.media)
             # Evict completed job from memory immediately to prevent leaks
             self._jobs.pop(job_id, None)
             self._clear_persisted_job(job_id)
@@ -636,7 +651,7 @@ class CueEngine:
             step += 1
 
             state = await self._poll_openapi_once(
-                auth, job.session_id, job.after_id, job.expected_user_text, client
+                auth, job.session_id, job.after_id, job.expected_user_text, client, sink=job.media
             )
             if state["rate_limited"]:
                 rate_hits += 1
@@ -680,6 +695,7 @@ class CueEngine:
         after_id: str,
         expected_user_text: str,
         client: httpx.AsyncClient,
+        sink: Optional[list] = None,
     ) -> dict[str, Any]:
         params: dict[str, str] = {"task_id": task_id, "order": "asc", "limit": "100"}
         if after_id:
@@ -720,9 +736,12 @@ class CueEngine:
                 if not received_user:
                     continue
                 if etype == "assistant_message":
-                    ac = ((ev.get("assistant_message") or {}) if isinstance(ev.get("assistant_message"), dict) else {}).get("content")
+                    am = ev.get("assistant_message") if isinstance(ev.get("assistant_message"), dict) else {}
+                    ac = am.get("content")
                     if isinstance(ac, str) and ac.strip():
                         assistant_reply = ac.strip()
+                    if sink is not None:
+                        _collect_media(am, sink)
                 elif etype == "error_message":
                     reason = _extract_error_reason(ev)
                     return {"done": False, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,

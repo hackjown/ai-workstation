@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import contextlib
 import os
 import re
 import time
@@ -201,6 +202,26 @@ def parse_decision(out: str) -> dict:
     d = d if isinstance(d, dict) else {}
     return {"done": bool(d.get("done")), "next": str(d.get("next") or "").strip(),
             "report": str(d.get("report") or "").strip(), "ask_user": str(d.get("ask_user") or "").strip()}
+
+
+def media_kind(name: str, ct: str = "", typ: str = "") -> str:
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ct.startswith("image/") or typ == "image" or ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"):
+        return "image"
+    if ct.startswith("video/") or ext in ("mp4", "mov", "webm", "m4v", "mkv"):
+        return "video"
+    if ct.startswith("audio/") or typ == "voice" or ext in ("mp3", "wav", "m4a", "ogg", "aac"):
+        return "audio"
+    return "file"
+
+
+def media_text(text: str, media: list) -> str:
+    """Drop the reply's links / images that point at a file we now show as media (paths inside Cue's sandbox)."""
+    for m in media or []:
+        src = m.get("src") or ""
+        if src:
+            text = re.sub(r"!?\[[^\]]*\]\(\s*" + re.escape(src) + r"\s*\)", "", text)
+    return text.strip() or "（生成好了）"
 
 
 def turn_text(r: dict, bot: str = "agy") -> str:
@@ -1129,6 +1150,9 @@ class Bots:
                 "steps": steps, "step_count": step_count, "denied": (res.get("denied") or [])[-5:], "said": [],
                 "changes": res.get("changes"), "usage": res.get("usage"), "ended": _now()}
         text = turn_text(res, c["bot"])
+        if res.get("media"):   # v3.9.85: Cue's images / videos / files: copied here, shown in the reply
+            data["media"] = await self.save_media(cid, res["media"])
+            text = media_text(text, data["media"])
         if data["status"] == "blocked":
             den = (data["denied"] or [{}])[-1]
             for x in data["denied"]:
@@ -1154,6 +1178,51 @@ class Bots:
             else:
                 await self._notify(cid, text)
         return {"status": data["status"], "text": text, "result": res}
+
+    MEDIA_MAX = 300 * 1048576
+
+    def _art_dir(self) -> str:
+        d = getattr(self, "artifacts_dir", None) or os.environ.get("AIW_ARTIFACTS")
+        if not d:
+            from .config import Settings
+            d = Settings().artifacts_dir
+        return d
+
+    async def save_media(self, cid: str, items: list) -> list:
+        """v3.9.85: download each file a cloud engine returned (a temporary signed URL) into the artifacts folder."""
+        import hashlib
+        import httpx
+        d = os.path.join(self._art_dir(), "engine-files", cid)
+        os.makedirs(d, exist_ok=True)
+        out = []
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True) as cli:
+            for it in (items or [])[:20]:
+                url = str(it.get("url") or "")
+                name = os.path.basename(str(it.get("filename") or "").strip()) or os.path.basename(url.split("?")[0]) or "file"
+                name = re.sub(r"[\\/:*?\"<>|]+", "_", name)[:120]
+                path = os.path.join(d, hashlib.sha1((it.get("version_uid") or url).encode()).hexdigest()[:8] + "-" + name)
+                ct = str(it.get("content_type") or "")
+                row = {"name": name, "kind": media_kind(name, ct, str(it.get("type") or "")), "content_type": ct,
+                       "src": str(it.get("path") or "")}
+                try:
+                    if not os.path.isfile(path):
+                        n = 0
+                        async with cli.stream("GET", url) as r:
+                            r.raise_for_status()
+                            with open(path + ".part", "wb") as f:
+                                async for chunk in r.aiter_bytes(1 << 16):
+                                    n += len(chunk)
+                                    if n > self.MEDIA_MAX:
+                                        raise ValueError("文件太大")
+                                    f.write(chunk)
+                        os.replace(path + ".part", path)
+                    row.update(path=path, size=os.path.getsize(path))
+                except Exception as e:  # noqa: BLE001  keep the link; it works for a while
+                    with contextlib.suppress(OSError):
+                        os.remove(path + ".part")
+                    row.update(url=url, error=clip(str(e), 120))
+                out.append(row)
+        return out
 
     # ------------------------------------------------------------------ v3.9.68 permission card in the AIW chat
     async def permit_card(self, cid: str, denied: list) -> Optional[dict]:
@@ -1508,6 +1577,9 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     dep = [Depends(auth)]
     if chat is not None:
         bots.chat = chat                                 # v3.9.68: permission cards go to the AIW chat
+    st = getattr(getattr(app, "state", None), "settings", None)
+    if getattr(st, "artifacts_dir", None):
+        bots.artifacts_dir = st.artifacts_dir           # v3.9.85: where Cue's files are copied
 
     def need(cid: str) -> dict:
         c = bots.conv(cid)

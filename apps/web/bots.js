@@ -316,9 +316,22 @@ function btMsg(m) {
     ? `<div class="bubble hdots-b"><span class="hdots"><i></i><i></i><i></i></span><span class="hnote">${esc(((d.said || [])[0] || "").slice(0, 80) || "在电脑上干活…")}</span></div>`
     : `<div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(btFileLinks(m.text))}</div>`;
   const files = running ? "" : btFileCards(m.text);
+  const media = running ? "" : btMedia(d.media);
   return `<div class="bt-row bot">${btAv((BT.conv || {}).bot)}<div class="bt-col">
     <div class="bt-name ${esc((BT.conv || {}).bot || "agy")}">${esc(eng.title)}${d.status === "blocked" ? " · 被权限挡住" : d.status === "stopped" ? " · 已停止" : ""}</div>
-    ${body}${files ? `<div class="bt-files">${files}</div>` : ""}${stepHtml}${den}${permit}${ch}<div class="meta">${hTime(m.created_at)}${running ? "" : acts}</div></div></div>`;
+    ${body}${media}${files ? `<div class="bt-files">${files}</div>` : ""}${stepHtml}${den}${permit}${ch}<div class="meta">${hTime(m.created_at)}${running ? "" : acts}</div></div></div>`;
+}
+// v3.9.85: pictures, videos, sounds and files a cloud engine (Cue) made, copied to AIW: shown right in the reply
+function btMedia(list) {
+  if (!(list || []).length) return "";
+  return `<div class="bt-media">` + list.map((x) => {
+    const src = x.path ? artUrl(x.path) : (x.url || ""), dl = x.path ? artUrl(x.path, true) : (x.url || "");
+    if (!src) return "";
+    if (x.kind === "image") return `<a class="bt-mimg" href="${esc(src)}" target="_blank" rel="noopener"><img src="${esc(src)}" alt="${esc(x.name)}" loading="lazy"></a>`;
+    if (x.kind === "video") return `<video class="bt-mvid" src="${esc(src)}" controls playsinline preload="metadata"></video>`;
+    if (x.kind === "audio") return `<audio src="${esc(src)}" controls preload="metadata"></audio>`;
+    return `<a class="bt-file" href="${esc(dl)}" download="${esc(x.name)}">${icon("file")}<span>${esc(x.name)}</span><i>下载</i></a>`;
+  }).join("") + `</div>`;
 }
 function btRenderConv() {
   const c = BT.conv; if (!c) return;

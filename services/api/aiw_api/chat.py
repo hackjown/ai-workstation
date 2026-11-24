@@ -1122,6 +1122,7 @@ class Chat:
                     n = max(2, min(int(a.get("turns") or 8), 30))
                     ms = _d.bots.messages(cid, limit=n)
                     eng = _B.ENGINES.get(c["bot"], {}).get("title", c["bot"])
+                    self.note_engine_focus(c)   # v3.9.85: 「让 agy 按方案改」 then goes to THIS task
                     head = (f"{eng} 对话「{c['title']}」id={cid} 文件夹={c['workdir']}"
                             f"{' · 管家接管中' if c.get('takeover') else ''}{' · 正在回复' if _d.bots.busy(cid) else ''}")
                     body = "\n\n".join(f"[{_B.who(m['role'], eng)}] {_B.clip(m['text'], 1500)}" for m in ms)
@@ -1131,6 +1132,10 @@ class Chat:
                                           int(a.get("limit") or 8))
                 if not rows:
                     return "引擎里没有找到相关的对话"
+                if len(rows) == 1 or (str(a.get("query") or "").strip() and rows):   # the best match is what we're on
+                    c0 = _d.bots.conv(rows[0].get("id") or "")
+                    if c0:
+                        self.note_engine_focus(c0)
                 return json.dumps(rows, ensure_ascii=False)
             async def _engine_config(a, _d=disp):   # v3.9.81: 「把 agy 默认模型设成 3.8 flash」
                 from . import bots as _B
@@ -1727,6 +1732,20 @@ class Chat:
             out.append(a)
         return out
 
+    FOCUS_S = 3 * 3600
+
+    def note_engine_focus(self, c: dict) -> None:
+        """v3.9.85: the engine task AIW last looked into for the user (engine_convs)."""
+        if c:   # a task → the work goes into that task; the engine's own chat (dm) → into its chat
+            self._eng_focus = {"conv": c["id"], "bot": c.get("bot") or "", "title": c.get("title") or "",
+                               "dm": c.get("kind") == "dm", "at": time.time()}
+
+    def engine_focus(self, eng: str) -> Optional[dict]:
+        f = getattr(self, "_eng_focus", None)
+        if f and f["bot"] == eng and time.time() - f["at"] < self.FOCUS_S:
+            return f
+        return None
+
     def engine_offer(self, eng: str, text: str, user: dict) -> dict:
         """v3.9.84: the hand-off text carries the plan AIW just wrote, so the engine knows 「你的要求」."""
         from . import bots as B
@@ -1735,6 +1754,15 @@ class Chat:
                              "ORDER BY seq DESC LIMIT 1", (CONV, user.get("seq") or 1 << 62))
         plan = (_row(rows[0])["text"] or "").strip() if rows else ""
         fwd = f"@{eng} {text.strip()}" + (f"\n\n下面是 AIW 刚才给出的方案，按它来做：\n{plan[:4000]}" if plan else "")
+        f = self.engine_focus(eng)
+        if f:   # v3.9.85: carry on where we just looked — that task, or the engine's own chat
+            where = f"的单聊" if f.get("dm") else f"的任务「{f['title']}」"
+            tip = f"以后直接在开头 @{title} 就行。" if f.get("dm") else f"以后也可以直接发「@{title} 继续 {f['title']} 任务 …」。"
+            return self.add("assistant", "text",
+                            f"这是要 {title} 动手吧？我不自己开任务。点下面的按钮，把这句话连同上面的方案发到 {title} {where}"
+                            f"里接着做。{tip}",
+                            {"offer_engine": eng, "offer_engine_text": fwd, "offer_engine_conv": f["conv"],
+                             "offer_engine_title": f["title"]})
         return self.add("assistant", "text",
                         f"这是要 {title} 动手吧？我不自己开任务，免得和 {title} 重复改。点下面的按钮，把这句话连同上面的方案发到 "
                         f"{title} 的单聊；要建成任务，就发「@{title} 新建任务 …」。以后直接在开头 @{title} 就行。",
@@ -1753,6 +1781,8 @@ class Chat:
         if not p:
             raise ValueError("没法交给引擎")
         p["task"] = re.sub(r"^\s*[@＠]\S+\s*", "", full, count=1)
+        if d.get("offer_engine_conv"):   # v3.9.85: into the task we were talking about
+            p.update(conv=d["offer_engine_conv"], mode="continue")
         att = self._attachments_before(m)
         try:
             r = await disp.run(p, att, origin=mid)

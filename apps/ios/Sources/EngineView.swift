@@ -316,12 +316,26 @@ struct EngineSheet: View {
     func avatarCell(_ e: JSON) -> some View {
         let id = e.s("id")
         let busy = e.d("busy") > 0
+        let unread = Int(e.d("unread"))
         let rd = e.s("ready").isEmpty ? ((e.b("cloud") && !e.b("configured")) ? "off" : "unknown") : e.s("ready")
         let dot: Color = busy ? amber : (rd == "ok" ? Color.green : Color.gray)   // v3.9.83: green only when it works
         return VStack(spacing: 3) {
             EngineAvatar(bot: id, size: 44)
                 .saturation(busy || rd == "ok" ? 1 : 0.4).opacity(busy || rd == "ok" ? 1 : 0.75)
                 .overlay(Circle().fill(dot).frame(width: 11, height: 11).overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2)), alignment: .bottomTrailing)
+                .overlay(alignment: .topTrailing) {
+                    if unread > 0 {
+                        Text(unread > 99 ? "99+" : "\(unread)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 5)
+                            .frame(minWidth: 18, minHeight: 18)
+                            .background(Color.red)
+                            .clipShape(Capsule())
+                            .overlay(Capsule().stroke(Color(.systemBackground), lineWidth: 1.5))
+                            .offset(x: 5, y: -4)
+                    }
+                }
             Text(e.s("short").isEmpty ? e.s("title") : e.s("short")).font(.caption2).foregroundColor(.secondary).lineLimit(1)
         }
         .frame(width: 52)
@@ -337,6 +351,7 @@ struct EngineSheet: View {
         do {
             let c = try await API.shared.obj("POST", "/api/bots/dm/\(bot)")
             if !convs.contains(where: { $0.s("id") == c.s("id") }) { convs.insert(c, at: 0) }
+            if let idx = engines.firstIndex(where: { $0.s("id") == bot }) { engines[idx]["unread"] = 0 }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { open = c.s("id") }
         } catch let e { error = "没能打开单聊：\(e.localizedDescription)" }
     }
@@ -516,6 +531,18 @@ struct EngineConvView: View {
         let wd: String = conv.s("workdir")
         return "直接说要它做什么。它在\(place)的 \(wd) 里干活，改动不会自动推送。"
     }
+    var navSubtitle: String {
+        var parts: [String] = []
+        let title = engine.s("title")
+        if !title.isEmpty { parts.append(title) }
+        if conv.s("kind") == "dm" { parts.append("单聊") }
+        let ml = conv.s("machine_label")
+        if !ml.isEmpty { parts.append(ml) }
+        let mn = EngineModels.shared.name(conv)
+        if !mn.isEmpty && mn != "默认" && !engine.b("cloud") { parts.append(mn) }
+        else if parts.count <= 1 && !mn.isEmpty { parts.append(mn) }
+        return parts.joined(separator: " · ")
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -543,7 +570,7 @@ struct EngineConvView: View {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 0) {
                     Text(conv.s("title").isEmpty ? "引擎" : conv.s("title")).font(.subheadline.weight(.bold)).lineLimit(1)
-                    Text("\(engine.s("title")) · \(EngineModels.shared.name(conv))").font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                    Text(navSubtitle).font(.caption2).foregroundColor(.secondary).lineLimit(1)
                 }.onTapGesture { showModel = true }
             }
             ToolbarItem(placement: .navigationBarTrailing) { menu }

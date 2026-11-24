@@ -87,7 +87,8 @@ def ensure_tables(store) -> None:
     for col in ("cursor INTEGER DEFAULT 0", "model TEXT", "effort TEXT", "job_model TEXT",   # v3.9.58: model, effort
                 "grp TEXT", "origin TEXT", "branch TEXT",   # v3.9.61: group member / sent from the main chat
                 "permit_card TEXT",                         # v3.9.68: the open permission card in the AIW chat
-                "kind TEXT"):                               # v3.9.80: 'dm' = the engine's own long-lived chat, else a task
+                "kind TEXT",                                # v3.9.80: 'dm' = the engine's own long-lived chat, else a task
+                "read_seq INTEGER DEFAULT -1"):             # unread tracking: seq of last read message (-1 = pre-migration)
         try:
             store._x(f"ALTER TABLE bot_convs ADD COLUMN {col}")
         except Exception:  # noqa: BLE001  already there
@@ -208,7 +209,7 @@ def media_kind(name: str, ct: str = "", typ: str = "") -> str:
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
     if ct.startswith("image/") or typ == "image" or ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"):
         return "image"
-    if ct.startswith("video/") or ext in ("mp4", "mov", "webm", "m4v", "mkv"):
+    if ct.startswith("video/") or typ == "video" or ext in ("mp4", "mov", "webm", "m4v", "mkv"):
         return "video"
     if ct.startswith("audio/") or typ == "voice" or ext in ("mp3", "wav", "m4a", "ogg", "aac"):
         return "audio"
@@ -547,8 +548,31 @@ class Bots:
             c["last"] = {"role": last[0]["role"], "text": clip(last[0]["text"], 80)} if last else None
             c["busy"] = self.busy(c["id"])
             c["machine_label"] = self.machine_label(c.get("machine_id"))
+            c["unread"] = self.unread_count(c["id"], c.get("read_seq"))
             out.append(c)
         return out
+
+    def unread_count(self, cid: str, read_seq: Optional[int] = None) -> int:
+        if read_seq is None:
+            r = self.store._x("SELECT read_seq FROM bot_convs WHERE id=?", (cid,))
+            read_seq = r[0]["read_seq"] if r else None
+        if read_seq is None or int(read_seq) < 0:
+            return 0
+        r = self.store._x(
+            "SELECT COUNT(*) AS n FROM bot_messages WHERE conv=? AND role='bot' AND seq>? "
+            "AND data NOT LIKE '%\"status\": \"running\"%' AND data NOT LIKE '%\"status\":\"running\"%'",
+            (cid, int(read_seq)),
+        )
+        return int(r[0]["n"]) if r else 0
+
+    def mark_read(self, cid: str) -> None:
+        r = self.store._x(
+            "SELECT COALESCE(MAX(seq), 0) AS s FROM bot_messages WHERE conv=? "
+            "AND (role!='bot' OR (data NOT LIKE '%\"status\": \"running\"%' AND data NOT LIKE '%\"status\":\"running\"%'))",
+            (cid,),
+        )
+        seq = int(r[0]["s"]) if r else 0
+        self.store._x("UPDATE bot_convs SET read_seq=? WHERE id=?", (seq, cid))
 
     def find_convs(self, q: str = "", bot: str = "", limit: int = 8) -> list[dict]:
         """v3.9.64: engine conversations (group members too) whose title or messages match every word of q, newest
@@ -670,7 +694,7 @@ class Bots:
                 raise ValueError("工作文件夹路径不合法")
         now = _now()
         self.store._x("INSERT INTO bot_convs (id, bot, title, machine_id, workdir, job, session, status, takeover, "
-                      "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                      "created_at, updated_at, read_seq) VALUES (?,?,?,?,?,?,?,?,?,?,?,0)",
                       (cid, bot, (title or "").strip()[:60] or f"{eng['title']} 对话", machine_id or self.default_machine(),
                        wd, None, None, "idle", None, now, now))
         if grp or origin or branch:
@@ -714,14 +738,21 @@ class Bots:
         added = 0
         for it in items or []:
             txt = str(it.get("text") or "").strip()
-            if not txt:
+            raw_media = it.get("media") or []
+            if not txt and not raw_media:
                 continue
-            self.add(cid, "bot", txt, {
+            saved_media = await self.save_media(cid, raw_media) if raw_media else []
+            if saved_media:
+                txt = media_text(txt, saved_media)
+            msg_data: dict[str, Any] = {
                 "status": "failed" if it.get("error") else "done",
                 "cue_event_id": it.get("id") or "",
                 "proactive": True,
                 "ended": _now(),
-            })
+            }
+            if saved_media:
+                msg_data["media"] = saved_media
+            self.add(cid, "bot", txt, msg_data)
             added += 1
             if not c.get("takeover"):
                 await self._notify(cid, txt)
@@ -898,11 +929,18 @@ class Bots:
         return msg_row(r[0]) if r else None
 
     def add(self, cid: str, role: str, text: str, data: Optional[dict] = None) -> dict:
+        if role == "bot":
+            r = self.store._x("SELECT read_seq FROM bot_convs WHERE id=?", (cid,))
+            if r and (r[0]["read_seq"] is None or int(r[0]["read_seq"]) < 0):
+                cur = self.store._x("SELECT COALESCE(MAX(seq), 0) AS s FROM bot_messages WHERE conv=?", (cid,))
+                self.store._x("UPDATE bot_convs SET read_seq=? WHERE id=?", (int(cur[0]["s"]) if cur else 0, cid))
         mid = f"bm-{uuid.uuid4().hex[:12]}"
         now = _now()
         self.store._x("INSERT INTO bot_messages (id, conv, role, text, data, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
                       (mid, cid, role, text or "", json.dumps(data or {}, ensure_ascii=False), now, now))
         self.store._x("UPDATE bot_convs SET updated_at=? WHERE id=?", (now, cid))
+        if role == "user":
+            self.mark_read(cid)
         m = self.message(mid)
         self._emit("message", m)
         return m
@@ -1196,7 +1234,13 @@ class Bots:
         d = os.path.join(self._art_dir(), "engine-files", cid)
         os.makedirs(d, exist_ok=True)
         out = []
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True) as cli:
+        c = self.conv(cid) or {}
+        bot_id = str(c.get("bot") or "")
+        proxy_url = str((self.auth_store.load(bot_id) or {}).get("proxy_url") or "").strip() if is_cloud_engine(bot_id) else ""
+        cli_kw: dict[str, Any] = {"timeout": httpx.Timeout(30.0, read=300.0), "follow_redirects": True}
+        if proxy_url:
+            cli_kw["proxy"] = proxy_url
+        async with httpx.AsyncClient(**cli_kw) as cli:
             for it in (items or [])[:20]:
                 url = str(it.get("url") or "")
                 raw_bytes = it.get("data_bytes") if isinstance(it.get("data_bytes"), (bytes, bytearray)) else None
@@ -1230,6 +1274,12 @@ class Bots:
                             n = 0
                             async with cli.stream("GET", url) as r:
                                 r.raise_for_status()
+                                if not ct:
+                                    hdr_ct = (r.headers.get("content-type") or "").split(";", 1)[0].strip()
+                                    if hdr_ct:
+                                        ct = hdr_ct
+                                        row["content_type"] = ct
+                                        row["kind"] = media_kind(name, ct, str(it.get("type") or ""))
                                 with open(path + ".part", "wb") as f:
                                     async for chunk in r.aiter_bytes(1 << 16):
                                         n += len(chunk)
@@ -1626,6 +1676,7 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
             row["cfg"] = bots.engine_cfg(row["id"])
             row["busy"] = ov.get("busy", 0)
             row["dm"] = d["id"] if d else ""
+            row["unread"] = bots.unread_count(d["id"], d.get("read_seq")) if d else 0
             engines.append(row)
         return {"engines": engines, "convs": bots.convs()}
 
@@ -1731,8 +1782,10 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
         if not bots.busy(cid) and is_cloud_engine(c.get("bot") or ""):
             await bots.sync_cloud(cid)
             c = need(cid)
+        bots.mark_read(cid)
         c["busy"] = bots.busy(cid)
         c["queued"] = len(bots.queues.get(cid) or [])
+        c["unread"] = 0
         return {"conv": c, "messages": bots.messages(cid, after)}
 
     @app.patch("/api/bots/convs/{cid}", dependencies=dep)

@@ -4,7 +4,10 @@ import SwiftUI
 typealias JSON = [String: Any]
 
 extension Dictionary where Key == String, Value == Any {
-    func s(_ k: String) -> String { (self[k] as? String) ?? (self[k].map { "\($0)" } ?? "") }
+    func s(_ k: String) -> String {
+        guard let v = self[k], !(v is NSNull) else { return "" }
+        return (v as? String) ?? "\(v)"
+    }
     func d(_ k: String) -> Double { (self[k] as? Double) ?? Double(self[k] as? Int ?? 0) }
     func o(_ k: String) -> JSON { (self[k] as? JSON) ?? [:] }
     func a(_ k: String) -> [JSON] { (self[k] as? [JSON]) ?? [] }

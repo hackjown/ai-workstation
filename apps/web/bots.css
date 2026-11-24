@@ -125,6 +125,7 @@ html[data-theme=dark] .bt-av.grok { background:#e9e9e9; color:#111; }
 .bt-dot.unknown { background:transparent; border-color:#9ca3af; box-shadow:inset 0 0 0 2px var(--bg, #fff); }
 .bt-eng.off .bt-av, .bt-eng.unknown .bt-av { filter:grayscale(.6); opacity:.75; }
 .bt-dot.busy { background:var(--amber); animation:btPulse 1.2s ease-in-out infinite; }
+.bt-unread { position:absolute; top:0; right:0; min-width:17px; height:17px; padding:0 4px; border-radius:999px; background:#ef4444; color:#fff; font-size:10px; font-weight:700; font-style:normal; line-height:15px; text-align:center; border:1.5px solid var(--bg, #fff); box-sizing:border-box; pointer-events:none; }
 @keyframes btPulse { 50% { opacity:.35; } }
 .bt-eng-name { background:none; border:0; padding:0 2px; font-size:11px; color:var(--dim); cursor:pointer; max-width:56px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .bt-eng-name:hover { color:var(--text); text-decoration:underline; }

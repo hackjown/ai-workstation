@@ -90,7 +90,8 @@ function v24Group() {
   if (nav && !nav.querySelector('[href="#g-v24"]')) {
     const a = document.createElement("a"); a.href = "#g-v24"; a.textContent = "进阶";
     a.onclick = (e) => { e.preventDefault(); sec.scrollIntoView({ behavior: "smooth" }); };
-    nav.appendChild(a);
+    const ref = nav.querySelector('[href="#g-upd"]') || nav.querySelector('[href="#g-about"]');
+    if (ref) nav.insertBefore(a, ref); else nav.appendChild(a);
   }
 }
 

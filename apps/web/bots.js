@@ -35,8 +35,10 @@ function btEngBar() {
     const rd = e.ready || (e.cloud && !e.configured ? "off" : "unknown");   // v3.9.83: green only when we know it works
     const st = e.busy > 0 ? "busy" : rd;
     const tip = e.busy > 0 ? `正在做 ${e.busy} 件事` : (e.ready_why || (rd === "ok" ? "空闲" : "还没确认"));
+    const unread = on === e.id ? 0 : Math.max(0, Number(e.unread) || 0);
+    const badge = unread > 0 ? `<i class="bt-unread">${unread > 99 ? "99+" : unread}</i>` : "";
     return `<div class="bt-eng ${st} ${on === e.id ? "on" : ""}">
-      <button class="bt-eng-av" onclick="btDm('${esc(e.id)}')" oncontextmenu="event.preventDefault();btCfg('${esc(e.id)}')" title="和 ${esc(e.title)} 单聊（${tip}）">${btAv(e.id)}<i class="bt-dot ${st}"></i></button>
+      <button class="bt-eng-av" onclick="btDm('${esc(e.id)}')" oncontextmenu="event.preventDefault();btCfg('${esc(e.id)}')" title="和 ${esc(e.title)} 单聊（${tip}）">${btAv(e.id)}<i class="bt-dot ${st}"></i>${badge}</button>
       <button class="bt-eng-name" onclick="btCfg('${esc(e.id)}')" title="配置 ${esc(e.title)}">${esc(e.short || e.title)}</button></div>`;
   }).join("") + `</div>`;
 }
@@ -61,7 +63,7 @@ async function btDm(bot) {
   try {
     const c = await api("POST", `/api/bots/dm/${encodeURIComponent(bot)}`);
     if (!BT.convs.some((x) => x.id === c.id)) BT.convs.unshift(c);
-    const i = BT.engines.findIndex((x) => x.id === bot); if (i >= 0) BT.engines[i].dm = c.id;
+    const i = BT.engines.findIndex((x) => x.id === bot); if (i >= 0) { BT.engines[i].dm = c.id; BT.engines[i].unread = 0; }
     btOpen(c.id);
   } catch (err) { toast("没能打开单聊：" + err.message); }
 }
@@ -214,7 +216,18 @@ async function btRefresh(scroll) {
   try { r = await api("GET", `/api/bots/convs/${BT.cid}?after=0`); } catch (e) { return; }
   BT.conv = r.conv; BT.msgs = r.messages || [];
   const i = BT.convs.findIndex((c) => c.id === r.conv.id);
-  if (i >= 0) BT.convs[i] = { ...BT.convs[i], ...r.conv };
+  if (i >= 0) BT.convs[i] = { ...BT.convs[i], ...r.conv, unread: 0 };
+  if (r.conv.kind === "dm") {
+    const ei = BT.engines.findIndex((e) => e.id === r.conv.bot);
+    if (ei >= 0 && BT.engines[ei].unread) { BT.engines[ei].unread = 0; btRenderList(); }
+  }
+  const now = Date.now();
+  if (now - (BT._listAt || 0) > 12000) {
+    BT._listAt = now;
+    api("GET", "/api/bots").then((res) => {
+      if (res && Array.isArray(res.engines)) { BT.engines = res.engines; btRenderList(); }
+    }).catch(() => {});
+  }
   const box = $("btMsgs"), near = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 160;
   btRenderConv();
   if (scroll || near) btScroll();

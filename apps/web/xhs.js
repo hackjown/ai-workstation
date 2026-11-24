@@ -59,7 +59,8 @@ function xhsSettingsGroup(o) {
   if (nav && !nav.querySelector('[href="#g-xhs"]')) {
     const a = document.createElement("a"); a.href = "#g-xhs"; a.textContent = "小红书";
     a.onclick = (e) => { e.preventDefault(); xhsOpen(); };
-    nav.appendChild(a);
+    const ref = nav.querySelector('[href="#g-v24"]') || nav.querySelector('[href="#g-upd"]') || nav.querySelector('[href="#g-about"]');
+    if (ref) nav.insertBefore(a, ref); else nav.appendChild(a);
   }
 }
 

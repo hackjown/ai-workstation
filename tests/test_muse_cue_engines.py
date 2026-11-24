@@ -363,3 +363,94 @@ def test_bots_and_groups_muse_and_cue_cloud(tmp_path):
 
     ms = groups.merge_script(g_after)
     assert f"aiw/{gid}/codex" in ms and "/muse" not in ms and "/cue" not in ms
+
+
+@pytest.mark.asyncio
+async def test_cue_sync_messages_async_media(tmp_path):
+    store = Store(str(tmp_path / "aiw.db"))
+    secrets = SecretBox(store, str(tmp_path))
+    bots = B.Bots(store, secrets=secrets)
+    bots.artifacts_dir = str(tmp_path / "artifacts")
+    bots.auth_store.save("cue", {"api_key": "sk-manus-test", "mode": "openapi", "source": "manual"})
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        assert "task.listMessages" in str(req.url)
+        return httpx.Response(200, json={"ok": True, "messages": [
+            {"id": "ev-10", "type": "assistant_message", "assistant_message": {
+                "content": "两张海滩漫步图都好了。",
+                "attachments": [
+                    {"type": "image", "filename": "beach1.png", "url": "https://cdn.example/beach1.png",
+                     "content_type": "image/png", "file_uid": "f1"},
+                ],
+            }},
+            {"id": "ev-11", "type": "assistant_message", "assistant_message": {
+                "content": "",
+                "attachments": [
+                    {"type": "video", "filename": "clip.mp4", "url": "https://cdn.example/clip.mp4",
+                     "content_type": "video/mp4", "file_uid": "f2"},
+                ],
+            }},
+        ]})
+
+    cue = bots.engines["cue"]
+    cue.transport = httpx.MockTransport(handler)
+    conv = bots.create("cue", "Cue 图片测试")
+    bots.set_conv(conv["id"], session="task-media-1")
+    cue._save_sync(conv["id"], "ev-09", ["ev-09"])
+
+    saved_calls = []
+
+    async def fake_save_media(cid, items):
+        saved_calls.append((cid, items))
+        return [{"name": it["filename"], "kind": B.media_kind(it["filename"], it["content_type"], it["type"]),
+                 "path": f"/tmp/{it['filename']}", "size": 123, "content_type": it["content_type"]}
+                for it in items]
+
+    bots.save_media = fake_save_media
+    added = await bots.sync_cloud(conv["id"], min_interval_s=0)
+    assert added == 1
+    assert len(saved_calls) == 1 and len(saved_calls[0][1]) == 2
+    msgs = bots.messages(conv["id"])
+    assert len(msgs) == 1
+    media = msgs[0]["data"].get("media") or []
+    assert [m["kind"] for m in media] == ["image", "video"]
+    assert [m["name"] for m in media] == ["beach1.png", "clip.mp4"]
+
+
+def test_dm_unread_badge_lifecycle(tmp_path):
+    store = Store(str(tmp_path / "aiw.db"))
+    secrets = SecretBox(store, str(tmp_path))
+    bots = B.Bots(store, secrets=secrets)
+
+    app = FastAPI()
+    B.mount(app, bots, lambda: None)
+    client = TestClient(app)
+
+    dm = client.post("/api/bots/dm/cue").json()
+    cid = dm["id"]
+
+    # Initially 0 unread
+    eng_map = {e["id"]: e for e in client.get("/api/bots").json()["engines"]}
+    assert eng_map["cue"]["unread"] == 0
+
+    # User sends a message -> still 0 unread
+    bots.add(cid, "user", "帮我生成图片")
+    eng_map = {e["id"]: e for e in client.get("/api/bots").json()["engines"]}
+    assert eng_map["cue"]["unread"] == 0
+
+    # Running placeholder does not count as unread yet
+    running_msg = bots.add(cid, "bot", "", {"status": "running"})
+    eng_map = {e["id"]: e for e in client.get("/api/bots").json()["engines"]}
+    assert eng_map["cue"]["unread"] == 0
+
+    # When running message completes + another async reply arrives -> 2 unread
+    bots.update(running_msg["id"], "好，我来生成", {"status": "done"})
+    bots.add(cid, "bot", "两张图都好了", {"status": "done", "proactive": True})
+    eng_map = {e["id"]: e for e in client.get("/api/bots").json()["engines"]}
+    assert eng_map["cue"]["unread"] == 2
+
+    # Opening the DM marks it read -> 0 unread
+    res = client.get(f"/api/bots/convs/{cid}")
+    assert res.status_code == 200 and res.json()["conv"]["unread"] == 0
+    eng_map = {e["id"]: e for e in client.get("/api/bots").json()["engines"]}
+    assert eng_map["cue"]["unread"] == 0

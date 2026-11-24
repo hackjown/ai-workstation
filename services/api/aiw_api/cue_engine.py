@@ -121,15 +121,25 @@ def _read_assistant_text(ev: dict[str, Any]) -> str:
 
 
 def _collect_media(am: dict[str, Any], sink: list) -> None:
-    """v3.9.85: assistant_message.attachments (type image|file|voice|slides, filename, url, path, content_type).
+    """v3.9.85: assistant_message.attachments (type image|video|file|voice|slides, filename, url, path, content_type).
     The url is a temporary signed link, so AIW copies the file right after the turn."""
-    for a in am.get("attachments") or []:
-        if not isinstance(a, dict) or not str(a.get("url") or "").startswith(("http://", "https://")):
+    raw_list = am.get("attachments") or am.get("files") or []
+    if not isinstance(raw_list, list):
+        return
+    for a in raw_list:
+        if not isinstance(a, dict):
             continue
-        key = a.get("version_uid") or a.get("file_uid") or a.get("url")
+        url = str(a.get("url") or a.get("file_url") or a.get("download_url") or a.get("presigned_url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        key = a.get("version_uid") or a.get("file_uid") or url
         if any((x.get("version_uid") or x.get("file_uid") or x.get("url")) == key for x in sink):
             continue
-        sink.append({k: str(a.get(k) or "") for k in ("type", "filename", "url", "path", "content_type", "file_uid", "version_uid")})
+        row = {k: str(a.get(k) or "") for k in ("type", "filename", "path", "content_type", "file_uid", "version_uid")}
+        row["url"] = url
+        if not row["filename"]:
+            row["filename"] = str(a.get("name") or "")
+        sink.append(row)
 
 
 def _extract_error_reason(ev: dict[str, Any]) -> str:
@@ -829,9 +839,19 @@ class CueEngine:
                         new_seen.append(ev_id)
                         seen.add(ev_id)
                         if ev.get("type") == "assistant_message":
-                            ac = ((ev.get("assistant_message") or {}) if isinstance(ev.get("assistant_message"), dict) else {}).get("content")
-                            if isinstance(ac, str) and ac.strip():
-                                new_replies.append({"id": ev_id, "text": ac.strip()})
+                            am = ev.get("assistant_message") if isinstance(ev.get("assistant_message"), dict) else {}
+                            ac = am.get("content")
+                            txt = ac.strip() if isinstance(ac, str) and ac.strip() else ""
+                            media_items: list[dict[str, Any]] = []
+                            _collect_media(am, media_items)
+                            if txt or media_items:
+                                if media_items and not txt and new_replies and not new_replies[-1].get("error"):
+                                    new_replies[-1].setdefault("media", []).extend(media_items)
+                                else:
+                                    entry: dict[str, Any] = {"id": ev_id, "text": txt}
+                                    if media_items:
+                                        entry["media"] = media_items
+                                    new_replies.append(entry)
                         elif ev.get("type") == "error_message":
                             reason = _extract_error_reason(ev)
                             if reason:

@@ -23,9 +23,11 @@
     const tg = e.target && e.target.closest ? e.target : null;
     if (tg && tg.closest("#hprompt, #hcomposer, .hcomp")) return "home";
     if (tg && tg.closest("#prompt, #composer")) return "task";
+    if (tg && tg.closest("#btPrompt, .bt-cw")) return "bots";      // v3.9.84: the engine chat takes pastes too
     if (tg && tg.closest("input, textarea, [contenteditable=true], #modal, .overlay")) return null;   // some other box
     if (S.view === "home" && document.getElementById("hprompt")) return "home";
     if (S.view === "chat" && document.getElementById("prompt")) return "task";
+    if (S.view === "bots" && typeof BT !== "undefined" && BT.cid && document.getElementById("btPrompt")) return "bots";
     return null;
   }
   window.aiwPasteFiles = function (files, where) {
@@ -33,8 +35,9 @@
     const pics = files.filter((f) => (f.type || "").startsWith("image")).length;
     toast(pics === files.length ? `已粘贴 ${pics} 张截图，正在上传…` : `已粘贴 ${files.length} 个文件，正在上传…`);
     if (where === "home" && typeof hUpload === "function") hUpload(files);
+    else if (where === "bots" && typeof btUpload === "function") btUpload(files);
     else if (typeof uploadFiles === "function") uploadFiles(files);
-    const box = document.getElementById(where === "home" ? "hprompt" : "prompt");
+    const box = document.getElementById(where === "home" ? "hprompt" : where === "bots" ? "btPrompt" : "prompt");
     if (box) box.focus();
     return true;
   };

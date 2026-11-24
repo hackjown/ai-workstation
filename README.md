@@ -93,6 +93,10 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.84
+
+没加 @ 却让某个引擎动手时，AIW 不自己做，给「交给 @引擎」按钮（带上方案）；引擎对话框支持粘贴截图。详见 docs/v3.9.84.md。
+
 ## v3.9.83
 
 引擎头像栏两排显示；绿点只在引擎确认能用（已登录/已配置）时亮，否则灰点并写明原因。详见 docs/v3.9.83.md。

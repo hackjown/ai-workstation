@@ -274,6 +274,15 @@ final class HomeChat: ObservableObject {
         let t = card.o("data").s("thread_id")
         if !t.isEmpty && t != "<null>" { handoffThread = t }
     }
+    @MainActor func toEngine(_ id: String) async {
+        do {
+            let r = try await API.shared.obj("POST", "/api/chat/messages/\(id)/to_engine")
+            upsert(r, stick: true)
+            if let i = index(id) {
+                var m = msgs[i]; var d = m.o("data"); d["engine_sent"] = r.s("id"); m["data"] = d; msgs[i] = m
+            }
+        } catch { err = "没能交给引擎：\(error.localizedDescription)" }
+    }
     @MainActor func toTask(_ id: String) async {
         do {
             let card = try await API.shared.obj("POST", "/api/chat/messages/\(id)/to_task", ["machine_id": API.shared.machine])
@@ -687,6 +696,14 @@ struct HomeChatView: View {
                             Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
                         }.padding(8).background(Color(.secondarySystemBackground)).clipShape(RoundedRectangle(cornerRadius: 12))
                     }.buttonStyle(.plain)
+                }
+                if !d.s("offer_engine").isEmpty {   // v3.9.84: 「让 agy 改…」 without @
+                    if d.s("engine_sent").isEmpty {
+                        Button { Task { await m.toEngine(msg.s("id")) } } label: { Label("交给 @\(d.s("offer_engine"))", systemImage: "at") }
+                            .buttonStyle(.borderedProminent).tint(amber).controlSize(.small)
+                    } else {
+                        Label("已交给 @\(d.s("offer_engine"))", systemImage: "checkmark").font(.caption).foregroundColor(.secondary)
+                    }
                 }
                 if !d.s("offer_task").isEmpty {
                     if d.s("task_started").isEmpty {

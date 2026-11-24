@@ -46,6 +46,25 @@ ALIASES = [   # (engine, names the user types), longest first inside each
 ALL_WORDS = ("所有引擎", "全部引擎", "各个引擎", "所有 agent", "全部 agent", "大家")
 MANAGER_WORDS = ("管家", "aiw")
 
+# v3.9.84: 「让 agy 改代码」 without @ — the user wants that engine to do it. AIW must not do it itself; it offers a
+# one-tap 「交给 @agy」 instead. A question about an engine (「agy 进度怎样」「查一下 agy 的任务」) is not this.
+_EXEC_LEAD = r"(?:让|叫|请|交给|派给|派|给|用|找|由)"
+_EXEC_VERB = r"(?:改|修|做|写|实现|开发|执行|跑|重构|加上?|删|优化|部署|按照|按|照着|继续|完成|处理|搞|弄)"
+
+
+def implied_engine(text: str) -> Optional[str]:
+    t = (text or "").strip()
+    if not t or re.match(LEAD, t) or len(t) > 400:
+        return None
+    low = t.lower()
+    if re.search(r"(查|看看?|问问?|进度|状态|怎么样|在做什么|做到哪)", low) and not re.search(r"(改|修|写|实现|重构|开发)", low):
+        return None
+    for eng, names in ALIASES:
+        for n in names:
+            if re.search(_EXEC_LEAD + r"\s*" + re.escape(n) + r"(?![a-z0-9])\s*.{0,40}?" + _EXEC_VERB, low):
+                return eng
+    return None
+
 PLAN = """你是 AIW 管家，带一组 Agent 在群里协同工作：本地编程 Agent（agy、Codex、Claude Code、CodeBuddy、Grok）各自在独立的 git 分支和工作文件夹里写代码；云端 Agent（Meta Muse、Cue）只负责讨论、调研、方案设计、评审或资料汇总，绝不操作本地代码。
 成员：{members}
 根据用户的话分工。只输出一个 JSON 对象，不要别的文字：

@@ -861,6 +861,15 @@ class Chat:
                 await say("message", m)
                 self.background(self.after_exchange(user, [m]))
                 return {"route": "engine", "user": user, "messages": [m]}
+            imp = None
+            if disp is not None and mode == "auto" and not SKILL_RE.match(text):
+                from .bot_groups import implied_engine
+                imp = implied_engine(text)
+            if imp:   # v3.9.84: 「让 agy 改代码」 without @ — never do it ourselves; offer a one-tap hand-off to that engine
+                m = self.engine_offer(imp, text, user)
+                await say("route", {"route": "engine_offer"})
+                await say("message", m)
+                return {"route": "engine_offer", "user": user, "messages": [m]}
             cands = self.recent_tasks() if mode == "auto" and not SKILL_RE.match(text) else []
             if cands:   # 3.8.5: a follow-up about an earlier task goes to THAT task, never to a new one
                 fu = await self.followup(text, attachments, user, cands)
@@ -1718,6 +1727,41 @@ class Chat:
             out.append(a)
         return out
 
+    def engine_offer(self, eng: str, text: str, user: dict) -> dict:
+        """v3.9.84: the hand-off text carries the plan AIW just wrote, so the engine knows 「你的要求」."""
+        from . import bots as B
+        title = B.ENGINES.get(eng, {}).get("short") or eng
+        rows = self.store._x("SELECT * FROM chat_messages WHERE conv=? AND role='assistant' AND kind='text' AND seq<? "
+                             "ORDER BY seq DESC LIMIT 1", (CONV, user.get("seq") or 1 << 62))
+        plan = (_row(rows[0])["text"] or "").strip() if rows else ""
+        fwd = f"@{eng} {text.strip()}" + (f"\n\n下面是 AIW 刚才给出的方案，按它来做：\n{plan[:4000]}" if plan else "")
+        return self.add("assistant", "text",
+                        f"这是要 {title} 动手吧？我不自己开任务，免得和 {title} 重复改。点下面的按钮，把这句话连同上面的方案发到 "
+                        f"{title} 的单聊；要建成任务，就发「@{title} 新建任务 …」。以后直接在开头 @{title} 就行。",
+                        {"offer_engine": eng, "offer_engine_text": fwd})
+
+    async def to_engine(self, mid: str) -> dict:
+        m = self.get(mid)
+        d = (m or {}).get("data") or {}
+        if not d.get("offer_engine_text"):
+            raise KeyError(mid)
+        if d.get("engine_sent"):
+            return self.get(d["engine_sent"]) or m
+        disp = getattr(self, "engines", None)
+        full = d["offer_engine_text"]
+        p = disp.parse(full.split("\n", 1)[0]) if disp is not None else None   # the mode comes from the user's own line
+        if not p:
+            raise ValueError("没法交给引擎")
+        p["task"] = re.sub(r"^\s*[@＠]\S+\s*", "", full, count=1)
+        att = self._attachments_before(m)
+        try:
+            r = await disp.run(p, att, origin=mid)
+        except Exception as e:  # noqa: BLE001
+            r = {"text": f"没能交给引擎：{str(e)[:200]}", "data": {"error": True}}
+        out = self.add("assistant", "text", r["text"], r["data"])
+        self.update(mid, data={"engine_sent": out["id"]})
+        return out
+
     async def to_task(self, mid: str, machine_id: Optional[str] = None) -> dict:
         m = self.get(mid)
         if not m or not (m["data"] or {}).get("offer_task"):
@@ -2174,6 +2218,15 @@ def mount(app, chat: Chat, auth) -> None:
             return chat.delete_message(mid)
         except KeyError:
             raise HTTPException(404)
+        except ValueError as e:
+            raise HTTPException(409, str(e))
+
+    @app.post("/api/chat/messages/{mid}/to_engine", dependencies=dep)
+    async def chat_to_engine(mid: str):
+        try:
+            return await chat.to_engine(mid)
+        except KeyError:
+            raise HTTPException(404, "no engine offer on this message")
         except ValueError as e:
             raise HTTPException(409, str(e))
 

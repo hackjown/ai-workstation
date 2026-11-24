@@ -280,6 +280,9 @@ function hMsg(m) {
   if (d.offer_task) offer = d.task_started
     ? `<div class="opts"><button class="btn sm" disabled>${icon("check")}已交给电脑</button></div>`
     : `<div class="opts"><button class="btn sm primary" onclick="hToTask('${m.id}', this)">${icon("monitor")}交给电脑去做</button></div>`;
+  if (d.offer_engine) offer += d.engine_sent   // v3.9.84: 「让 agy 改…」 without @ → one tap hands it to that engine
+    ? `<div class="opts"><button class="btn sm" disabled>${icon("check")}已交给 @${esc(d.offer_engine)}</button></div>`
+    : `<div class="opts"><button class="btn sm primary" onclick="hToEngine('${m.id}', this)">${icon("at")}交给 @${esc(d.offer_engine)}</button></div>`;
   if (d.bot_conv || d.bot_group) offer += `<div class="opts"><button class="btn sm" onclick="hOpenBot('${esc(d.bot_group ? "g:" + d.bot_group : d.bot_conv)}')">${icon("monitor")}${d.bot_group ? "打开群聊" : "打开引擎对话"}</button></div>`;   // v3.9.61 派活
   return hA(m, `<div class="hbody"><div class="bubble hmd ${d.error ? "err" : ""}">${hMd(m.text)}</div>${hFiles(d.files)}${offer}<div class="meta">${m.stream ? "" : hTime(m.created_at)}</div></div>`);
 }
@@ -1009,6 +1012,12 @@ async function hForm(mid) {
   await hOpenTask(mid);
   let n = 0;
   const t = setInterval(() => { n++; if ((S.forms || {})[sid] || n > 30) { clearInterval(t); if ((S.forms || {})[sid]) openForm(sid); } }, 150);
+}
+async function hToEngine(mid, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "交给引擎…"; }
+  try { const r = await api("POST", `/api/chat/messages/${mid}/to_engine`); hUpsert(r, { stick: true });
+    const m = hFind(mid); if (m) hUpsert({ ...m, data: { ...m.data, engine_sent: r.id } }); }
+  catch (e) { toast("没能交给引擎：" + e.message); if (btn) btn.disabled = false; }
 }
 async function hToTask(mid, btn) {
   if (btn) { btn.disabled = true; btn.textContent = "交给电脑…"; }

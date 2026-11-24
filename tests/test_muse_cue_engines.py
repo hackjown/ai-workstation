@@ -55,7 +55,7 @@ def test_muse_cli_cmd_steps_session_no_yolo_and_jsonl():
     assert "--session-id" in argv and argv[argv.index("--session-id") + 1] == "sess-42"
     assert "--max-model-steps" in argv and argv[argv.index("--max-model-steps") + 1] == "100"
     assert "--model" in argv and argv[argv.index("--model") + 1] == "muse-pro"
-    assert argv[-1] == "修一下登录 bug"
+    assert argv[-1].endswith("修一下登录 bug")   # v3.9.78: AIW rules lead the prompt
 
     # Simulate `muse exec --json` JSONL output
     events = []
@@ -83,7 +83,8 @@ def test_muse_meta_api_key_injected_from_secretbox(tmp_path):
     bots = B.Bots(store, secrets=secrets)
     job = bots.engines["muse"].job({"session": "s1", "workdir": "~/workspace/proj", "effort": "medium"}, "hello")
     assert job["engine"] == "muse"
-    assert job["env"] == {"META_API_KEY": "meta-secret-xyz"}
+    assert "env" not in job   # v3.9.78: the key goes to the computer through setenv, never in the job
+    assert bots.engines["muse"]._env_fn() == {"META_API_KEY": "meta-secret-xyz"}
     assert job["effort"] == "medium"
 
 
@@ -275,3 +276,65 @@ def test_bots_and_groups_muse_local_and_cue_cloud(tmp_path):
     assert f"aiw/{g_dev['id']}/codex" in ms
     assert f"aiw/{g_dev['id']}/muse" in ms
     assert "/cue" not in ms
+
+
+# ---------------------------------------------------------------- v3.9.78: Muse secrets and permissions
+def test_v3978_muse_key_never_in_job_or_start_command():
+    import asyncio as _a
+    from aiw_api.bots import CliEngine
+    from agent_runtime import cli_engines as ce
+
+    cmds = []
+
+    async def sh(mid, cmd, to):
+        cmds.append(cmd)
+        if "CLI_BRIDGE_OK" in cmd:
+            return "CLI_BRIDGE_OK"
+        return 'CLIRESULT {"ok": true, "job": "muse-1"}'
+
+    eng = CliEngine("muse", sh, set(), env_fn=lambda: {"META_API_KEY": "sk-secret-123"})
+    job = eng.job({"bot": "muse"}, "hi")
+    assert "env" not in job
+    _a.run(eng.start("m1", {"bot": "muse"}, "hi"))
+    _a.run(eng.start("m1", {"bot": "muse"}, "again"))
+    import base64 as _b
+    setenv = [c for c in cmds if " setenv " in c]
+    starts = [c for c in cmds if " start " in c]
+    assert len(setenv) == 1, "secrets are written once, not every start"
+    assert len(starts) == 2
+    for c in starts:
+        payload = c.split("--job-b64 ", 1)[1].strip()
+        assert "sk-secret-123" not in _b.b64decode(payload).decode()
+
+
+def test_v3978_bridge_env_file_is_private_and_job_json_clean(tmp_path, monkeypatch):
+    from agent_runtime import cli_bridge as cb
+    monkeypatch.setattr(cb, "ROOT", str(tmp_path))
+    monkeypatch.setattr(cb, "ENV_DIR", str(tmp_path / "env"))
+    cb.save_engine_env("muse", {"META_API_KEY": "k1", "EMPTY": ""})
+    import os as _o, stat as _s
+    path = cb.env_path("muse")
+    assert _s.S_IMODE(_o.stat(path).st_mode) == 0o600
+    assert cb.load_engine_env("muse") == {"META_API_KEY": "k1"}
+    assert cb.run_env(cb.load_engine_env("muse"))["META_API_KEY"] == "k1"
+
+
+def test_v3978_muse_cmd_uses_deny_and_approval_flags_when_present(monkeypatch):
+    from agent_runtime import cli_bridge as cb
+    monkeypatch.setattr(cb, "muse_flags", lambda b: {"deny": "deny", "approval": "--disable-approval"})
+    argv, stdin = cb.build_cmd({"engine": "muse", "bin": "muse", "workdir": "/w", "effort": "high"}, "做事", "", "/tmp")
+    assert "--yolo" not in argv
+    assert "--disable-approval" in argv
+    assert "--deny" in argv and any("git push" in x for x in argv)
+    assert argv[-1].startswith("[AIW 规则]") and argv[-1].endswith("做事")
+    assert argv[argv.index("--max-model-steps") + 1] == "100"
+
+
+def test_v3978_muse_cmd_without_flags_still_has_rules(monkeypatch):
+    from agent_runtime import cli_bridge as cb
+    monkeypatch.setattr(cb, "muse_flags", lambda b: {"deny": "", "approval": ""})
+    argv, _ = cb.build_cmd({"engine": "muse", "bin": "muse", "workdir": "/w"}, "x", "s1", "/tmp")
+    assert argv[:3] == ["muse", "exec", "--json"]
+    assert "--deny" not in argv and "--disable-approval" not in argv
+    assert argv[argv.index("--session-id") + 1] == "s1"
+    assert "git push" in argv[-1]

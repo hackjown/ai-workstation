@@ -23,6 +23,7 @@ Ops (each prints exactly one line `CLIRESULT {json}` as its last stdout line):
   diff  JOB [--full]       git status / diff of the folder
   models ENGINE            the models this computer's CLI can use (its own list when it has one, else its config)
   list                     jobs on this computer
+  setenv ENGINE --text-b64 B64  save that engine's secrets (JSON) to ~/.config/aiw/cli/env/ENGINE.json (0600)
   daemon JOB               (internal)
 
 Job state lives in ~/.config/aiw/cli/jobs/<job>/ (job.json, state.json, events.jsonl, inbox/, turn-N.stderr).
@@ -175,10 +176,79 @@ def run_env(extra: dict | None = None) -> dict:
     return env
 
 
+ENV_DIR = os.path.join(ROOT, "env")
+
+
+def env_path(engine: str) -> str:
+    return os.path.join(ENV_DIR, re.sub(r"[^a-z0-9_-]", "", str(engine or "").lower()) + ".json")
+
+
+def save_engine_env(engine: str, env: dict) -> None:
+    """v3.9.78: secrets live in a 0600 file per engine, never in job.json or a turn's argv."""
+    os.makedirs(ENV_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(ENV_DIR, 0o700)
+    except OSError:
+        pass
+    clean = {str(k): str(v) for k, v in (env or {}).items() if isinstance(k, str) and k and v not in (None, "")}
+    path = env_path(engine)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(clean, f)
+    os.replace(tmp, path)
+
+
+def load_engine_env(engine: str) -> dict:
+    d = read_json(env_path(engine), {}) or {}
+    return d if isinstance(d, dict) else {}
+
+
+def op_setenv(engine: str, text_b64: str):
+    if engine not in ENGINES:
+        out({"ok": False, "error": f"unknown engine {engine!r}"})
+    try:
+        env = json.loads(base64.b64decode(text_b64 or "").decode("utf-8") or "{}")
+    except Exception as e:  # noqa: BLE001
+        out({"ok": False, "error": f"bad env: {e}"}, 2)
+    if not isinstance(env, dict):
+        out({"ok": False, "error": "env must be a JSON object"}, 2)
+    save_engine_env(engine, env)
+    out({"ok": True, "engine": engine, "keys": sorted(k for k, v in env.items() if v)})
+
+
 # ------------------------------------------------------------------------------------------------------- commands
 def claude_tools() -> tuple:
     deny = [f"Bash({c}:*)" for c in DENY_SHELL] + [f"Edit({p})" for p in DENY_PATHS] + [f"Write({p})" for p in DENY_PATHS]
     return "Bash,Edit,Write,MultiEdit,Read,Glob,Grep,LS,TodoWrite,NotebookEdit", ",".join(deny)
+
+
+MUSE_RULES = ("[AIW 规则] 只在当前工作文件夹里读写；绝不运行：" + "、".join(DENY_SHELL) + "；绝不读写："
+              + "、".join(DENY_PATHS) + "。需要这些就停下说明原因。\n\n")
+_MUSE_FLAGS: dict = {}
+
+
+def muse_flags(b: str) -> dict:
+    """Which deny / approval flags this muse build has, from `muse exec --help` (cached per process)."""
+    if b in _MUSE_FLAGS:
+        return _MUSE_FLAGS[b]
+    txt = ""
+    try:
+        r = subprocess.run([b, "exec", "--help"], capture_output=True, text=True, timeout=20, env=run_env(),
+                           stdin=subprocess.DEVNULL)
+        txt = (r.stdout or "") + (r.stderr or "")
+    except Exception:  # noqa: BLE001
+        pass
+    deny = ""
+    if re.search(r"--deny\b", txt):
+        deny = "deny"
+    else:
+        m = re.search(r"(--disallowed-?tools|--disallowedTools)\b", txt)
+        deny = m.group(1) if m else ""
+    m = re.search(r"--disable-approvals?\b", txt)
+    res = {"deny": deny, "approval": m.group(0) if m else ""}
+    _MUSE_FLAGS[b] = res
+    return res
 
 
 def build_cmd(job: dict, prompt: str, session: str, turn_dir: str) -> tuple:
@@ -228,8 +298,20 @@ def build_cmd(job: dict, prompt: str, session: str, turn_dir: str) -> tuple:
             c += ["-r", session]
         return c, None
     if e == "muse":
-        # muse exec --json: default NO --yolo (follow v3.9.75 deny list); effort maps to --max-model-steps
+        # muse exec --json, never --yolo. v3.9.78: the deny list goes in as real flags when this muse has them
+        # (read from `muse exec --help`), headless approval prompts are turned off so a turn can't hang or
+        # silently refuse every write, and the same rules lead the prompt as a backstop.
+        flags = muse_flags(b)
         c = [b, "exec", "--json"]
+        if flags["deny"] == "deny":
+            for cmd in DENY_SHELL:
+                c += ["--deny", f"Bash({cmd}*)"]
+            for p in DENY_PATHS:
+                c += ["--deny", f"Edit({p})", "--deny", f"Write({p})"]
+        elif flags["deny"]:
+            c += [flags["deny"], claude_tools()[1]]
+        if flags["approval"]:
+            c += [flags["approval"]]
         if model:
             c += ["--model", model]
         steps = MUSE_EFFORT_STEPS.get(effort)
@@ -237,7 +319,7 @@ def build_cmd(job: dict, prompt: str, session: str, turn_dir: str) -> tuple:
             c += ["--max-model-steps", str(steps)]
         if session:
             c += ["--session-id", session]
-        return c + [prompt], None
+        return c + [MUSE_RULES + prompt], None
     raise ValueError(f"unknown engine {e}")
 
 
@@ -483,7 +565,8 @@ def op_check(engine: str, probe: bool):
         job = {"engine": engine, "bin": b, "workdir": d}
         argv, stdin = build_cmd(job, "Reply with exactly: ok", "", d)
         try:
-            r = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=150, cwd=d, env=run_env(),
+            r = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=150, cwd=d,
+                               env=run_env(load_engine_env(engine)),
                                stdin=None if stdin is not None else subprocess.DEVNULL)
             t = Turn(engine, lambda rec: None)
             for line in (r.stdout or "").splitlines():
@@ -635,6 +718,9 @@ def op_start(job_b64: str):
     if os.path.exists(d):
         out({"ok": False, "error": f"job {jid} exists"})
     os.makedirs(os.path.join(d, "inbox"), exist_ok=True)
+    if isinstance(job.get("env"), dict):   # v3.9.78: an older AIW may still send env in the job; keep it out of job.json
+        save_engine_env(engine, job.pop("env"))
+    job.pop("env", None)
     job.update({"id": jid, "bin": b, "workdir": wd, "worktree": wd, "branch": "", "base": "", "created": time.time()})
     job_path = os.path.join(d, "job.json")
     write_json(job_path, job)
@@ -715,7 +801,7 @@ class Daemon:
         errf = open(err_path, "w", encoding="utf-8")
         try:
             proc = subprocess.Popen(argv, cwd=j["workdir"], stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1, env=run_env(j.get("env")),
+                                    stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1, env=run_env(load_engine_env(j["engine"])),
                                     start_new_session=True)
         except Exception as e:  # noqa: BLE001
             self.save(status="turn_failed", error=f"cannot start {j['engine']}: {e}", response="")
@@ -983,6 +1069,8 @@ def main():
         op_diff(a.job, a.full)
     elif a.op == "list":
         op_list()
+    elif a.op == "setenv":
+        op_setenv(a.job or "", a.text_b64 or "")
     else:
         out({"ok": False, "error": f"unknown op {a.op}"}, 2)
 

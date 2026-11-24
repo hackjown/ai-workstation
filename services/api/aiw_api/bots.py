@@ -19,6 +19,7 @@ Nothing here pushes, merges or deletes: the bridge's deny rules stay in force, a
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -401,6 +402,7 @@ class CliEngine:
         self.shell = shell
         self._installed = installed if installed is not None else set()   # shared: one bridge file per computer
         self._env_fn = env_fn
+        self._env_fp: dict = {}   # mid -> fingerprint of the secrets last written there
 
     async def op(self, mid: str, op: str, a: dict, job: Optional[dict] = None) -> dict:
         from agent_runtime import cli_engines as ce
@@ -409,6 +411,7 @@ class CliEngine:
             if "CLI_BRIDGE_OK" not in (out or ""):
                 raise RuntimeError("没能把引擎桥接脚本写到电脑上：" + clip(out, 200))
             self._installed.add(mid)
+            self._env_fp.pop(mid, None)   # a fresh bridge: write the secrets again
         cmd, to = ce.command(op, {"engine": self.id, **a}, job)
         out = await self.shell(mid, cmd, to)
         r = ce.parse(out)
@@ -421,16 +424,27 @@ class CliEngine:
         j = {"engine": self.id, "prompt": prompt, "session": conv.get("session") or "",
              "workdir": conv.get("workdir") or f"~/workspace/{self.id}-chat", "model": model, "effort": effort,
              "max_turns": 1000, "timeout_min": 24 * 60, "keep_min": 120, "idle_min": 20}
-        if self._env_fn:
-            extra_env = {k: v for k, v in (self._env_fn() or {}).items() if v}
-            if extra_env:
-                j["env"] = extra_env
-        return j
+        return j   # v3.9.78: secrets go to the computer once through setenv, never inside the job
 
     async def models(self, mid: str) -> dict:
         return await self.op(mid, "models", {})
 
+    async def sync_env(self, mid: str) -> None:
+        """v3.9.78: write this engine's secrets (e.g. META_API_KEY) to a 0600 file on the computer, only when they
+        changed, so they never ride in job.json or every start command."""
+        if not self._env_fn:
+            return
+        env = {k: v for k, v in (self._env_fn() or {}).items() if v}
+        fp = hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest() if env else ""
+        if self._env_fp.get(mid) == fp:
+            return
+        r = await self.op(mid, "setenv", {"env": env})
+        if not r.get("ok"):
+            raise RuntimeError(f"{self.id} 没能把密钥写到电脑上：{r.get('error') or ''}")
+        self._env_fp[mid] = fp
+
     async def start(self, mid: str, conv: dict, prompt: str, skip: bool = False) -> dict:
+        await self.sync_env(mid)
         return await self.op(mid, "start", {}, self.job(conv, prompt))   # v3.9.67: permits are agy-only
 
     async def send(self, mid: str, job: str, text: str) -> dict:

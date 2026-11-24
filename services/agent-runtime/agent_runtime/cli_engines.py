@@ -41,6 +41,9 @@ def command(op: str, a: dict, job: dict | None = None) -> tuple[str, int]:
     if op == "wait":
         secs = max(5, min(int(a.get("seconds") or 600), 1500))
         return f"{py} wait {jid} --seconds {secs} --cursor {int(a.get('cursor') or 0)}", secs + 60
+    if op == "setenv":
+        b = base64.b64encode(json.dumps(a.get("env") or {}, ensure_ascii=False).encode()).decode()
+        return f"{py} setenv {eng} --text-b64 {b}", 30
     if op == "send":
         b = base64.b64encode(str(a.get("message") or "").encode()).decode()
         return f"{py} send {jid} --text-b64 {b}", 30

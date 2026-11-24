@@ -93,6 +93,9 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.78 Muse 密钥和权限
+- META_API_KEY 改由 setenv 写到电脑上的 0600 文件，不再出现在命令行和 job.json；muse 按 `muse exec --help` 自动带上拒绝清单和关闭审批的参数（不加 --yolo），提示词带 AIW 规则兜底。详见 docs/v3.9.78.md。版本 3.9.78 (52)。
+
 ## v3.9.77 引擎步数显示整轮总数
 - 「正在做 40 步」只是显示截断，引擎没有步数上限；现在显示整轮真实步数。详见 docs/v3.9.77.md。版本 3.9.77 (51)。
 

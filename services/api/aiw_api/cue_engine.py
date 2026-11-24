@@ -191,9 +191,11 @@ def _connect_headers(auth: dict[str, Any]) -> dict[str, str]:
 @dataclass
 class _CueJob:
     job_id: str
+    conv_id: str
     agent_id: str
     session_id: str
     after_id: str = ""
+    last_event_id: str = ""
     expected_user_text: str = ""
     status: str = "running"          # running | turn_done | turn_failed | blocked
     response: str = ""
@@ -227,6 +229,38 @@ class CueEngine:
         self.transport = transport        # optional httpx.MockTransport for unit tests
         self.poll_backoff = poll_backoff  # customizable in unit tests
         self._jobs: dict[str, _CueJob] = {}
+        self._last_sync: dict[str, float] = {}
+        self._sync_locks: dict[str, asyncio.Lock] = {}
+
+    def _sync_key(self, conv_id: str) -> str:
+        return f"cue_sync:{conv_id}"
+
+    def _load_sync(self, conv_id: str) -> dict[str, Any]:
+        st = getattr(self.auth_store, "store", None)
+        if st is None or not conv_id:
+            return {}
+        d = st.kv_get(self._sync_key(conv_id), None)
+        return dict(d) if isinstance(d, dict) else {}
+
+    def _save_sync(self, conv_id: str, last_event_id: str, seen_ids: Optional[list[str]] = None) -> None:
+        st = getattr(self.auth_store, "store", None)
+        if st is None or not conv_id or not last_event_id:
+            return
+        cur = self._load_sync(conv_id)
+        seen = list(cur.get("seen_ids") or [])
+        for x in (seen_ids or []):
+            if x and x not in seen:
+                seen.append(x)
+        if last_event_id not in seen:
+            seen.append(last_event_id)
+        try:
+            st.kv_set(self._sync_key(conv_id), {
+                "last_event_id": last_event_id,
+                "seen_ids": seen[-120:],
+                "updated_at": time.time(),
+            })
+        except Exception:  # noqa: BLE001
+            pass
 
     def _kv_key(self, job_id: str) -> str:
         return f"cue_job:{job_id}"
@@ -423,8 +457,9 @@ class CueEngine:
             return {"ok": False, "error": "Cue 尚未配置 Manus API Key：请点右上角「凭据」填写 API Key（默认只走官方 API v2）。"}
         agent_id = str(conv.get("model") or auth.get("agent_id") or IM_AGENT).strip() or IM_AGENT
         session_id = str(conv.get("session") or "").strip()
+        conv_id = str(conv.get("id") or "").strip()
         job_id = f"cue-{uuid.uuid4().hex[:10]}"
-        job = _CueJob(job_id=job_id, agent_id=agent_id, session_id=session_id, expected_user_text=prompt)
+        job = _CueJob(job_id=job_id, conv_id=conv_id, agent_id=agent_id, session_id=session_id, expected_user_text=prompt)
         self._jobs[job_id] = job
         job.task = asyncio.get_running_loop().create_task(self._run_turn(job, auth, mode, prompt))
         return {"ok": True, "job": job_id}
@@ -461,6 +496,7 @@ class CueEngine:
                 if self._effective_mode(auth) == "openapi":
                     job = _CueJob(
                         job_id=job_id,
+                        conv_id=str(saved.get("conv_id") or ""),
                         agent_id=str(saved.get("agent_id") or IM_AGENT),
                         session_id=str(saved["session_id"]),
                         after_id=str(saved.get("after_id") or ""),
@@ -614,10 +650,14 @@ class CueEngine:
             if state["error"]:
                 self._finish(job, "turn_failed", error=state["error"], auth_error=state["auth_error"])
                 return
+            if state.get("last_event_id"):
+                job.last_event_id = state["last_event_id"]
             if state["reply"] and state["reply"] != last_reply:
                 last_reply = state["reply"]
                 step = 0   # reset backoff when new output arrives
             if state["waiting"]:
+                if job.conv_id and job.last_event_id:
+                    self._save_sync(job.conv_id, job.last_event_id, state.get("seen_ids"))
                 msg = last_reply or "Cue 正在等待你的输入或确认，请打开 Manus 查看或继续回复。"
                 job.denied = [{
                     "action": "confirm",
@@ -628,6 +668,8 @@ class CueEngine:
                 self._finish(job, "blocked", response=msg, waiting_confirm=True)
                 return
             if state["done"]:
+                if job.conv_id and job.last_event_id:
+                    self._save_sync(job.conv_id, job.last_event_id, state.get("seen_ids"))
                 self._finish(job, "turn_done", response=last_reply or "（Cue 已完成，但没有返回文字）")
                 return
 
@@ -644,29 +686,35 @@ class CueEngine:
             params["start_event_id"] = after_id
         assistant_reply = ""
         received_user = False
+        last_event_id = ""
+        seen_ids: list[str] = []
         seen_cursors: set[str] = set()
         while True:
             ok, st, data, retry_after = await self._openapi_req(
                 auth, f"task.listMessages?{urlencode(params)}", client=client
             )
             if st == 429:
-                return {"done": False, "waiting": False, "reply": assistant_reply,
-                        "error": "", "auth_error": False, "rate_limited": True, "retry_after": retry_after}
+                return {"done": False, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,
+                        "seen_ids": seen_ids, "error": "", "auth_error": False, "rate_limited": True, "retry_after": retry_after}
             if not ok:
                 reason = _extract_error_reason(data)
-                return {"done": False, "waiting": False, "reply": assistant_reply,
-                        "error": f"轮询 Cue 回复失败（HTTP {st}）" + (f"：{reason}" if reason else ""),
+                return {"done": False, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,
+                        "seen_ids": seen_ids, "error": f"轮询 Cue 回复失败（HTTP {st}）" + (f"：{reason}" if reason else ""),
                         "auth_error": st in (401, 403), "rate_limited": False, "retry_after": None}
             for ev in data.get("messages") or []:
                 if not isinstance(ev, dict):
                     continue
-                if after_id and ev.get("id") == after_id:
+                ev_id = str(ev.get("id") or "").strip()
+                if after_id and ev_id == after_id:
                     continue
+                if ev_id:
+                    last_event_id = ev_id
+                    seen_ids.append(ev_id)
                 etype = ev.get("type")
                 if etype == "user_message":
                     if received_user:
-                        return {"done": True, "waiting": False, "reply": assistant_reply,
-                                "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
+                        return {"done": True, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,
+                                "seen_ids": seen_ids, "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
                     ucontent = ((ev.get("user_message") or {}) if isinstance(ev.get("user_message"), dict) else {}).get("content")
                     received_user = (ucontent == expected_user_text) or not expected_user_text
                 if not received_user:
@@ -677,29 +725,109 @@ class CueEngine:
                         assistant_reply = ac.strip()
                 elif etype == "error_message":
                     reason = _extract_error_reason(ev)
-                    return {"done": False, "waiting": False, "reply": assistant_reply,
-                            "error": f"Cue 执行出错：{reason}" if reason else "Cue 执行出错，请在 Manus 中查看会话",
+                    return {"done": False, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,
+                            "seen_ids": seen_ids, "error": f"Cue 执行出错：{reason}" if reason else "Cue 执行出错，请在 Manus 中查看会话",
                             "auth_error": False, "rate_limited": False, "retry_after": None}
                 status_obj = ev.get("status_update") if isinstance(ev.get("status_update"), dict) else {}
                 st_val = str(status_obj.get("agent_status") or "").lower()
                 if st_val == "waiting":
-                    return {"done": True, "waiting": True, "reply": assistant_reply,
-                            "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
+                    return {"done": True, "waiting": True, "reply": assistant_reply, "last_event_id": last_event_id,
+                            "seen_ids": seen_ids, "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
                 if st_val == "stopped":
-                    return {"done": True, "waiting": False, "reply": assistant_reply,
-                            "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
+                    return {"done": True, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,
+                            "seen_ids": seen_ids, "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
                 if st_val == "error":
                     reason = _extract_error_reason(ev)
-                    return {"done": False, "waiting": False, "reply": assistant_reply,
-                            "error": f"Cue 执行出错：{reason}" if reason else "Cue 执行出错，请在 Manus 中查看会话",
+                    return {"done": False, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,
+                            "seen_ids": seen_ids, "error": f"Cue 执行出错：{reason}" if reason else "Cue 执行出错，请在 Manus 中查看会话",
                             "auth_error": False, "rate_limited": False, "retry_after": None}
             nxt = str(data.get("next_cursor") or "").strip()
             if not nxt or nxt in seen_cursors:
-                return {"done": False, "waiting": False, "reply": assistant_reply,
-                        "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
+                return {"done": False, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,
+                        "seen_ids": seen_ids, "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
             seen_cursors.add(nxt)
             params.pop("start_event_id", None)
             params["cursor"] = nxt
+
+    async def sync_messages(self, conv: dict[str, Any], min_interval_s: float = 6.0) -> list[dict[str, Any]]:
+        """Pull asynchronous follow-up messages (e.g. Cue background subtask reports) after a turn has ended."""
+        cid = str(conv.get("id") or "").strip()
+        task_id = str(conv.get("session") or "").strip()
+        if not cid or not task_id:
+            return []
+        now = time.monotonic()
+        if min_interval_s > 0 and (now - self._last_sync.get(cid, 0.0)) < min_interval_s:
+            return []
+        auth = self.auth_store.load("cue")
+        if self._effective_mode(auth) != "openapi":
+            return []
+
+        lock = self._sync_locks.setdefault(cid, asyncio.Lock())
+        if lock.locked():
+            return []
+        async with lock:
+            self._last_sync[cid] = time.monotonic()
+            sync_state = self._load_sync(cid)
+            last_id = str(sync_state.get("last_event_id") or "").strip()
+            seen = set(sync_state.get("seen_ids") or [])
+
+            client = _http_client(str(auth.get("proxy_url") or ""), 15.0, self.transport)
+            try:
+                if not last_id:
+                    # First-time watermark bootstrap for existing conversations: grab latest event id so we don't replay old history
+                    ok, _, data, _ = await self._openapi_req(
+                        auth, f"task.listMessages?{urlencode({'task_id': task_id, 'order': 'desc', 'limit': '5'})}",
+                        client=client,
+                    )
+                    if not ok:
+                        return []
+                    msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+                    if not msgs:
+                        return []
+                    newest_id = str(msgs[0].get("id") or "").strip()
+                    if newest_id:
+                        self._save_sync(cid, newest_id, [str(m.get("id") or "") for m in msgs])
+                    return []
+
+                params: dict[str, str] = {"task_id": task_id, "order": "asc", "limit": "50", "start_event_id": last_id}
+                new_replies: list[dict[str, Any]] = []
+                new_seen: list[str] = []
+                newest_id = last_id
+                seen_cursors: set[str] = set()
+                while True:
+                    ok, _, data, _ = await self._openapi_req(
+                        auth, f"task.listMessages?{urlencode(params)}", client=client
+                    )
+                    if not ok:
+                        break
+                    for ev in data.get("messages") or []:
+                        if not isinstance(ev, dict):
+                            continue
+                        ev_id = str(ev.get("id") or "").strip()
+                        if not ev_id or ev_id == last_id or ev_id in seen:
+                            continue
+                        newest_id = ev_id
+                        new_seen.append(ev_id)
+                        seen.add(ev_id)
+                        if ev.get("type") == "assistant_message":
+                            ac = ((ev.get("assistant_message") or {}) if isinstance(ev.get("assistant_message"), dict) else {}).get("content")
+                            if isinstance(ac, str) and ac.strip():
+                                new_replies.append({"id": ev_id, "text": ac.strip()})
+                        elif ev.get("type") == "error_message":
+                            reason = _extract_error_reason(ev)
+                            if reason:
+                                new_replies.append({"id": ev_id, "text": f"（Cue 后台任务出错：{reason}）", "error": True})
+                    nxt = str(data.get("next_cursor") or "").strip()
+                    if not nxt or nxt in seen_cursors:
+                        break
+                    seen_cursors.add(nxt)
+                    params.pop("start_event_id", None)
+                    params["cursor"] = nxt
+                if newest_id != last_id or new_seen:
+                    self._save_sync(cid, newest_id, new_seen)
+                return new_replies
+            finally:
+                await client.aclose()
 
     async def _run_native_turn(self, job: _CueJob, auth: dict[str, Any], prompt: str) -> None:
         """Experimental native Cue ConnectRPC + Socket.IO v4 turn (`wss://api.manus.im/socket.io/`)."""

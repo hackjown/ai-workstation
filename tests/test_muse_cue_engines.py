@@ -237,6 +237,35 @@ async def test_cue_openapi_backoff_429_eviction_error_and_waiting_card(tmp_path)
     res3 = await eng_wait.wait("cloud", st3["job"], 0, seconds=5)
     assert res3["status"] == "blocked" and res3["waiting_confirm"] is True
 
+    # Test asynchronous follow-up sync after a turn ends (e.g. Cue background subtask report)
+    bots = B.Bots(store, secrets=SecretBox(store, str(tmp_path)))
+    sync_calls = {"n": 0}
+
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/task.listMessages"):
+            sync_calls["n"] += 1
+            if request.url.params.get("start_event_id") == "m3":
+                return httpx.Response(200, json={"ok": True, "messages": [
+                    {"id": "m3", "type": "status_update", "status_update": {"agent_status": "stopped"}},
+                    {"id": "m4", "type": "assistant_message", "assistant_message": {"content": "5个新候选已测完，找到2个可用节点"}},
+                ]})
+            return httpx.Response(200, json={"ok": True, "messages": []})
+        return httpx.Response(404, json={"ok": False})
+
+    cue_eng = CueEngine(bots.auth_store, transport=httpx.MockTransport(sync_handler))
+    bots.engines["cue"] = cue_eng
+    conv = bots.create("cue", "cue测试")
+    bots.set_conv(conv["id"], session="agent-default-main_task")
+    cue_eng._save_sync(conv["id"], "m3", ["m1", "m2", "m3"])
+
+    added1 = await bots.sync_cloud(conv["id"], min_interval_s=0)
+    assert added1 == 1
+    msgs = bots.messages(conv["id"])
+    assert any("5个新候选已测完" in m["text"] for m in msgs)
+    # Second sync with same watermark does not duplicate
+    added2 = await bots.sync_cloud(conv["id"], min_interval_s=0)
+    assert added2 == 0
+
 
 def test_cue_socketio_helpers():
     assert build_cue_socket_url("https://api.manus.im", "dev-123").startswith("wss://api.manus.im/socket.io/?")

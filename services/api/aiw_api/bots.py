@@ -488,6 +488,7 @@ class Bots:
         }
         self.queues: dict[str, list] = {}
         self.runners: dict[str, asyncio.Task] = {}
+        self._watchers: dict[str, asyncio.Task] = {}
         self.listeners: list = []
         self._models: dict = {}
 
@@ -660,7 +661,65 @@ class Bots:
             self.add(cid, "system", f"模型改成 {m or '默认'}{' · ' + e if e else ''}，下一句起生效（接着原会话）")
         return c
 
+    async def sync_cloud(self, cid: str, min_interval_s: float = 6.0) -> int:
+        """Pull asynchronous follow-up replies (e.g. Cue background subtask completions) into bot_messages."""
+        if self.busy(cid):
+            return 0
+        c = self.conv(cid)
+        if not c or not c.get("session"):
+            return 0
+        eng = self.engines.get(c["bot"])
+        if not eng or not hasattr(eng, "sync_messages"):
+            return 0
+        try:
+            items = await eng.sync_messages(c, min_interval_s=min_interval_s)
+        except Exception as e:  # noqa: BLE001
+            log.debug("cloud sync %s: %s", cid, e)
+            return 0
+        added = 0
+        for it in items or []:
+            txt = str(it.get("text") or "").strip()
+            if not txt:
+                continue
+            self.add(cid, "bot", txt, {
+                "status": "failed" if it.get("error") else "done",
+                "cue_event_id": it.get("id") or "",
+                "proactive": True,
+                "ended": _now(),
+            })
+            added += 1
+            if not c.get("takeover"):
+                await self._notify(cid, txt)
+        return added
+
+    def _start_followup_watch(self, cid: str, duration_s: float = 1800.0, interval_s: float = 15.0) -> None:
+        """Watch an idle Cue conversation in the background for up to 30m to catch delayed subtask replies."""
+        old = self._watchers.get(cid)
+        if old and not old.done():
+            old.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _watch():
+            deadline = time.monotonic() + duration_s
+            while time.monotonic() < deadline:
+                await asyncio.sleep(interval_s)
+                if not self.conv(cid):
+                    return
+                if self.busy(cid):
+                    continue
+                await self.sync_cloud(cid, min_interval_s=interval_s - 2.0)
+
+        t = loop.create_task(_watch())
+        self._watchers[cid] = t
+        t.add_done_callback(lambda _t: self._watchers.pop(cid, None) if self._watchers.get(cid) is _t else None)
+
     def delete(self, cid: str) -> bool:
+        w = self._watchers.pop(cid, None)
+        if w and not w.done():
+            w.cancel()
         self.store._x("DELETE FROM bot_messages WHERE conv=?", (cid,))
         self.store._x("DELETE FROM bot_convs WHERE id=?", (cid,))
         return True
@@ -942,6 +1001,8 @@ class Bots:
             alive = False
         self.set_conv(cid, status="idle", job=job if alive else None, cursor=cursor,
                       session=res.get("conversation_id") or res.get("session") or c.get("session"))
+        if hasattr(eng, "sync_messages") and self.conv(cid) and (self.conv(cid) or {}).get("session"):
+            self._start_followup_watch(cid)
         if not self.conv(cid).get("takeover"):
             if data["status"] == "blocked" and (c["bot"] == "agy" or res.get("waiting_confirm")):
                 await self.permit_card(cid, data["denied"])    # v3.9.68: approval / Cue waiting-confirm card in chat + push
@@ -1386,6 +1447,9 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     @app.get("/api/bots/convs/{cid}", dependencies=dep)
     async def bots_conv(cid: str, after: int = 0):
         c = need(cid)
+        if not bots.busy(cid) and is_cloud_engine(c.get("bot") or ""):
+            await bots.sync_cloud(cid)
+            c = need(cid)
         c["busy"] = bots.busy(cid)
         c["queued"] = len(bots.queues.get(cid) or [])
         return {"conv": c, "messages": bots.messages(cid, after)}

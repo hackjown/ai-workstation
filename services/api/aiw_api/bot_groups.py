@@ -814,6 +814,9 @@ def mount(app, groups: Groups, auth) -> None:
     @app.get("/api/bots/groups/{gid}", dependencies=dep)
     async def groups_get(gid: str, after: int = 0):
         g = need(gid)
+        for m in g["members"]:
+            if m.get("conv") and B.is_cloud_engine(m.get("bot") or ""):
+                await groups.bots.sync_cloud(m["conv"])
         convs = {m["conv"]: groups.bots.conv(m["conv"]) for m in g["members"] if m.get("conv")}
         for m in g["members"]:
             c = convs.get(m.get("conv")) or {}

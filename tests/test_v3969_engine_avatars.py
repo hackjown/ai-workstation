@@ -18,13 +18,14 @@ def test_web_uses_round_logo_avatar():
     js = (ROOT / "apps/web/bots.js").read_text()
     css = (ROOT / "apps/web/bots.css").read_text()
     assert "function btAv(" in js and 'src="engines/${id}.svg"' in js
-    assert js.count("${btAv(") == 4 and js.count('<span class="bt-av') == 2   # helper + the group count
-    assert "border-radius:50%" in css and "border:4px solid var(--amber)" in css
+    assert js.count("${btAv(") >= 4   # v3.9.80: + avatar bar, task picker, settings
+    assert js.count('<span class="bt-av') == 2   # helper + the group count
+    assert "border-radius:50%" in css and "border:1.5px solid var(--bt-c" in css   # v3.9.80
 
 
 def test_ios_engine_avatar():
     sw = (ROOT / "apps/ios/Sources/EngineView.swift").read_text()
     assert "struct EngineAvatar: View" in sw and 'inDirectory: "engines"' in sw
     assert sw.count("EngineAvatar(bot:") >= 4   # list row, reply, group reply, new-conversation picker
-    assert "Circle().strokeBorder(amber, lineWidth: max(2.5, size * 0.125))" in sw
+    assert "Circle().strokeBorder(engineColor(id, cs)" in sw   # v3.9.80: its own colour, amber is AIW's
     assert "cp engines/eng-*.png engines/LICENSE $APP/engines/" in (ROOT / "apps/ios/build-ipa.sh").read_text()

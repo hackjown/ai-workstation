@@ -27,6 +27,7 @@ func engineColor(_ bot: String, _ cs: ColorScheme) -> Color {
 struct EngineAvatar: View {
     let bot: String
     var size: CGFloat = 32
+    @Environment(\.colorScheme) private var cs
     static var cache: [String: UIImage] = [:]
     static func logo(_ id: String) -> UIImage? {
         if let i = cache[id] { return i }
@@ -45,7 +46,7 @@ struct EngineAvatar: View {
             }
         }
         .frame(width: size, height: size)
-        .overlay(Circle().strokeBorder(amber, lineWidth: max(2.5, size * 0.125)))   // v3.9.70: as thick as AIW's own ring
+        .overlay(Circle().strokeBorder(engineColor(id, cs), lineWidth: size >= 30 ? 1.5 : 1))   // v3.9.80: its own colour; amber is AIW's
         .accessibilityLabel(id)
     }
 }
@@ -190,24 +191,36 @@ struct EngineSheet: View {
     @State private var groups: [JSON] = []          // v3.9.61 引擎群聊
     @State private var openGroup: String? = nil
     @State private var showNewGroup = false
+    @State private var cfgBot: EngineCfgTarget? = nil   // v3.9.80
     var body: some View {
         SheetChrome("引擎", close: close, trailing: {
             Menu {
-                Button { showNew = true } label: { Label("新对话", systemImage: "square.and.pencil") }
-                Button { showNewGroup = true } label: { Label("新群聊（几个引擎并行）", systemImage: "person.3") }
+                Button { showNew = true } label: { Label("新任务（一个引擎）", systemImage: "square.and.pencil") }
+                Button { showNewGroup = true } label: { Label("新群聊任务（几个引擎分工）", systemImage: "person.3") }
             } label: { Image(systemName: "square.and.pencil").font(.system(size: 17)) }.accessibilityLabel("新建")
         }) {
             List {
+                Section(footer: Text("点头像单聊，长按配置")) { avatarBar }   // v3.9.80
                 if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
-                if loaded && convs.isEmpty {
+                if !dms.isEmpty {
+                    Section(header: Text("单聊")) {
+                        ForEach(dms.indices, id: \.self) { i in
+                            let c = dms[i]
+                            NavigationLink(tag: c.s("id"), selection: $open) {
+                                EngineConvView(cid: c.s("id"), engines: engines) { Task { await load() } }
+                            } label: { row(c) }
+                        }
+                    }
+                }
+                if loaded && tasks.isEmpty && groups.isEmpty {
                     Section {
-                        Text("还没有对话。新建一个，直接和电脑上的 Antigravity 说话；也可以把目标交给 AIW 管家，让它替你和 Antigravity 来回沟通。")
+                        Text("还没有任务。点上面的头像直接和引擎单聊，或者新建一个任务交给它做。")
                             .font(.subheadline).foregroundColor(.secondary)
-                        Button { showNew = true } label: { Label("新对话", systemImage: "plus") }.foregroundColor(amber)
+                        Button { showNew = true } label: { Label("新任务", systemImage: "plus") }.foregroundColor(amber)
                     }
                 }
                 if !groups.isEmpty {
-                    Section(header: Text("群聊")) {
+                    Section(header: Text("群聊任务")) {
                         ForEach(groups.indices, id: \.self) { i in
                             let g = groups[i]
                             NavigationLink(tag: g.s("id"), selection: $openGroup) {
@@ -216,9 +229,9 @@ struct EngineSheet: View {
                         }
                     }
                 }
-                Section(header: groups.isEmpty ? nil : Text("对话"), footer: Text(soon)) {
-                    ForEach(convs.indices, id: \.self) { i in
-                        let c = convs[i]
+                Section(header: tasks.isEmpty ? nil : Text("任务"), footer: Text(soon)) {
+                    ForEach(tasks.indices, id: \.self) { i in
+                        let c = tasks[i]
                         NavigationLink(tag: c.s("id"), selection: $open) {
                             EngineConvView(cid: c.s("id"), engines: engines) { Task { await load() } }
                         } label: { row(c) }
@@ -229,6 +242,9 @@ struct EngineSheet: View {
             .refreshable { await load() }
         }
         .task { await load() }
+        .sheet(item: $cfgBot) { t in
+            EngineCfgSheet(engine: engines.first { $0.s("id") == t.id } ?? ["id": t.id, "title": t.id]) { Task { await load() } }
+        }
         .sheet(isPresented: $showNewGroup) {
             EngineGroupNewSheet(engines: engines) { g in
                 showNewGroup = false
@@ -243,6 +259,44 @@ struct EngineSheet: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { open = c.s("id") }
             }
         }
+    }
+    var dms: [JSON] { convs.filter { $0.s("kind") == "dm" } }
+    var tasks: [JSON] { convs.filter { $0.s("kind") != "dm" } }
+    var avatarBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 14) {
+                ForEach(engines.filter { $0.b("available") }.indices, id: \.self) { i in
+                    let e = engines.filter { $0.b("available") }[i]
+                    avatarCell(e)
+                }
+            }.padding(.vertical, 4)
+        }
+    }
+    func avatarCell(_ e: JSON) -> some View {
+        let id = e.s("id")
+        let busy = e.d("busy") > 0
+        let off = e.b("cloud") && !e.b("configured")
+        let dot: Color = busy ? amber : (off ? Color.gray : Color.green)
+        return VStack(spacing: 3) {
+            EngineAvatar(bot: id, size: 44)
+                .overlay(Circle().fill(dot).frame(width: 11, height: 11).overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2)), alignment: .bottomTrailing)
+            Text(e.s("short").isEmpty ? e.s("title") : e.s("short")).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+        }
+        .frame(width: 52)
+        .contentShape(Rectangle())
+        .onTapGesture { Task { await openDm(id) } }
+        .contextMenu {
+            Button { Task { await openDm(id) } } label: { Label("单聊", systemImage: "bubble.left") }
+            Button { cfgBot = EngineCfgTarget(id: id) } label: { Label("配置", systemImage: "gearshape") }
+        }
+    }
+    @MainActor func openDm(_ bot: String) async {
+        if let e = engines.first(where: { $0.s("id") == bot }), e.b("cloud"), !e.b("configured") { cfgBot = EngineCfgTarget(id: bot); return }
+        do {
+            let c = try await API.shared.obj("POST", "/api/bots/dm/\(bot)")
+            if !convs.contains(where: { $0.s("id") == c.s("id") }) { convs.insert(c, at: 0) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { open = c.s("id") }
+        } catch let e { error = "没能打开单聊：\(e.localizedDescription)" }
     }
     var soon: String {
         engines.filter { !$0.b("available") }.map { $0.s("title") + "：下一版接入" }.joined(separator: " · ")
@@ -526,8 +580,12 @@ struct EngineConvView: View {
             }
             if live { Button { Task { await act("POST", "/stop") } } label: { Label("停止", systemImage: "stop.circle") } }
             Button { showModel = true } label: { Label("模型和强度", systemImage: "cpu") }
-            Button { newTitle = conv.s("title"); showRename = true } label: { Label("改名", systemImage: "pencil") }
-            Button(role: .destructive) { confirmDelete = true } label: { Label("删除对话", systemImage: "trash") }
+            if conv.s("kind") == "dm" {   // v3.9.80: the engine's own chat keeps its context until a new topic
+                Button { Task { await act("POST", "/new_topic") } } label: { Label("新话题", systemImage: "arrow.counterclockwise") }
+            } else {
+                Button { newTitle = conv.s("title"); showRename = true } label: { Label("改名", systemImage: "pencil") }
+                Button(role: .destructive) { confirmDelete = true } label: { Label("删除对话", systemImage: "trash") }
+            }
         } label: { Image(systemName: "ellipsis.circle").font(.system(size: 18)) }.accessibilityLabel("更多")
     }
     var takeBar: some View {
@@ -963,6 +1021,84 @@ struct EngineModelSheet: View {
                 }
             }
         }
+    }
+}
+
+
+// MARK: - v3.9.80 an engine's settings (long-press its avatar): model and strength, computer and folder for its own chat
+struct EngineCfgTarget: Identifiable { let id: String }
+
+struct EngineCfgSheet: View {
+    let engine: JSON
+    let changed: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var group = ""
+    @State private var effort = ""
+    @State private var machine = ""
+    @State private var workdir = ""
+    @State private var machines: [JSON] = []
+    @State private var busy = false
+    @State private var error = ""
+    var bot: String { engine.s("id") }
+    var cloud: Bool { engine.b("cloud") }
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    HStack(spacing: 10) {
+                        EngineAvatar(bot: bot, size: 40)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(engine.s("title")).font(.headline)
+                            Text(engine.s("desc")).font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                    if cloud {
+                        Text(engine.b("configured") ? "已配置凭据" : "还没配置凭据，请在网页的 引擎 › 点名字 › 配置凭据 里填。").font(.footnote).foregroundColor(.secondary)
+                    } else {
+                        Text("登录：" + (engine.s("login").isEmpty ? "在电脑上登录这个 CLI" : engine.s("login"))).font(.footnote).foregroundColor(.secondary)
+                    }
+                }
+                EngineModelSection(group: $group, effort: $effort)
+                if !cloud {
+                    Section(header: Text("电脑")) {
+                        Picker("电脑", selection: $machine) {
+                            Text("默认").tag("")
+                            ForEach(machines.indices, id: \.self) { i in
+                                Text(machines[i].s("name").isEmpty ? machines[i].s("id") : machines[i].s("name")).tag(machines[i].s("id"))
+                            }
+                        }
+                    }
+                    Section(header: Text("单聊的工作文件夹"), footer: Text("单聊在这里干活；空着用 ~/workspace/\(bot)-chat/main。")) {
+                        TextField("~/workspace/\(bot)-chat/main", text: $workdir).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    }
+                }
+                if !error.isEmpty { Section { Text(error).foregroundColor(.red).font(.footnote) } }
+            }
+            .navigationTitle("配置").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    if busy { ProgressView() } else { Button("保存") { Task { await save() } }.bold() }
+                }
+            }
+        }
+        .task {
+            await EngineModels.shared.load(bot: bot)
+            if let r = try? await API.shared.obj("GET", "/api/bots/engines/\(bot)/config") {
+                let c = r.o("cfg")
+                let (g, e) = EngineModelSection.split(c.s("model"), c.s("effort"))
+                group = g; effort = e; machine = c.s("machine_id"); workdir = c.s("workdir")
+            }
+            if !cloud { machines = (try? await API.shared.list("/api/machines")) ?? [] }
+        }
+    }
+    @MainActor func save() async {
+        busy = true; defer { busy = false }
+        var req: JSON = ["model": "", "effort": ""]
+        for (k, v) in EngineModels.shared.value(group, effort) { req[k] = v }
+        if !cloud { req["machine_id"] = machine; req["workdir"] = workdir }
+        do { _ = try await API.shared.obj("PUT", "/api/bots/engines/\(bot)/config", req); changed(); dismiss() }
+        catch { self.error = "没保存：\(error.localizedDescription)" }
     }
 }
 

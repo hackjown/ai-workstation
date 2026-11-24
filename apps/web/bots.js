@@ -27,19 +27,125 @@ function btAv(bot, extra) {
   return `<span class="bt-av ${esc(id)}${extra ? " " + extra : ""}" title="${esc(eng.title)}">${inner}</span>`;
 }
 function btEngine(id) { return BT.engines.find((e) => e.id === id) || { title: id, short: id }; }
+/* v3.9.80: every engine has a fixed avatar at the top. Tap it: your own chat with that engine (one per engine, context
+   kept until 新话题). Tap its name or long-press: its settings. Below: tasks (one engine) and groups (several). */
+function btEngBar() {
+  const on = BT.conv && BT.conv.kind === "dm" ? BT.conv.bot : "";
+  return `<div class="bt-engs">` + BT.engines.filter((e) => e.available).map((e) => {
+    const st = e.busy > 0 ? "busy" : e.cloud && !e.configured ? "off" : "ok";
+    const tip = e.busy > 0 ? `正在做 ${e.busy} 件事` : st === "off" ? "还没配置凭据" : "空闲";
+    return `<div class="bt-eng ${on === e.id ? "on" : ""}">
+      <button class="bt-eng-av" onclick="btDm('${esc(e.id)}')" oncontextmenu="event.preventDefault();btCfg('${esc(e.id)}')" title="和 ${esc(e.title)} 单聊（${tip}）">${btAv(e.id)}<i class="bt-dot ${st}"></i></button>
+      <button class="bt-eng-name" onclick="btCfg('${esc(e.id)}')" title="配置 ${esc(e.title)}">${esc(e.short || e.title)}</button></div>`;
+  }).join("") + `</div>`;
+}
 function btRenderList() {
   const box = $("btList"); if (!box) return;
-  const items = BT.convs.map((c) => {
+  const items = BT.convs.filter((c) => c.kind !== "dm").map((c) => {
     const e = btEngine(c.bot), st = c.takeover ? "管家接管中" : (c.busy || c.status === "running") ? "回复中…" : "";
     return `<button class="bt-it ${esc(c.bot || "agy")} ${c.id === BT.cid ? "on" : ""}" onclick="btOpen('${c.id}')">
       ${btAv(c.bot)}
       <span class="grow"><span class="t1">${esc(c.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${c.last ? esc(c.last.text) : esc(e.title)}</span></span></button>`;
   }).join("");
-  box.innerHTML = `<div class="bt-head"><div class="heading">引擎</div><button class="btn sm" onclick="btGroupNew()" title="几个引擎各开一个分支并行干，管家合并">${icon("plus")}群聊</button><button class="btn sm primary" onclick="btNew()">${icon("plus")}新对话</button></div>`
+  box.innerHTML = `<div class="bt-head"><div class="heading">引擎</div><button class="btn sm primary" onclick="btNewTask()">${icon("plus")}新建任务</button></div>`
+    + btEngBar()
+    + `<div class="small muted pad bt-hint">点头像单聊，点名字配置</div>`
     + btGroupItems()
-    + (items || `<div class="muted pad">还没有对话。新建一个，直接和电脑上的 Antigravity、Codex、Claude Code、CodeBuddy 或 Grok 说话；也可以把目标交给 AIW 管家，让它替你来回沟通。</div>`)
-    + `<div class="small muted pad">${BT.engines.filter((e) => !e.available).map((e) => esc(e.title) + "：下一版接入").join(" · ")}</div>`;
+    + (items || (BT.groups.length ? "" : `<div class="muted pad">还没有任务。点「新建任务」选一个引擎单独做，选几个就组群分工。</div>`));
   paintIcons(box);
+}
+async function btDm(bot) {
+  const e = btEngine(bot);
+  if (e.cloud && !e.configured) { btCfg(bot); toast(`先给 ${e.title} 配置凭据`); return; }
+  try {
+    const c = await api("POST", `/api/bots/dm/${encodeURIComponent(bot)}`);
+    if (!BT.convs.some((x) => x.id === c.id)) BT.convs.unshift(c);
+    const i = BT.engines.findIndex((x) => x.id === bot); if (i >= 0) BT.engines[i].dm = c.id;
+    btOpen(c.id);
+  } catch (err) { toast("没能打开单聊：" + err.message); }
+}
+async function btNewTopic() {
+  if (!BT.cid || !confirm("开一个新话题？之前的内容还在，但不再带给引擎。")) return;
+  try { await api("POST", `/api/bots/convs/${BT.cid}/new_topic`); toast("新话题"); btRefresh(true); } catch (e) { toast("没成功：" + e.message); }
+}
+/* 新建任务: one engine is a task conversation; several make a group that 管家 splits and merges */
+function btNewTask() {
+  const chips = BT.engines.filter((e) => e.available).map((e) => `<label class="bt-pick"><input type="checkbox" name="m" value="${esc(e.id)}" onchange="btTaskToggle()" />${btAv(e.id)}<span>${esc(e.short || e.title)}</span></label>`).join("");
+  modal(`<form class="callnote bt-form" onsubmit="btTaskCreate(event)"><h3>新建任务</h3>
+      <div class="bt-fl">选引擎<div class="bt-picks">${chips}</div><small id="btTaskHint">选一个：它单独做；选几个：组群，管家分工。</small></div>
+      <label>标题<input name="title" placeholder="例如 ldok 重建" /></label>
+      <div id="btTaskLocal">
+        <label id="btTaskMachine">电脑<select name="machine">${btMachineOpts()}</select></label>
+        <label><span id="btTaskWdLabel">工作文件夹</span><input name="workdir" placeholder="~/workspace/ldok" /><small id="btTaskWdHint">电脑上的文件夹；空着就新建一个。</small></label>
+        <label id="btTaskBase" style="display:none">基线分支<input name="base" placeholder="main" /><small>空着用仓库当前分支。</small></label>
+      </div>
+      <label>要做什么<textarea name="goal" rows="3" placeholder="可以先空着，进去再说"></textarea></label>
+      <div class="row gap"><button class="btn primary">开始</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
+    </form>`);
+  if (!(S.machines || []).length) api("GET", "/api/machines").then((ms) => { S.machines = ms; const m = document.querySelector("#modal select[name=machine]"); if (m) m.innerHTML = btMachineOpts(); }).catch(() => {});
+  btTaskToggle();
+}
+function btTaskToggle() {
+  const f = document.querySelector("#modal form"); if (!f) return;
+  const picked = [...f.querySelectorAll("input[name=m]:checked")].map((x) => x.value);
+  const local = picked.filter((id) => !btIsCloud(id)), grp = picked.length > 1;
+  $("btTaskLocal").style.display = picked.length && !local.length ? "none" : "";
+  $("btTaskMachine").style.display = grp ? "none" : "";
+  $("btTaskBase").style.display = grp && local.length ? "" : "none";
+  $("btTaskWdLabel").textContent = grp ? "git 仓库" : "工作文件夹";
+  $("btTaskWdHint").textContent = grp ? "本地引擎各开一个分支，做完管家合并；空着就新建一个仓库。" : "电脑上的文件夹；空着就新建一个。";
+  $("btTaskHint").textContent = !picked.length ? "选一个：它单独做；选几个：组群，管家分工。" : grp ? `组群：${picked.map((id) => btEngine(id).short || id).join("、")}，管家分工。` : `${btEngine(picked[0]).title} 单独做。`;
+}
+async function btTaskCreate(ev) {
+  ev.preventDefault();
+  const f = ev.target, picked = [...f.querySelectorAll("input[name=m]:checked")].map((x) => x.value);
+  if (!picked.length) { toast("至少选一个引擎"); return; }
+  const btn = f.querySelector(".btn.primary"); btn.disabled = true;
+  try {
+    if (picked.length > 1) {
+      btn.textContent = "正在建工作树…";
+      const g = await api("POST", "/api/bots/groups", { title: f.title.value, repo: f.workdir.value, base: f.base.value, members: picked, auto_merge: true, goal: f.goal.value });
+      closeOverlays(); BT.groups.unshift(g); btGroupOpen(g.id); return;
+    }
+    const c = await api("POST", "/api/bots/convs", { bot: picked[0], title: f.title.value, workdir: f.workdir.value, machine_id: f.machine ? f.machine.value : "" });
+    closeOverlays(); BT.convs.unshift(c); await btOpen(c.id);
+    const goal = f.goal.value.trim();
+    if (goal) { $("btPrompt").value = goal; btSend({ preventDefault() {} }); }
+  } catch (e) { toast("没能新建：" + e.message); btn.disabled = false; btn.textContent = "开始"; }
+}
+/* 点名字: the engine's settings — sign-in, model and strength, computer and folder for its own chat and new tasks */
+async function btCfg(bot) {
+  const e = btEngine(bot);
+  let cfg = e.cfg || {};
+  try { cfg = (await api("GET", `/api/bots/engines/${encodeURIComponent(bot)}/config`)).cfg || cfg; } catch (_) {}
+  const effs = ["", "minimal", "low", "medium", "high", "xhigh", "max"].map((x) => `<option value="${x}" ${x === (cfg.effort || "") ? "selected" : ""}>${x || "默认"}</option>`).join("");
+  modal(`<form class="callnote bt-form" onsubmit="btCfgSave(event,'${esc(bot)}')"><h3 class="row gap" style="align-items:center">${btAv(bot)}${esc(e.title)}</h3>
+      <div class="muted small">${esc(e.desc || "")}</div>
+      ${e.cloud ? `<div class="row gap" style="align-items:center;justify-content:space-between"><span class="small">${e.configured ? "<b>已配置凭据</b>" : "<span class='muted'>还没配置凭据</span>"}</span><button type="button" class="btn sm" onclick="btCloudAuth('${esc(bot)}')">配置凭据</button></div>`
+        : `<div class="small muted">登录：${esc(e.login || "在电脑上登录这个 CLI")}</div>`}
+      <label>模型<input name="model" list="btCfgModels" value="${esc(cfg.model || "")}" placeholder="默认" /><datalist id="btCfgModels"></datalist></label>
+      <label>强度<select name="effort">${effs}</select></label>
+      ${e.cloud ? "" : `<label>电脑<select name="machine">${btMachineOpts()}</select></label>
+      <label>单聊的工作文件夹<input name="workdir" value="${esc(cfg.workdir || "")}" placeholder="~/workspace/${esc(bot)}-chat/main" /><small>单聊在这里干活；新建任务不填文件夹时也用这台电脑。</small></label>`}
+      <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="closeOverlays();btDm('${esc(bot)}')">打开单聊</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
+    </form>`);
+  const ms = document.querySelector("#modal select[name=machine]");
+  if (ms) { if (cfg.machine_id) ms.value = cfg.machine_id; if (!(S.machines || []).length) api("GET", "/api/machines").then((x) => { S.machines = x; ms.innerHTML = btMachineOpts(); if (cfg.machine_id) ms.value = cfg.machine_id; }).catch(() => {}); }
+  api("GET", `/api/bots/engines/${encodeURIComponent(bot)}/models`).then((r) => {
+    const dl = $("btCfgModels"); if (!dl) return;
+    dl.innerHTML = (r.groups || []).map((g) => `<option value="${esc(g.id)}">${esc(g.label || g.id)}</option>`).join("");
+  }).catch(() => {});
+}
+async function btCfgSave(ev, bot) {
+  ev.preventDefault();
+  const f = ev.target, body = { model: f.model.value, effort: f.effort.value };
+  if (f.machine) body.machine_id = f.machine.value === "auto" ? "" : f.machine.value;
+  if (f.workdir) body.workdir = f.workdir.value;
+  try {
+    const r = await api("PUT", `/api/bots/engines/${encodeURIComponent(bot)}/config`, body);
+    const i = BT.engines.findIndex((x) => x.id === bot); if (i >= 0) BT.engines[i].cfg = r.cfg;
+    closeOverlays(); toast("已保存");
+  } catch (e) { toast("没保存：" + e.message); }
 }
 function btIsCloud(id) { return !!(btEngine(id) || {}).cloud; }
 function btNewToggleCloud(bot) {
@@ -218,12 +324,13 @@ function btRenderConv() {
   const eng = btEngine(c.bot), cloud = !!eng.cloud, tk = c.takeover, live = c.busy || c.status === "running";
   $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
     <div class="grow"><div class="heading" onclick="btRename()" title="点一下改名">${esc(c.title)}</div>
-      <div class="small muted bt-sub">${esc(eng.title)}<span class="bt-wd">${c.machine_label ? " · " + esc(c.machine_label) : ""}${cloud ? "" : " · " + esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</span></div></div>
+      <div class="small muted bt-sub">${esc(eng.title)}${c.kind === "dm" ? " · 单聊" : ""}<span class="bt-wd">${c.machine_label ? " · " + esc(c.machine_label) : ""}${cloud ? "" : " · " + esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</span></div></div>
     ${cloud ? `<button class="btn sm" onclick="btCloudAuth('${esc(c.bot)}')" title="配置凭据或从浏览器读取">凭据</button>` : ""}
     <button class="btn sm bt-model" onclick="btModelEdit()" title="换模型和强度">${esc(btModelName(c))}</button>
+    ${c.kind === "dm" ? `<button class="btn sm" onclick="btNewTopic()" title="清掉引擎的上下文，历史还在">新话题</button>` : ""}
     ${tk ? `<button class="btn sm" onclick="btRelease()">收回</button>` : `<button class="btn sm primary" onclick="btTake()">交给管家</button>`}
     ${live ? `<button class="btn sm" onclick="btStop()">停止</button>` : ""}
-    <button class="icon" onclick="btDelete()" aria-label="删除对话" title="删除对话">${icon("x")}</button>`;
+    ${c.kind === "dm" ? "" : `<button class="icon" onclick="btDelete()" aria-label="删除对话" title="删除对话">${icon("x")}</button>`}`;
   $("btTake").innerHTML = tk ? `<div class="bt-tk"><b>AIW 管家接管中</b>（第 ${tk.rounds}/${tk.max} 轮）：${esc(tk.goal)}<br><span class="small muted">你随时可以插话，它会先发你的话再继续；点「收回」自己接手。</span></div>` : "";
   $("btMsgs").innerHTML = BT.msgs.length ? BT.msgs.map(btMsg).join("")
     : `<div class="muted pad center">${cloud ? `直接对 ${esc(eng.title)} 说话；如尚未登录可点右上角「凭据」从浏览器读取。` : `直接说要它做什么。它在电脑的 ${esc(c.workdir || "")} 里干活，改动不会自动推送。`}</div>`;
@@ -504,12 +611,12 @@ async function btLoadGroups() {
 }
 function btGroupItems() {
   if (!BT.groups.length) return "";
-  return `<div class="small muted pad" style="padding-bottom:0">群聊</div>` + BT.groups.map((g) => {
+  return `<div class="small muted pad" style="padding-bottom:0">群聊任务</div>` + BT.groups.map((g) => {
     const st = BT_GST[g.status] || "";
     return `<button class="bt-it ${g.id === BT.gid ? "on" : ""}" onclick="btGroupOpen('${g.id}')">
       <span class="bt-av grp">${g.members.length}</span>
       <span class="grow"><span class="t1">${esc(g.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${g.last ? esc((g.last.role === "bot" ? btEngine(g.last.who).title + "：" : "") + g.last.text) : esc(g.members.map((m) => btEngine(m.bot).title).join("、"))}</span></span></button>`;
-  }).join("") + `<div class="small muted pad" style="padding-bottom:0">对话</div>`;
+  }).join("") + `<div class="small muted pad" style="padding-bottom:0">任务</div>`;
 }
 function btGroupToggleGit() {
   const form = document.querySelector("#modal form"); if (!form) return;

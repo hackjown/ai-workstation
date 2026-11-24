@@ -1067,6 +1067,11 @@ class Chat:
                         ("agy", "codex", "claude", "codebuddy", "grok", "muse", "cue")]
                 task = str(a.get("task") or "").strip()
                 conv = str(a.get("conv") or "").strip()
+                if not conv and a.get("dm") and len(bots) == 1:   # v3.9.80: say it in the engine's own chat
+                    try:
+                        conv = _d.bots.dm(bots[0])["id"]
+                    except ValueError as e:
+                        return f"没能打开 {bots[0]} 的单聊：{e}"
                 if conv:   # v3.9.64: carry on in a conversation engine_convs found
                     c = _d.bots.conv(conv)
                     if not c:
@@ -1099,6 +1104,32 @@ class Chat:
                 if not rows:
                     return "引擎里没有找到相关的对话"
                 return json.dumps(rows, ensure_ascii=False)
+            async def _engine_status(a, _d=disp):   # v3.9.80: what every engine and group is doing now
+                from . import bots as _B
+                ov = _d.bots.overview()
+                lines = []
+                for b, v in ov["engines"].items():
+                    e = _B.ENGINES.get(b, {})
+                    if not e.get("available"):
+                        continue
+                    lines.append(f"{e.get('title', b)}（{b}）：{'正在做 ' + str(v['busy']) + ' 件' if v['busy'] else '空闲'}，共 {v['convs']} 个对话")
+                run = [f"- {_B.ENGINES.get(r['bot'], {}).get('title', r['bot'])}「{r['title']}」id={r['id']}"
+                       f"{'（单聊）' if r['kind'] == 'dm' else ''}{'（群 ' + r['group'] + '）' if r['group'] else ''}：{r['last']}"
+                       for r in ov["running"]]
+                grp = []
+                for g in _d.groups.groups()[:8]:
+                    q = g.get("queue") or []
+                    st = {"idle": "空闲", "working": "进行中", "fixing": "修冲突", "merging": "合并中"}.get(g["status"], g["status"])
+                    who = "、".join(g.get("pending") or [])
+                    grp.append(f"- 群「{g['title']}」id={g['id']}：{st}" + (f"，在等 {who}" if who else "")
+                               + (f"，还有 {len(q)} 步" if q else "")
+                               + (f"；最后：{(g.get('last') or {}).get('text', '')}" if g.get("last") else ""))
+                return ("引擎：\n" + "\n".join(lines) + "\n\n正在跑的对话：\n" + ("\n".join(run) or "（没有）")
+                        + "\n\n群聊：\n" + ("\n".join(grp) or "（没有）"))
+            out["engine_status"] = ({"name": "engine_status", "description": "看所有引擎和群聊现在的状态：哪个引擎空闲、"
+                                     "正在做什么、群聊进行到哪一步、在等谁。用户问“任务进度”“agy 在干嘛”“群里做到哪了”时用；"
+                                     "要看某个对话的具体内容再用 engine_convs",
+                                     "parameters": {"type": "object", "properties": {}}}, _engine_status)
             out["engine_convs"] = ({"name": "engine_convs", "description": "查编程引擎和云端引擎（agy、codex、claude、codebuddy、grok、muse、cue）"
                                     "的对话记录：给 query 按标题、文件夹和内容搜，返回对话列表（id、引擎、标题、匹配片段、最后一条）；"
                                     "给 conv 读这个对话最近几轮。用户提到引擎里已有的对话或任务（如「agy 的 ldok 后端对接」）时先用它找，"
@@ -1119,6 +1150,7 @@ class Chat:
                                        "task": {"type": "string", "description": "交给它的任务，原话加上必要的上下文"},
                                        "workdir": {"type": "string", "description": "电脑上的项目文件夹（~/… 或 /home/…），不知道就留空"},
                                        "conv": {"type": "string", "description": "已有的引擎对话 id（engine_convs 找到的），在它里面接着做"},
+                                       "dm": {"type": "boolean", "description": "true：发到这个引擎的单聊里（带着单聊的上下文），用户说“跟 agy 说…”“问一下 cue…”时用；新开独立任务就别填"},
                                        "manage": {"type": "boolean", "description": "true：AIW 管家盯着它直到做完"}},
                                        "required": ["task"]}}, _engine_task)
         srch = getattr(self, "search", None)
@@ -1161,7 +1193,7 @@ class Chat:
         return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…",
                 "session_search": "正在翻以前的记录…", "generate_image": "正在画图…",
                 "edit_image": "正在改图…", "doc_ask": "正在读文档…", "engine_task": "正在交给引擎…",
-                "engine_convs": "正在翻引擎的对话…"}.get(name, "正在查…")
+                "engine_convs": "正在翻引擎的对话…", "engine_status": "正在看引擎进度…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:

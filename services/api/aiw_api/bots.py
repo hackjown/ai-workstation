@@ -82,13 +82,22 @@ def ensure_tables(store) -> None:
     store._x("CREATE TABLE IF NOT EXISTS bot_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, "
              "conv TEXT, role TEXT, text TEXT, data TEXT, created_at REAL, updated_at REAL)")
     store._x("CREATE INDEX IF NOT EXISTS ix_botmsg_conv ON bot_messages(conv, seq)")
+    ensure_cfg_table(store)
     for col in ("cursor INTEGER DEFAULT 0", "model TEXT", "effort TEXT", "job_model TEXT",   # v3.9.58: model, effort
                 "grp TEXT", "origin TEXT", "branch TEXT",   # v3.9.61: group member / sent from the main chat
-                "permit_card TEXT"):                        # v3.9.68: the open permission card in the AIW chat
+                "permit_card TEXT",                         # v3.9.68: the open permission card in the AIW chat
+                "kind TEXT"):                               # v3.9.80: 'dm' = the engine's own long-lived chat, else a task
         try:
             store._x(f"ALTER TABLE bot_convs ADD COLUMN {col}")
         except Exception:  # noqa: BLE001  already there
             pass
+
+
+def ensure_cfg_table(store) -> None:
+    store._x("CREATE TABLE IF NOT EXISTS bot_engine_cfg (bot TEXT PRIMARY KEY, data TEXT, updated_at REAL)")
+
+
+CFG_KEYS = ("model", "effort", "machine_id", "workdir")
 
 
 def _j(v, default):
@@ -623,7 +632,9 @@ class Bots:
         if not eng["available"]:
             raise ValueError(f"{eng['title']} 还没接入")
         cloud_bot = bool(eng.get("cloud"))
-        machine_id = CLOUD_MACHINE if cloud_bot else (machine_id or "").strip()
+        cfg = self.engine_cfg(bot)                        # v3.9.80: the engine's own defaults (点头像 › 配置)
+        model, effort = model or cfg["model"], effort or cfg["effort"]
+        machine_id = CLOUD_MACHINE if cloud_bot else ((machine_id or "").strip() or cfg["machine_id"])
         if machine_id and machine_id not in (AUTO_MACHINE, CLOUD_MACHINE) and hasattr(self.store, "machine") and not self.store.machine(machine_id):
             raise ValueError(f"没有这台电脑：{machine_id}")
         cid = f"bc-{uuid.uuid4().hex[:10]}"
@@ -723,6 +734,78 @@ class Bots:
         self.store._x("DELETE FROM bot_messages WHERE conv=?", (cid,))
         self.store._x("DELETE FROM bot_convs WHERE id=?", (cid,))
         return True
+
+    # ------------------------------------------------------------------ v3.9.80: each engine's settings and its own chat
+    def engine_cfg(self, bot: str) -> dict:
+        r = self.store._x("SELECT data FROM bot_engine_cfg WHERE bot=?", (bot,))
+        d = _j(r[0]["data"], {}) if r else {}
+        return {k: str(d.get(k) or "") for k in CFG_KEYS}
+
+    def set_engine_cfg(self, bot: str, **kw) -> dict:
+        if bot not in ENGINES:
+            raise ValueError(f"没有这个引擎：{bot}")
+        cur = self.engine_cfg(bot)
+        for k, v in kw.items():
+            if k in CFG_KEYS and v is not None:
+                cur[k] = str(v).strip()
+        if cur["effort"] and cur["effort"].lower() not in EFFORTS:
+            raise ValueError("强度只能是 " + "/".join(EFFORTS))
+        if cur["model"] and not re.fullmatch(r"[\w.\- ():/@\[\]]{1,80}", cur["model"]):
+            raise ValueError("模型名不合法")
+        wd = cur["workdir"]
+        if wd and (not re.fullmatch(r"[~\w./ \-\u4e00-\u9fff]{1,200}", wd) or ".." in wd.split("/")):
+            raise ValueError("工作文件夹路径不合法")
+        self.store._x("INSERT OR REPLACE INTO bot_engine_cfg (bot, data, updated_at) VALUES (?,?,?)",
+                      (bot, json.dumps(cur, ensure_ascii=False), _now()))
+        d = self.dm_conv(bot)
+        if d and (cur["model"] or cur["effort"]) and (d.get("model") or "", d.get("effort") or "") != (cur["model"], cur["effort"]):
+            self.set_model(d["id"], cur["model"], cur["effort"])
+        return cur
+
+    def dm_conv(self, bot: str) -> Optional[dict]:
+        r = self.store._x("SELECT id FROM bot_convs WHERE bot=? AND kind='dm' ORDER BY created_at LIMIT 1", (bot,))
+        return self.conv(r[0]["id"]) if r else None
+
+    def dm(self, bot: str) -> dict:
+        """The engine's own chat: one per engine, kept with its context until 新话题."""
+        c = self.dm_conv(bot)
+        if c:
+            return c
+        cfg = self.engine_cfg(bot)
+        eng = ENGINES.get(bot) or {}
+        c = self.create(bot, eng.get("title", bot), cfg["workdir"] or f"~/workspace/{bot}-chat/main", cfg["machine_id"],
+                        cfg["model"], cfg["effort"])
+        self.store._x("UPDATE bot_convs SET kind='dm' WHERE id=?", (c["id"],))
+        return self.conv(c["id"])
+
+    async def new_topic(self, cid: str) -> dict:
+        """Start over with the engine: the next message opens a fresh engine session; the history stays visible."""
+        c = self.conv(cid)
+        if not c:
+            raise KeyError(cid)
+        if self.busy(cid) or c.get("job"):
+            await self.stop(cid)
+        self.set_conv(cid, session=None, job=None, status="idle")
+        self.add(cid, "system", "—— 新话题：从这里开始，之前的内容不再带给引擎 ——", {"new_topic": True})
+        return self.conv(cid)
+
+    def overview(self) -> dict:
+        """What every engine is doing: for the 引擎 page's avatars and the main chat's engine_status tool."""
+        rows = self.store._x("SELECT * FROM bot_convs ORDER BY updated_at DESC LIMIT 200")
+        per: dict = {b: {"busy": 0, "convs": 0} for b in ENGINES}
+        live = []
+        for r in rows:
+            c = conv_row(r)
+            b = c.get("bot")
+            if b not in per:
+                continue
+            per[b]["convs"] += 1
+            if self.busy(c["id"]) or c.get("status") == "running":
+                per[b]["busy"] += 1
+                last = self.store._x("SELECT text FROM bot_messages WHERE conv=? ORDER BY seq DESC LIMIT 1", (c["id"],))
+                live.append({"id": c["id"], "bot": b, "title": c["title"], "kind": c.get("kind") or "task",
+                             "group": c.get("grp") or "", "last": clip(last[0]["text"], 160) if last else ""})
+        return {"engines": per, "running": live}
 
     def messages(self, cid: str, after: int = 0, limit: int = 200) -> list[dict]:
         rows = self.store._x("SELECT * FROM bot_messages WHERE conv=? AND seq>? ORDER BY seq DESC LIMIT ?",
@@ -1330,6 +1413,12 @@ class PermitIn(BaseModel):
     mode: str = "once"
     rule: str = ""
 
+class CfgIn(BaseModel):
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    machine_id: Optional[str] = None
+    workdir: Optional[str] = None
+
 class PatchIn(BaseModel):
     title: Optional[str] = None
     model: Optional[str] = None
@@ -1366,14 +1455,46 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
 
     @app.get("/api/bots", dependencies=dep)
     async def bots_list():
-        engines = []
+        engines, ovs = [], bots.overview()["engines"]
         for e in ENGINES.values():
             row = dict(e)
             if row.get("cloud"):
                 row["auth"] = bots.auth_store.public_view(row["id"])
                 row["configured"] = bool(row["auth"].get("configured"))
+            ov = ovs.get(row["id"], {})
+            d = bots.dm_conv(row["id"])
+            row["cfg"] = bots.engine_cfg(row["id"])
+            row["busy"] = ov.get("busy", 0)
+            row["dm"] = d["id"] if d else ""
             engines.append(row)
         return {"engines": engines, "convs": bots.convs()}
+
+    @app.post("/api/bots/dm/{bot}", dependencies=dep)
+    async def bots_dm(bot: str):
+        if bot not in ENGINES:
+            raise HTTPException(404, "没有这个引擎")
+        try:
+            return bots.dm(bot)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/api/bots/engines/{bot}/config", dependencies=dep)
+    async def bots_cfg_get(bot: str):
+        if bot not in ENGINES:
+            raise HTTPException(404, "没有这个引擎")
+        return {"engine": ENGINES[bot], "cfg": bots.engine_cfg(bot)}
+
+    @app.put("/api/bots/engines/{bot}/config", dependencies=dep)
+    async def bots_cfg_put(bot: str, body: CfgIn):
+        try:
+            return {"cfg": bots.set_engine_cfg(bot, **body.model_dump() if hasattr(body, "model_dump") else body.dict())}
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/bots/convs/{cid}/new_topic", dependencies=dep)
+    async def bots_new_topic(cid: str):
+        need(cid)
+        return await bots.new_topic(cid)
 
     @app.get("/api/bots/engines/{bot}/auth", dependencies=dep)
     async def bots_auth_get(bot: str):

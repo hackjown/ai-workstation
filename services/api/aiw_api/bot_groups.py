@@ -892,9 +892,15 @@ def parse_dispatch(text: str) -> Optional[dict]:
     path = re.search(r"(?<![\w/])(~/[\w./\-\u4e00-\u9fff]+|/(?:home|Users|root|tmp|srv|opt|data|mnt|workspace)/"
                      r"[\w./\-\u4e00-\u9fff]+)", task)
     wd = path.group(1).rstrip("。.，,") if path else ""
-    return {"bots": bots, "task": task, "workdir": wd if ok_path(wd) else "",
-            "manage": bool(re.search(r"盯着|直到|跟进|管家|做完为止|全程", task)),
-            "cont": bool(re.match(r"(?:继续|接着|再)", task))}
+    new = re.match(r"(?:新建|新开|开)(?:一个|个)?(?:新)?任务\s*[:：,，]?\s*(?:去|来)?", task)
+    if new:   # v3.9.81: 「让 agy 新建任务，完成…」
+        task = task[new.end():].strip() or task
+    # v3.9.81: only these words make it a task; everything else is said in the engine's own chat
+    cont = bool(re.match(r"(?:继续|接着)", task) or re.search(r"继续(?:做|完成|改|弄|跟进)?|接着做|(?:完成|做完|接着).{0,30}任务", task))
+    manage = bool(re.search(r"盯着|直到|跟进|管家|做完为止|全程", task))
+    wd = wd if ok_path(wd) else ""
+    mode = "new" if new or len(bots) > 1 else ("continue" if cont else "chat")
+    return {"bots": bots, "task": task, "workdir": wd, "manage": manage, "cont": cont, "mode": mode}
 
 
 class Dispatch:
@@ -924,12 +930,12 @@ class Dispatch:
             if not c:
                 raise ValueError(f"没有这个引擎对话：{p['conv']}")
             bot = c["bot"]
-        elif not p.get("workdir"):
-            if p.get("cont"):
-                c = next((x for x in self.bots.convs() if x["bot"] == bot), None)
-            else:   # "让 agy 完成 ldok后端对接" names an existing conversation by its title: that one, not a new one
-                c = next((x for x in self.bots.convs() if x["bot"] == bot and len(x["title"] or "") >= 4
-                          and x["title"].lower() in task.lower()), None)
+        elif p.get("mode") == "chat":   # v3.9.81: no 新建任务 / 继续 words: the engine's own chat, always
+            c = self.bots.dm(bot)
+        elif p.get("mode") != "new" and not p.get("workdir"):
+            c = self.named_task(bot, task)   # 「让 agy 继续 ldok 增加导出功能」: the ldok task, not a new one
+            if not c and p.get("cont"):
+                c = next(iter(self.tasks(bot)), None)
         if not c:
             c = self.bots.create(bot, title, p.get("workdir") or "", machine_id, origin=origin or "chat")
         elif not c.get("origin"):
@@ -946,10 +952,30 @@ class Dispatch:
             self.bots.takeover(c["id"], task)
             text = f"交给 {eng}{where} 了，AIW 管家盯着它做完，结果回到这里。"
         else:
-            self.bots.send(c["id"], task, "user", attachments=att)
-            text = (f"在 {eng} 的对话{where}里接着做了，它回复后结果回到这里。" if where else
+            self.bots.send(c["id"], task, "user", attachments=att, via="chat")
+            if c.get("kind") == "dm":
+                return {"text": f"发到 {eng} 的单聊了，它回复后结果回到这里。",
+                        "data": {"bot_conv": c["id"], "bots": [{"bot": bot, "conv": c["id"]}]}}
+            text = (f"在 {eng} 的任务{where}里接着做了，它回复后结果回到这里。" if where else
                     f"交给 {eng} 了（在电脑的 {c['workdir']} 里），它回复后结果回到这里。")
         return {"text": text, "data": {"bot_conv": c["id"], "bots": [{"bot": bot, "conv": c["id"]}]}}
+
+    def tasks(self, bot: str) -> list:
+        """v3.9.81: this engine's own tasks (not its 单聊, not group members), newest first."""
+        return [x for x in self.bots.convs() if x["bot"] == bot and x.get("kind") != "dm" and not x.get("grp")]
+
+    def named_task(self, bot: str, text: str) -> Optional[dict]:
+        """v3.9.81: the task the words name, by its title or its folder's name (「ldok」 for ~/workspace/ldok)."""
+        low = (text or "").lower()
+        for x in self.tasks(bot):
+            title = (x.get("title") or "").strip().lower()
+            folder = [w for w in (x.get("workdir") or "").lower().rstrip("/").split("/") if w][-2:]
+            names = [title] if len(title) >= 2 else []
+            names += [w for w in folder if len(w) >= 3 and w not in ("main", "workspace", "home", "aiw")]
+            names += [w for w in re.findall(r"[a-z][a-z0-9_\-]{2,}", title)]
+            if any(n and n in low for n in names):
+                return x
+        return None
 
     def _on_bot(self, kind: str, obj):
         """A conversation started from the chat finished a turn: its reply goes back to the chat."""
@@ -961,6 +987,14 @@ class Dispatch:
         c = self.bots.conv(obj["conv"])
         if not c or not c.get("origin") or c.get("grp") or c.get("takeover"):
             return       # a group reports through its merge; under takeover the 管家's verdict is reported instead
+        if c.get("kind") == "dm":   # v3.9.81: the engine's own chat reports only what the main chat asked
+            u = self.bots.store._x("SELECT data FROM bot_messages WHERE conv=? AND role='user' AND seq<? "
+                                   "ORDER BY seq DESC LIMIT 1", (c["id"], obj.get("seq") or 1 << 60))
+            try:
+                if not u or json.loads(u[0]["data"] or "{}").get("via") != "chat":
+                    return
+            except Exception:  # noqa: BLE001
+                return
         self.bots.store._x("UPDATE bot_messages SET data=json_set(data, '$.to_chat', 1) WHERE id=?", (obj["id"],))
         eng = B.ENGINES.get(c["bot"], {}).get("title", c["bot"])
         try:

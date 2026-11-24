@@ -1067,11 +1067,28 @@ class Chat:
                         ("agy", "codex", "claude", "codebuddy", "grok", "muse", "cue")]
                 task = str(a.get("task") or "").strip()
                 conv = str(a.get("conv") or "").strip()
-                if not conv and a.get("dm") and len(bots) == 1:   # v3.9.80: say it in the engine's own chat
-                    try:
-                        conv = _d.bots.dm(bots[0])["id"]
-                    except ValueError as e:
-                        return f"没能打开 {bots[0]} 的单聊：{e}"
+                mode = str(a.get("mode") or "").strip().lower()
+                if a.get("dm"):
+                    mode = "chat"
+                if not mode:   # v3.9.81: one engine, nothing else said: its own chat; several: a group task
+                    mode = "continue" if conv else ("new" if len(bots) != 1 else "chat")
+                if not conv and mode == "continue":   # v3.9.81: find the task to carry on (「把 ldok 增加导出功能」)
+                    q = str(a.get("find") or "").strip() or task
+                    rows = [r for r in _d.bots.find_convs(q, bots[0] if len(bots) == 1 else "", 12)
+                            if not r.get("group") and (_d.bots.conv(r["id"]) or {}).get("kind") != "dm"]
+                    words = [w.lower() for w in re.split(r"[\s,，。、;；:：]+", q) if w]
+                    named = [r for r in rows if words and all(w in (r["title"] + " " + r["workdir"]).lower() for w in words)]
+                    pick = named if named else rows
+                    if not pick:   # the words of a whole sentence rarely all match: the task its title or folder names
+                        hit = next((t for t in (_d.named_task(b, q) for b in (bots or list(_d.bots.engines))) if t), None)
+                        pick = [{"id": hit["id"]}] if hit else []
+                    if not pick:
+                        return (f"没找到和「{q}」相关的任务。告诉用户没找到，问要不要新建任务"
+                                "（再调用 engine_task，mode=new）")
+                    if len(pick) > 1 and not (named and len(named) == 1):
+                        return ("找到几个可能的任务，问用户是哪一个（再调用 engine_task 带 conv）：\n"
+                                + "\n".join(f"- {r['id']} {r['bot']}「{r['title']}」{r['workdir']}" for r in pick[:6]))
+                    conv = pick[0]["id"]
                 if conv:   # v3.9.64: carry on in a conversation engine_convs found
                     c = _d.bots.conv(conv)
                     if not c:
@@ -1079,9 +1096,11 @@ class Chat:
                     bots = [c["bot"]]
                 if not bots or not task:
                     return "需要 engines（或 conv）和 task"
+                if mode == "chat" and len(bots) > 1:
+                    return "单聊只能对一个引擎；几个引擎一起做就用 mode=new 建群聊任务"
                 wd = "" if conv else str(a.get("workdir") or "").strip()
                 r = await _d.run({"bots": bots, "task": task, "workdir": wd, "manage": bool(a.get("manage")),
-                                  "cont": False, "conv": conv}, origin="chat")
+                                  "cont": False, "conv": conv, "mode": mode}, origin="chat")
                 return r["text"]
 
             async def _engine_convs(a, _d=disp):
@@ -1104,6 +1123,65 @@ class Chat:
                 if not rows:
                     return "引擎里没有找到相关的对话"
                 return json.dumps(rows, ensure_ascii=False)
+            async def _engine_config(a, _d=disp):   # v3.9.81: 「把 agy 默认模型设成 3.8 flash」
+                from . import bots as _B
+                b = str(a.get("engine") or "").strip().lower()
+                if b not in _B.ENGINES:
+                    return "engine 要是 agy / codex / claude / codebuddy / grok / muse / cue 之一"
+                title = _B.ENGINES[b].get("title", b)
+                want = str(a.get("model") or "").strip()
+                kw = {}
+                if want:
+                    norm = lambda x: re.sub(r"[\s._\-·()（）]+", "", str(x).lower())
+                    try:
+                        mid = _d.bots.engine_cfg(b).get("machine_id") or _d.bots.default_machine()
+                        groups = (await _d.bots.models(b, mid)).get("groups") or []
+                    except Exception as e:  # noqa: BLE001
+                        groups, err = [], str(e)
+                    else:
+                        err = ""
+                    if want.lower() in ("默认", "default", "清空", "none"):
+                        kw["model"] = ""
+                    else:
+                        w = norm(want)
+                        exact = [g for g in groups if w in (norm(g.get("id")), norm(g.get("label")))]
+                        part = exact or [g for g in groups if w and (w in norm(g.get("id")) or w in norm(g.get("label")))]
+                        if len(part) == 1:
+                            kw["model"] = part[0]["id"]
+                            want = part[0].get("label") or part[0]["id"]
+                        elif part:
+                            return (f"{title} 有几个模型都像「{want}」，问用户要哪个：\n"
+                                    + "\n".join(f"- {g.get('label') or g['id']}（{g['id']}）" for g in part[:8]))
+                        elif groups:
+                            return (f"{title} 的模型里没有「{want}」。能用的：\n"
+                                    + "\n".join(f"- {g.get('label') or g['id']}（{g['id']}）" for g in groups[:15]))
+                        elif re.fullmatch(r"[\w.:/@-]{1,80}", want):
+                            kw["model"] = want   # the engine gave no list: take the name as said
+                        else:
+                            return f"读不到 {title} 的模型列表（{err or '空'}），请给出准确的模型名"
+                for k in ("effort", "workdir"):
+                    if a.get(k) is not None and str(a.get(k)).strip() != "":
+                        v = str(a.get(k)).strip()
+                        kw[k] = "" if v in ("默认", "default") else v
+                if not kw:
+                    cfg = _d.bots.engine_cfg(b)
+                    return (f"{title} 现在的默认：模型 {cfg.get('model') or '引擎自己的默认'}，强度 {cfg.get('effort') or '默认'}，"
+                            f"单聊文件夹 {cfg.get('workdir') or '~/workspace/' + b + '-chat/main'}")
+                try:
+                    cfg = _d.bots.set_engine_cfg(b, **kw)
+                except ValueError as e:
+                    return f"没改成：{e}"
+                return (f"好了，{title} 的默认模型 {('「' + want + '」') if kw.get('model') else (cfg.get('model') or '引擎自己的默认')}，"
+                        f"强度 {cfg.get('effort') or '默认'}。单聊和任务都用它（单独选过模型的任务除外）")
+            out["engine_config"] = ({"name": "engine_config", "description": "看或改某个引擎的默认设置：默认模型、强度、单聊的工作文件夹。"
+                                     "用户说“把 agy 默认模型设成 3.8 flash”“codex 强度调高”“agy 现在用什么模型”时用。"
+                                     "model 照用户的说法填，会自动对上引擎的模型列表；不填任何设置就是查看",
+                                     "parameters": {"type": "object", "properties": {
+                                         "engine": {"type": "string", "description": "agy / codex / claude / codebuddy / grok / muse / cue"},
+                                         "model": {"type": "string", "description": "模型名，照用户说的；“默认”表示清掉"},
+                                         "effort": {"type": "string", "description": "minimal / low / medium / high / xhigh / max，或“默认”"},
+                                         "workdir": {"type": "string", "description": "单聊的工作文件夹（~/workspace/…）"}},
+                                         "required": ["engine"]}}, _engine_config)
             async def _engine_status(a, _d=disp):   # v3.9.80: what every engine and group is doing now
                 from . import bots as _B
                 ov = _d.bots.overview()
@@ -1140,17 +1218,21 @@ class Chat:
                                         "conv": {"type": "string", "description": "对话 id（bc-…），读它最近几轮"},
                                         "turns": {"type": "integer", "description": "读几条，默认 8"},
                                         "limit": {"type": "integer", "description": "最多几个对话，默认 8"}}}}, _engine_convs)
-            out["engine_task"] = ({"name": "engine_task", "description": "把任务交给引擎去做"
-                                   "（agy=Antigravity、codex、claude=Claude Code、codebuddy、grok、muse=Meta Muse、cue=Cue by Manus）。用户点名要某个引擎做事时用；"
-                                   "点名多个引擎就建群聊并行协作，本地代码引擎各开分支、云端成员参与讨论。要接着引擎里已有的对话做，先用 engine_convs 找到它，"
-                                   "再把它的 id 填进 conv（不用填 engines）。结果稍后自动回到聊天里",
+            out["engine_task"] = ({"name": "engine_task", "description": "把话或任务交给引擎"
+                                   "（agy=Antigravity、codex、claude=Claude Code、codebuddy、grok、muse=Meta Muse、cue=Cue by Manus）。用户点名某个引擎时用。"
+                                   "mode 三种，只看用户有没有说这几个词：new＝用户说了“新建任务”“开个任务”，或点名几个引擎一起做（群聊任务）；"
+                                   "continue＝用户说了“继续”“接着做”“完成…任务”，find 填任务的关键词（如 ldok），知道 id 就填 conv；"
+                                   "其余一律 chat＝发到这个引擎的单聊（带着单聊上下文，默认），哪怕内容提到某个项目。"
+                                   "引擎会用它的默认模型。结果稍后自动回到聊天里",
                                    "parameters": {"type": "object", "properties": {
                                        "engines": {"type": "array", "items": {"type": "string"},
                                                    "description": "agy / codex / claude / codebuddy / grok / muse / cue，一个或多个"},
                                        "task": {"type": "string", "description": "交给它的任务，原话加上必要的上下文"},
                                        "workdir": {"type": "string", "description": "电脑上的项目文件夹（~/… 或 /home/…），不知道就留空"},
                                        "conv": {"type": "string", "description": "已有的引擎对话 id（engine_convs 找到的），在它里面接着做"},
-                                       "dm": {"type": "boolean", "description": "true：发到这个引擎的单聊里（带着单聊的上下文），用户说“跟 agy 说…”“问一下 cue…”时用；新开独立任务就别填"},
+                                       "mode": {"type": "string", "enum": ["chat", "new", "continue"],
+                                                "description": "chat 单聊（默认）/ new 新建任务 / continue 接着做已有任务"},
+                                       "find": {"type": "string", "description": "mode=continue 时：已有任务的关键词，如 ldok"},
                                        "manage": {"type": "boolean", "description": "true：AIW 管家盯着它直到做完"}},
                                        "required": ["task"]}}, _engine_task)
         srch = getattr(self, "search", None)
@@ -1193,7 +1275,7 @@ class Chat:
         return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…",
                 "session_search": "正在翻以前的记录…", "generate_image": "正在画图…",
                 "edit_image": "正在改图…", "doc_ask": "正在读文档…", "engine_task": "正在交给引擎…",
-                "engine_convs": "正在翻引擎的对话…", "engine_status": "正在看引擎进度…"}.get(name, "正在查…")
+                "engine_convs": "正在翻引擎的对话…", "engine_status": "正在看引擎进度…", "engine_config": "正在改引擎设置…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:

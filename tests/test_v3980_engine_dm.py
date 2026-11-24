@@ -34,11 +34,14 @@ def test_cfg_defaults_for_dm_and_tasks(tmp_path):
     b.set_engine_cfg("claude", model="opus", effort="high", workdir="~/workspace/mine")
     assert b.engine_cfg("claude") == {"model": "opus", "effort": "high", "machine_id": "", "workdir": "~/workspace/mine"}
     d = b.dm("claude")
-    assert d["model"] == "opus" and d["effort"] == "high" and d["workdir"] == "~/workspace/mine"
+    assert d["workdir"] == "~/workspace/mine"
+    assert b.effective(d)["model"] == "opus" and b.effective(d)["effort"] == "high"
     t = b.create("claude", "x")
-    assert t["model"] == "opus" and (t.get("kind") or "") != "dm"
-    b.set_engine_cfg("claude", model="sonnet")
-    assert b.conv(d["id"])["model"] == "sonnet"
+    assert (t.get("kind") or "") != "dm" and b.effective(t)["model"] == "opus"
+    b.set_engine_cfg("claude", model="sonnet")   # v3.9.81: chats and tasks follow the default as it changes
+    assert b.effective(b.conv(d["id"]))["model"] == "sonnet" and b.effective(b.conv(t["id"]))["model"] == "sonnet"
+    own = b.create("claude", "y", model="haiku")
+    assert b.effective(own)["model"] == "haiku"
 
 
 def test_cfg_rejects_bad_values(tmp_path):

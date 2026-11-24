@@ -521,7 +521,11 @@ function btGroupOf(model) {
   return null;
 }
 function btModelName(c) {
-  if (!c.model && !c.effort) return "默认模型";
+  if (!c.model && !c.effort) {   // v3.9.81: follows the engine's default (点名字 › 配置)
+    const d = btEngine(c.bot).cfg || {};
+    if (!d.model && !d.effort) return "默认模型";
+    return btModelName({ ...d, bot: c.bot, model: d.model, effort: d.effort }) ;
+  }
   const hit = c.model ? btGroupOf(c.model) : null;
   const name = hit ? hit.g.label : (c.model || "默认模型"), eff = (hit && hit.eff) || c.effort;
   return name + (eff ? " · " + (BT_EFF[eff] || eff) : "");

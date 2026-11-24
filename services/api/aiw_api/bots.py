@@ -632,8 +632,8 @@ class Bots:
         if not eng["available"]:
             raise ValueError(f"{eng['title']} 还没接入")
         cloud_bot = bool(eng.get("cloud"))
-        cfg = self.engine_cfg(bot)                        # v3.9.80: the engine's own defaults (点头像 › 配置)
-        model, effort = model or cfg["model"], effort or cfg["effort"]
+        cfg = self.engine_cfg(bot)                        # v3.9.80: the engine's own defaults (点名字 › 配置)
+        # v3.9.81: no model of its own stays empty, so it follows the engine's default even after that changes (_turn)
         machine_id = CLOUD_MACHINE if cloud_bot else ((machine_id or "").strip() or cfg["machine_id"])
         if machine_id and machine_id not in (AUTO_MACHINE, CLOUD_MACHINE) and hasattr(self.store, "machine") and not self.store.machine(machine_id):
             raise ValueError(f"没有这台电脑：{machine_id}")
@@ -757,10 +757,17 @@ class Bots:
             raise ValueError("工作文件夹路径不合法")
         self.store._x("INSERT OR REPLACE INTO bot_engine_cfg (bot, data, updated_at) VALUES (?,?,?)",
                       (bot, json.dumps(cur, ensure_ascii=False), _now()))
-        d = self.dm_conv(bot)
-        if d and (cur["model"] or cur["effort"]) and (d.get("model") or "", d.get("effort") or "") != (cur["model"], cur["effort"]):
-            self.set_model(d["id"], cur["model"], cur["effort"])
-        return cur
+        return cur   # v3.9.81: chats and tasks without a model of their own read it at their next turn (effective)
+
+    def effective(self, c: dict) -> dict:
+        """v3.9.81: the conversation as it runs: no model of its own means the engine's default (点名字 › 配置)."""
+        if c and not c.get("model") and not c.get("effort"):
+            try:
+                cfg = self.engine_cfg(c["bot"])
+                return {**c, "model": cfg.get("model") or "", "effort": cfg.get("effort") or ""}
+            except Exception:  # noqa: BLE001
+                pass
+        return c
 
     def dm_conv(self, bot: str) -> Optional[dict]:
         r = self.store._x("SELECT id FROM bot_convs WHERE bot=? AND kind='dm' ORDER BY created_at LIMIT 1", (bot,))
@@ -773,8 +780,7 @@ class Bots:
             return c
         cfg = self.engine_cfg(bot)
         eng = ENGINES.get(bot) or {}
-        c = self.create(bot, eng.get("title", bot), cfg["workdir"] or f"~/workspace/{bot}-chat/main", cfg["machine_id"],
-                        cfg["model"], cfg["effort"])
+        c = self.create(bot, eng.get("title", bot), cfg["workdir"] or f"~/workspace/{bot}-chat/main", cfg["machine_id"])
         self.store._x("UPDATE bot_convs SET kind='dm' WHERE id=?", (c["id"],))
         return self.conv(c["id"])
 
@@ -914,7 +920,7 @@ class Bots:
         return bool(t and not t.done())
 
     def send(self, cid: str, text: str, role: str = "user", quote: Optional[dict] = None,
-             attachments: Optional[list] = None, skills: Optional[list] = None) -> dict:
+             attachments: Optional[list] = None, skills: Optional[list] = None, via: str = "") -> dict:
         c = self.conv(cid)
         if not c:
             raise KeyError(cid)
@@ -930,6 +936,8 @@ class Bots:
             data["attachments"] = attachments
         if skills:
             data["skills"] = skills
+        if via:   # v3.9.81: said from the main chat, so the reply goes back there too
+            data["via"] = via
         if self.busy(cid):
             data["queued"] = True
         m = self.add(cid, role, text, data)
@@ -974,7 +982,7 @@ class Bots:
                 self.set_conv(cid, status="idle")
 
     async def _turn(self, cid: str, prompt: str, skip: bool = False, fresh: bool = False) -> dict:
-        c = self.conv(cid)
+        c = self.effective(self.conv(cid))   # v3.9.81: no model of its own: the engine's default
         eng = self.engines[c["bot"]]
         cloud_bot = is_cloud_engine(c["bot"])
         mid = CLOUD_MACHINE if cloud_bot else (self.resolve_machine(cid, prompt) if c["machine_id"] == AUTO_MACHINE else c["machine_id"])

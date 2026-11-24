@@ -13,7 +13,7 @@ from pathlib import Path
 
 BRIDGE_SRC = Path(__file__).with_name("cli_bridge.py")
 REMOTE = "$HOME/.config/aiw/cli/cli_bridge.py"
-ENGINES = ("codex", "claude", "codebuddy", "grok")
+ENGINES = ("codex", "claude", "codebuddy", "grok", "muse")
 
 
 def install_command() -> str:

@@ -1,4 +1,4 @@
-"""Read Cue (cue.im / manus.im) and Muse (muse.ai) cookies from local or connected-computer browsers.
+"""Read Cue (cue.im / manus.im) cookies from local or connected-computer browsers (explicit user action only).
 
 Supports two extraction methods in priority order:
   1. Chromium DevTools Protocol (CDP) on local debugging ports (BrowserOS / Chrome / Edge) via `Storage.getCookies`.
@@ -27,7 +27,6 @@ from typing import Any, Callable, Optional
 
 log = logging.getLogger("aiw.browser_cookies")
 
-MUSE_DOMAINS = ("muse.ai",)
 CUE_DOMAINS = ("cue.im", "manus.im", "manus.ai")
 CUE_SESSION_COOKIE_NAMES = ("cue_session_id", "session_id", "access_token", "manus_session", "auth_token")
 
@@ -142,22 +141,6 @@ def extract_cue_credentials_from_cookies(cookies: list[dict[str, Any]]) -> dict[
     if claims.get("expires_at_ms"):
         out["expires_at_ms"] = claims["expires_at_ms"]
     return out
-
-
-def extract_muse_credentials_from_cookies(cookies: list[dict[str, Any]]) -> dict[str, Any]:
-    """Extract cookie_header for Muse from raw browser cookies."""
-    matched = [c for c in cookies if isinstance(c, dict) and _domain_matches(str(c.get("domain") or ""), MUSE_DOMAINS)]
-    if not matched:
-        return {}
-    cookie_header = format_cookie_header(matched, MUSE_DOMAINS)
-    names = sorted({str(c.get("name") or "").strip() for c in matched if c.get("name") and c.get("value")})
-    if not cookie_header:
-        return {}
-    return {
-        "cookie_header": cookie_header,
-        "cookie_count": len(names),
-        "cookie_names": names,
-    }
 
 
 # --------------------------------------------------------------------------------------------- CDP reader
@@ -530,13 +513,15 @@ async def read_remote_browser_cookies(
 
 
 async def read_browser_cookies(
-    bot: str,
+    bot: str = "cue",
     *,
     shell: Optional[Callable[[str, str, int], Any]] = None,
     machine_id: str = "",
 ) -> dict[str, Any]:
-    """Read cookies for `muse` or `cue` from local browsers first, then connected computer if available."""
-    domains = MUSE_DOMAINS if bot == "muse" else CUE_DOMAINS
+    """Read cookies for `cue` from local browsers first, then connected computer if available."""
+    if bot != "cue":
+        return {"ok": False, "source": "", "cookies": [], "creds": {}}
+    domains = CUE_DOMAINS
 
     cookies, source = await read_local_cdp_cookies(domains)
     if not cookies:
@@ -550,11 +535,7 @@ async def read_browser_cookies(
     if not cookies:
         return {"ok": False, "source": "", "cookies": [], "creds": {}}
 
-    creds = (
-        extract_muse_credentials_from_cookies(cookies)
-        if bot == "muse"
-        else extract_cue_credentials_from_cookies(cookies)
-    )
+    creds = extract_cue_credentials_from_cookies(cookies)
     return {
         "ok": bool(creds),
         "source": source,

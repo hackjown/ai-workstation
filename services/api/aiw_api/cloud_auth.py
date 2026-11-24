@@ -1,4 +1,4 @@
-"""Encrypted credential store for cloud engines (Cue by Manus, Meta Muse).
+"""Encrypted credential store for cloud engines (Cue by Manus).
 
 Stores credentials inside `SecretBox` (AES-256-GCM at rest), never exposing raw tokens/cookies back to the UI.
 """
@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any
 
-CLOUD_BOTS = ("cue", "muse")
+CLOUD_BOTS = ("cue",)
 
 
 def _secret_key(bot: str) -> str:
@@ -47,6 +47,8 @@ class CloudAuthStore:
         for k, v in (patch or {}).items():
             if v is None:
                 cur.pop(k, None)
+            elif isinstance(v, bool):
+                cur[k] = v
             elif isinstance(v, str):
                 s = v.strip()
                 if s:
@@ -55,8 +57,6 @@ class CloudAuthStore:
                     cur.pop(k, None)
             else:
                 cur[k] = v
-        if bot == "muse" and not cur.get("node_id"):
-            cur["node_id"] = str(uuid.uuid4())
         if bot == "cue" and not cur.get("device_id"):
             cur["device_id"] = str(uuid.uuid4())
         cur["updated_at"] = time.time()
@@ -80,38 +80,30 @@ class CloudAuthStore:
                 pass
 
     def public_view(self, bot: str) -> dict[str, Any]:
+        if bot not in CLOUD_BOTS:
+            return {"bot": bot, "configured": False}
         d = self.load(bot)
-        if bot == "cue":
-            has_key = bool(d.get("api_key"))
-            has_token = bool(d.get("access_token"))
-            has_cookie = bool(d.get("cookie_header"))
-            mode = d.get("mode") or ("openapi" if has_key and not has_token else ("native" if has_token or has_cookie else "auto"))
-            return {
-                "bot": "cue",
-                "configured": has_key or has_token or has_cookie,
-                "mode": mode,
-                "has_api_key": has_key,
-                "api_key_preview": _mask(d.get("api_key", "")),
-                "has_access_token": has_token,
-                "access_token_preview": _mask(d.get("access_token", "")),
-                "has_cookie": has_cookie,
-                "agent_id": d.get("agent_id") or "",
-                "proxy_url": d.get("proxy_url") or "",
-                "base_url": d.get("base_url") or "",
-                "handle": d.get("handle") or "",
-                "display_name": d.get("display_name") or "",
-                "source": d.get("source") or "",
-                "updated_at": d.get("updated_at") or 0,
-            }
+        has_key = bool(d.get("api_key"))
+        has_token = bool(d.get("access_token"))
         has_cookie = bool(d.get("cookie_header"))
+        exp_native = bool(d.get("experimental_native"))
+        mode = d.get("mode") or ("native" if (exp_native and not has_key and (has_token or has_cookie)) else "openapi")
+        configured = has_key or (exp_native and (has_token or has_cookie))
         return {
-            "bot": "muse",
-            "configured": has_cookie,
+            "bot": "cue",
+            "configured": configured,
+            "mode": mode,
+            "experimental_native": exp_native,
+            "has_api_key": has_key,
+            "api_key_preview": _mask(d.get("api_key", "")),
+            "has_access_token": has_token,
+            "access_token_preview": _mask(d.get("access_token", "")),
             "has_cookie": has_cookie,
-            "cookie_preview": _mask(d.get("cookie_header", "")),
-            "node_id": d.get("node_id") or "",
+            "agent_id": d.get("agent_id") or "",
             "proxy_url": d.get("proxy_url") or "",
-            "viewer_id": d.get("viewer_id") or "",
+            "base_url": d.get("base_url") or "",
+            "handle": d.get("handle") or "",
+            "display_name": d.get("display_name") or "",
             "source": d.get("source") or "",
             "updated_at": d.get("updated_at") or 0,
         }

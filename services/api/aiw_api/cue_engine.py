@@ -1,8 +1,15 @@
-"""Cue by Manus cloud engine (OpenAPI v2 + ConnectRPC / Socket.IO v4).
+"""Cue by Manus cloud engine (official OpenAPI v2 default + opt-in experimental ConnectRPC/Socket.IO v4).
 
-Reference protocol: qybaihe/botark (`src/main/cue/cueOpenApi.ts`, `cueClient.ts`, `cueChatSocket.ts`).
-Implements the same Engine interface as `AgyEngine` / `CliEngine` (`models`, `start`, `send`, `wait`, `stop`)
-so `Bots` and `Groups` can drive Cue directly from `aiw-api` without a local VM CLI.
+Security & stability design:
+  - Browser cookies are NEVER read automatically; users must explicitly trigger「从浏览器读取」.
+  - Defaults strictly to official Manus OpenAPI v2 (`https://api.manus.ai/v2/` + `x-manus-api-key`).
+  - Non-public ConnectRPC/Socket.IO (`api.manus.im`) and web-token fallback require `experimental_native=True`.
+  - Reuses a single `httpx.AsyncClient` per turn with progressive polling backoff (1.5s -> 10s, 429 retry-after).
+  - Long-running tasks never fail on a 10-minute timeout; `task_id` / `after_id` are persisted so polling resumes
+    even across API restarts.
+  - Completed jobs are evicted from `_jobs` on terminal `wait()` and by TTL pruning to prevent memory leaks.
+  - `agent_status == "waiting"` surfaces as `status="blocked"` with confirmation metadata for AIW chat cards.
+  - `error_message` / `status_update(error)` surface the exact error reason returned by Cue.
 """
 from __future__ import annotations
 
@@ -19,7 +26,6 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 
-from .browser_cookies import read_browser_cookies
 from .cloud_auth import CloudAuthStore
 
 log = logging.getLogger("aiw.cue")
@@ -30,6 +36,8 @@ CUE_MANUS_API_BASE = "https://api.manus.ai/v2/"
 IM_AGENT = "agent-default"
 IM_TASK = "agent-default-main_task"
 _EVENT_ALPHABET = string.ascii_letters + string.digits
+_POLL_BACKOFF = (1.5, 2.5, 4.0, 6.0, 8.0, 10.0)
+_JOB_TTL_S = 3600.0
 
 
 def create_cue_event_id() -> str:
@@ -112,6 +120,24 @@ def _read_assistant_text(ev: dict[str, Any]) -> str:
     return ""
 
 
+def _extract_error_reason(ev: dict[str, Any]) -> str:
+    """Extract human-readable error details from Cue error_message or status_update events."""
+    for container_key in ("error_message", "status_update", "error"):
+        sub = ev.get(container_key)
+        if isinstance(sub, dict):
+            for k in ("content", "message", "error", "reason", "detail", "code"):
+                v = sub.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()[:300]
+        elif isinstance(sub, str) and sub.strip():
+            return sub.strip()[:300]
+    for k in ("content", "message", "reason", "detail"):
+        v = ev.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:300]
+    return ""
+
+
 def _http_client(proxy_url: str = "", timeout: float = 20.0, transport: Any = None) -> httpx.AsyncClient:
     kw: dict[str, Any] = {"timeout": timeout, "follow_redirects": False}
     if transport is not None:
@@ -167,18 +193,23 @@ class _CueJob:
     job_id: str
     agent_id: str
     session_id: str
-    status: str = "running"          # running | turn_done | turn_failed
+    after_id: str = ""
+    expected_user_text: str = ""
+    status: str = "running"          # running | turn_done | turn_failed | blocked
     response: str = ""
     error: str = ""
     auth_error: bool = False
+    waiting_confirm: bool = False
+    denied: list[dict[str, Any]] = field(default_factory=list)
     tools: list[dict[str, Any]] = field(default_factory=list)
-    cursor: int = 0
+    created_at: float = field(default_factory=time.time)
+    finished_at: float = 0.0
     event: asyncio.Event = field(default_factory=asyncio.Event)
     task: Optional[asyncio.Task] = None
 
 
 class CueEngine:
-    """Cloud engine for Cue by Manus (`api.manus.ai/v2` OpenAPI + `api.manus.im` ConnectRPC/Socket.IO)."""
+    """Cloud engine for Cue by Manus (official OpenAPI v2 default; experimental ConnectRPC/Socket.IO opt-in)."""
     id = "cue"
     cloud = True
 
@@ -188,41 +219,69 @@ class CueEngine:
         shell: Optional[Callable[[str, str, int], Any]] = None,
         default_machine: Optional[Callable[[], str]] = None,
         transport: Any = None,
+        poll_backoff: tuple[float, ...] = _POLL_BACKOFF,
     ):
         self.auth_store = auth_store
         self.shell = shell
         self.default_machine = default_machine
-        self.transport = transport   # optional httpx.MockTransport for unit tests
+        self.transport = transport        # optional httpx.MockTransport for unit tests
+        self.poll_backoff = poll_backoff  # customizable in unit tests
         self._jobs: dict[str, _CueJob] = {}
 
+    def _kv_key(self, job_id: str) -> str:
+        return f"cue_job:{job_id}"
+
+    def _persist_job(self, job: _CueJob) -> None:
+        st = getattr(self.auth_store, "store", None)
+        if st is None:
+            return
+        try:
+            st.kv_set(self._kv_key(job.job_id), {
+                "job_id": job.job_id,
+                "agent_id": job.agent_id,
+                "session_id": job.session_id,
+                "after_id": job.after_id,
+                "expected_user_text": job.expected_user_text,
+                "ts": time.time(),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _clear_persisted_job(self, job_id: str) -> None:
+        st = getattr(self.auth_store, "store", None)
+        if st is None:
+            return
+        try:
+            st.kv_set(self._kv_key(job_id), None)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _prune_jobs(self) -> None:
+        now = time.time()
+        stale = [
+            jid for jid, j in self._jobs.items()
+            if j.status != "running" and j.finished_at and (now - j.finished_at) > _JOB_TTL_S
+        ]
+        for jid in stale:
+            self._jobs.pop(jid, None)
+
     def _effective_mode(self, auth: dict[str, Any]) -> str:
-        mode = str(auth.get("mode") or "auto").strip().lower()
+        """Default strictly to official OpenAPI v2. Native mode requires explicit experimental_native=True."""
+        exp_native = bool(auth.get("experimental_native"))
+        mode = str(auth.get("mode") or "openapi").strip().lower()
         has_key = bool(auth.get("api_key"))
         has_native = bool(auth.get("access_token") or auth.get("cookie_header"))
-        if mode == "openapi" and has_key:
-            return "openapi"
-        if mode == "native" and has_native:
+        if mode == "native" and exp_native and has_native:
             return "native"
         if has_key:
             return "openapi"
-        if has_native:
+        if exp_native and has_native:
             return "native"
         return ""
 
     async def _ensure_auth(self, mid: str = "") -> dict[str, Any]:
-        auth = self.auth_store.load("cue")
-        if self._effective_mode(auth):
-            return auth
-        # Best-effort auto-read from local / connected-computer browser
-        res = await read_browser_cookies(
-            "cue",
-            shell=self.shell,
-            machine_id=mid or (self.default_machine() if self.default_machine else ""),
-        )
-        if res.get("ok") and res.get("creds"):
-            patch = {**res["creds"], "source": res.get("source") or "browser", "mode": "native"}
-            return self.auth_store.save("cue", patch)
-        return auth
+        """Load saved credentials only. Never auto-read browser cookies without explicit user action."""
+        return self.auth_store.load("cue")
 
     # ------------------------------------------------------------------ OpenAPI v2 helpers
     async def _openapi_req(
@@ -231,18 +290,32 @@ class CueEngine:
         path: str,
         body: Any = None,
         as_web_token: bool = False,
-    ) -> tuple[bool, int, dict[str, Any]]:
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> tuple[bool, int, dict[str, Any], Optional[float]]:
+        """-> (ok, status_code, json_dict, retry_after_s)."""
         key = str(auth.get("access_token") if as_web_token else auth.get("api_key") or "").strip()
         if not key:
-            return False, 401, {"error": "未配置 Cue API Key / Token"}
+            return False, 401, {"error": "未配置 Manus API Key"}, None
         base = (str(auth.get("openapi_base") or "") or CUE_MANUS_API_BASE).rstrip("/") + "/"
         url = base + path.lstrip("/")
         headers = _openapi_headers(key, as_web_token=as_web_token)
-        async with _http_client(str(auth.get("proxy_url") or ""), 20.0, self.transport) as client:
+        own = client is None
+        cli = client or _http_client(str(auth.get("proxy_url") or ""), 20.0, self.transport)
+        try:
             if body is None:
-                r = await client.get(url, headers=headers)
+                r = await cli.get(url, headers=headers)
             else:
-                r = await client.post(url, headers=headers, json=body)
+                r = await cli.post(url, headers=headers, json=body)
+        finally:
+            if own:
+                await cli.aclose()
+        retry_after: Optional[float] = None
+        ra = r.headers.get("retry-after") or r.headers.get("Retry-After")
+        if ra:
+            try:
+                retry_after = max(1.0, min(float(ra), 120.0))
+            except ValueError:
+                pass
         try:
             data = r.json()
         except Exception:  # noqa: BLE001
@@ -250,7 +323,7 @@ class CueEngine:
         if not isinstance(data, dict):
             data = {}
         ok = r.is_success and data.get("ok") is True
-        return ok, r.status_code, data
+        return ok, r.status_code, data, retry_after
 
     async def _connect_req(
         self,
@@ -279,7 +352,7 @@ class CueEngine:
         mode = self._effective_mode(auth)
         out: list[dict[str, str]] = []
         if mode == "openapi":
-            ok, _, data = await self._openapi_req(auth, "agent.list")
+            ok, _, data, _ = await self._openapi_req(auth, "agent.list")
             if ok:
                 out.append({"id": IM_AGENT, "name": "Cue（默认）", "session_id": IM_TASK})
                 for item in data.get("data") or []:
@@ -313,12 +386,13 @@ class CueEngine:
         auth = auth_override if auth_override is not None else self.auth_store.load("cue")
         mode = self._effective_mode(auth)
         if not mode:
-            return {"ok": False, "error": "尚未配置 Cue API Key 或浏览器登录态"}
+            return {"ok": False, "error": "尚未配置 Manus API Key（或在实验设置中开启浏览器登录态模式）"}
         if mode == "openapi":
-            ok, status, data = await self._openapi_req(auth, "user.me")
+            ok, status, data, _ = await self._openapi_req(auth, "user.me")
             if not ok:
+                detail = _extract_error_reason(data)
                 return {"ok": False, "status": status, "auth_error": status in (401, 403),
-                        "error": f"Manus OpenAPI 验证失败（HTTP {status}）"}
+                        "error": f"Manus OpenAPI 验证失败（HTTP {status}）" + (f"：{detail}" if detail else "")}
             agents = await self.list_agents(auth)
             handle = str(data.get("email") or "").strip()
             display = str(data.get("name") or "").strip()
@@ -328,16 +402,8 @@ class CueEngine:
 
         ok, status, data = await self._connect_req(auth, "/agents.v1.AgentsService/ListAgents", {})
         if not ok:
-            # Fallback: try OpenAPI with web token
-            if auth.get("access_token"):
-                ok2, status2, data2 = await self._openapi_req(auth, "user.me", as_web_token=True)
-                if ok2:
-                    return {"ok": True, "mode": "native", "handle": str(data2.get("email") or ""),
-                            "display_name": str(data2.get("name") or ""), "agents": await self.list_agents(auth)}
-                return {"ok": False, "status": status2, "auth_error": status2 in (401, 403),
-                        "error": f"Cue 登录态验证失败（HTTP {status} / {status2}）"}
             return {"ok": False, "status": status, "auth_error": status in (401, 403),
-                    "error": f"Cue 登录态验证失败（HTTP {status}）"}
+                    "error": f"Cue 实验实时通道验证失败（HTTP {status}）"}
         agents = await self.list_agents(auth)
         return {"ok": True, "mode": "native", "handle": auth.get("handle") or "",
                 "display_name": auth.get("display_name") or "", "agents": agents}
@@ -350,14 +416,15 @@ class CueEngine:
         return {"ok": True, "groups": groups, "efforts": []}
 
     async def start(self, mid: str, conv: dict[str, Any], prompt: str, skip: bool = False) -> dict[str, Any]:
+        self._prune_jobs()
         auth = await self._ensure_auth(mid)
         mode = self._effective_mode(auth)
         if not mode:
-            return {"ok": False, "error": "Cue 尚未配置凭据：请点右上角配置 Manus API Key，或先在浏览器登录 cue.im 后点「从浏览器读取」。"}
+            return {"ok": False, "error": "Cue 尚未配置 Manus API Key：请点右上角「凭据」填写 API Key（默认只走官方 API v2）。"}
         agent_id = str(conv.get("model") or auth.get("agent_id") or IM_AGENT).strip() or IM_AGENT
         session_id = str(conv.get("session") or "").strip()
         job_id = f"cue-{uuid.uuid4().hex[:10]}"
-        job = _CueJob(job_id=job_id, agent_id=agent_id, session_id=session_id)
+        job = _CueJob(job_id=job_id, agent_id=agent_id, session_id=session_id, expected_user_text=prompt)
         self._jobs[job_id] = job
         job.task = asyncio.get_running_loop().create_task(self._run_turn(job, auth, mode, prompt))
         return {"ok": True, "job": job_id}
@@ -369,18 +436,38 @@ class CueEngine:
         auth = await self._ensure_auth(mid)
         mode = self._effective_mode(auth)
         if not mode:
-            return {"ok": False, "error": "Cue 尚未配置凭据"}
+            return {"ok": False, "error": "Cue 尚未配置 Manus API Key"}
         job.status = "running"
         job.response = ""
         job.error = ""
         job.auth_error = False
+        job.waiting_confirm = False
+        job.denied = []
         job.tools = []
+        job.finished_at = 0.0
+        job.expected_user_text = text
         job.event.clear()
         job.task = asyncio.get_running_loop().create_task(self._run_turn(job, auth, mode, text))
         return {"ok": True, "job": job_id}
 
     async def wait(self, mid: str, job_id: str, cursor: int, seconds: int = 20) -> dict[str, Any]:
         job = self._jobs.get(job_id)
+        if not job:
+            # Restart recovery: resume polling persisted task_id via OpenAPI v2
+            st = getattr(self.auth_store, "store", None)
+            saved = st.kv_get(self._kv_key(job_id), None) if st is not None else None
+            if isinstance(saved, dict) and saved.get("session_id"):
+                auth = await self._ensure_auth(mid)
+                if self._effective_mode(auth) == "openapi":
+                    job = _CueJob(
+                        job_id=job_id,
+                        agent_id=str(saved.get("agent_id") or IM_AGENT),
+                        session_id=str(saved["session_id"]),
+                        after_id=str(saved.get("after_id") or ""),
+                        expected_user_text=str(saved.get("expected_user_text") or ""),
+                    )
+                    self._jobs[job_id] = job
+                    job.task = asyncio.get_running_loop().create_task(self._resume_openapi_poll(job, auth))
         if not job:
             return {"status": "turn_failed", "cursor": cursor, "error": "Cue 会话已结束"}
         if job.status == "running":
@@ -404,99 +491,145 @@ class CueEngine:
                 out["error"] = job.error
             if job.auth_error:
                 out["auth_error"] = True
+            if job.waiting_confirm:
+                out["waiting_confirm"] = True
+            if job.denied:
+                out["denied"] = list(job.denied)
+            # Evict completed job from memory immediately to prevent leaks
+            self._jobs.pop(job_id, None)
+            self._clear_persisted_job(job_id)
         return out
 
     async def stop(self, mid: str, job_id: str) -> dict[str, Any]:
         job = self._jobs.pop(job_id, None)
+        self._clear_persisted_job(job_id)
         if job and job.task and not job.task.done():
             job.task.cancel()
         return {"ok": True}
 
     # ------------------------------------------------------------------ Turn execution
+    def _finish(self, job: _CueJob, status: str, response: str = "", error: str = "",
+                auth_error: bool = False, waiting_confirm: bool = False) -> None:
+        job.status = status
+        job.response = response
+        job.error = error
+        job.auth_error = auth_error
+        job.waiting_confirm = waiting_confirm
+        job.finished_at = time.time()
+        job.event.set()
+
     async def _run_turn(self, job: _CueJob, auth: dict[str, Any], mode: str, prompt: str) -> None:
         try:
             if mode == "openapi":
-                await self._run_openapi_turn(job, auth, prompt, as_web_token=False)
+                await self._run_openapi_turn(job, auth, prompt)
             else:
                 await self._run_native_turn(job, auth, prompt)
         except asyncio.CancelledError:
-            job.status = "turn_failed"
-            job.error = "已停止"
-            job.event.set()
+            self._finish(job, "turn_failed", error="已停止")
             raise
         except Exception as e:  # noqa: BLE001
             log.warning("cue turn error: %r", e)
-            job.status = "turn_failed"
-            job.error = str(e)
-            job.event.set()
+            self._finish(job, "turn_failed", error=str(e))
 
-    async def _run_openapi_turn(self, job: _CueJob, auth: dict[str, Any], prompt: str, as_web_token: bool) -> None:
-        task_id = job.session_id or IM_TASK
-        if not job.session_id and job.agent_id and job.agent_id != IM_AGENT:
-            ok, status, detail = await self._openapi_req(
-                auth, f"agent.detail?{urlencode({'agent_id': job.agent_id})}", as_web_token=as_web_token
+    async def _run_openapi_turn(self, job: _CueJob, auth: dict[str, Any], prompt: str) -> None:
+        client = _http_client(str(auth.get("proxy_url") or ""), 25.0, self.transport)
+        try:
+            task_id = job.session_id or IM_TASK
+            if not job.session_id and job.agent_id and job.agent_id != IM_AGENT:
+                ok, status, detail, _ = await self._openapi_req(
+                    auth, f"agent.detail?{urlencode({'agent_id': job.agent_id})}", client=client
+                )
+                if ok:
+                    tid = str(((detail.get("data") or {}) if isinstance(detail.get("data"), dict) else {}).get("task_id") or "")
+                    if tid:
+                        task_id = tid
+                elif status in (401, 403):
+                    reason = _extract_error_reason(detail)
+                    self._finish(job, "turn_failed", auth_error=True,
+                                 error=f"Manus API 认证失败（HTTP {status}）" + (f"：{reason}" if reason else ""))
+                    return
+
+            ok_b, st_b, before, _ = await self._openapi_req(
+                auth, f"task.listMessages?{urlencode({'task_id': task_id, 'order': 'desc', 'limit': '1'})}",
+                client=client,
             )
-            if ok:
-                tid = str(((detail.get("data") or {}) if isinstance(detail.get("data"), dict) else {}).get("task_id") or "")
-                if tid:
-                    task_id = tid
-            elif status in (401, 403):
-                job.status = "turn_failed"
-                job.auth_error = True
-                job.error = f"Manus API 认证失败（HTTP {status}）"
-                job.event.set()
+            if not ok_b:
+                reason = _extract_error_reason(before)
+                self._finish(job, "turn_failed", auth_error=st_b in (401, 403),
+                             error=f"读取 Cue 会话失败（HTTP {st_b}）" + (f"：{reason}" if reason else ""))
                 return
+            before_msgs = before.get("messages") or []
+            job.after_id = str(before_msgs[0].get("id") or "") if before_msgs and isinstance(before_msgs[0], dict) else ""
 
-        ok_b, st_b, before = await self._openapi_req(
-            auth, f"task.listMessages?{urlencode({'task_id': task_id, 'order': 'desc', 'limit': '1'})}",
-            as_web_token=as_web_token,
-        )
-        if not ok_b:
-            job.status = "turn_failed"
-            job.auth_error = st_b in (401, 403)
-            job.error = f"读取 Cue 会话失败（HTTP {st_b}）"
-            job.event.set()
-            return
-        before_msgs = before.get("messages") or []
-        after_id = str(before_msgs[0].get("id") or "") if before_msgs and isinstance(before_msgs[0], dict) else ""
+            ok_s, st_s, sent, _ = await self._openapi_req(
+                auth, "task.sendMessage",
+                {"task_id": task_id, "message": {"content": prompt}},
+                client=client,
+            )
+            if not ok_s:
+                reason = _extract_error_reason(sent)
+                self._finish(job, "turn_failed", auth_error=st_s in (401, 403),
+                             error=f"发送 Cue 消息失败（HTTP {st_s}）" + (f"：{reason}" if reason else ""))
+                return
+            job.session_id = str(sent.get("task_id") or task_id)
+            self._persist_job(job)
+            await self._poll_loop(job, auth, client)
+        finally:
+            await client.aclose()
 
-        ok_s, st_s, sent = await self._openapi_req(
-            auth, "task.sendMessage",
-            {"task_id": task_id, "message": {"content": prompt}},
-            as_web_token=as_web_token,
-        )
-        if not ok_s:
-            job.status = "turn_failed"
-            job.auth_error = st_s in (401, 403)
-            job.error = f"发送 Cue 消息失败（HTTP {st_s}）"
-            job.event.set()
-            return
-        job.session_id = str(sent.get("task_id") or task_id)
+    async def _resume_openapi_poll(self, job: _CueJob, auth: dict[str, Any]) -> None:
+        client = _http_client(str(auth.get("proxy_url") or ""), 25.0, self.transport)
+        try:
+            await self._poll_loop(job, auth, client)
+        except asyncio.CancelledError:
+            self._finish(job, "turn_failed", error="已停止")
+            raise
+        except Exception as e:  # noqa: BLE001
+            self._finish(job, "turn_failed", error=str(e))
+        finally:
+            await client.aclose()
 
-        deadline = time.monotonic() + 600.0
+    async def _poll_loop(self, job: _CueJob, auth: dict[str, Any], client: httpx.AsyncClient) -> None:
+        """Long-running poll loop with progressive backoff (1.5s -> 10s), 429 retry-after, and no 10m failure cap."""
+        step = 0
         last_reply = ""
-        while time.monotonic() < deadline:
-            await asyncio.sleep(1.5)
-            done, reply_text, err_text, is_auth = await self._poll_openapi_once(
-                auth, job.session_id, after_id, prompt, as_web_token
-            )
-            if err_text:
-                job.status = "turn_failed"
-                job.auth_error = is_auth
-                job.error = err_text
-                job.event.set()
-                return
-            if reply_text:
-                last_reply = reply_text
-            if done:
-                job.response = last_reply or "（Cue 已完成，但没有返回文字）"
-                job.status = "turn_done"
-                job.event.set()
-                return
+        rate_hits = 0
+        while True:
+            delay = self.poll_backoff[min(step, len(self.poll_backoff) - 1)]
+            await asyncio.sleep(delay)
+            step += 1
 
-        job.status = "turn_failed"
-        job.error = "等待 Cue 回复超时"
-        job.event.set()
+            state = await self._poll_openapi_once(
+                auth, job.session_id, job.after_id, job.expected_user_text, client
+            )
+            if state["rate_limited"]:
+                rate_hits += 1
+                wait_s = state.get("retry_after") or min(15.0 * rate_hits, 60.0)
+                job.tools.append({"tool": "cue", "arg": f"触发限流（HTTP 429），等待 {int(wait_s)} 秒后继续轮询"})
+                job.event.set()
+                await asyncio.sleep(wait_s)
+                continue
+            rate_hits = 0
+
+            if state["error"]:
+                self._finish(job, "turn_failed", error=state["error"], auth_error=state["auth_error"])
+                return
+            if state["reply"] and state["reply"] != last_reply:
+                last_reply = state["reply"]
+                step = 0   # reset backoff when new output arrives
+            if state["waiting"]:
+                msg = last_reply or "Cue 正在等待你的输入或确认，请打开 Manus 查看或继续回复。"
+                job.denied = [{
+                    "action": "confirm",
+                    "tool": "cue",
+                    "target": f"https://manus.im/app/{job.session_id}",
+                    "why": "Cue 正在等待确认或补充输入",
+                }]
+                self._finish(job, "blocked", response=msg, waiting_confirm=True)
+                return
+            if state["done"]:
+                self._finish(job, "turn_done", response=last_reply or "（Cue 已完成，但没有返回文字）")
+                return
 
     async def _poll_openapi_once(
         self,
@@ -504,8 +637,8 @@ class CueEngine:
         task_id: str,
         after_id: str,
         expected_user_text: str,
-        as_web_token: bool,
-    ) -> tuple[bool, str, str, bool]:
+        client: httpx.AsyncClient,
+    ) -> dict[str, Any]:
         params: dict[str, str] = {"task_id": task_id, "order": "asc", "limit": "100"}
         if after_id:
             params["start_event_id"] = after_id
@@ -513,11 +646,17 @@ class CueEngine:
         received_user = False
         seen_cursors: set[str] = set()
         while True:
-            ok, st, data = await self._openapi_req(
-                auth, f"task.listMessages?{urlencode(params)}", as_web_token=as_web_token
+            ok, st, data, retry_after = await self._openapi_req(
+                auth, f"task.listMessages?{urlencode(params)}", client=client
             )
+            if st == 429:
+                return {"done": False, "waiting": False, "reply": assistant_reply,
+                        "error": "", "auth_error": False, "rate_limited": True, "retry_after": retry_after}
             if not ok:
-                return False, assistant_reply, f"轮询 Cue 回复失败（HTTP {st}）", st in (401, 403)
+                reason = _extract_error_reason(data)
+                return {"done": False, "waiting": False, "reply": assistant_reply,
+                        "error": f"轮询 Cue 回复失败（HTTP {st}）" + (f"：{reason}" if reason else ""),
+                        "auth_error": st in (401, 403), "rate_limited": False, "retry_after": None}
             for ev in data.get("messages") or []:
                 if not isinstance(ev, dict):
                     continue
@@ -526,7 +665,8 @@ class CueEngine:
                 etype = ev.get("type")
                 if etype == "user_message":
                     if received_user:
-                        return True, assistant_reply, "", False
+                        return {"done": True, "waiting": False, "reply": assistant_reply,
+                                "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
                     ucontent = ((ev.get("user_message") or {}) if isinstance(ev.get("user_message"), dict) else {}).get("content")
                     received_user = (ucontent == expected_user_text) or not expected_user_text
                 if not received_user:
@@ -536,35 +676,41 @@ class CueEngine:
                     if isinstance(ac, str) and ac.strip():
                         assistant_reply = ac.strip()
                 elif etype == "error_message":
-                    return False, assistant_reply, "Cue 执行出错，请在 Manus 中查看会话", False
+                    reason = _extract_error_reason(ev)
+                    return {"done": False, "waiting": False, "reply": assistant_reply,
+                            "error": f"Cue 执行出错：{reason}" if reason else "Cue 执行出错，请在 Manus 中查看会话",
+                            "auth_error": False, "rate_limited": False, "retry_after": None}
                 status_obj = ev.get("status_update") if isinstance(ev.get("status_update"), dict) else {}
                 st_val = str(status_obj.get("agent_status") or "").lower()
-                if st_val in ("waiting", "stopped"):
-                    if not assistant_reply and st_val == "waiting":
-                        assistant_reply = "Cue 正在等待输入或确认，请打开 Manus 查看。"
-                    return True, assistant_reply, "", False
+                if st_val == "waiting":
+                    return {"done": True, "waiting": True, "reply": assistant_reply,
+                            "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
+                if st_val == "stopped":
+                    return {"done": True, "waiting": False, "reply": assistant_reply,
+                            "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
                 if st_val == "error":
-                    return False, assistant_reply, "Cue 执行出错，请在 Manus 中查看会话", False
+                    reason = _extract_error_reason(ev)
+                    return {"done": False, "waiting": False, "reply": assistant_reply,
+                            "error": f"Cue 执行出错：{reason}" if reason else "Cue 执行出错，请在 Manus 中查看会话",
+                            "auth_error": False, "rate_limited": False, "retry_after": None}
             nxt = str(data.get("next_cursor") or "").strip()
             if not nxt or nxt in seen_cursors:
-                return False, assistant_reply, "", False
+                return {"done": False, "waiting": False, "reply": assistant_reply,
+                        "error": "", "auth_error": False, "rate_limited": False, "retry_after": None}
             seen_cursors.add(nxt)
             params.pop("start_event_id", None)
             params["cursor"] = nxt
 
     async def _run_native_turn(self, job: _CueJob, auth: dict[str, Any], prompt: str) -> None:
-        """Native Cue ConnectRPC + Socket.IO v4 WebSocket turn (`wss://api.manus.im/socket.io/`)."""
+        """Experimental native Cue ConnectRPC + Socket.IO v4 turn (`wss://api.manus.im/socket.io/`)."""
         import websockets
 
         token = str(auth.get("access_token") or "").strip()
         if not token:
-            job.status = "turn_failed"
-            job.auth_error = True
-            job.error = "Cue 浏览器登录态中未找到 session token，请重新从浏览器读取或改用 Manus API Key"
-            job.event.set()
+            self._finish(job, "turn_failed", auth_error=True,
+                         error="Cue 浏览器登录态中未找到 session token，请重新点「从浏览器读取」或改用 Manus API Key")
             return
 
-        # Resolve session_id from agent list if not set yet
         if not job.session_id:
             agents = await self.list_agents(auth)
             hit = next((a for a in agents if a["id"] == job.agent_id and a.get("session_id")), None)
@@ -573,8 +719,7 @@ class CueEngine:
             if hit and hit.get("session_id"):
                 job.session_id = hit["session_id"]
             else:
-                # Fallback to OpenAPI using web token
-                await self._run_openapi_turn(job, auth, prompt, as_web_token=True)
+                self._finish(job, "turn_failed", error="实验实时通道未找到可用会话，请改用官方 Manus API Key 模式")
                 return
 
         device_id = str(auth.get("device_id") or uuid.uuid4())
@@ -604,7 +749,6 @@ class CueEngine:
             close_timeout=5,
             max_size=16 * 1024 * 1024,
         ) as ws:
-            # 1) Engine.IO open -> send Socket.IO connect with auth token
             connected = False
             deadline = time.monotonic() + 15.0
             while not connected and time.monotonic() < deadline:
@@ -617,15 +761,12 @@ class CueEngine:
                 elif pkt["kind"] == "connect":
                     connected = True
                 elif pkt["kind"] in ("connect_error", "disconnect"):
-                    job.status = "turn_failed"
-                    job.auth_error = True
-                    job.error = "Cue 实时连接鉴权失败，请重新从浏览器读取登录态"
-                    job.event.set()
+                    self._finish(job, "turn_failed", auth_error=True,
+                                 error="Cue 实验实时连接鉴权失败，请重新点「从浏览器读取」或改用 Manus API Key")
                     return
             if not connected:
                 raise RuntimeError("Cue 实时 WebSocket 握手超时")
 
-            # 2) Join session & send user message
             await ws.send(encode_socketio_event("message", {
                 "id": create_cue_event_id(),
                 "timestamp": int(time.time() * 1000),
@@ -646,17 +787,13 @@ class CueEngine:
                 "deliveryMode": "interrupt",
             }))
 
-            # 3) Receive streaming reply
-            turn_deadline = time.monotonic() + 600.0
-            while time.monotonic() < turn_deadline:
+            while True:
                 wait_s = 2.0 if (latest_text and not seen_running) else 15.0
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=wait_s)
                 except asyncio.TimeoutError:
                     if latest_text and not seen_running and last_update_at and (time.monotonic() - last_update_at) >= 4.0:
-                        job.response = latest_text
-                        job.status = "turn_done"
-                        job.event.set()
+                        self._finish(job, "turn_done", response=latest_text)
                         return
                     continue
 
@@ -676,9 +813,8 @@ class CueEngine:
                     continue
                 ptype = str(payload.get("type") or "")
                 if ptype in ("agent_error", "error"):
-                    job.status = "turn_failed"
-                    job.error = str(payload.get("message") or payload.get("error") or "Cue Agent 执行失败")
-                    job.event.set()
+                    reason = _extract_error_reason(payload)
+                    self._finish(job, "turn_failed", error=f"Cue 执行出错：{reason}" if reason else "Cue Agent 执行失败")
                     return
                 if ptype != "event":
                     continue
@@ -721,22 +857,26 @@ class CueEngine:
                     if st_val == "running":
                         seen_running = True
                         turn_accepted = True
-                    elif st_val in ("stopped", "waiting", "idle", "completed"):
+                    elif st_val == "waiting":
+                        msg = latest_text or "Cue 正在等待你的输入或确认，请打开 Manus 查看或继续回复。"
+                        job.denied = [{
+                            "action": "confirm",
+                            "tool": "cue",
+                            "target": f"https://manus.im/app/{job.session_id}",
+                            "why": "Cue 正在等待确认或补充输入",
+                        }]
+                        self._finish(job, "blocked", response=msg, waiting_confirm=True)
+                        return
+                    elif st_val in ("stopped", "idle", "completed"):
                         if seen_running or latest_text:
-                            job.response = latest_text or "（Cue 已完成）"
-                            job.status = "turn_done"
-                            job.event.set()
+                            self._finish(job, "turn_done", response=latest_text or "（Cue 已完成）")
                             return
                     elif st_val in ("error", "failed"):
-                        job.status = "turn_failed"
-                        job.error = str(ev.get("message") or "Cue Agent 执行出错")
-                        job.event.set()
+                        reason = _extract_error_reason(ev)
+                        self._finish(job, "turn_failed", error=f"Cue 执行出错：{reason}" if reason else "Cue Agent 执行出错")
                         return
 
         if latest_text:
-            job.response = latest_text
-            job.status = "turn_done"
+            self._finish(job, "turn_done", response=latest_text)
         else:
-            job.status = "turn_failed"
-            job.error = "Cue 实时连接关闭，未收到回复"
-        job.event.set()
+            self._finish(job, "turn_failed", error="Cue 实时连接关闭，未收到回复")

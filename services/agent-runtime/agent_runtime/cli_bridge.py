@@ -64,13 +64,18 @@ ENGINES = {
     "grok": {"title": "Grok Build", "bins": ("grok",), "env": "AIW_GROK_BIN", "stdin": False,
              "install": "curl -fsSL https://x.ai/cli/install.sh | bash，然后运行一次 grok login --device-auth",
              "efforts": ["low", "medium", "high"]},
+    "muse": {"title": "Meta Muse", "bins": ("muse",), "env": "AIW_MUSE_BIN", "stdin": False,
+             "install": "curl -fsSL https://dev.meta.ai/install.sh | bash，并在 AIW 密钥库里配置 META_API_KEY",
+             "efforts": ["low", "medium", "high", "xhigh", "max"]},
 }
+
+MUSE_EFFORT_STEPS = {"minimal": 12, "low": 20, "medium": 50, "high": 100, "xhigh": 200, "max": 400}
 
 # What no engine may run (the same lines as agy's deny rules). Claude-style engines take them as deny rules; Codex
 # runs in its workspace-write sandbox instead, and AIW's prompt rules forbid the rest.
 DENY_SHELL = ["git push", "git reset --hard", "git clean", "git checkout .", "git restore .", "sudo", "rm -rf /",
               "rm -rf ~", "rm -rf $HOME"]
-DENY_PATHS = ["~/.config/aiw/**", "~/.codex/**", "~/.claude/**", "~/.codebuddy/**", "~/.grok/**", "~/.gemini/**"]
+DENY_PATHS = ["~/.config/aiw/**", "~/.codex/**", "~/.claude/**", "~/.codebuddy/**", "~/.grok/**", "~/.gemini/**", "~/.muse/**"]
 STATIC_MODELS = {   # shown when the CLI has no model list of its own; any model id the account has also works
     "claude": [("opus", "Opus（最新）"), ("sonnet", "Sonnet（最新）"), ("haiku", "Haiku（最新）")],
     # v3.9.63: CodeBuddy only lists models inside its TUI (/model), per WorkBuddy account; this is the list a
@@ -157,13 +162,16 @@ def clip(s, n: int) -> str:
     return s if len(s) <= n else s[: n - 20] + f"…(+{len(s) - n + 20})"
 
 
-def run_env() -> dict:
+def run_env(extra: dict | None = None) -> dict:
     env = dict(os.environ)
     home = os.path.expanduser("~")
     env["PATH"] = ":".join([f"{home}/.local/bin", f"{home}/bin", f"{home}/.npm-global/bin", f"{home}/.grok/bin",
-                            "/usr/local/bin", env.get("PATH", "/usr/bin:/bin")])
+                            f"{home}/.muse/bin", "/usr/local/bin", env.get("PATH", "/usr/bin:/bin")])
     env.setdefault("GROK_DISABLE_AUTOUPDATER", "1")
     env.setdefault("CI", "1")
+    for k, v in (extra or {}).items():
+        if isinstance(k, str) and k and v is not None and str(v) != "":
+            env[k] = str(v)
     return env
 
 
@@ -219,6 +227,17 @@ def build_cmd(job: dict, prompt: str, session: str, turn_dir: str) -> tuple:
         if session:
             c += ["-r", session]
         return c, None
+    if e == "muse":
+        # muse exec --json: default NO --yolo (follow v3.9.75 deny list); effort maps to --max-model-steps
+        c = [b, "exec", "--json"]
+        if model:
+            c += ["--model", model]
+        steps = MUSE_EFFORT_STEPS.get(effort)
+        if steps:
+            c += ["--max-model-steps", str(steps)]
+        if session:
+            c += ["--session-id", session]
+        return c + [prompt], None
     raise ValueError(f"unknown engine {e}")
 
 
@@ -277,7 +296,12 @@ class Turn:
         except ValueError:
             return
         if isinstance(e, dict):
-            (self.codex if self.engine == "codex" else self.messages)(e)
+            if self.engine == "codex":
+                self.codex(e)
+            elif self.engine == "muse":
+                self.muse(e)
+            else:
+                self.messages(e)
 
     # ---- Claude Code / CodeBuddy / Grok (Messages stream-json)
     def messages(self, e: dict):
@@ -380,6 +404,55 @@ class Turn:
             elif mt == "error":
                 self.failed = True
                 self.error = clip(m.get("message"), 400)
+
+    # ---- Meta Muse (`muse exec --json`)
+    def muse(self, e: dict):
+        sid = e.get("session_id") or e.get("sessionId") or e.get("thread_id")
+        if not sid and isinstance(e.get("session"), dict):
+            sid = e["session"].get("id")
+        if sid:
+            self.session = str(sid)
+        t = str(e.get("type") or e.get("event") or "").lower()
+        if t in ("assistant", "user", "result"):
+            self.messages(e)
+            return
+        if t in ("thread.started", "item.completed", "turn.completed", "turn.failed"):
+            self.codex(e)
+            return
+        if t in ("session", "session.started", "session_started", "init"):
+            return
+        if t in ("message", "assistant_message", "text", "output"):
+            txt = e.get("text") or e.get("content") or (e.get("message") if isinstance(e.get("message"), str) else "")
+            if not txt and isinstance(e.get("message"), dict):
+                txt = block_text(e["message"].get("content"))
+            self.say(txt)
+        elif t in ("final", "done", "completed", "turn_done", "response"):
+            self.got_result = True
+            txt = e.get("result") or e.get("response") or e.get("text") or e.get("content") or ""
+            if isinstance(txt, str) and txt.strip():
+                self.final = txt.strip()
+            if e.get("usage"):
+                self.usage = e.get("usage")
+            if e.get("is_error") or e.get("error"):
+                self.failed = True
+                self.error = clip(e.get("error") or e.get("message") or "error", 400)
+        elif t in ("tool_use", "tool_call", "tool.start"):
+            tid = str(e.get("id") or e.get("tool_call_id") or len(self.pending))
+            name = str(e.get("name") or e.get("tool") or "tool")
+            self.pending[tid] = (name, tool_arg(e.get("input") or e.get("arguments") or e.get("args")))
+        elif t in ("tool_result", "tool.end", "tool_output"):
+            tid = str(e.get("tool_use_id") or e.get("tool_call_id") or e.get("id") or "")
+            name, arg = self.pending.pop(tid, (str(e.get("name") or e.get("tool") or "?"), tool_arg(e.get("input"))))
+            txt = block_text(e.get("output") if "output" in e else e.get("content"))
+            err = str(e.get("error") or (txt if e.get("is_error") else ""))
+            if err and re.search(r"permission|not allowed|denied|requires approval", err, re.I):
+                self.denied.append({"action": "command" if name.lower() in ("bash", "shell", "exec") else "write_file",
+                                    "tool": name, "target": arg, "outside_worktree": False, "why": clip(err, 200)})
+            self.tool(name, arg, "" if err else txt, err)
+        elif t == "error":
+            self.failed = True
+            err = e.get("message") or e.get("error") or "error"
+            self.error = clip(err.get("message") if isinstance(err, dict) else err, 400)
 
     def response(self) -> str:
         if self.final and str(self.final).strip():
@@ -563,7 +636,12 @@ def op_start(job_b64: str):
         out({"ok": False, "error": f"job {jid} exists"})
     os.makedirs(os.path.join(d, "inbox"), exist_ok=True)
     job.update({"id": jid, "bin": b, "workdir": wd, "worktree": wd, "branch": "", "base": "", "created": time.time()})
-    write_json(os.path.join(d, "job.json"), job)
+    job_path = os.path.join(d, "job.json")
+    write_json(job_path, job)
+    try:
+        os.chmod(job_path, 0o600)
+    except OSError:
+        pass
     write_json(os.path.join(d, "state.json"), {"status": "starting", "turn": 0, "events": 0, "ts": time.time(),
                                                "conversation_id": job.get("session") or ""})
     with open(os.path.join(d, "inbox", f"{time.time():.6f}.json"), "w", encoding="utf-8") as f:
@@ -637,7 +715,7 @@ class Daemon:
         errf = open(err_path, "w", encoding="utf-8")
         try:
             proc = subprocess.Popen(argv, cwd=j["workdir"], stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1, env=run_env(),
+                                    stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1, env=run_env(j.get("env")),
                                     start_new_session=True)
         except Exception as e:  # noqa: BLE001
             self.save(status="turn_failed", error=f"cannot start {j['engine']}: {e}", response="")

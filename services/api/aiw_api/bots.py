@@ -41,11 +41,11 @@ ENGINES = {
                   "desc": "腾讯 CodeBuddy Code，WorkBuddy 的命令行版，同一个账号", "login": "codebuddy"},
     "grok": {"id": "grok", "title": "Grok Build", "short": "grok", "available": True,
              "desc": "xAI Grok Build（grok -p）", "login": "grok login --device-auth"},
-    # Cloud engines (run directly on aiw-api, no local VM CLI or git worktree required)
-    "muse": {"id": "muse", "title": "Meta Muse", "short": "muse", "available": True, "cloud": True,
-             "desc": "Meta Muse 云端 Agent（原生 Noise 网关，支持从浏览器读取登录态）", "login": "muse.ai"},
+    "muse": {"id": "muse", "title": "Meta Muse", "short": "muse", "available": True,
+             "desc": "Meta Muse CLI（muse exec --json，本地工作区，使用 META_API_KEY）", "login": "在密钥库配置 META_API_KEY"},
+    # Cloud engine (runs on aiw-api, for discussion/research only; never edits local code)
     "cue": {"id": "cue", "title": "Cue", "short": "cue", "available": True, "cloud": True,
-            "desc": "Cue by Manus 云端 Agent（支持 Manus API Key 或从浏览器读取登录态）", "login": "cue.im"},
+            "desc": "Cue by Manus 云端 Agent（默认官方 Manus API v2，用于调研/讨论）", "login": "Manus API Key"},
 }
 
 
@@ -63,7 +63,7 @@ MANAGER = """你是 AIW 管家，代替用户和编程 Agent（{engine}）对话
 规则：
 - 目标的验收点都满足了才算 done；Agent 只说"完成了"不算，让它给出验证结果（跑过的测试、命令输出）。
 - next 要具体：指出没满足的点、要它做的下一步、怎么验证；一次一件事，用中文。
-- 不许让 Agent git push、合并、删分支、重置、删用户文件、改 ~/.gemini ~/.codex ~/.claude ~/.codebuddy ~/.grok 或 ~/.config/aiw；需要这些就 ask_user。
+- 不许让 Agent git push、合并、删分支、重置、删用户文件、改 ~/.gemini ~/.codex ~/.claude ~/.codebuddy ~/.grok ~/.muse 或 ~/.config/aiw；需要这些就 ask_user。
 - Agent 的操作被拒绝（权限）时，让它换在工作文件夹里能完成的做法；做不到就 ask_user，说明被拒的是什么。
 - 花钱、对外发消息、删除数据、不确定用户意图的决定，都 ask_user。
 - 要跑几分钟以上的命令（渲染、转码、批量处理），让 Agent 写成工作文件夹里的脚本，用 setsid nohup bash 脚本.sh > 脚本.log 2>&1 & 后台跑，之后每轮只看日志和进度；不要让它在前台分批手跑，也不要让它自己写循环去等。
@@ -393,12 +393,14 @@ class AgyEngine:
 
 
 class CliEngine:
-    """v3.9.60: Codex / Claude Code / CodeBuddy / Grok Build through cli_bridge.py. Same ops as AgyEngine."""
+    """v3.9.60: Codex / Claude Code / CodeBuddy / Grok Build / Meta Muse through cli_bridge.py. Same ops as AgyEngine."""
 
-    def __init__(self, engine: str, shell: Callable[[str, str, int], Any], installed: Optional[set] = None):
+    def __init__(self, engine: str, shell: Callable[[str, str, int], Any], installed: Optional[set] = None,
+                 env_fn: Optional[Callable[[], dict]] = None):
         self.id = engine
         self.shell = shell
         self._installed = installed if installed is not None else set()   # shared: one bridge file per computer
+        self._env_fn = env_fn
 
     async def op(self, mid: str, op: str, a: dict, job: Optional[dict] = None) -> dict:
         from agent_runtime import cli_engines as ce
@@ -416,9 +418,14 @@ class CliEngine:
 
     def job(self, conv: dict, prompt: str) -> dict:
         model, effort = model_flags(conv)
-        return {"engine": self.id, "prompt": prompt, "session": conv.get("session") or "",
-                "workdir": conv.get("workdir") or f"~/workspace/{self.id}-chat", "model": model, "effort": effort,
-                "max_turns": 1000, "timeout_min": 24 * 60, "keep_min": 120, "idle_min": 20}
+        j = {"engine": self.id, "prompt": prompt, "session": conv.get("session") or "",
+             "workdir": conv.get("workdir") or f"~/workspace/{self.id}-chat", "model": model, "effort": effort,
+             "max_turns": 1000, "timeout_min": 24 * 60, "keep_min": 120, "idle_min": 20}
+        if self._env_fn:
+            extra_env = {k: v for k, v in (self._env_fn() or {}).items() if v}
+            if extra_env:
+                j["env"] = extra_env
+        return j
 
     async def models(self, mid: str) -> dict:
         return await self.op(mid, "models", {})
@@ -456,13 +463,21 @@ class Bots:
         shared: set = set()
         from .cloud_auth import CloudAuthStore
         from .cue_engine import CueEngine
-        from .muse_engine import MuseEngine
+        self.secrets = secrets
         self.auth_store = CloudAuthStore(store, secrets)
+
+        def _muse_env() -> dict:
+            key = ""
+            if secrets is not None:
+                key = secrets.get("META_API_KEY") or secrets.get("meta_api_key") or ""
+            key = key or os.environ.get("META_API_KEY") or ""
+            return {"META_API_KEY": key} if key else {}
+
         self.engines = {
             "agy": AgyEngine(sh),
             **{e: CliEngine(e, sh, shared) for e in ("codex", "claude", "codebuddy", "grok")},
+            "muse": CliEngine("muse", sh, shared, env_fn=_muse_env),
             "cue": CueEngine(self.auth_store, shell=sh, default_machine=self.default_machine),
-            "muse": MuseEngine(self.auth_store, shell=sh, default_machine=self.default_machine),
         }
         self.queues: dict[str, list] = {}
         self.runners: dict[str, asyncio.Task] = {}
@@ -919,10 +934,10 @@ class Bots:
                 log.warning("%s stop after unrestricted turn: %s", c["bot"], e)
             alive = False
         self.set_conv(cid, status="idle", job=job if alive else None, cursor=cursor,
-                      session=res.get("conversation_id") or c.get("session"))
+                      session=res.get("conversation_id") or res.get("session") or c.get("session"))
         if not self.conv(cid).get("takeover"):
-            if data["status"] == "blocked" and c["bot"] == "agy":
-                await self.permit_card(cid, data["denied"])    # v3.9.68: an approval card in the chat + a push
+            if data["status"] == "blocked" and (c["bot"] == "agy" or res.get("waiting_confirm")):
+                await self.permit_card(cid, data["denied"])    # v3.9.68: approval / Cue waiting-confirm card in chat + push
             else:
                 await self._notify(cid, text)
         return {"status": data["status"], "text": text, "result": res}
@@ -1285,6 +1300,7 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
         base_url: Optional[str] = None
         mode: Optional[str] = None
         agent_id: Optional[str] = None
+        experimental_native: Optional[bool] = None
         verify: bool = False
 
     class CloudBrowserIn(BaseModel):
@@ -1294,13 +1310,13 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     @app.get("/api/bots/engines/{bot}/auth", dependencies=dep)
     async def bots_auth_get(bot: str):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（muse / cue）需要凭据设置")
+            raise HTTPException(400, "只有云端引擎（cue）需要凭据设置；Muse 请在密钥库配置 META_API_KEY")
         return bots.auth_store.public_view(bot)
 
     @app.put("/api/bots/engines/{bot}/auth", dependencies=dep)
     async def bots_auth_put(bot: str, body: CloudAuthIn):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据设置")
+            raise HTTPException(400, "只有云端引擎（cue）支持凭据设置")
         patch = {k: v for k, v in body.model_dump().items() if k != "verify" and v is not None}
         if patch:
             patch["source"] = "manual"
@@ -1315,22 +1331,21 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     @app.delete("/api/bots/engines/{bot}/auth", dependencies=dep)
     async def bots_auth_del(bot: str):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据设置")
+            raise HTTPException(400, "只有云端引擎（cue）支持凭据设置")
         bots.auth_store.clear(bot)
         return {"ok": True, "auth": bots.auth_store.public_view(bot)}
 
     @app.post("/api/bots/engines/{bot}/auth/browser", dependencies=dep)
     async def bots_auth_browser(bot: str, body: Optional[CloudBrowserIn] = None):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（muse / cue）支持从浏览器读取")
+            raise HTTPException(400, "只有云端引擎（cue）支持从浏览器读取")
         from .browser_cookies import read_browser_cookies
         mid = (body.machine_id if body else "") or bots.default_machine()
         res = await read_browser_cookies(bot, shell=bots.sh, machine_id=mid)
         if not res.get("ok") or not res.get("creds"):
-            site = "muse.ai" if bot == "muse" else "cue.im"
-            raise HTTPException(404, f"未在本机或连接电脑的浏览器里找到 {site} 的登录 Cookie；请先在 Chrome / Arc / Edge / BrowserOS 里登录 {site} 后重试。")
-        patch = {**res["creds"], "source": res.get("source") or "browser"}
-        if bot == "cue" and not bots.auth_store.load("cue").get("api_key"):
+            raise HTTPException(404, "未在本机或连接电脑的浏览器里找到 cue.im 的登录 Cookie；请先在 Chrome / Arc / Edge / BrowserOS 登录 cue.im 后重试。")
+        patch = {**res["creds"], "source": res.get("source") or "browser", "experimental_native": True}
+        if not bots.auth_store.load("cue").get("api_key"):
             patch["mode"] = "native"
         bots.auth_store.save(bot, patch)
         out: dict = {"ok": True, "source": res.get("source") or "browser",
@@ -1345,7 +1360,7 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     @app.post("/api/bots/engines/{bot}/auth/test", dependencies=dep)
     async def bots_auth_test(bot: str):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据测试")
+            raise HTTPException(400, "只有云端引擎（cue）支持凭据测试")
         eng = bots.engines.get(bot)
         if not eng or not hasattr(eng, "verify"):
             raise HTTPException(404, "不支持验证")

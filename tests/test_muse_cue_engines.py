@@ -158,6 +158,11 @@ async def test_muse_media_parse_and_save_media(tmp_path, monkeypatch):
     assert saved[1]["kind"] == "video" and saved[1]["size"] == len(b"\x00\x00\x00\x18ftypmp42")
     assert saved[2]["kind"] == "image" and saved[2]["size"] == len(b"\x89PNG\r\n\x1a\n1234")
 
+    # Verify delta.presentation / image_options widgets are also parsed
+    pres = {"widgets": [{"kind": "image_options", "data": {"images": [{"path": "workspace/gen/cat.png", "image_id": "img1"}]}}]}
+    m_pres = parse_muse_media(pres)
+    assert len(m_pres) == 1 and m_pres[0]["fs_path"] == "workspace/gen/cat.png" and m_pres[0]["type"] == "image"
+
 
 # --------------------------------------------------------------------------------------------- Cookie & Cue tests
 def test_cookie_extractors_and_cloud_auth_store(tmp_path):

@@ -552,7 +552,7 @@ _VIDEO_EXT_RE = re.compile(r"\.(mp4|mov|webm|m4v|mkv)(?:[?#].*)?$", re.I)
 _AUDIO_EXT_RE = re.compile(r"\.(mp3|wav|m4a|ogg|aac)(?:[?#].*)?$", re.I)
 _SKIP_WIDGET_TYPES = {
     "shopping_results", "shopping_results_v2", "shopping_cart",
-    "marketplace_map", "hotel_results", "image_options",
+    "marketplace_map", "hotel_results",
 }
 _MEDIA_CONTAINERS = (
     "content", "items", "images", "generated_images", "attachments", "files",
@@ -906,14 +906,14 @@ class MuseEngine:
                         hdrs.insert(0, ("Content-Type", "application/json"))
                     return hdrs
 
-                async def _fetch_fs_raw(fs_path: str) -> tuple[bytes, str]:
-                    enc_path = "/".join(quote(seg, safe="") for seg in fs_path.split("/") if seg)
-                    fid, fframes = nt.encrypt_request("daemon", "GET", f"/fs/raw/{enc_path}", _req_headers(json_body=False))
+                async def _fetch_noise_get(req_path: str) -> tuple[int, bytes, str]:
+                    fid, fframes = nt.encrypt_request("daemon", "GET", req_path, _req_headers(json_body=False))
                     for fr in fframes:
                         await ws.send(fr)
                     chunks: list[bytes] = []
                     total = 0
                     ctype = ""
+                    status_code = 200
                     dl_deadline = time.monotonic() + 60.0
                     while time.monotonic() < dl_deadline:
                         raw_f = await asyncio.wait_for(ws.recv(), timeout=20.0)
@@ -923,10 +923,9 @@ class MuseEngine:
                         if not fr_dec or fr_dec["stream_id"] != fid:
                             continue
                         if fr_dec["kind"] == "reset":
-                            break
+                            return 502, b"", ""
                         if fr_dec["kind"] == "response":
-                            if fr_dec.get("status", 200) >= 400:
-                                return b"", ""
+                            status_code = int(fr_dec.get("status", 200))
                             for hk, hv in fr_dec.get("headers") or []:
                                 if hk.lower() == "content-type":
                                     ctype = hv.split(";", 1)[0].strip()
@@ -934,22 +933,69 @@ class MuseEngine:
                             if b:
                                 total += len(b)
                                 if total > _MAX_NOISE_FILE_BYTES:
-                                    return b"", ""
+                                    return 413, b"", ""
                                 chunks.append(b)
                             if fr_dec.get("end_body"):
-                                return b"".join(chunks), ctype
+                                return status_code, b"".join(chunks), ctype
                         elif fr_dec["kind"] == "body_chunk":
                             b = fr_dec.get("data") or b""
                             if b:
                                 total += len(b)
                                 if total > _MAX_NOISE_FILE_BYTES:
-                                    return b"", ""
+                                    return 413, b"", ""
                                 chunks.append(b)
                             if fr_dec.get("end_body"):
-                                return b"".join(chunks), ctype
-                    return b"".join(chunks), ctype
+                                return status_code, b"".join(chunks), ctype
+                    return status_code, b"".join(chunks), ctype
+
+                async def _fetch_fs_raw(fs_path: str) -> tuple[bytes, str]:
+                    enc_path = "/".join(quote(seg, safe="") for seg in fs_path.split("/") if seg)
+                    st_c, data_b, ctype = await _fetch_noise_get(f"/fs/raw/{enc_path}")
+                    if st_c == 404:
+                        st_c, data_b, ctype = await _fetch_noise_get(f"/api/fs/raw/{enc_path}")
+                    if st_c >= 400:
+                        log.info("muse fs.raw %s -> HTTP %s", fs_path, st_c)
+                        return b"", ""
+                    return data_b, ctype
+
+                async def _reconcile_history_media() -> None:
+                    """Fetch latest assistant messages from /chat/history to catch any media not in delta events."""
+                    if not job.session_id:
+                        return
+                    try:
+                        qs = urlencode({"session_id": job.session_id, "limit": "10"})
+                        st_c, body_b, _ = await _fetch_noise_get(f"/chat/history?{qs}")
+                        if st_c >= 400 or not body_b:
+                            return
+                        hdata = json.loads(body_b.decode("utf-8", "replace"))
+                        root = hdata.get("result") if isinstance(hdata, dict) and isinstance(hdata.get("result"), dict) else hdata
+                        msgs = []
+                        if isinstance(root, dict):
+                            for k in ("messages", "items", "turns", "history"):
+                                if isinstance(root.get(k), list):
+                                    msgs = root[k]
+                                    break
+                        elif isinstance(root, list):
+                            msgs = root
+                        # Take all assistant messages after the last user message (covers multi-bubble replies like text -> image -> text)
+                        last_user_idx = -1
+                        for idx, m in enumerate(msgs):
+                            if isinstance(m, dict) and str(m.get("role") or m.get("sender") or "").lower() == "user":
+                                last_user_idx = idx
+                        tail = msgs[last_user_idx + 1:] if last_user_idx >= 0 else msgs[-4:]
+                        picked = [
+                            m for m in tail
+                            if isinstance(m, dict)
+                            and str(m.get("role") or m.get("sender") or "").lower() in ("", "assistant", "model")
+                        ]
+                        for m in picked:
+                            parse_muse_media(m, job.media)
+                    except Exception as ex:  # noqa: BLE001
+                        log.debug("muse history media reconcile failed: %r", ex)
 
                 async def _materialize_media() -> None:
+                    if not job.media:
+                        await _reconcile_history_media()
                     for item in job.media[:20]:
                         fs_p = str(item.get("fs_path") or "").strip()
                         if not fs_p or item.get("url") or item.get("data_uri") or item.get("data_bytes"):
@@ -961,7 +1007,7 @@ class MuseEngine:
                                 if ctype and not item.get("content_type"):
                                     item["content_type"] = ctype
                         except Exception as ex:  # noqa: BLE001
-                            log.debug("muse fs.raw %s failed: %r", fs_p, ex)
+                            log.info("muse fs.raw %s failed: %r", fs_p, ex)
 
                 # 2) Open chat.subscribe stream
                 sub_body = json.dumps({"capabilities": MUSE_CHAT_CAPABILITIES}).encode("utf-8")
@@ -1064,7 +1110,7 @@ class MuseEngine:
                             if delta:
                                 msg_texts[mid_s] += delta
                                 last_text_at = time.monotonic()
-                        elif ename == "delta.message_done":
+                        elif ename in ("delta.message_done", "message.assistant"):
                             mid_s = str(payload.get("message_id") or payload.get("id") or (msg_order[-1] if msg_order else "m0"))
                             if mid_s not in msg_texts:
                                 msg_order.append(mid_s)
@@ -1075,6 +1121,17 @@ class MuseEngine:
                             parse_muse_media(payload, job.media)
                             done_ids.add(mid_s)
                             last_text_at = time.monotonic()
+                        elif ename == "delta.presentation" or re.search(r"presentation|attachment|media|artifact|image|file", ename, re.I):
+                            parse_muse_media(payload, job.media)
+                            full_txt = _extract_muse_text(payload)
+                            if full_txt:
+                                mid_s = str(payload.get("message_id") or payload.get("id") or (msg_order[-1] if msg_order else "m0"))
+                                if mid_s not in msg_texts:
+                                    msg_order.append(mid_s)
+                                    msg_texts[mid_s] = full_txt
+                                elif not msg_texts[mid_s]:
+                                    msg_texts[mid_s] = full_txt
+                                last_text_at = time.monotonic()
                         elif ename in ("agent.status", "agent_status", "presence.status"):
                             code = str(payload.get("activity_code") or payload.get("status") or "").lower()
                             if code:

@@ -93,6 +93,9 @@ VM_AGENT_TOKEN=... python tools-cli.py ws://<VM_IP>:8765 click 500 300
 
 **升级（VM 102）**：`cd ~/docker/aiw && docker-compose pull && docker-compose up -d --force-recreate`。数据库自动迁移，旧任务保留在"活动"里。
 
+## v3.9.79 群聊按步骤分工
+- 用户写明「第 N 步 @谁」时照写的分工和顺序执行，前一步回复后才交下一步，不再让模型重新分；交给「@管家」的步骤由管家自己做：合并、运行任务里写的检查命令（只允许 pytest/python3 xx.py 等），再按群聊记录出汇报表。每一步都带上前面成员的结果，本地成员开工前先合入前面步骤的分支；云端成员被告知回复会自动贴到群里，不用自己找群。某一步失败就暂停，说「@管家 继续」接着做。详见 docs/v3.9.79.md。版本 3.9.79 (53)。
+
 ## v3.9.78 Muse 密钥和权限
 - META_API_KEY 改由 setenv 写到电脑上的 0600 文件，不再出现在命令行和 job.json；muse 按 `muse exec --help` 自动带上拒绝清单和关闭审批的参数（不加 --yolo），提示词带 AIW 规则兜底。详见 docs/v3.9.78.md。版本 3.9.78 (52)。
 

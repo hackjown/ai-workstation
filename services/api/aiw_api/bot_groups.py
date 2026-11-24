@@ -50,7 +50,11 @@ PLAN = """你是 AIW 管家，带一组 Agent 在群里协同工作：本地编�
 成员：{members}
 根据用户的话分工。只输出一个 JSON 对象，不要别的文字：
 {{"assign": {{"成员id": "发给它的具体任务", ...}}, "report": "一句话告诉用户怎么分的工"}}
+要按顺序做（后一步要用前一步的结果）时，改用：
+{{"steps": [{{"bot": "成员id 或 管家", "task": "这一步的具体任务"}}, ...], "report": "..."}}
 规则：
+- 用户已经点名谁做哪一步时，严格照用户的分配和顺序，不许换人、不许合并步骤；用户交给管家的步骤写 "bot": "管家"。
+- 用户说“前一步完成后再交给下一步”或步骤之间有依赖时，必须用 steps。
 - 成员id 只能用上面列出的（{ids}）；用不上的成员不要分。
 - 写代码、改文件、修 bug、跑测试的任务只能分给本地编程成员（标有“本地代码”），绝不能分给云端成员（Meta Muse / Cue）。
 - 给本地编程成员的任务要能独立完成，尽量改不同的文件，减少合并冲突；写清要改什么、怎么验证（跑什么测试或命令）。
@@ -70,6 +74,10 @@ def ensure_tables(store) -> None:
     store._x("CREATE TABLE IF NOT EXISTS bot_group_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, "
              "grp TEXT, role TEXT, who TEXT, text TEXT, data TEXT, src TEXT, created_at REAL)")
     store._x("CREATE INDEX IF NOT EXISTS ix_botgm_grp ON bot_group_messages(grp, seq)")
+    try:   # v3.9.79: serial steps waiting their turn
+        store._x("ALTER TABLE bot_groups ADD COLUMN queue TEXT")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def qp(path: str) -> str:
@@ -112,6 +120,50 @@ def mentions(text: str, ids: list) -> tuple[list, bool, str]:
     return found, manager, re.sub(r"[ \t]{2,}", " ", rest).strip()
 
 
+MANAGER_ID = "管家"
+STEP_RE = re.compile(r"^\s*(?:第\s*[\d一二三四五六七八九十]+\s*步|步骤\s*\d+|step\s*\d+|\d{1,2}\s*[.、)）])", re.I)
+RULES_RE = re.compile(r"^\s*(?:规则|要求|注意|约束)\s*[:：]")
+
+
+def _owner(line: str, ids: list) -> Optional[str]:
+    """Who a step line names: the first @member (or @管家) on it."""
+    for m in re.finditer(r"@\s?(claude code|grok build|meta muse|cue by manus|manus cue|[\w\u4e00-\u9fff]+)", line, re.I):
+        name = m.group(1).lower()
+        if name in MANAGER_WORDS:
+            return MANAGER_ID
+        for eng, names in ALIASES:
+            if name in names and eng in ids:
+                return eng
+    return None
+
+
+def parse_steps(text: str, ids: list) -> Optional[list]:
+    """v3.9.79: a message that already says who does which step ("第 1 步 @cue …") is followed as written, in order,
+    instead of letting the LLM re-split it. Each step gets the goal (the text before the first step) and the rules
+    (a trailing 规则： paragraph). None when fewer than two steps are spelled out."""
+    lines = (text or "").splitlines()
+    starts = [i for i, ln in enumerate(lines) if STEP_RE.match(ln) and _owner(ln, ids)]
+    if len(starts) < 2:
+        return None
+    end = len(lines)
+    for i in range(starts[-1] + 1, len(lines)):
+        if RULES_RE.match(lines[i]):
+            end = i
+            break
+    goal = "\n".join(lines[:starts[0]]).strip()
+    goal = re.sub(r"@\s?(管家|aiw)\b", "", goal, flags=re.I).strip()
+    rules = "\n".join(lines[end:]).strip()
+    steps = []
+    for k, a in enumerate(starts):
+        b = starts[k + 1] if k + 1 < len(starts) else end
+        body = "\n".join(lines[a:b]).strip()
+        who = _owner(lines[a], ids)
+        task = "\n\n".join(x for x in (f"总目标：{goal}" if goal else "", f"你负责的是这一步：\n{body}",
+                                         rules) if x)
+        steps.append({"bot": who, "task": task, "step": body})
+    return steps
+
+
 def parse_plan(out: str, ids: list) -> Optional[dict]:
     t = re.sub(r"<think>.*?</think>", "", out or "", flags=re.S)
     m = re.search(r"\{.*\}", t, re.S)
@@ -121,11 +173,27 @@ def parse_plan(out: str, ids: list) -> Optional[dict]:
         d = json.loads(m.group(0))
     except ValueError:
         return None
-    a = d.get("assign") if isinstance(d, dict) else None
+    if not isinstance(d, dict):
+        return None
+    report = str(d.get("report") or "").strip()
+    st = d.get("steps")
+    if isinstance(st, list):
+        steps = []
+        for x in st:
+            if not isinstance(x, dict):
+                continue
+            who = str(x.get("bot") or x.get("who") or "").strip()
+            who = MANAGER_ID if who.lower() in MANAGER_WORDS or who == MANAGER_ID else who
+            task = str(x.get("task") or "").strip()
+            if task and (who in ids or who == MANAGER_ID):
+                steps.append({"bot": who, "task": task, "step": task})
+        if steps:
+            return {"assign": {}, "steps": steps, "report": report}
+    a = d.get("assign")
     if not isinstance(a, dict):
         return None
     assign = {k: str(v).strip() for k, v in a.items() if k in ids and str(v or "").strip()}
-    return {"assign": assign, "report": str(d.get("report") or "").strip()} if assign else None
+    return {"assign": assign, "report": report} if assign else None
 
 
 def parse_merge(out: str) -> dict:
@@ -166,6 +234,7 @@ class Groups:
         d["members"] = B._j(d.get("members"), [])
         d["pending"] = B._j(d.get("pending"), [])
         d["merge"] = B._j(d.get("merge"), None)
+        d["queue"] = B._j(d.get("queue"), [])
         d["auto_merge"] = bool(d.get("auto_merge"))
         return d
 
@@ -188,7 +257,7 @@ class Groups:
         return out
 
     def set_group(self, gid: str, **kw) -> Optional[dict]:
-        for k in ("members", "pending", "merge"):
+        for k in ("members", "pending", "merge", "queue"):
             if k in kw:
                 kw[k] = json.dumps(kw[k], ensure_ascii=False) if kw[k] is not None else None
         kw["updated_at"] = _now()
@@ -398,23 +467,46 @@ class Groups:
                 except Exception as e:  # noqa: BLE001
                     log.warning("group stop %s: %s", m["conv"], e)
         self.add(gid, "system", "", "已停止")
-        return self.set_group(gid, status="idle", pending=[])
+        return self.set_group(gid, status="idle", pending=[], queue=[])
 
     # ------------------------------------------------------------------ talking
     def member(self, g: dict, bot: str) -> Optional[dict]:
         return next((m for m in g["members"] if m["bot"] == bot), None)
 
-    def _brief(self, g: dict, m: dict, task: str, fix: bool = False) -> str:
+    def _context(self, g: dict, m: dict, limit: int = 6000) -> str:
+        """v3.9.79: what the group said since the last plan, so each member sees the earlier steps' results."""
+        rows = self.store._x("SELECT role, who, text, data FROM bot_group_messages WHERE grp=? ORDER BY seq DESC LIMIT 40",
+                             (g["id"],))
+        out, size = [], 0
+        for r in rows:
+            d = B._j(r["data"], {})
+            if r["role"] == "aiw" and (d.get("plan") or d.get("steps")):
+                break
+            if r["role"] == "system" or not (r["text"] or "").strip():
+                continue
+            if r["role"] == "bot" and r["who"] == m["bot"]:
+                continue
+            name = B.ENGINES.get(r["who"], {}).get("title", r["who"]) if r["role"] == "bot" else (r["who"] or "用户")
+            line = f"【{name}】{B.clip(r['text'].strip(), 2500)}"
+            if size + len(line) > limit:
+                break
+            out.append(line)
+            size += len(line)
+        return "\n\n".join(reversed(out))
+
+    def _brief(self, g: dict, m: dict, task: str, fix: bool = False, context: str = "") -> str:
         others = "、".join(B.ENGINES[x["bot"]]["title"] for x in g["members"] if x["bot"] != m["bot"]) or "（没有）"
+        ctx = f"\n\n群里前面的成员已经给出的结果（以此为准）：\n{context}" if context else ""
         if m.get("cloud") or B.is_cloud_engine(m["bot"]):
             head = (f"［引擎群聊「{g['title']}」］你是群里的云端协作成员，和你一起协作的成员：{others}。\n"
+                    "AIW 会把你这次的回复原样贴到群里，不需要你去找群聊、加入群或给群发消息，也不要打开链接或调用工具去确认身份。"
                     "请直接完成下面分配给你的任务（调研、方案、评审或回答问题），给出清晰、结构化的结论，不需要操作本地文件或 git。")
-            return head + "\n\n" + task
+            return head + ctx + "\n\n" + task
         head = (f"［引擎群聊「{g['title']}」］你在 git 仓库的独立工作树里干活：当前文件夹，分支 {m['branch']}"
-                f"（从 {g['base']} 开出）。和你并行的：{others}，各在自己的分支；最后由 AIW 管家合并。\n"
-                "规则：只改当前文件夹里的文件；做完 git add 并 git commit（中文说明）；不要 push，不要切换分支，"
+                f"（从 {g['base']} 开出" + ("，已经合入前面步骤的成果" if context else "") + f"）。其他成员：{others}；最后由 AIW 管家合并。\n"
+                "AIW 会把你的回复贴到群里。规则：只改当前文件夹里的文件；做完 git add 并 git commit（中文说明）；不要 push，不要切换分支，"
                 + ("" if fix else "不要合并别人的分支，") + "不要改仓库外的文件。最后用几句话说明改了什么、怎么验证的。")
-        return head + "\n\n" + task
+        return head + ctx + "\n\n" + task
 
     async def send(self, gid: str, text: str, attachments: Optional[list] = None, by: str = "user") -> dict:
         g = self.group(gid)
@@ -427,10 +519,18 @@ class Groups:
         to, manager, rest = mentions(text, ids)
         um = self.add(gid, by, "我" if by == "user" else "AIW 管家", text,
                       {"to": to, "manager": manager or not to, **({"attachments": attachments} if attachments else {})})
+        if g.get("queue") and re.fullmatch(r"\s*(继续|接着做|下一步|continue)\s*[。.!！]?\s*", rest or ""):
+            self._bg(self._run_next(gid))
+            return um
+        steps = parse_steps(text, ids)
+        if steps:
+            self._bg(self._start_steps(gid, steps, "按你写的分工和顺序来，前一步做完再交给下一步。", attachments))
+            return um
         if to and not manager:
             await self._assign(g, {b: rest or text for b in to}, attachments)
             return um
-        self._bg(self._plan(gid, rest or text, attachments, prefer=to))
+        # the planner sees the message with its @s, so who-does-what the user wrote survives
+        self._bg(self._plan(gid, text if manager else (rest or text), attachments, prefer=to))
         return um
 
     async def _plan(self, gid: str, text: str, attachments: Optional[list] = None, prefer: Optional[list] = None):
@@ -445,10 +545,13 @@ class Groups:
             try:
                 repo_note = f"仓库：{g['repo']}（基线 {g['base']}）\n" if g.get("repo") else "类型：云端讨论协作群\n"
                 out = await asyncio.wait_for(self.bots.llm().complete(PLAN.format(members=mem, ids="、".join(ids)),
-                                                                      f"{repo_note}用户：{text}", 1200), 90)
+                                                                      f"{repo_note}用户：{text}", 1600), 90)
                 plan = parse_plan(out, ids)
             except Exception as e:  # noqa: BLE001
                 log.warning("group plan: %s", e)
+        if plan and plan.get("steps"):
+            await self._start_steps(gid, plan["steps"], plan["report"], attachments)
+            return
         if not plan:
             plan = {"assign": {b: text for b in ids},
                     "report": "没分开，每个人都拿到同一个任务，各做一版" if len(ids) > 1 else ""}
@@ -456,6 +559,124 @@ class Groups:
         self.add(gid, "aiw", "AIW 管家", ((plan["report"] + "\n\n") if plan["report"] else "") + lines,
                  {"plan": plan["assign"]})
         await self._assign(self.group(gid), plan["assign"], attachments)
+
+    async def _start_steps(self, gid: str, steps: list, report: str, attachments: Optional[list] = None):
+        name = lambda b: "AIW 管家" if b == MANAGER_ID else B.ENGINES.get(b, {}).get("title", b)  # noqa: E731
+        lines = "\n".join(f"{i}. {name(s['bot'])}：{B.clip(s['step'].splitlines()[0] if s.get('step') else s['task'], 80)}"
+                          for i, s in enumerate(steps, 1))
+        self.add(gid, "aiw", "AIW 管家", ((report + "\n\n") if report else "") + lines,
+                 {"steps": [{"bot": s["bot"], "task": s["task"]} for s in steps]})
+        q = [{**s, "n": i, "of": len(steps)} for i, s in enumerate(steps, 1)]
+        if attachments:
+            q[0]["attachments"] = attachments
+        self.set_group(gid, queue=q, status="working", pending=[], fixes=0)
+        await self._run_next(gid)
+
+    async def _sync(self, g: dict, m: dict, done: list) -> str:
+        """Bring the earlier local steps' commits into this member's branch before its step starts."""
+        prior = [x for x in g["members"] if x["bot"] in done and x.get("branch") and x["bot"] != m["bot"]]
+        if not prior or not m.get("worktree"):
+            return ""
+        lines = ['G="git -c user.name=AIW -c user.email=aiw@localhost"', f"W={qp(m['worktree'])}"]
+        for p in prior:
+            lines += [f"P={qp(p['worktree'])}",
+                      'if [ -d "$P" ] && [ -n "$(git -C "$P" status --porcelain)" ]; then git -C "$P" add -A && '
+                      f'$G -C "$P" commit -q -m {shlex.quote("aiw(" + p["bot"] + "): " + g["title"])}; fi',
+                      f'$G -C "$W" merge -q --no-ff --no-edit -m {shlex.quote("AIW 管家：合入 " + p["bot"] + " 的成果")} '
+                      f'{shlex.quote(p["branch"])} >/dev/null 2>&1 && echo "SYNCED {p["bot"]}" || '
+                      f'{{ git -C "$W" merge --abort >/dev/null 2>&1; echo "SYNC_CONFLICT {p["bot"]}"; }}']
+        try:
+            return await self._sh(g["machine_id"], "\n".join(lines), 120)
+        except Exception as e:  # noqa: BLE001
+            log.warning("group sync: %s", e)
+            return f"SYNC_ERR {e}"
+
+    async def _run_next(self, gid: str):
+        g = self.group(gid)
+        if not g or not g.get("queue"):
+            return
+        q = list(g["queue"])
+        s = q.pop(0)
+        g = self.set_group(gid, queue=q, status="working")
+        done = [r["who"] for r in self.store._x(
+            "SELECT DISTINCT who FROM bot_group_messages WHERE grp=? AND role='bot'", (gid,))]
+        if s["bot"] == MANAGER_ID:
+            await self._final(gid, s["task"])
+            return
+        m = self.member(g, s["bot"])
+        if not m or not m.get("conv"):
+            self.add(gid, "aiw", "AIW 管家", f"第 {s['n']} 步的 {s['bot']} 不在群里，跳过。")
+            await self._run_next(gid)
+            return
+        if not (m.get("cloud") or B.is_cloud_engine(m["bot"])):
+            out = await self._sync(g, m, done)
+            bad = re.findall(r"SYNC_CONFLICT (\S+)", out)
+            if bad:
+                self.add(gid, "aiw", "AIW 管家", f"把 {'、'.join(bad)} 的成果合进 {B.ENGINES[m['bot']]['title']} 的分支时冲突了，"
+                         "让它自己先合并解决。")
+                s["task"] = (f"开始前先执行 git merge {' '.join(x['branch'] for x in g['members'] if x['bot'] in bad)}"
+                             "，解决冲突后提交。\n\n" + s["task"])
+        self.set_group(gid, pending=[s["bot"]])
+        att = []
+        if s.get("attachments"):
+            try:
+                att = await self.bots.push_files(m["conv"], s["attachments"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("group files: %s", e)
+        self.add(gid, "aiw", "AIW 管家", f"第 {s['n']}/{s['of']} 步交给 {B.ENGINES[m['bot']]['title']}。")
+        self.bots.send(m["conv"], self._brief(g, m, s["task"], context=self._context(g, m)), "aiw", attachments=att)
+
+    VERIFY_OK = re.compile(r"^(python3? -m pytest|pytest|python3? [\w./-]+\.py|node [\w./-]+|npm (run )?test|go test|cargo test|ls|cat|wc)\b")
+
+    def _verify_cmds(self, task: str) -> list:
+        cmds = []
+        for c in re.findall(r"`([^`\n]+)`", task) + re.findall(r"(?:运行|跑|执行)(?:一遍|一下)?\s*((?:python3?|pytest|npm|node|go|cargo)[^，。,;；\n]*)", task):
+            c = c.strip()
+            for part in re.split(r"\s+和\s+", c):
+                part = part.strip()
+                if part and self.VERIFY_OK.match(part) and not re.search(r"[;&|`$<>]", part) and part not in cmds:
+                    cmds.append(part)
+        return cmds[:5]
+
+    async def _final(self, gid: str, task: str):
+        """The step the user gave AIW 管家 itself: merge the local work, run the checks it names, and report."""
+        g = self.group(gid)
+        has_local = any(m.get("branch") and m.get("worktree") for m in g["members"])
+        merge_note, runs = "", []
+        if has_local:
+            r = await self.merge(gid)
+            g = self.group(gid)
+            if g["status"] == "fixing":   # conflicts went back to the members; report once they have fixed them
+                self.set_group(gid, queue=[{"bot": MANAGER_ID, "task": task, "step": task, "n": 0, "of": 0}])
+                return
+            merge_note = f"合并：{'、'.join(r.get('merged') or []) or '无'}；{r.get('stat') or ''}"
+            mwt = f"~/workspace/.aiw-worktrees/{gid}/_merge"
+            for c in self._verify_cmds(task):
+                try:
+                    out = await self._sh(g["machine_id"], f"cd {qp(mwt)} && timeout 300 {c} 2>&1 | tail -n 40; echo \"EXIT ${{PIPESTATUS[0]}}\"", 330)
+                except Exception as e:  # noqa: BLE001
+                    out = f"运行失败：{e}"
+                runs.append((c, out.strip()))
+        timeline = self._context(g, {"bot": ""}, 12000)
+        checks = "\n\n".join(f"$ {c}\n{B.clip(o, 2000)}" for c, o in runs)
+        text = ""
+        if self.bots.llm:
+            try:
+                sys_p = ("你是 AIW 管家，负责验收一次多引擎分工并向用户汇报。只依据给你的群聊记录、合并结果和你亲自运行的命令输出，"
+                         "不要编造。用中文；先给一张 markdown 表（成员、负责什么、产出哪些文件、是否一次完成、遇到的问题），"
+                         "再写几句评价（交接是否顺畅、谁越权、最终测试结果、下次怎么改进）。没有的数据写“未知”。")
+                text = await asyncio.wait_for(self.bots.llm().complete(
+                    sys_p, f"用户交给你的验收任务：\n{task}\n\n{merge_note}\n\n你运行的命令：\n{checks or '（没有）'}\n\n群聊记录：\n{timeline}", 2500), 120)
+                text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+            except Exception as e:  # noqa: BLE001
+                log.warning("group final: %s", e)
+        if not text:
+            text = "\n\n".join(x for x in (merge_note, checks) if x) or "都做完了。"
+        elif checks:
+            text += "\n\n运行记录：\n" + checks
+        self.set_group(gid, status="idle", pending=[], queue=[])
+        self.add(gid, "aiw", "AIW 管家", text, {"report": True, "done": True})
+        await self._tell_chat(self.group(gid), B.clip(text, 400))
 
     async def _assign(self, g: dict, assign: dict, attachments: Optional[list] = None):
         pending = list(dict.fromkeys(list(g["pending"]) + list(assign)))
@@ -499,6 +720,15 @@ class Groups:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 return
+            if g.get("queue"):
+                if g["status"] == "working" and d.get("status") in ("turn_failed", "blocked", "failed", "error"):
+                    self.set_group(gid, status="idle")
+                    self.add(gid, "aiw", "AIW 管家", f"{B.ENGINES.get(bot, {}).get('title', bot)} 这一步没做成，后面的步骤先停下。"
+                             "处理好后说「@管家 继续」接着往下做。")
+                    loop.create_task(self._tell_chat(g, f"{B.ENGINES.get(bot, {}).get('title', bot)} 没做成，分工暂停了。"))
+                    return
+                self._bg(self._run_next(gid))
+                return
             has_local = any(m.get("branch") for m in g["members"])
             if g["auto_merge"] and has_local:
                 self._bg(self.merge(gid))
@@ -507,6 +737,7 @@ class Groups:
                 note = "都回复了。看一下各自的结果，需要合并就点「合并」。" if has_local else "群里的成员都回复了。"
                 self.add(gid, "aiw", "AIW 管家", note)
                 loop.create_task(self._tell_chat(g, "群里的引擎都做完了" + ("，等你看一下再合并。" if has_local else "。")))
+
 
     # ------------------------------------------------------------------ merge (AIW 管家)
     def merge_script(self, g: dict) -> str:

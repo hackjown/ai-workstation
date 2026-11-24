@@ -268,6 +268,12 @@ def test_bots_and_groups_muse_and_cue_cloud(tmp_path):
     eng_map = {e["id"]: e for e in client.get("/api/bots").json()["engines"]}
     assert eng_map["muse"]["cloud"] is True and eng_map["cue"]["cloud"] is True
 
+    # PUT / GET / DELETE /api/bots/engines/muse/auth (verify JSON body parsing, not query param)
+    r = client.put("/api/bots/engines/muse/auth", json={"cookie_header": "c_user=1; xs=abc", "verify": False})
+    assert r.status_code == 200 and r.json()["ok"] is True and r.json()["auth"]["configured"] is True
+    assert client.get("/api/bots/engines/muse/auth").json()["has_cookie"] is True
+    assert client.delete("/api/bots/engines/muse/auth").status_code == 200
+
     # Pure cloud group (muse + cue) skips git shell completely
     r = client.post("/api/bots/groups", json={"title": "云端讨论", "members": ["muse", "cue"]})
     assert r.status_code == 200 and len(shell_calls) == 0 and r.json()["repo"] == ""

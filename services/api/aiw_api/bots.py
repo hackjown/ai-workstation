@@ -1274,6 +1274,21 @@ class PatchIn(BaseModel):
     model: Optional[str] = None
     effort: Optional[str] = None
 
+class CloudAuthIn(BaseModel):
+    api_key: Optional[str] = None
+    access_token: Optional[str] = None
+    cookie_header: Optional[str] = None
+    proxy_url: Optional[str] = None
+    base_url: Optional[str] = None
+    mode: Optional[str] = None
+    agent_id: Optional[str] = None
+    experimental_native: Optional[bool] = None
+    verify: bool = False
+
+class CloudBrowserIn(BaseModel):
+    machine_id: str = ""
+    verify: bool = True
+
 
 def mount(app, bots: Bots, auth, chat=None) -> None:
     from fastapi import Depends, HTTPException
@@ -1298,21 +1313,6 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
                 row["configured"] = bool(row["auth"].get("configured"))
             engines.append(row)
         return {"engines": engines, "convs": bots.convs()}
-
-    class CloudAuthIn(BaseModel):
-        api_key: Optional[str] = None
-        access_token: Optional[str] = None
-        cookie_header: Optional[str] = None
-        proxy_url: Optional[str] = None
-        base_url: Optional[str] = None
-        mode: Optional[str] = None
-        agent_id: Optional[str] = None
-        experimental_native: Optional[bool] = None
-        verify: bool = False
-
-    class CloudBrowserIn(BaseModel):
-        machine_id: str = ""
-        verify: bool = True
 
     @app.get("/api/bots/engines/{bot}/auth", dependencies=dep)
     async def bots_auth_get(bot: str):

@@ -500,6 +500,9 @@ class Bots:
         self._watchers: dict[str, asyncio.Task] = {}
         self.listeners: list = []
         self._models: dict = {}
+        self._ready: dict = {}                            # v3.9.83: bot -> what the computer said about its CLI
+        self._ready_at = 0.0
+        self._ready_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------ computer
     async def _shell(self, mid: str, command: str, timeout: int) -> str:
@@ -794,6 +797,57 @@ class Bots:
         self.set_conv(cid, session=None, job=None, status="idle")
         self.add(cid, "system", "—— 新话题：从这里开始，之前的内容不再带给引擎 ——", {"new_topic": True})
         return self.conv(cid)
+
+    # ------------------------------------------------------------------ v3.9.83: is the engine usable?
+    READY_TTL = 600
+
+    async def refresh_ready(self) -> dict:
+        """Ask the computer (no model call) whether each local CLI is installed and has a login."""
+        mid = self.default_machine()
+        for b in ("agy", "codex", "claude", "codebuddy", "grok"):
+            try:
+                r = await self.engines[b].op(mid, "check", {})
+                self._ready[b] = {"installed": bool(r.get("installed", r.get("ok"))), "creds": r.get("creds"),
+                                  "at": time.time()}
+            except Exception as e:  # noqa: BLE001  computer off: keep what we knew, note why
+                self._ready.setdefault(b, {})["error"] = clip(str(e), 120)
+        self._ready_at = time.time()
+        return self._ready
+
+    def kick_ready(self, force: bool = False) -> None:
+        if not force and time.time() - self._ready_at < self.READY_TTL:
+            return
+        if self._ready_task and not self._ready_task.done():
+            return
+        try:
+            self._ready_at = time.time()   # don't pile up checks while one runs
+            self._ready_task = asyncio.get_running_loop().create_task(self.refresh_ready())
+        except RuntimeError:
+            pass
+
+    def _last_reply(self, bot: str) -> str:
+        rows = self.store._x("SELECT m.text FROM bot_messages m JOIN bot_convs c ON c.id=m.conv "
+                             "WHERE c.bot=? AND m.role IN ('bot','assistant') ORDER BY m.seq DESC LIMIT 1", (bot,))
+        return str(rows[0]["text"] or "") if rows else ""
+
+    def ready_state(self, bot: str, auth: Optional[dict] = None) -> tuple[str, str]:
+        """(ok | off | unknown, why). Green only when we know the engine can answer."""
+        eng = ENGINES.get(bot, {})
+        if eng.get("cloud"):
+            return ("ok", "已配置") if (auth or {}).get("configured") else ("off", "还没配置凭据")
+        last = self._last_reply(bot)
+        if "需要重新登录" in last or "认证失败" in last:
+            return "off", f"登录已失效，在电脑终端运行一次 {eng.get('login') or bot}"
+        r = self._ready.get(bot) or {}
+        if r.get("at") and not r.get("installed"):
+            return "off", "电脑上没装"
+        if r.get("creds") is False:
+            return "off", f"还没登录，在电脑终端运行一次 {eng.get('login') or bot}"
+        if r.get("creds") is True:
+            return "ok", "已登录"
+        if last and not last.startswith("（"):
+            return "ok", "用过，能回复"
+        return "unknown", "还没确认登录" if r.get("at") else "正在检查"
 
     def overview(self) -> dict:
         """What every engine is doing: for the 引擎 page's avatars and the main chat's engine_status tool."""
@@ -1462,7 +1516,9 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
         return c
 
     @app.get("/api/bots", dependencies=dep)
-    async def bots_list():
+    async def bots_list(check: int = 0):
+        if check:                                        # v3.9.83: the 引擎 page asks; 2 = check now
+            bots.kick_ready(check >= 2)
         engines, ovs = [], bots.overview()["engines"]
         for e in ENGINES.values():
             row = dict(e)
@@ -1470,6 +1526,7 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
                 row["auth"] = bots.auth_store.public_view(row["id"])
                 row["configured"] = bool(row["auth"].get("configured"))
             ov = ovs.get(row["id"], {})
+            row["ready"], row["ready_why"] = bots.ready_state(row["id"], row.get("auth"))
             d = bots.dm_conv(row["id"])
             row["cfg"] = bots.engine_cfg(row["id"])
             row["busy"] = ov.get("busy", 0)

@@ -670,7 +670,7 @@ function hSlashCheck(el) {
 /* v3.9.82 "@" engine picker: the chosen engines are tokens, sent as 「@agy …」; without one the message is for AIW itself */
 async function hEngineList() {
   if (!HK.engines) {
-    try { const r = await api("GET", "/api/bots"); HK.engines = r.engines || []; } catch (e) { HK.engines = []; }
+    try { const r = await api("GET", "/api/bots?check=1"); HK.engines = r.engines || []; } catch (e) { HK.engines = []; }
     setTimeout(() => { HK.engines = null; }, 60000);
   }
   return HK.engines;
@@ -679,7 +679,7 @@ async function hAtOpen() {
   const list = await hEngineList(), q = HK.q;
   HK.rows = list.filter((e) => !q || [e.id, e.title].some((v) => String(v || "").toLowerCase().includes(q)))
     .map((e) => ({ id: e.id, title: e.title || e.id, eng: true,
-      desc: [e.cloud ? "云端" : "本地编程", e.busy ? `${e.busy} 个在忙` : "空闲", e.cfg && e.cfg.model ? "默认 " + e.cfg.model : ""].filter(Boolean).join(" · ") }));
+      desc: [e.cloud ? "云端" : "本地编程", e.busy ? `${e.busy} 个在忙` : e.ready === "ok" ? "可用" : (e.ready_why || "还没确认"), e.cfg && e.cfg.model ? "默认 " + e.cfg.model : ""].filter(Boolean).join(" · ") }));
   HK.sel = Math.min(HK.sel, Math.max(0, HK.rows.length - 1));
   HK.open = true; hSkRender();
 }

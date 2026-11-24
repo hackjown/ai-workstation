@@ -388,6 +388,45 @@ class Turn:
 
 
 # ------------------------------------------------------------------------------------------------------- check / models
+# v3.9.83: where each CLI keeps its login (files under ~, or an API key in the environment). None = we don't know.
+CREDS = {
+    "codex": (["~/.codex/auth.json"], ["OPENAI_API_KEY", "CODEX_API_KEY"]),
+    "claude": (["~/.claude/.credentials.json"], ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]),
+    "codebuddy": (["~/.codebuddy/auth.json", "~/.codebuddy/credentials.json", "~/.codebuddy/.credentials.json"],
+                  ["CODEBUDDY_API_KEY"]),
+    "grok": (["~/.grok/auth.json", "~/.grok/credentials.json", "~/.config/grok/auth.json"], ["XAI_API_KEY", "GROK_API_KEY"]),
+}
+
+
+def has_creds(engine: str):
+    """True: a login file or key is there. False: none of the known places has one. Claude also logs in through
+    ~/.claude.json (oauthAccount)."""
+    spec = CREDS.get(engine)
+    if not spec:
+        return None
+    files, keys = spec
+    if any(os.environ.get(k) for k in keys):
+        return True
+    for f in files:
+        f = os.path.expanduser(f)
+        try:
+            if os.path.isfile(f) and os.path.getsize(f) > 2:
+                return True
+        except OSError:
+            pass
+    if engine in ("codebuddy", "grok"):   # their login file layout isn't pinned: no folder = never logged in
+        homes = {"codebuddy": ["~/.codebuddy"], "grok": ["~/.grok", "~/.config/grok"]}[engine]
+        return None if any(os.path.isdir(os.path.expanduser(h)) for h in homes) else False
+    if engine == "claude":
+        try:
+            with open(os.path.expanduser("~/.claude.json"), encoding="utf-8") as fh:
+                if '"oauthAccount"' in fh.read():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
 def op_check(engine: str, probe: bool):
     if engine not in ENGINES:
         out({"ok": False, "error": f"unknown engine {engine}"})
@@ -403,7 +442,7 @@ def op_check(engine: str, probe: bool):
     except Exception as e:  # noqa: BLE001
         ver = f"? ({type(e).__name__})"
     res = {"ok": True, "installed": True, "engine": engine, "path": b, "version": ver, "bridge": CLIV,
-           "git": bool(shutil.which("git"))}
+           "git": bool(shutil.which("git")), "creds": has_creds(engine)}
     if probe:
         d = os.path.join(ROOT, "probe")
         os.makedirs(d, exist_ok=True)

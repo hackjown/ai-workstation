@@ -263,22 +263,22 @@ struct EngineSheet: View {
     var dms: [JSON] { convs.filter { $0.s("kind") == "dm" } }
     var tasks: [JSON] { convs.filter { $0.s("kind") != "dm" } }
     var avatarBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 14) {
-                ForEach(engines.filter { $0.b("available") }.indices, id: \.self) { i in
-                    let e = engines.filter { $0.b("available") }[i]
-                    avatarCell(e)
-                }
-            }.padding(.vertical, 4)
-        }
+        // v3.9.83: two rows (4 + 3), every engine visible without scrolling
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 8) {
+            ForEach(engines.filter { $0.b("available") }.indices, id: \.self) { i in
+                let e = engines.filter { $0.b("available") }[i]
+                avatarCell(e)
+            }
+        }.padding(.vertical, 4)
     }
     func avatarCell(_ e: JSON) -> some View {
         let id = e.s("id")
         let busy = e.d("busy") > 0
-        let off = e.b("cloud") && !e.b("configured")
-        let dot: Color = busy ? amber : (off ? Color.gray : Color.green)
+        let rd = e.s("ready").isEmpty ? ((e.b("cloud") && !e.b("configured")) ? "off" : "unknown") : e.s("ready")
+        let dot: Color = busy ? amber : (rd == "ok" ? Color.green : Color.gray)   // v3.9.83: green only when it works
         return VStack(spacing: 3) {
             EngineAvatar(bot: id, size: 44)
+                .saturation(busy || rd == "ok" ? 1 : 0.4).opacity(busy || rd == "ok" ? 1 : 0.75)
                 .overlay(Circle().fill(dot).frame(width: 11, height: 11).overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2)), alignment: .bottomTrailing)
             Text(e.s("short").isEmpty ? e.s("title") : e.s("short")).font(.caption2).foregroundColor(.secondary).lineLimit(1)
         }
@@ -342,7 +342,7 @@ struct EngineSheet: View {
     }
     @MainActor func load() async {
         do {
-            let r = try await API.shared.obj("GET", "/api/bots")
+            let r = try await API.shared.obj("GET", "/api/bots?check=1")
             engines = r.a("engines"); convs = r.a("convs"); error = ""
         } catch let e { self.error = "读不到引擎对话：\(e.localizedDescription)" }
         if let r = try? await API.shared.obj("GET", "/api/bots/groups") { groups = r.a("groups") }

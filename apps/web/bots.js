@@ -4,7 +4,7 @@ const BT = { engines: [], convs: [], cid: null, conv: null, msgs: [], quote: nul
 const BT_WHO = { user: "我", aiw: "AIW 管家", system: "" };
 
 async function btLoad() {
-  try { const r = await api("GET", "/api/bots"); BT.engines = r.engines || []; BT.convs = r.convs || []; }
+  try { const r = await api("GET", "/api/bots?check=1"); BT.engines = r.engines || []; BT.convs = r.convs || []; }
   catch (e) { toast("引擎加载失败：" + e.message); return; }
   await btLoadGroups();
   btRenderList();
@@ -32,9 +32,10 @@ function btEngine(id) { return BT.engines.find((e) => e.id === id) || { title: i
 function btEngBar() {
   const on = BT.conv && BT.conv.kind === "dm" ? BT.conv.bot : "";
   return `<div class="bt-engs">` + BT.engines.filter((e) => e.available).map((e) => {
-    const st = e.busy > 0 ? "busy" : e.cloud && !e.configured ? "off" : "ok";
-    const tip = e.busy > 0 ? `正在做 ${e.busy} 件事` : st === "off" ? "还没配置凭据" : "空闲";
-    return `<div class="bt-eng ${on === e.id ? "on" : ""}">
+    const rd = e.ready || (e.cloud && !e.configured ? "off" : "unknown");   // v3.9.83: green only when we know it works
+    const st = e.busy > 0 ? "busy" : rd;
+    const tip = e.busy > 0 ? `正在做 ${e.busy} 件事` : (e.ready_why || (rd === "ok" ? "空闲" : "还没确认"));
+    return `<div class="bt-eng ${st} ${on === e.id ? "on" : ""}">
       <button class="bt-eng-av" onclick="btDm('${esc(e.id)}')" oncontextmenu="event.preventDefault();btCfg('${esc(e.id)}')" title="和 ${esc(e.title)} 单聊（${tip}）">${btAv(e.id)}<i class="bt-dot ${st}"></i></button>
       <button class="bt-eng-name" onclick="btCfg('${esc(e.id)}')" title="配置 ${esc(e.title)}">${esc(e.short || e.title)}</button></div>`;
   }).join("") + `</div>`;

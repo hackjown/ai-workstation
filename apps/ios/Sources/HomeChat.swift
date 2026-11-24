@@ -861,7 +861,7 @@ struct HomeChatView: View {
     }
     // MARK: v3.9.82 "@" engines: without one the message is for AIW itself (it can still read the engines' progress)
     func loadEngines() async {
-        if let r = try? await API.shared.obj("GET", "/api/bots"), let e = r["engines"] as? [JSON] { engines = e }
+        if let r = try? await API.shared.obj("GET", "/api/bots?check=1"), let e = r["engines"] as? [JSON] { engines = e }
     }
     func engineTitle(_ id: String) -> String {
         let e = engines.first { $0.s("id") == id }

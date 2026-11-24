@@ -439,6 +439,12 @@ class MuseControlPlane:
             "Origin": MUSE_ORIGIN,
             "Referer": MUSE_ORIGIN + "/",
             "User-Agent": MUSE_UA,
+            "Sec-Ch-Ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"macOS"',
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
             "Cookie": self.cookie_header,
         }
 
@@ -462,7 +468,12 @@ class MuseControlPlane:
                 if not isinstance(data, dict):
                     data = {}
                 if r.status_code in (401, 403):
-                    raise MuseAuthError(f"Muse 未登录或 Cookie 已过期（{path}: HTTP {r.status_code}）")
+                    detail = str(data.get("error") or data.get("message") or "").strip() or (r.text or "").strip()[:120]
+                    detail = re.sub(r"\s+", " ", detail)
+                    raise MuseAuthError(
+                        f"Muse 未登录、Cookie 已过期或请求被拒（{path}: HTTP {r.status_code}"
+                        + (f"，{detail}" if detail else "") + "）"
+                    )
                 if r.status_code in (429, 502, 503, 504) and attempt < 2:
                     last_err = RuntimeError(f"{path}: HTTP {r.status_code}")
                     continue

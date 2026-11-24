@@ -20,7 +20,7 @@ async function btLoad() {
   else btShowConv(false);
 }
 // v3.9.69: round avatar — amber ring like AIW's, the engine's real logo inside (apps/web/engines/<id>.svg)
-const BT_LOGOS = ["agy", "codex", "claude", "codebuddy", "grok"];
+const BT_LOGOS = ["agy", "codex", "claude", "codebuddy", "grok", "muse", "cue"];
 function btAv(bot, extra) {
   const id = bot || "agy", eng = btEngine(id);
   const inner = BT_LOGOS.includes(id) ? `<img src="engines/${id}.svg" alt="${esc(eng.title)}" draggable="false">` : esc((eng.short || eng.title || id).slice(0, 3));
@@ -41,19 +41,39 @@ function btRenderList() {
     + `<div class="small muted pad">${BT.engines.filter((e) => !e.available).map((e) => esc(e.title) + "：下一版接入").join(" · ")}</div>`;
   paintIcons(box);
 }
+function btIsCloud(id) { return !!(btEngine(id) || {}).cloud; }
+function btNewToggleCloud(bot) {
+  const cloud = btIsCloud(bot);
+  const mEl = $("btNewMachine"), wEl = $("btNewWorkdir"), cEl = $("btNewCloudBar");
+  if (mEl) mEl.style.display = cloud ? "none" : "";
+  if (wEl) wEl.style.display = cloud ? "none" : "";
+  if (cEl) {
+    cEl.style.display = cloud ? "" : "none";
+    if (cloud) {
+      const eng = btEngine(bot);
+      const ok = eng.configured;
+      cEl.innerHTML = `<div class="row gap" style="align-items:center;justify-content:space-between;padding:8px 10px;border-radius:8px;background:var(--bg2,rgba(127,127,127,.08))">
+        <span class="small">${esc(eng.title)}（云端）· ${ok ? "<b>已配置凭据</b>" : "<span class='muted'>未配置凭据（发消息时会自动尝试从浏览器读取）</span>"}</span>
+        <button type="button" class="btn sm" onclick="btCloudAuth('${esc(bot)}')">配置 / 从浏览器读取</button>
+      </div>`;
+    }
+  }
+}
 function btNew() {
-  const opts = BT.engines.map((e) => `<option value="${esc(e.id)}" ${e.available ? "" : "disabled"}>${esc(e.title)}${e.available ? "" : "（即将支持）"}</option>`).join("");
+  const opts = BT.engines.map((e) => `<option value="${esc(e.id)}" ${e.available ? "" : "disabled"}>${esc(e.title)}${e.cloud ? "（云端）" : ""}${e.available ? "" : "（即将支持）"}</option>`).join("");
   const first = (BT.engines.find((e) => e.available) || { id: "agy" }).id;
   modal(`<form class="callnote bt-form" onsubmit="btCreate(event)"><h3>新对话</h3>
-      <label>引擎<select name="bot" onchange="btModelsFill('', '', false, this.value)">${opts}</select></label>
+      <label>引擎<select name="bot" onchange="btNewToggleCloud(this.value);btModelsFill('', '', false, this.value)">${opts}</select></label>
+      <div id="btNewCloudBar" style="display:none"></div>
       <label>标题<input name="title" placeholder="例如 ldok 重建" /></label>
-      <label>电脑<select name="machine">${btMachineOpts()}</select><small>自动：画 CAD、渲染或剪辑视频交给云电脑，写代码和其他事留在本地电脑。选云电脑时，它上面要装好并登录引擎。</small></label>
-      <label>工作文件夹<input name="workdir" placeholder="~/workspace/ldok-rebuild" /><small>电脑上的文件夹，引擎就在这里改文件；空着就新建一个。</small></label>
+      <label id="btNewMachine">电脑<select name="machine">${btMachineOpts()}</select><small>自动：画 CAD、渲染或剪辑视频交给云电脑，写代码和其他事留在本地电脑。选云电脑时，它上面要装好并登录引擎。</small></label>
+      <label id="btNewWorkdir">工作文件夹<input name="workdir" placeholder="~/workspace/ldok-rebuild" /><small>电脑上的文件夹，引擎就在这里改文件；空着就新建一个。</small></label>
       ${btModelFields()}
       <div class="row gap"><button class="btn primary">开始</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
   if (!(S.machines || []).length) api("GET", "/api/machines").then((ms) => { S.machines = ms; const m = document.querySelector("#modal select[name=machine]"); if (m) m.innerHTML = btMachineOpts(); }).catch(() => {});
   const sel = document.querySelector("#modal select[name=bot]"); if (sel) sel.value = first;
+  btNewToggleCloud(first);
   btModelsFill("", "", false, first);
 }
 /* v3.9.73: which computer the conversation runs on; 自动 decides from the first message (CAD / video -> cloud) */
@@ -195,17 +215,18 @@ function btMsg(m) {
 }
 function btRenderConv() {
   const c = BT.conv; if (!c) return;
-  const eng = btEngine(c.bot), tk = c.takeover, live = c.busy || c.status === "running";
+  const eng = btEngine(c.bot), cloud = !!eng.cloud, tk = c.takeover, live = c.busy || c.status === "running";
   $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
     <div class="grow"><div class="heading" onclick="btRename()" title="点一下改名">${esc(c.title)}</div>
-      <div class="small muted bt-sub">${esc(eng.title)}<span class="bt-wd">${c.machine_label ? " · " + esc(c.machine_label) : ""} · ${esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</span></div></div>
+      <div class="small muted bt-sub">${esc(eng.title)}<span class="bt-wd">${c.machine_label ? " · " + esc(c.machine_label) : ""}${cloud ? "" : " · " + esc(c.workdir || "")}${c.session ? " · 会话已保存" : ""}</span></div></div>
+    ${cloud ? `<button class="btn sm" onclick="btCloudAuth('${esc(c.bot)}')" title="配置凭据或从浏览器读取">凭据</button>` : ""}
     <button class="btn sm bt-model" onclick="btModelEdit()" title="换模型和强度">${esc(btModelName(c))}</button>
     ${tk ? `<button class="btn sm" onclick="btRelease()">收回</button>` : `<button class="btn sm primary" onclick="btTake()">交给管家</button>`}
     ${live ? `<button class="btn sm" onclick="btStop()">停止</button>` : ""}
     <button class="icon" onclick="btDelete()" aria-label="删除对话" title="删除对话">${icon("x")}</button>`;
   $("btTake").innerHTML = tk ? `<div class="bt-tk"><b>AIW 管家接管中</b>（第 ${tk.rounds}/${tk.max} 轮）：${esc(tk.goal)}<br><span class="small muted">你随时可以插话，它会先发你的话再继续；点「收回」自己接手。</span></div>` : "";
   $("btMsgs").innerHTML = BT.msgs.length ? BT.msgs.map(btMsg).join("")
-    : `<div class="muted pad center">直接说要它做什么。它在电脑的 ${esc(c.workdir || "")} 里干活，改动不会自动推送。</div>`;
+    : `<div class="muted pad center">${cloud ? `直接对 ${esc(eng.title)} 说话；如尚未登录可点右上角「凭据」从浏览器读取。` : `直接说要它做什么。它在电脑的 ${esc(c.workdir || "")} 里干活，改动不会自动推送。`}</div>`;
   $("btPrompt").placeholder = matchMedia("(max-width: 760px)").matches ? "对它说，或输入 / 选技能…" : "对它说，或输入 / 选技能…（管家接管时也可以插话）";
   btQuoteRender();
   paintIcons($("btHead"));
@@ -490,18 +511,27 @@ function btGroupItems() {
       <span class="grow"><span class="t1">${esc(g.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${g.last ? esc((g.last.role === "bot" ? btEngine(g.last.who).title + "：" : "") + g.last.text) : esc(g.members.map((m) => btEngine(m.bot).title).join("、"))}</span></span></button>`;
   }).join("") + `<div class="small muted pad" style="padding-bottom:0">对话</div>`;
 }
+function btGroupToggleGit() {
+  const form = document.querySelector("#modal form"); if (!form) return;
+  const picked = [...form.querySelectorAll("input[name=m]:checked")].map((x) => x.value);
+  const hasLocal = picked.some((id) => !btIsCloud(id));
+  const gitBox = $("btGrpGit"); if (gitBox) gitBox.style.display = hasLocal ? "" : "none";
+}
 function btGroupNew() {
-  const boxes = BT.engines.filter((e) => e.available).map((e) => `<label class="bt-chk"><input type="checkbox" name="m" value="${esc(e.id)}" ${["codex", "claude"].includes(e.id) ? "checked" : ""}/>${esc(e.title)}</label>`).join("");
+  const boxes = BT.engines.filter((e) => e.available).map((e) => `<label class="bt-chk"><input type="checkbox" name="m" value="${esc(e.id)}" onchange="btGroupToggleGit()" ${["codex", "claude"].includes(e.id) ? "checked" : ""}/>${esc(e.title)}${e.cloud ? "（云端）" : ""}</label>`).join("");
   modal(`<form class="callnote bt-form" onsubmit="btGroupCreate(event)"><h3>新群聊</h3>
-      <div class="muted">选几个引擎，各在自己的分支和工作树里并行干，做完由 AIW 管家合并到一个新分支。不推送，也不动你的基线分支。</div>
+      <div class="muted">本地代码引擎各开独立分支并行开发，云端引擎（Meta Muse / Cue）参与调研、方案与评审；也可以组建纯云端讨论群。</div>
       <div class="bt-fl">成员<div class="bt-chks">${boxes}</div></div>
       <label>标题<input name="title" placeholder="例如 登录页改版" /></label>
-      <label>git 仓库<input name="repo" placeholder="~/workspace/ldok" /><small>电脑上的仓库；空着就新建一个。</small></label>
-      <label>基线分支<input name="base" placeholder="main" /><small>空着用仓库当前分支。</small></label>
-      <label class="bt-chk"><input type="checkbox" name="auto" checked />都做完后管家自动合并</label>
+      <div id="btGrpGit">
+        <label>git 仓库<input name="repo" placeholder="~/workspace/ldok" /><small>电脑上的仓库；空着就新建一个。</small></label>
+        <label>基线分支<input name="base" placeholder="main" /><small>空着用仓库当前分支。</small></label>
+        <label class="bt-chk"><input type="checkbox" name="auto" checked />本地代码成员都做完后管家自动合并</label>
+      </div>
       <label>要做什么<textarea name="goal" rows="3" placeholder="例如：做一个登录页，后端加接口，前端做页面，跑通测试"></textarea><small>可以先空着，进群再说。</small></label>
       <div class="row gap"><button class="btn primary">建群</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
+  btGroupToggleGit();
 }
 async function btGroupCreate(ev) {
   ev.preventDefault();
@@ -536,18 +566,23 @@ async function btGroupRefresh(scroll) {
 function btGroupRender() {
   const g = BT.group; if (!g) return;
   const st = BT_GST[g.status] || "", live = g.busy || g.status !== "idle";
-  const chips = g.members.map((m) => `<button class="link small" onclick="btOpen('${m.conv}')" title="打开 ${esc(btEngine(m.bot).title)} 的对话（分支 ${esc(m.branch)}）">${btAv(m.bot, "sm")}${m.busy ? "…" : ""}</button>`).join(" ");
+  const hasLocal = (g.members || []).some((m) => !!m.branch);
+  const existingIds = new Set((g.members || []).map((m) => m.bot));
+  const canAdd = BT.engines.some((e) => e.available && !existingIds.has(e.id));
+  const chips = g.members.map((m) => `<button class="link small" onclick="btOpen('${m.conv}')" title="打开 ${esc(btEngine(m.bot).title)} 的对话${m.branch ? `（分支 ${esc(m.branch)}）` : "（云端）"}">${btAv(m.bot, "sm")}${m.busy ? "…" : ""}</button>`).join(" ");
+  const sub = g.repo ? `${esc(g.repo)} · 基线 ${esc(g.base)}` : "云端协作群";
   $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
     <div class="grow"><div class="heading">${esc(g.title)}</div>
-      <div class="small muted">${esc(g.repo)} · 基线 ${esc(g.base)}${st ? " · <b>" + st + "</b>" : ""}</div></div>
+      <div class="small muted">${sub}${st ? " · <b>" + st + "</b>" : ""}</div></div>
     <span class="row gap">${chips}</span>
-    <button class="btn sm primary" onclick="btGroupMerge()" ${g.status === "merging" ? "disabled" : ""} title="提交各分支的改动，合并到 aiw/${esc(g.id)}/merge">合并</button>
+    ${canAdd ? `<button class="btn sm" onclick="btGroupAddMembers()" title="添加其他引擎（如 Muse / Cue）加入群聊">+ 成员</button>` : ""}
+    ${hasLocal ? `<button class="btn sm primary" onclick="btGroupMerge()" ${g.status === "merging" ? "disabled" : ""} title="提交各分支的改动，合并到 aiw/${esc(g.id)}/merge">合并</button>` : ""}
     ${live ? `<button class="btn sm" onclick="btGroupStop()">停止</button>` : ""}
     <button class="icon" onclick="btGroupDelete()" aria-label="删除群聊" title="删除群聊">${icon("x")}</button>`;
-  $("btTake").innerHTML = (g.pending || []).length ? `<div class="bt-tk"><b>${st || "在干活"}</b>：等 ${esc(g.pending.map((b) => btEngine(b).title).join("、"))} 回复${g.auto_merge ? "，都回复后管家自动合并" : ""}</div>` : "";
+  $("btTake").innerHTML = (g.pending || []).length ? `<div class="bt-tk"><b>${st || "在干活"}</b>：等 ${esc(g.pending.map((b) => btEngine(b).title).join("、"))} 回复${g.auto_merge && hasLocal ? "，都回复后管家自动合并" : ""}</div>` : "";
   $("btMsgs").innerHTML = BT.gmsgs.length ? BT.gmsgs.map(btGMsg).join("")
-    : `<div class="muted pad center">说要做什么：不 @ 就由 AIW 管家分工；@codex 只发给它。每个引擎在自己的分支上改，做完管家合并。</div>`;
-  $("btPrompt").placeholder = "说要做什么，@codex @claude @grok @cbc @agy 指定谁做，@管家 分工…";
+    : `<div class="muted pad center">说要做什么：不 @ 就由 AIW 管家分工；@muse @cue @codex 只发给指定成员。</div>`;
+  $("btPrompt").placeholder = "说要做什么，@muse @cue @codex @claude @grok @cbc @agy 指定谁做，@管家 分工…";
   btQuoteRender();
   paintIcons($("btHead"));
 }
@@ -573,4 +608,97 @@ async function btGroupStop() { try { await api("POST", `/api/bots/groups/${BT.gi
 async function btGroupDelete() {
   if (!confirm("删除这个群聊和成员的对话？（电脑上的仓库、分支和工作树不会删）")) return;
   try { await api("DELETE", `/api/bots/groups/${BT.gid}`); BT.groups = BT.groups.filter((g) => g.id !== BT.gid); btBack(); } catch (e) { toast(e.message); }
+}
+function btGroupAddMembers() {
+  const g = BT.group; if (!g) return;
+  const existing = new Set((g.members || []).map((m) => m.bot));
+  const avail = BT.engines.filter((e) => e.available && !existing.has(e.id));
+  if (!avail.length) { toast("所有引擎都已在群里"); return; }
+  const boxes = avail.map((e) => `<label class="bt-chk"><input type="checkbox" name="m" value="${esc(e.id)}" ${e.cloud ? "checked" : ""}/>${esc(e.title)}${e.cloud ? "（云端）" : ""}</label>`).join("");
+  modal(`<form class="callnote bt-form" onsubmit="btGroupAddSubmit(event)"><h3>添加成员到「${esc(g.title)}」</h3>
+      <div class="muted">云端引擎（Meta Muse / Cue）会直接加入讨论；本地代码引擎会自动补建独立工作树。</div>
+      <div class="bt-fl">选择引擎<div class="bt-chks">${boxes}</div></div>
+      <div class="row gap"><button class="btn primary">添加</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
+    </form>`);
+}
+async function btGroupAddSubmit(ev) {
+  ev.preventDefault();
+  const f = ev.target, members = [...f.querySelectorAll("input[name=m]:checked")].map((x) => x.value);
+  if (!members.length) { toast("至少选一个引擎"); return; }
+  const btn = f.querySelector(".btn.primary"); btn.disabled = true; btn.textContent = "正在添加…";
+  try {
+    await api("POST", `/api/bots/groups/${BT.gid}/members`, { members });
+    closeOverlays(); toast("已添加到群聊"); await btGroupRefresh(true);
+  } catch (e) { toast("添加失败：" + e.message); btn.disabled = false; btn.textContent = "添加"; }
+}
+async function btCloudAuth(bot) {
+  const eng = btEngine(bot);
+  let info = {};
+  try { info = await api("GET", `/api/bots/engines/${bot}/auth`); } catch (e) { toast("读取凭据状态失败：" + e.message); return; }
+  const isCue = bot === "cue";
+  const statusLine = info.configured
+    ? `<b>已配置</b>${info.handle ? " · " + esc(info.handle) : info.viewer_id ? " · " + esc(info.viewer_id) : ""}${info.source ? " · 来源：" + esc(info.source) : ""}`
+    : `<span class="muted">尚未配置</span>`;
+  modal(`<form class="callnote bt-form" onsubmit="btCloudAuthSave(event, '${esc(bot)}')">
+      <h3>${esc(eng.title)} 凭据设置</h3>
+      <div class="small" id="btAuthStatus">状态：${statusLine}</div>
+      <div class="row gap" style="margin:6px 0">
+        <button type="button" class="btn sm primary" onclick="btCloudAuthBrowser('${esc(bot)}')">从本机浏览器读取</button>
+        <button type="button" class="btn sm" onclick="btCloudAuthTest('${esc(bot)}')">测试连接</button>
+        ${info.configured ? `<button type="button" class="btn sm" onclick="btCloudAuthClear('${esc(bot)}')">清除凭据</button>` : ""}
+      </div>
+      <small class="muted">先在 Chrome / Arc / Edge / BrowserOS 登录 ${isCue ? "cue.im" : "muse.ai"}，再点「从本机浏览器读取」即可自动导入登录态。</small>
+      ${isCue ? `
+        <label>Manus API Key（OpenAPI 模式，可选）<input name="api_key" type="password" placeholder="${info.has_api_key ? esc(info.api_key_preview) + "（留空保持不变）" : "粘贴 Manus API Key"}" /></label>
+        <label>连接模式<select name="mode">
+          <option value="auto" ${(info.mode || "auto") === "auto" ? "selected" : ""}>自动（有 API Key 优先 OpenAPI，否则用浏览器登录态）</option>
+          <option value="openapi" ${info.mode === "openapi" ? "selected" : ""}>OpenAPI（api.manus.ai/v2）</option>
+          <option value="native" ${info.mode === "native" ? "selected" : ""}>原生实时通道（api.manus.im + Socket.IO）</option>
+        </select></label>
+        <label>Cookie / Token（手动导入，可选）<textarea name="cookie_header" rows="2" placeholder="${info.has_cookie ? "已保存（留空保持不变）" : "cue_session_id=..."}"></textarea></label>
+      ` : `
+        <label>Muse Cookie（手动导入，可选）<textarea name="cookie_header" rows="3" placeholder="${info.has_cookie ? esc(info.cookie_preview) + "（留空保持不变）" : "从 muse.ai 请求头复制 Cookie"}"></textarea></label>
+      `}
+      <label>代理地址（可选）<input name="proxy_url" value="${esc(info.proxy_url || "")}" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></label>
+      <div class="row gap"><button class="btn primary">保存并测试</button><button type="button" class="btn" onclick="closeOverlays()">关闭</button></div>
+    </form>`);
+}
+async function btCloudAuthBrowser(bot) {
+  const st = $("btAuthStatus"); if (st) st.innerHTML = "正在从本机/连接电脑的浏览器读取登录态…";
+  try {
+    const r = await api("POST", `/api/bots/engines/${bot}/auth/browser`, { verify: true });
+    const v = r.verify || {};
+    toast(v.ok ? `已从浏览器读取并验证通过（${r.source}）` : `已读取 ${r.cookie_count || 0} 条 Cookie（${r.source}），验证提示：${v.error || "待确认"}`);
+    await btLoad();
+    btCloudAuth(bot);
+  } catch (e) {
+    toast(e.message);
+    if (st) st.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+  }
+}
+async function btCloudAuthSave(ev, bot) {
+  ev.preventDefault();
+  const f = ev.target;
+  const body = { proxy_url: f.proxy_url ? f.proxy_url.value.trim() : "", verify: true };
+  if (f.api_key && f.api_key.value.trim()) body.api_key = f.api_key.value.trim();
+  if (f.cookie_header && f.cookie_header.value.trim()) body.cookie_header = f.cookie_header.value.trim();
+  if (f.mode) body.mode = f.mode.value;
+  try {
+    const r = await api("PUT", `/api/bots/engines/${bot}/auth`, body);
+    const v = r.verify || {};
+    toast(v.ok ? "凭据已保存并验证通过" : ("已保存，但验证未通过：" + (v.error || "请检查凭据或代理")));
+    await btLoad();
+    closeOverlays();
+  } catch (e) { toast("保存失败：" + e.message); }
+}
+async function btCloudAuthTest(bot) {
+  try {
+    const r = await api("POST", `/api/bots/engines/${bot}/auth/test`);
+    toast(r.ok ? "连接验证通过" : ("验证失败：" + (r.error || "未知错误")));
+  } catch (e) { toast("测试失败：" + e.message); }
+}
+async function btCloudAuthClear(bot) {
+  if (!confirm("清除已保存的凭据？")) return;
+  try { await api("DELETE", `/api/bots/engines/${bot}/auth`); toast("已清除"); await btLoad(); closeOverlays(); }
+  catch (e) { toast(e.message); }
 }

@@ -16,6 +16,8 @@ func engineColor(_ bot: String, _ cs: ColorScheme) -> Color {
     case "claude": return Color(red: 0xd9 / 255, green: 0x77 / 255, blue: 0x57 / 255)  // #d97757
     case "codebuddy": return Color(red: 0x2b / 255, green: 0x6c / 255, blue: 0xff / 255) // #2b6cff
     case "grok": return cs == .dark ? Color(white: 0xe9 / 255) : Color(white: 0x11 / 255)
+    case "muse": return Color(red: 0x6a / 255, green: 0x5c / 255, blue: 0xff / 255)      // #6a5cff
+    case "cue": return Color(red: 0x10 / 255, green: 0xb9 / 255, blue: 0x81 / 255)       // #10b981
     default: return .secondary
     }
 }
@@ -1108,7 +1110,7 @@ struct EngineGroupView: View {
 
     var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextField("说要做什么，@codex @claude @grok @cbc @agy 指定谁做…", text: $text, axis: .vertical)
+            TextField("说要做什么，@muse @cue @codex @claude @grok @cbc @agy 指定谁做…", text: $text, axis: .vertical)
                 .lineLimit(1...5).padding(.horizontal, 12).padding(.vertical, 8)
                 .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemBackground)))
             Button { Task { await send() } } label: {

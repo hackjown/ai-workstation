@@ -41,7 +41,16 @@ ENGINES = {
                   "desc": "腾讯 CodeBuddy Code，WorkBuddy 的命令行版，同一个账号", "login": "codebuddy"},
     "grok": {"id": "grok", "title": "Grok Build", "short": "grok", "available": True,
              "desc": "xAI Grok Build（grok -p）", "login": "grok login --device-auth"},
+    # Cloud engines (run directly on aiw-api, no local VM CLI or git worktree required)
+    "muse": {"id": "muse", "title": "Meta Muse", "short": "muse", "available": True, "cloud": True,
+             "desc": "Meta Muse 云端 Agent（原生 Noise 网关，支持从浏览器读取登录态）", "login": "muse.ai"},
+    "cue": {"id": "cue", "title": "Cue", "short": "cue", "available": True, "cloud": True,
+            "desc": "Cue by Manus 云端 Agent（支持 Manus API Key 或从浏览器读取登录态）", "login": "cue.im"},
 }
+
+
+def is_cloud_engine(bot: str) -> bool:
+    return bool(ENGINES.get(bot, {}).get("cloud"))
 LIVE = ("running", "starting")
 TURN_DONE = ("turn_done", "turn_failed", "blocked")
 MAX_ROUNDS = 8
@@ -190,8 +199,11 @@ def turn_text(r: dict, bot: str = "agy") -> str:
     if t:
         return t
     if r.get("auth_error"):
-        login = ENGINES.get(bot, {}).get("login") or bot
-        return f"（{ENGINES.get(bot, {}).get('title', bot)} 需要重新登录：在电脑终端运行一次 {login} 完成登录）"
+        eng = ENGINES.get(bot, {})
+        if eng.get("cloud"):
+            return f"（{eng.get('title', bot)} 认证失败或登录态已过期：请在引擎设置里重新「从浏览器读取」或更新凭据）"
+        login = eng.get("login") or bot
+        return f"（{eng.get('title', bot)} 需要重新登录：在电脑终端运行一次 {login} 完成登录）"
     if r.get("error"):
         return f"（这一轮没完成：{clip(r['error'], 300)}）"
     said = [s for s in r.get("said") or [] if s]
@@ -428,9 +440,12 @@ class CliEngine:
 AUTO_MACHINE = "auto"   # v3.9.73: pick the computer from the first message (CAD / video -> cloud)
 
 
+CLOUD_MACHINE = "cloud"
+
+
 class Bots:
     def __init__(self, store, sessions=None, notifier=None, llm: Optional[Callable[[], Any]] = None,
-                 default_machine: Optional[Callable[[], str]] = None, shell=None):
+                 default_machine: Optional[Callable[[], str]] = None, shell=None, secrets=None):
         self.store, self.sessions, self.notifier = store, sessions, notifier
         self.llm = llm                                   # () -> router with .complete(system, user, max_tokens)
         self.chat = None                                 # v3.9.68: the AIW chat (set by mount) for permission cards
@@ -439,8 +454,16 @@ class Bots:
         sh = shell or self._shell
         self.sh = sh                                     # v3.9.61: groups run git on the computer with it
         shared: set = set()
-        self.engines = {"agy": AgyEngine(sh), **{e: CliEngine(e, sh, shared)
-                                                 for e in ("codex", "claude", "codebuddy", "grok")}}
+        from .cloud_auth import CloudAuthStore
+        from .cue_engine import CueEngine
+        from .muse_engine import MuseEngine
+        self.auth_store = CloudAuthStore(store, secrets)
+        self.engines = {
+            "agy": AgyEngine(sh),
+            **{e: CliEngine(e, sh, shared) for e in ("codex", "claude", "codebuddy", "grok")},
+            "cue": CueEngine(self.auth_store, shell=sh, default_machine=self.default_machine),
+            "muse": MuseEngine(self.auth_store, shell=sh, default_machine=self.default_machine),
+        }
         self.queues: dict[str, list] = {}
         self.runners: dict[str, asyncio.Task] = {}
         self.listeners: list = []
@@ -518,6 +541,8 @@ class Bots:
 
     # ------------------------------------------------------------------ v3.9.73: which computer
     def machine_label(self, mid: Optional[str]) -> str:
+        if mid == CLOUD_MACHINE:
+            return "云端"
         if not mid or mid == AUTO_MACHINE:
             return "自动选电脑" if mid == AUTO_MACHINE else ""
         try:
@@ -574,13 +599,17 @@ class Bots:
             raise ValueError(f"没有这个引擎：{bot}")
         if not eng["available"]:
             raise ValueError(f"{eng['title']} 还没接入")
-        machine_id = (machine_id or "").strip()
-        if machine_id and machine_id != AUTO_MACHINE and hasattr(self.store, "machine") and not self.store.machine(machine_id):
+        cloud_bot = bool(eng.get("cloud"))
+        machine_id = CLOUD_MACHINE if cloud_bot else (machine_id or "").strip()
+        if machine_id and machine_id not in (AUTO_MACHINE, CLOUD_MACHINE) and hasattr(self.store, "machine") and not self.store.machine(machine_id):
             raise ValueError(f"没有这台电脑：{machine_id}")
         cid = f"bc-{uuid.uuid4().hex[:10]}"
-        wd = (workdir or "").strip() or f"~/workspace/{bot}-chat/{cid}"
-        if not re.fullmatch(r"[~\w./ \-\u4e00-\u9fff]{1,200}", wd) or ".." in wd.split("/"):
-            raise ValueError("工作文件夹路径不合法")
+        if cloud_bot:
+            wd = ""
+        else:
+            wd = (workdir or "").strip() or f"~/workspace/{bot}-chat/{cid}"
+            if not re.fullmatch(r"[~\w./ \-\u4e00-\u9fff]{1,200}", wd) or ".." in wd.split("/"):
+                raise ValueError("工作文件夹路径不合法")
         now = _now()
         self.store._x("INSERT INTO bot_convs (id, bot, title, machine_id, workdir, job, session, status, takeover, "
                       "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -692,6 +721,9 @@ class Bots:
     async def push_files(self, cid: str, attachments: list, allowed: Optional[Callable[[str], Optional[str]]] = None) -> list:
         """v3.9.58: chat uploads live on the API host (local_only); copy each onto the conversation's computer."""
         c = self.conv(cid) or {}
+        if is_cloud_engine(c.get("bot") or ""):
+            return [{k: v for k, v in a.items() if k not in ("up", "pct", "uid")}
+                    for a in (attachments or []) if isinstance(a, dict)][:10]
         rel, shown = vm_rel_dir(c.get("workdir") or "")
         out = []
         for a in [x for x in attachments or [] if isinstance(x, dict)][:10]:
@@ -780,18 +812,20 @@ class Bots:
     async def _turn(self, cid: str, prompt: str, skip: bool = False, fresh: bool = False) -> dict:
         c = self.conv(cid)
         eng = self.engines[c["bot"]]
-        mid = self.resolve_machine(cid, prompt) if c["machine_id"] == AUTO_MACHINE else c["machine_id"]
+        cloud_bot = is_cloud_engine(c["bot"])
+        mid = CLOUD_MACHINE if cloud_bot else (self.resolve_machine(cid, prompt) if c["machine_id"] == AUTO_MACHINE else c["machine_id"])
         self.set_conv(cid, status="running")
         reply = self.add(cid, "bot", "", {"status": "running", "steps": [], "started": _now(),
                                           **({"unrestricted": True} if skip else {})})
         r: dict = {}
-        try:
-            await self.wake(mid)                          # v3.9.73: a cloud computer may be asleep
-        except Exception as e:  # noqa: BLE001
-            msg = f"{self.machine_label(mid) or mid} 没能唤醒：{clip(e, 200)}"
-            self.update(reply["id"], msg, {"status": "error"})
-            self.set_conv(cid, status="idle")
-            return {"status": "error", "error": msg}
+        if not cloud_bot:
+            try:
+                await self.wake(mid)                          # v3.9.73: a cloud computer may be asleep
+            except Exception as e:  # noqa: BLE001
+                msg = f"{self.machine_label(mid) or mid} 没能唤醒：{clip(e, 200)}"
+                self.update(reply["id"], msg, {"status": "error"})
+                self.set_conv(cid, status="idle")
+                return {"status": "error", "error": msg}
         job = c.get("job")
         if job and (skip or fresh):                       # v3.9.67: a new rule or no rules: restart, resuming the session
             try:
@@ -1234,7 +1268,88 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
 
     @app.get("/api/bots", dependencies=dep)
     async def bots_list():
-        return {"engines": list(ENGINES.values()), "convs": bots.convs()}
+        engines = []
+        for e in ENGINES.values():
+            row = dict(e)
+            if row.get("cloud"):
+                row["auth"] = bots.auth_store.public_view(row["id"])
+                row["configured"] = bool(row["auth"].get("configured"))
+            engines.append(row)
+        return {"engines": engines, "convs": bots.convs()}
+
+    class CloudAuthIn(BaseModel):
+        api_key: Optional[str] = None
+        access_token: Optional[str] = None
+        cookie_header: Optional[str] = None
+        proxy_url: Optional[str] = None
+        base_url: Optional[str] = None
+        mode: Optional[str] = None
+        agent_id: Optional[str] = None
+        verify: bool = False
+
+    class CloudBrowserIn(BaseModel):
+        machine_id: str = ""
+        verify: bool = True
+
+    @app.get("/api/bots/engines/{bot}/auth", dependencies=dep)
+    async def bots_auth_get(bot: str):
+        if not is_cloud_engine(bot):
+            raise HTTPException(400, "只有云端引擎（muse / cue）需要凭据设置")
+        return bots.auth_store.public_view(bot)
+
+    @app.put("/api/bots/engines/{bot}/auth", dependencies=dep)
+    async def bots_auth_put(bot: str, body: CloudAuthIn):
+        if not is_cloud_engine(bot):
+            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据设置")
+        patch = {k: v for k, v in body.model_dump().items() if k != "verify" and v is not None}
+        if patch:
+            patch["source"] = "manual"
+            bots.auth_store.save(bot, patch)
+        out = {"ok": True, "auth": bots.auth_store.public_view(bot)}
+        if body.verify:
+            eng = bots.engines.get(bot)
+            if eng and hasattr(eng, "verify"):
+                out["verify"] = await eng.verify()
+        return out
+
+    @app.delete("/api/bots/engines/{bot}/auth", dependencies=dep)
+    async def bots_auth_del(bot: str):
+        if not is_cloud_engine(bot):
+            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据设置")
+        bots.auth_store.clear(bot)
+        return {"ok": True, "auth": bots.auth_store.public_view(bot)}
+
+    @app.post("/api/bots/engines/{bot}/auth/browser", dependencies=dep)
+    async def bots_auth_browser(bot: str, body: Optional[CloudBrowserIn] = None):
+        if not is_cloud_engine(bot):
+            raise HTTPException(400, "只有云端引擎（muse / cue）支持从浏览器读取")
+        from .browser_cookies import read_browser_cookies
+        mid = (body.machine_id if body else "") or bots.default_machine()
+        res = await read_browser_cookies(bot, shell=bots.sh, machine_id=mid)
+        if not res.get("ok") or not res.get("creds"):
+            site = "muse.ai" if bot == "muse" else "cue.im"
+            raise HTTPException(404, f"未在本机或连接电脑的浏览器里找到 {site} 的登录 Cookie；请先在 Chrome / Arc / Edge / BrowserOS 里登录 {site} 后重试。")
+        patch = {**res["creds"], "source": res.get("source") or "browser"}
+        if bot == "cue" and not bots.auth_store.load("cue").get("api_key"):
+            patch["mode"] = "native"
+        bots.auth_store.save(bot, patch)
+        out: dict = {"ok": True, "source": res.get("source") or "browser",
+                     "cookie_count": res["creds"].get("cookie_count", 0),
+                     "auth": bots.auth_store.public_view(bot)}
+        if body is None or body.verify:
+            eng = bots.engines.get(bot)
+            if eng and hasattr(eng, "verify"):
+                out["verify"] = await eng.verify()
+        return out
+
+    @app.post("/api/bots/engines/{bot}/auth/test", dependencies=dep)
+    async def bots_auth_test(bot: str):
+        if not is_cloud_engine(bot):
+            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据测试")
+        eng = bots.engines.get(bot)
+        if not eng or not hasattr(eng, "verify"):
+            raise HTTPException(404, "不支持验证")
+        return await eng.verify()
 
     @app.post("/api/bots/convs", dependencies=dep)
     async def bots_create(body: ConvIn):
@@ -1289,9 +1404,10 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
         bots.resolve_machine(cid, body.text or "")          # v3.9.73: 自动 settles before files are copied over
         if att:
             att = await bots.push_files(cid, att, getattr(chat, "_allowed", None))
-            bad = [a.get("name") or "" for a in att if not a.get("vm_path")]
-            if bad and len(bad) == len(att) and not (body.text or "").strip():
-                raise HTTPException(502, "附件没能放到电脑上：" + "、".join(bad))
+            if not is_cloud_engine((bots.conv(cid) or {}).get("bot") or ""):
+                bad = [a.get("name") or "" for a in att if not a.get("vm_path")]
+                if bad and len(bad) == len(att) and not (body.text or "").strip():
+                    raise HTTPException(502, "附件没能放到电脑上：" + "、".join(bad))
         try:
             return bots.send(cid, body.text, "user", q, att, body.skills or [])
         except ValueError as e:

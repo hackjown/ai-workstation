@@ -334,7 +334,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     _chat.mount(app, chat, auth)
     from . import bots as _bots   # v3.9.57 引擎对话: agy (then Codex) sessions the user or AIW 管家 talks to
     app.state.bots = _bots.Bots(store, sessions, notifier, llm=lambda: chat.llm("chat"),
-                                default_machine=lambda: settings.machines[0].id if settings.machines else "ai-linux-001")
+                                default_machine=lambda: settings.machines[0].id if settings.machines else "ai-linux-001",
+                                secrets=secrets)
     _bots.mount(app, app.state.bots, auth, chat)
     from . import bot_groups as _groups   # v3.9.61 引擎群聊 (worktree per engine, 管家 merges) + 派活 from the chat
     app.state.bot_groups = _groups.Groups(app.state.bots, chat)

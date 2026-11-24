@@ -168,7 +168,7 @@ def test_endpoints_and_main_chat_quote(tmp_path):
     with TestClient(app) as cl:
         h = {"Authorization": "Bearer t"}
         r = cl.get("/api/bots", headers=h).json()
-        assert {e["id"] for e in r["engines"]} == {"agy", "codex", "claude", "codebuddy", "grok"} and r["convs"] == []
+        assert {e["id"] for e in r["engines"]} == {"agy", "codex", "claude", "codebuddy", "grok", "muse", "cue"} and r["convs"] == []
         c = cl.post("/api/bots/convs", json={"bot": "agy", "title": "t", "workdir": "~/workspace/x"}, headers=h).json()
         assert c["workdir"] == "~/workspace/x" and c["status"] == "idle"
         assert cl.post("/api/bots/convs", json={"bot": "nosuch"}, headers=h).status_code == 400

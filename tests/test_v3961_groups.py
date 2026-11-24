@@ -174,7 +174,7 @@ def test_parse_dispatch():
     assert G.parse_dispatch("用claude的api写个脚本") is None
     assert G.parse_dispatch("codex 是什么") is None
     assert G.parse_dispatch("让我想想") is None
-    assert G.parse_dispatch("让所有引擎一起重构") ["bots"] == ["agy", "codex", "claude", "codebuddy", "grok"]
+    assert G.parse_dispatch("让所有引擎一起重构")["bots"] == ["agy", "codex", "claude", "codebuddy", "grok", "muse", "cue"]
 
 
 def test_mentions():

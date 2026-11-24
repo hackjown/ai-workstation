@@ -1064,7 +1064,7 @@ class Chat:
         if disp is not None:   # v3.9.61: hand coding work to an engine on the computer (agy, Codex, Claude Code, …)
             async def _engine_task(a, _d=disp):
                 bots = [str(x).lower() for x in (a.get("engines") or []) if str(x).lower() in
-                        ("agy", "codex", "claude", "codebuddy", "grok")]
+                        ("agy", "codex", "claude", "codebuddy", "grok", "muse", "cue")]
                 task = str(a.get("task") or "").strip()
                 conv = str(a.get("conv") or "").strip()
                 if conv:   # v3.9.64: carry on in a conversation engine_convs found
@@ -1099,23 +1099,23 @@ class Chat:
                 if not rows:
                     return "引擎里没有找到相关的对话"
                 return json.dumps(rows, ensure_ascii=False)
-            out["engine_convs"] = ({"name": "engine_convs", "description": "查电脑上编程引擎（agy、codex、claude、codebuddy、grok）"
+            out["engine_convs"] = ({"name": "engine_convs", "description": "查编程引擎和云端引擎（agy、codex、claude、codebuddy、grok、muse、cue）"
                                     "的对话记录：给 query 按标题、文件夹和内容搜，返回对话列表（id、引擎、标题、匹配片段、最后一条）；"
                                     "给 conv 读这个对话最近几轮。用户提到引擎里已有的对话或任务（如「agy 的 ldok 后端对接」）时先用它找，"
                                     "再用 engine_task 带 conv 在那个对话里接着做",
                                     "parameters": {"type": "object", "properties": {
                                         "query": {"type": "string", "description": "关键词，空格分开，都要匹配"},
-                                        "engine": {"type": "string", "description": "只看某个引擎：agy / codex / claude / codebuddy / grok"},
+                                        "engine": {"type": "string", "description": "只看某个引擎：agy / codex / claude / codebuddy / grok / muse / cue"},
                                         "conv": {"type": "string", "description": "对话 id（bc-…），读它最近几轮"},
                                         "turns": {"type": "integer", "description": "读几条，默认 8"},
                                         "limit": {"type": "integer", "description": "最多几个对话，默认 8"}}}}, _engine_convs)
-            out["engine_task"] = ({"name": "engine_task", "description": "把编程/改代码的活交给电脑上的编程引擎去做"
-                                   "（agy=Antigravity、codex、claude=Claude Code、codebuddy、grok）。用户点名要某个引擎做事时用；"
-                                   "点名多个引擎就建群聊，各开分支并行干，管家合并。要接着引擎里已有的对话做，先用 engine_convs 找到它，"
+            out["engine_task"] = ({"name": "engine_task", "description": "把任务交给引擎去做"
+                                   "（agy=Antigravity、codex、claude=Claude Code、codebuddy、grok、muse=Meta Muse、cue=Cue by Manus）。用户点名要某个引擎做事时用；"
+                                   "点名多个引擎就建群聊并行协作，本地代码引擎各开分支、云端成员参与讨论。要接着引擎里已有的对话做，先用 engine_convs 找到它，"
                                    "再把它的 id 填进 conv（不用填 engines）。结果稍后自动回到聊天里",
                                    "parameters": {"type": "object", "properties": {
                                        "engines": {"type": "array", "items": {"type": "string"},
-                                                   "description": "agy / codex / claude / codebuddy / grok，一个或多个"},
+                                                   "description": "agy / codex / claude / codebuddy / grok / muse / cue，一个或多个"},
                                        "task": {"type": "string", "description": "交给它的任务，原话加上必要的上下文"},
                                        "workdir": {"type": "string", "description": "电脑上的项目文件夹（~/… 或 /home/…），不知道就留空"},
                                        "conv": {"type": "string", "description": "已有的引擎对话 id（engine_convs 找到的），在它里面接着做"},

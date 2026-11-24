@@ -40,17 +40,20 @@ ALIASES = [   # (engine, names the user types), longest first inside each
     ("claude", ("claude code", "claudecode", "claude", "clade", "克劳德")),
     ("codebuddy", ("codebuddy", "workbuddy", "cbc")),
     ("grok", ("grok build", "grok")),
+    ("muse", ("meta muse", "muse")),
+    ("cue", ("cue by manus", "manus cue", "cue")),
 ]
 ALL_WORDS = ("所有引擎", "全部引擎", "各个引擎", "所有 agent", "全部 agent", "大家")
 MANAGER_WORDS = ("管家", "aiw")
 
-PLAN = """你是 AIW 管家，带一组编程 Agent 在同一个 git 仓库里并行开发：每个 Agent 在自己的分支和工作文件夹里干活，最后由你合并。
+PLAN = """你是 AIW 管家，带一组 Agent 在群里协同工作：本地编程 Agent 各自在独立的 git 分支和工作文件夹里写代码，云端 Agent（如 Meta Muse、Cue）负责调研、方案、评审或回答问题，不操作本地 git 仓库。
 成员：{members}
 根据用户的话分工。只输出一个 JSON 对象，不要别的文字：
 {{"assign": {{"成员id": "发给它的具体任务", ...}}, "report": "一句话告诉用户怎么分的工"}}
 规则：
 - 成员id 只能用上面列出的（{ids}）；用不上的成员不要分。
-- 每个任务能独立完成，尽量改不同的文件，减少合并冲突；写清要改什么、怎么验证（跑什么测试或命令）。
+- 给本地编程成员的任务要能独立完成，尽量改不同的文件，减少合并冲突；写清要改什么、怎么验证（跑什么测试或命令）。
+- 给云端成员（标有“云端”）的任务聚焦调研、方案设计、代码/设计评审、资料汇总，不要让它跑本地命令或 git 操作。
 - 任务本身不可拆时，交给最合适的一个成员，或者让两个成员各做一版供比较（在 report 里说明）。
 - 用中文。不许让 Agent push、切分支、合并别人的分支、删用户文件。"""
 
@@ -104,7 +107,7 @@ def mentions(text: str, ids: list) -> tuple[list, bool, str]:
                     found.append(eng)
                 return ""
         return m.group(0)
-    rest = re.sub(r"@\s?(claude code|grok build|[\w\u4e00-\u9fff]+)", sub, text or "", flags=re.I)
+    rest = re.sub(r"@\s?(claude code|grok build|meta muse|cue by manus|manus cue|[\w\u4e00-\u9fff]+)", sub, text or "", flags=re.I)
     return found, manager, re.sub(r"[ \t]{2,}", " ", rest).strip()
 
 
@@ -224,26 +227,9 @@ class Groups:
     async def _sh(self, mid: str, cmd: str, timeout: int = 120) -> str:
         return await self.bots.sh(mid, cmd, timeout)
 
-    # ------------------------------------------------------------------ create
-    async def create(self, title: str, repo: str, members: list, base: str = "", machine_id: str = "",
-                     auto_merge: bool = True, origin: str = "", model: Optional[dict] = None) -> dict:
-        ids = []
-        for m in members or []:
-            m = str(m).strip().lower()
-            if m in B.ENGINES and B.ENGINES[m]["available"] and m not in ids:
-                ids.append(m)
-        if not ids:
-            raise ValueError("至少选一个引擎")
-        gid = f"bg-{uuid.uuid4().hex[:8]}"
-        repo = (repo or "").strip() or f"~/workspace/groups/{gid}"
-        if not ok_path(repo):
-            raise ValueError("仓库路径不合法")
-        base = (base or "").strip()
-        if base and not ok_ref(base):
-            raise ValueError("基线分支名不合法")
-        mid = machine_id or self.bots.default_machine()
+    # ------------------------------------------------------------------ create & add members
+    async def _init_worktrees(self, mid: str, repo: str, base: str, gid: str, local_members: list[dict]) -> tuple[str, int]:
         wt_root = f"~/workspace/.aiw-worktrees/{gid}"
-        mem = [{"bot": b, "branch": f"aiw/{gid}/{b}", "worktree": f"{wt_root}/{b}"} for b in ids]
         lines = [
             f"R={qp(repo)}",
             'G="git -c user.name=AIW -c user.email=aiw@localhost"',
@@ -254,7 +240,7 @@ class Groups:
             'git -C "$R" rev-parse -q --verify "$BASE^{commit}" >/dev/null || { echo "GROUP_ERR 没有分支 $BASE"; exit 0; }',
             'D=$(git -C "$R" status --porcelain | wc -l); echo "DIRTY $D"',
         ]
-        for m in mem:
+        for m in local_members:
             lines.append(f"mkdir -p {qp(wt_root)} && git -C \"$R\" worktree add -q -B {shlex.quote(m['branch'])} "
                          f"{qp(m['worktree'])} \"$BASE\" >/dev/null 2>&1 || {{ echo \"GROUP_ERR 建不了 {m['bot']} 的工作树\"; exit 0; }}")
         lines.append('echo "GROUP_OK $BASE"')
@@ -262,8 +248,47 @@ class Groups:
         if "GROUP_OK" not in out:
             err = re.search(r"GROUP_ERR (.*)", out)
             raise ValueError("没能建群：" + (err.group(1) if err else B.clip(out.strip() or "电脑没有响应", 300)))
-        base = re.search(r"GROUP_OK (\S+)", out).group(1)
+        resolved_base = re.search(r"GROUP_OK (\S+)", out).group(1)
         dirty = int((re.search(r"DIRTY\s+(\d+)", out) or [0, 0])[1] or 0)
+        return resolved_base, dirty
+
+    async def create(self, title: str, repo: str, members: list, base: str = "", machine_id: str = "",
+                     auto_merge: bool = True, origin: str = "", model: Optional[dict] = None) -> dict:
+        ids = []
+        for m in members or []:
+            m = str(m).strip().lower()
+            if m in B.ENGINES and B.ENGINES[m]["available"] and m not in ids:
+                ids.append(m)
+        if not ids:
+            raise ValueError("至少选一个引擎")
+        gid = f"bg-{uuid.uuid4().hex[:8]}"
+        local_ids = [b for b in ids if not B.is_cloud_engine(b)]
+        cloud_ids = [b for b in ids if B.is_cloud_engine(b)]
+
+        wt_root = f"~/workspace/.aiw-worktrees/{gid}"
+        mem: list[dict] = []
+        for b in ids:
+            if B.is_cloud_engine(b):
+                mem.append({"bot": b, "branch": "", "worktree": "", "cloud": True})
+            else:
+                mem.append({"bot": b, "branch": f"aiw/{gid}/{b}", "worktree": f"{wt_root}/{b}"})
+
+        dirty = 0
+        if local_ids:
+            repo = (repo or "").strip() or f"~/workspace/groups/{gid}"
+            if not ok_path(repo):
+                raise ValueError("仓库路径不合法")
+            base = (base or "").strip()
+            if base and not ok_ref(base):
+                raise ValueError("基线分支名不合法")
+            mid = machine_id or self.bots.default_machine()
+            base, dirty = await self._init_worktrees(mid, repo, base, gid, [m for m in mem if not m.get("cloud")])
+        else:
+            repo = ""
+            base = ""
+            mid = B.CLOUD_MACHINE
+            auto_merge = False
+
         now = _now()
         title = (title or "").strip()[:60] or "引擎群聊"
         self.store._x("INSERT INTO bot_groups (id, title, machine_id, repo, base, status, auto_merge, members, pending, "
@@ -272,14 +297,81 @@ class Groups:
                        None, now, now))
         for m in mem:
             mm = (model or {}).get(m["bot"]) or {}
-            c = self.bots.create(m["bot"], f"{title} · {B.ENGINES[m['bot']]['title']}", m["worktree"], mid,
-                                 mm.get("model", ""), mm.get("effort", ""), grp=gid, branch=m["branch"])
+            c = self.bots.create(
+                m["bot"], f"{title} · {B.ENGINES[m['bot']]['title']}", m["worktree"],
+                B.CLOUD_MACHINE if m.get("cloud") else mid,
+                mm.get("model", ""), mm.get("effort", ""), grp=gid, branch=m["branch"],
+            )
             m["conv"] = c["id"]
         self.set_group(gid, members=mem)
         names = "、".join(B.ENGINES[m["bot"]]["title"] for m in mem)
-        self.add(gid, "system", "", f"建好了：{names} 各在自己的分支（aiw/{gid}/…）上干活，从 {base} 开始；"
-                                    f"做完由 AIW 管家合并到 aiw/{gid}/merge，不推送，也不动 {base}。"
-                                    + ("\n注意：仓库里有没提交的改动，工作树里看不到它们，需要的话先提交。" if dirty else ""))
+        if local_ids and cloud_ids:
+            cloud_names = "、".join(B.ENGINES[b]["title"] for b in cloud_ids)
+            local_names = "、".join(B.ENGINES[b]["title"] for b in local_ids)
+            intro = (f"建好了：{local_names} 各在自己的分支（aiw/{gid}/…）上干活，从 {base} 开始；"
+                     f"{cloud_names} 作为云端成员参与讨论与协作（不操作本地 git）。"
+                     f"本地改动做完由 AIW 管家合并到 aiw/{gid}/merge，不推送，也不动 {base}。")
+        elif local_ids:
+            intro = (f"建好了：{names} 各在自己的分支（aiw/{gid}/…）上干活，从 {base} 开始；"
+                     f"做完由 AIW 管家合并到 aiw/{gid}/merge，不推送，也不动 {base}。")
+        else:
+            intro = f"建好了云端群聊：{names} 已入群，可以 @ 指定成员发言，或不 @ 让 AIW 管家分工协作。"
+        if dirty:
+            intro += "\n注意：仓库里有没提交的改动，工作树里看不到它们，需要的话先提交。"
+        self.add(gid, "system", "", intro)
+        return self.group(gid)
+
+    async def add_members(self, gid: str, members: list, model: Optional[dict] = None) -> dict:
+        """Add one or more engines (cloud or local) to an existing group."""
+        g = self.group(gid)
+        if not g:
+            raise KeyError(gid)
+        existing = {m["bot"] for m in g["members"]}
+        to_add = []
+        for m in members or []:
+            b = str(m).strip().lower()
+            if b in B.ENGINES and B.ENGINES[b]["available"] and b not in existing and b not in to_add:
+                to_add.append(b)
+        if not to_add:
+            raise ValueError("没有可添加的新引擎（可能已在群里）")
+
+        wt_root = f"~/workspace/.aiw-worktrees/{gid}"
+        new_local: list[dict] = []
+        new_mem: list[dict] = []
+        for b in to_add:
+            if B.is_cloud_engine(b):
+                new_mem.append({"bot": b, "branch": "", "worktree": "", "cloud": True})
+            else:
+                item = {"bot": b, "branch": f"aiw/{gid}/{b}", "worktree": f"{wt_root}/{b}"}
+                new_mem.append(item)
+                new_local.append(item)
+
+        repo = g.get("repo") or ""
+        base = g.get("base") or ""
+        mid = g.get("machine_id") or ""
+        if new_local:
+            if not mid or mid == B.CLOUD_MACHINE:
+                mid = self.bots.default_machine()
+            if not repo:
+                repo = f"~/workspace/groups/{gid}"
+            base, _ = await self._init_worktrees(mid, repo, base, gid, new_local)
+
+        for m in new_mem:
+            mm = (model or {}).get(m["bot"]) or {}
+            c = self.bots.create(
+                m["bot"], f"{g['title']} · {B.ENGINES[m['bot']]['title']}", m["worktree"],
+                B.CLOUD_MACHINE if m.get("cloud") else mid,
+                mm.get("model", ""), mm.get("effort", ""), grp=gid, branch=m["branch"],
+            )
+            m["conv"] = c["id"]
+
+        updated = list(g["members"]) + new_mem
+        patch: dict = {"members": updated}
+        if new_local and (not g.get("repo") or g.get("machine_id") == B.CLOUD_MACHINE):
+            patch.update(repo=repo, base=base, machine_id=mid)
+        self.set_group(gid, **patch)
+        added_names = "、".join(B.ENGINES[m["bot"]]["title"] for m in new_mem)
+        self.add(gid, "system", "", f"已添加 {added_names} 加入群聊。")
         return self.group(gid)
 
     def delete(self, gid: str) -> bool:
@@ -313,6 +405,10 @@ class Groups:
 
     def _brief(self, g: dict, m: dict, task: str, fix: bool = False) -> str:
         others = "、".join(B.ENGINES[x["bot"]]["title"] for x in g["members"] if x["bot"] != m["bot"]) or "（没有）"
+        if m.get("cloud") or B.is_cloud_engine(m["bot"]):
+            head = (f"［引擎群聊「{g['title']}」］你是群里的云端协作成员，和你一起协作的成员：{others}。\n"
+                    "请直接完成下面分配给你的任务（调研、方案、评审或回答问题），给出清晰、结构化的结论，不需要操作本地文件或 git。")
+            return head + "\n\n" + task
         head = (f"［引擎群聊「{g['title']}」］你在 git 仓库的独立工作树里干活：当前文件夹，分支 {m['branch']}"
                 f"（从 {g['base']} 开出）。和你并行的：{others}，各在自己的分支；最后由 AIW 管家合并。\n"
                 "规则：只改当前文件夹里的文件；做完 git add 并 git commit（中文说明）；不要 push，不要切换分支，"
@@ -341,10 +437,14 @@ class Groups:
         ids = prefer or [m["bot"] for m in g["members"]]
         plan = None
         if len(ids) > 1 and self.bots.llm:
-            mem = "；".join(f"{b}（{B.ENGINES[b]['title']}）" for b in ids)
+            mem = "；".join(
+                f"{b}（{B.ENGINES[b]['title']}{'，云端' if B.is_cloud_engine(b) else '，本地代码'}）"
+                for b in ids
+            )
             try:
+                repo_note = f"仓库：{g['repo']}（基线 {g['base']}）\n" if g.get("repo") else "类型：云端讨论协作群\n"
                 out = await asyncio.wait_for(self.bots.llm().complete(PLAN.format(members=mem, ids="、".join(ids)),
-                                                                      f"仓库：{g['repo']}（基线 {g['base']}）\n用户：{text}", 1200), 90)
+                                                                      f"{repo_note}用户：{text}", 1200), 90)
                 plan = parse_plan(out, ids)
             except Exception as e:  # noqa: BLE001
                 log.warning("group plan: %s", e)
@@ -398,20 +498,23 @@ class Groups:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
                 return
-            if g["auto_merge"]:
+            has_local = any(m.get("branch") for m in g["members"])
+            if g["auto_merge"] and has_local:
                 self._bg(self.merge(gid))
             else:
                 self.set_group(gid, status="idle")
-                self.add(gid, "aiw", "AIW 管家", "都回复了。看一下各自的结果，需要合并就点「合并」。")
-                loop.create_task(self._tell_chat(g, "群里的引擎都做完了，等你看一下再合并。"))
+                note = "都回复了。看一下各自的结果，需要合并就点「合并」。" if has_local else "群里的成员都回复了。"
+                self.add(gid, "aiw", "AIW 管家", note)
+                loop.create_task(self._tell_chat(g, "群里的引擎都做完了" + ("，等你看一下再合并。" if has_local else "。")))
 
     # ------------------------------------------------------------------ merge (AIW 管家)
     def merge_script(self, g: dict) -> str:
         gid, mb = g["id"], f"aiw/{g['id']}/merge"
         mwt = f"~/workspace/.aiw-worktrees/{gid}/_merge"
+        local_members = [m for m in g["members"] if m.get("branch") and m.get("worktree")]
         lines = [f"R={qp(g['repo'])}", f"BASE={shlex.quote(g['base'])}", f"M={shlex.quote(mb)}", f"MW={qp(mwt)}",
                  'G="git -c user.name=AIW -c user.email=aiw@localhost"']
-        for m in g["members"]:
+        for m in local_members:
             lines += [f"W={qp(m['worktree'])}",
                       'if [ -d "$W" ] && [ -n "$(git -C "$W" status --porcelain)" ]; then '
                       f'git -C "$W" add -A && $G -C "$W" commit -q -m {shlex.quote("aiw(" + m["bot"] + "): " + g["title"])} '
@@ -419,7 +522,7 @@ class Groups:
         lines += ['if [ -d "$MW" ]; then git -C "$MW" merge --abort >/dev/null 2>&1; git -C "$MW" checkout -q -f -B "$M" "$BASE" '
                   '|| { echo "MERGE_ERR 合并工作树重置失败"; exit 0; }; '
                   'else git -C "$R" worktree add -q -B "$M" "$MW" "$BASE" >/dev/null 2>&1 || { echo "MERGE_ERR 建不了合并工作树"; exit 0; }; fi']
-        for m in g["members"]:
+        for m in local_members:
             b = shlex.quote(m["branch"])
             lines.append(f'N=$(git -C "$MW" rev-list --count "$M"..{b} 2>/dev/null || echo 0); '
                          f'if [ "$N" = "0" ]; then echo "EMPTY {m["bot"]}"; '
@@ -437,6 +540,11 @@ class Groups:
         g = self.group(gid)
         if not g:
             raise KeyError(gid)
+        if not any(m.get("branch") and m.get("worktree") for m in g["members"]):
+            r = parse_merge("")
+            r["ok"] = True
+            self.add(gid, "aiw", "AIW 管家", "当前群里全是云端成员，没有本地 git 分支需要合并。", {"merge": r, "report": True, "done": True})
+            return r
         self._merging.add(gid)
         try:
             self.set_group(gid, status="merging")
@@ -671,6 +779,10 @@ class GroupSendIn(BaseModel):
     attachments: list = []
 
 
+class GroupMembersIn(BaseModel):
+    members: list = []
+
+
 def mount(app, groups: Groups, auth) -> None:
     from fastapi import Depends, HTTPException
 
@@ -707,6 +819,16 @@ def mount(app, groups: Groups, auth) -> None:
             m["busy"] = groups.bots.busy(m.get("conv") or "")
             m["status"] = c.get("status")
         return {"group": g, "messages": groups.messages(gid, after)}
+
+    @app.post("/api/bots/groups/{gid}/members", dependencies=dep)
+    async def groups_add_members(gid: str, body: GroupMembersIn):
+        need(gid)
+        try:
+            return await groups.add_members(gid, body.members)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"添加成员失败：{B.clip(e, 200)}")
 
     @app.post("/api/bots/groups/{gid}/send", dependencies=dep)
     async def groups_send(gid: str, body: GroupSendIn):

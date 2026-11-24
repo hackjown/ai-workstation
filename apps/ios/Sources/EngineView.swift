@@ -234,6 +234,7 @@ struct EngineSheet: View {
     @State private var openGroup: String? = nil
     @State private var showNewGroup = false
     @State private var cfgBot: EngineCfgTarget? = nil   // v3.9.80
+    @ObservedObject private var links = DeepLinks.shared
     var body: some View {
         SheetChrome("引擎", close: close, trailing: {
             Menu {
@@ -284,6 +285,21 @@ struct EngineSheet: View {
             .refreshable { await load() }
         }
         .task { await load() }
+        .onChange(of: links.focusEngineConv) { _ in Task { await applyDeepFocus() } }
+        .onChange(of: links.focusEngineGroup) { _ in Task { await applyDeepFocus() } }
+        .onChange(of: open) { id in
+            if let id = id {
+                if let idx = convs.firstIndex(where: { $0.s("id") == id }) {
+                    convs[idx]["unread"] = 0
+                    if convs[idx].s("kind") == "dm",
+                       let ei = engines.firstIndex(where: { $0.s("id") == convs[idx].s("bot") }) {
+                        engines[ei]["unread"] = 0
+                    }
+                }
+            } else {
+                Task { await load() }
+            }
+        }
         .sheet(item: $cfgBot) { t in
             EngineCfgSheet(engine: engines.first { $0.s("id") == t.id } ?? ["id": t.id, "title": t.id]) { Task { await load() } }
         }
@@ -361,8 +377,23 @@ struct EngineSheet: View {
     func row(_ c: JSON) -> some View {
         let eng = engines.first { $0.s("id") == c.s("bot") }
         let last = c.o("last")
+        let unread = Int(c.d("unread"))
         return HStack(alignment: .top, spacing: 10) {
-        EngineAvatar(bot: c.s("bot"), size: 36).padding(.top, 2)
+        EngineAvatar(bot: c.s("bot"), size: 36)
+            .overlay(alignment: .topTrailing) {
+                if unread > 0 {
+                    Text(unread > 99 ? "99+" : "\(unread)")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 5)
+                        .frame(minWidth: 17, minHeight: 17)
+                        .background(Color.red)
+                        .clipShape(Capsule())
+                        .overlay(Capsule().stroke(Color(.systemBackground), lineWidth: 1.5))
+                        .offset(x: 6, y: -5)
+                }
+            }
+            .padding(.top, 2)
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Text(c.s("title")).font(.subheadline.weight(.semibold)).lineLimit(1)
@@ -409,7 +440,43 @@ struct EngineSheet: View {
             UserDefaults.standard.removeObject(forKey: "aiw_open_engine_conv")
             if convs.contains(where: { $0.s("id") == want }) { open = want }
         }
+        await applyDeepFocus(allowReload: false)
         await EngineModels.shared.load()
+    }
+    @MainActor func applyDeepFocus(allowReload: Bool = true) async {
+        if let cid = links.focusEngineConv, !cid.isEmpty {
+            links.focusEngineConv = nil
+            if allowReload && !convs.contains(where: { $0.s("id") == cid }) {
+                await load()
+            }
+            if convs.contains(where: { $0.s("id") == cid }) {
+                openGroup = nil
+                if open == cid { return }
+                if open != nil {
+                    open = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { open = cid }
+                } else {
+                    open = cid
+                }
+            }
+            return
+        }
+        if let gid = links.focusEngineGroup, !gid.isEmpty {
+            links.focusEngineGroup = nil
+            if allowReload && !groups.contains(where: { $0.s("id") == gid }) {
+                await load()
+            }
+            if groups.contains(where: { $0.s("id") == gid }) {
+                open = nil
+                if openGroup == gid { return }
+                if openGroup != nil {
+                    openGroup = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { openGroup = gid }
+                } else {
+                    openGroup = gid
+                }
+            }
+        }
     }
 }
 

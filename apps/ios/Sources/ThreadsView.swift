@@ -78,6 +78,11 @@ struct RootView: View {
         case .monitor(let id):
             path = []; links.focusWatch = id
             sheet = .tracking
+        case .bots(let conv, let group):
+            path = []
+            links.focusEngineConv = conv
+            links.focusEngineGroup = group
+            sheet = .engine
         case .task(let id):
             sheet = nil
             Task { await openTask(id, takeover: false) }

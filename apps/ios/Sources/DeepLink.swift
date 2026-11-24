@@ -15,6 +15,7 @@ enum DeepTarget: Equatable {
     case takeover(machine: String, task: String?)
     case monitor(String)
     case chat(message: String?)
+    case bots(conv: String?, group: String?)
 
     init?(_ url: URL) {
         guard url.scheme?.lowercased() == "aiw" else { return nil }
@@ -34,6 +35,8 @@ enum DeepTarget: Equatable {
             self = .monitor(id)
         case "chat":
             self = .chat(message: param("m") ?? parts.first)
+        case "bots", "bot":
+            self = .bots(conv: param("c") ?? parts.first, group: param("g"))
         default:
             return nil
         }
@@ -45,6 +48,9 @@ final class DeepLinks: ObservableObject {
     @Published var pending: DeepTarget?
     /// the watch 追踪 should highlight (set with .monitor, read by TrackingSheet)
     @Published var focusWatch: String?
+    /// the engine conversation / group EngineSheet should open (aiw://bots?c=… or aiw://bots?g=…)
+    @Published var focusEngineConv: String?
+    @Published var focusEngineGroup: String?
 
     /// true when the URL was a deep link (else it is an import / file for ImportCenter)
     @discardableResult

@@ -46,8 +46,10 @@ function btRenderList() {
   const box = $("btList"); if (!box) return;
   const items = BT.convs.filter((c) => c.kind !== "dm").map((c) => {
     const e = btEngine(c.bot), st = c.takeover ? "管家接管中" : (c.busy || c.status === "running") ? "回复中…" : "";
+    const unread = c.id === BT.cid ? 0 : Math.max(0, Number(c.unread) || 0);
+    const badge = unread > 0 ? `<i class="bt-unread">${unread > 99 ? "99+" : unread}</i>` : "";
     return `<button class="bt-it ${esc(c.bot || "agy")} ${c.id === BT.cid ? "on" : ""}" onclick="btOpen('${c.id}')">
-      ${btAv(c.bot)}
+      <span class="bt-it-av">${btAv(c.bot)}${badge}</span>
       <span class="grow"><span class="t1">${esc(c.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${c.last ? esc(c.last.text) : esc(e.title)}</span></span></button>`;
   }).join("");
   box.innerHTML = `<div class="bt-head"><div class="heading">引擎</div><button class="btn sm primary" onclick="btNewTask()">${icon("plus")}新建任务</button></div>`
@@ -203,6 +205,8 @@ async function btOpen(id, quiet) {
   BT.gid = null; BT.group = null;
   if (BT.cid !== id) { BT.msgs = []; BT.last = 0; BT.quote = null; BT.attach = []; BT.skills = []; btRenderAttach(); btRenderTokens(); }
   BT.cid = id; localStorage.setItem("aiw_bot_conv", id);
+  const ci = BT.convs.findIndex((c) => c.id === id);
+  if (ci >= 0) BT.convs[ci].unread = 0;
   btShowConv(true); btRenderList();
   await btRefresh(true);
   if (BT.conv && (BT.conv.bot || "agy") !== BM.bot) btModels(false, BT.conv.bot || "agy").then(() => btRenderConv()).catch(() => {});
@@ -225,7 +229,12 @@ async function btRefresh(scroll) {
   if (now - (BT._listAt || 0) > 12000) {
     BT._listAt = now;
     api("GET", "/api/bots").then((res) => {
-      if (res && Array.isArray(res.engines)) { BT.engines = res.engines; btRenderList(); }
+      if (!res) return;
+      if (Array.isArray(res.engines)) BT.engines = res.engines;
+      if (Array.isArray(res.convs)) {
+        BT.convs = res.convs.map((c) => (c.id === BT.cid ? { ...c, unread: 0 } : c));
+      }
+      btRenderList();
     }).catch(() => {});
   }
   const box = $("btMsgs"), near = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 160;

@@ -1189,7 +1189,8 @@ class Bots:
         return d
 
     async def save_media(self, cid: str, items: list) -> list:
-        """v3.9.85: download each file a cloud engine returned (a temporary signed URL) into the artifacts folder."""
+        """v3.9.85: save each file a cloud engine (Cue / Muse) returned — signed URL, Noise bytes, or data URI — into artifacts."""
+        import base64
         import hashlib
         import httpx
         d = os.path.join(self._art_dir(), "engine-files", cid)
@@ -1198,29 +1199,51 @@ class Bots:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0), follow_redirects=True) as cli:
             for it in (items or [])[:20]:
                 url = str(it.get("url") or "")
+                raw_bytes = it.get("data_bytes") if isinstance(it.get("data_bytes"), (bytes, bytearray)) else None
+                data_uri = str(it.get("data_uri") or "")
+                if raw_bytes is None and data_uri.startswith("data:") and "," in data_uri:
+                    try:
+                        hdr, b64 = data_uri.split(",", 1)
+                        raw_bytes = base64.b64decode(b64)
+                        if not it.get("content_type") and ";" in hdr:
+                            it = {**it, "content_type": hdr[5:].split(";", 1)[0]}
+                    except Exception:  # noqa: BLE001
+                        raw_bytes = None
                 name = os.path.basename(str(it.get("filename") or "").strip()) or os.path.basename(url.split("?")[0]) or "file"
                 name = re.sub(r"[\\/:*?\"<>|]+", "_", name)[:120]
-                path = os.path.join(d, hashlib.sha1((it.get("version_uid") or url).encode()).hexdigest()[:8] + "-" + name)
+                seed = str(it.get("version_uid") or url or it.get("fs_path") or it.get("path") or name)
+                if raw_bytes is not None and not url:
+                    seed = seed + ":" + hashlib.sha1(raw_bytes[:4096]).hexdigest()[:8]
+                path = os.path.join(d, hashlib.sha1(seed.encode()).hexdigest()[:8] + "-" + name)
                 ct = str(it.get("content_type") or "")
                 row = {"name": name, "kind": media_kind(name, ct, str(it.get("type") or "")), "content_type": ct,
                        "src": str(it.get("path") or "")}
                 try:
                     if not os.path.isfile(path):
-                        n = 0
-                        async with cli.stream("GET", url) as r:
-                            r.raise_for_status()
+                        if raw_bytes is not None:
+                            if len(raw_bytes) > self.MEDIA_MAX:
+                                raise ValueError("文件太大")
                             with open(path + ".part", "wb") as f:
-                                async for chunk in r.aiter_bytes(1 << 16):
-                                    n += len(chunk)
-                                    if n > self.MEDIA_MAX:
-                                        raise ValueError("文件太大")
-                                    f.write(chunk)
-                        os.replace(path + ".part", path)
+                                f.write(raw_bytes)
+                            os.replace(path + ".part", path)
+                        elif url:
+                            n = 0
+                            async with cli.stream("GET", url) as r:
+                                r.raise_for_status()
+                                with open(path + ".part", "wb") as f:
+                                    async for chunk in r.aiter_bytes(1 << 16):
+                                        n += len(chunk)
+                                        if n > self.MEDIA_MAX:
+                                            raise ValueError("文件太大")
+                                        f.write(chunk)
+                            os.replace(path + ".part", path)
+                        else:
+                            raise ValueError("未能从云端获取文件内容")
                     row.update(path=path, size=os.path.getsize(path))
                 except Exception as e:  # noqa: BLE001  keep the link; it works for a while
                     with contextlib.suppress(OSError):
                         os.remove(path + ".part")
-                    row.update(url=url, error=clip(str(e), 120))
+                    row.update(**({"url": url} if url else {}), error=clip(str(e), 120))
                 out.append(row)
         return out
 

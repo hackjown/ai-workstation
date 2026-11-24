@@ -33,6 +33,8 @@ from aiw_api.muse_engine import (
     SymmetricState,
     _dh,
     _gen_x25519,
+    normalize_muse_fs_path,
+    parse_muse_media,
     pb_decode,
     pb_get,
 )
@@ -118,6 +120,43 @@ async def test_muse_control_plane_and_no_auto_cookie(tmp_path):
     eng = MuseEngine(auth_store)
     st = await eng.start("cloud", {"session": ""}, "hi")
     assert st["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_muse_media_parse_and_save_media(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIW_ARTIFACTS", str(tmp_path / "art"))
+    assert normalize_muse_fs_path("https://muse.ai/fs/raw/workspace/out/demo.mp4?x=1") == "workspace/out/demo.mp4"
+    assert normalize_muse_fs_path("/home/muse/workspace/img/pic.png") == "workspace/img/pic.png"
+    assert normalize_muse_fs_path("../etc/passwd") == ""
+
+    payload = {
+        "transcript": {
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "image", "path": "/home/muse/workspace/out/poster.png", "mime_type": "image/png"},
+                    {"type": "video", "file_ref": {"path": "workspace/out/clip.mp4"}, "filename": "clip.mp4"},
+                    {"type": "image", "data_base64": base64.b64encode(b"\x89PNG\r\n\x1a\n1234").decode(), "mime_type": "image/png", "filename": "inline.png"},
+                ],
+            }]
+        }
+    }
+    media = parse_muse_media(payload)
+    assert len(media) == 3
+    assert media[0]["fs_path"] == "workspace/out/poster.png" and media[0]["type"] == "image"
+    assert media[1]["fs_path"] == "workspace/out/clip.mp4" and media[1]["type"] == "video"
+    assert media[2]["data_uri"].startswith("data:image/png;base64,")
+
+    # Simulate Noise /fs/raw downloaded bytes and persist via Bots.save_media
+    media[0]["data_bytes"] = b"\x89PNG\r\n\x1a\nposter"
+    media[1]["data_bytes"] = b"\x00\x00\x00\x18ftypmp42"
+    store = Store(str(tmp_path / "aiw.db"))
+    bots = B.Bots(store, secrets=SecretBox(store, str(tmp_path)))
+    saved = await bots.save_media("bc-muse-1", media)
+    assert len(saved) == 3
+    assert saved[0]["kind"] == "image" and saved[0]["size"] == len(b"\x89PNG\r\n\x1a\nposter")
+    assert saved[1]["kind"] == "video" and saved[1]["size"] == len(b"\x00\x00\x00\x18ftypmp42")
+    assert saved[2]["kind"] == "image" and saved[2]["size"] == len(b"\x89PNG\r\n\x1a\n1234")
 
 
 # --------------------------------------------------------------------------------------------- Cookie & Cue tests

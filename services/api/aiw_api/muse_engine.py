@@ -18,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urlencode
 
 import httpx
 from cryptography.hazmat.primitives import serialization
@@ -545,7 +545,165 @@ class MuseControlPlane:
         return {**lease, "auth_token": auth_token, "notary_token": notary}
 
 
-# --------------------------------------------------------------------------------------------- Text extraction
+# --------------------------------------------------------------------------------------------- Text & media extraction
+_MEDIA_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|bmp|svg|mp4|mov|webm|m4v|mkv|mp3|wav|m4a|ogg|aac|pdf|docx?|xlsx?|pptx?|zip|tar\.gz|csv|txt|md)(?:[?#].*)?$", re.I)
+_IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|bmp|svg)(?:[?#].*)?$", re.I)
+_VIDEO_EXT_RE = re.compile(r"\.(mp4|mov|webm|m4v|mkv)(?:[?#].*)?$", re.I)
+_AUDIO_EXT_RE = re.compile(r"\.(mp3|wav|m4a|ogg|aac)(?:[?#].*)?$", re.I)
+_SKIP_WIDGET_TYPES = {
+    "shopping_results", "shopping_results_v2", "shopping_cart",
+    "marketplace_map", "hotel_results", "image_options",
+}
+_MEDIA_CONTAINERS = (
+    "content", "items", "images", "generated_images", "attachments", "files",
+    "media", "artifacts", "resources", "image", "file", "file_ref", "fileRef",
+    "source", "data", "presentation", "presentations", "widgets", "result",
+    "output", "outputs", "metadata", "transcript", "messages",
+)
+_MAX_NOISE_FILE_BYTES = 64 * 1024 * 1024
+
+
+def normalize_muse_fs_path(path: str) -> str:
+    """Normalize a Muse VM file path (or /fs/raw/ URL) into a safe relative path for GET /fs/raw/{*path}."""
+    s = (path or "").strip()
+    was_fs_raw = bool(re.match(r"^https?://[^/]+/fs/raw/", s, re.I) or re.match(r"^/?fs/raw/", s, re.I))
+    s = re.sub(r"^https?://[^/]+/fs/raw/", "", s, flags=re.I)
+    if was_fs_raw:
+        s = re.split(r"[?#]", s, maxsplit=1)[0]
+        s = unquote(s)
+    s = re.sub(r"^/+", "", s)
+    s = re.sub(r"^fs/raw/", "", s, flags=re.I)
+    s = re.sub(r"^/+", "", s)
+    m_ws = re.search(r"(?:^|/)workspace/", s, re.I)
+    if m_ws and m_ws.start() > 0:
+        s = s[m_ws.start():].lstrip("/")
+    if not s:
+        return ""
+    segs = [seg for seg in s.split("/") if seg]
+    if not segs or any(seg in (".", "..") or "\\" in seg or "\x00" in seg for seg in segs):
+        return ""
+    return "/".join(segs)
+
+
+def _infer_muse_media_type(path: str, mime: str = "", typ: str = "") -> str:
+    m = (mime or "").lower()
+    t = (typ or "").lower()
+    if m.startswith("image/") or t in ("image", "image_url", "generated_image", "photo") or _IMAGE_EXT_RE.search(path):
+        return "image"
+    if m.startswith("video/") or t == "video" or _VIDEO_EXT_RE.search(path):
+        return "video"
+    if m.startswith("audio/") or t in ("audio", "voice") or _AUDIO_EXT_RE.search(path):
+        return "audio"
+    return "file"
+
+
+def _extract_inline_data_uri(obj: dict[str, Any], mime: str = "") -> str:
+    b64 = obj.get("data_base64") or obj.get("base64") or obj.get("b64_json")
+    if isinstance(b64, str) and b64.strip():
+        s = b64.strip()
+        if s.startswith("data:"):
+            return s
+        return f"data:{mime or 'image/png'};base64,{s}"
+    data_val = obj.get("data")
+    if isinstance(data_val, str) and data_val.strip():
+        s = data_val.strip()
+        if s.startswith("data:"):
+            return s
+        if str(obj.get("type") or "").lower() in ("base64", "image") and len(s) > 64:
+            return f"data:{mime or 'image/png'};base64,{s}"
+    return ""
+
+
+def parse_muse_media(payload: Any, sink: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
+    """Extract image / video / audio / file references from Muse event payloads (mirrors botark parseMediaParts)."""
+    out = sink if sink is not None else []
+    seen = {str(x.get("path") or x.get("url") or x.get("data_uri") or "") for x in out}
+
+    def push(raw_ref: str, *, name: str = "", mime: str = "", typ: str = "") -> None:
+        ref = (raw_ref or "").strip()
+        if not ref or ref in seen:
+            return
+        seen.add(ref)
+        eff_type = _infer_muse_media_type(ref, mime, typ)
+        if ref.startswith("data:"):
+            fname = name or ("image.png" if eff_type == "image" else "file.bin")
+            out.append({"type": eff_type, "filename": fname, "data_uri": ref, "path": "", "url": "", "content_type": mime})
+            return
+        if re.match(r"^https?://", ref, re.I) and not re.match(r"^https?://[^/]+/fs/raw/", ref, re.I):
+            fname = name or (ref.split("?", 1)[0].rsplit("/", 1)[-1] or "file")
+            out.append({"type": eff_type, "filename": fname, "url": ref, "path": ref, "content_type": mime})
+            return
+        norm = normalize_muse_fs_path(ref)
+        if not norm:
+            return
+        if norm != ref and norm in seen:
+            return
+        seen.add(norm)
+        fname = name or norm.rsplit("/", 1)[-1] or "file"
+        out.append({"type": eff_type, "filename": fname, "fs_path": norm, "path": ref, "url": "", "content_type": mime})
+
+    def inspect(node: Any, depth: int = 0) -> None:
+        if depth > 5 or node is None:
+            return
+        if isinstance(node, str):
+            if _IMAGE_EXT_RE.search(node) and (re.match(r"^https?://", node, re.I) or "/" in node):
+                push(node, typ="image")
+            return
+        if isinstance(node, list):
+            for item in node:
+                inspect(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        typ = str(node.get("type") or node.get("kind") or node.get("widget_kind") or node.get("widgetKind") or "").lower()
+        if typ in _SKIP_WIDGET_TYPES:
+            return
+        mime = str(node.get("mime_type") or node.get("mimeType") or node.get("media_type") or node.get("content_type") or "").strip()
+        name = str(node.get("filename") or node.get("file_name") or node.get("name") or node.get("label") or "").strip()
+        src_obj = node.get("source") if isinstance(node.get("source"), dict) else {}
+        src_mime = str(src_obj.get("media_type") or src_obj.get("mime_type") or src_obj.get("mimeType") or mime).strip()
+        src_ref = str(src_obj.get("url") or src_obj.get("path") or "") or _extract_inline_data_uri(src_obj, src_mime)
+        fref_obj = node.get("file_ref") if isinstance(node.get("file_ref"), dict) else (
+            node.get("fileRef") if isinstance(node.get("fileRef"), dict) else {}
+        )
+        fref_path = str(fref_obj.get("path") or fref_obj.get("file_path") or fref_obj.get("url") or "")
+        direct = (
+            str(node.get("path") or node.get("file_path") or node.get("filePath") or node.get("image_path")
+                or node.get("imagePath") or node.get("output_path") or node.get("outputPath") or node.get("artifact_path") or "")
+            or fref_path
+            or str(node.get("image_url") if isinstance(node.get("image_url"), str) else (
+                (node.get("image_url") or {}).get("url") if isinstance(node.get("image_url"), dict) else ""
+            ))
+            or str(node.get("imageUrl") or node.get("url") or node.get("uri") or node.get("src") or "")
+            or src_ref
+            or _extract_inline_data_uri(node, mime)
+        )
+        if typ in ("image", "image_url", "generated_image", "photo", "media"):
+            if direct:
+                push(direct, name=name, mime=src_mime, typ="image")
+        elif typ in ("file", "file_ref", "attachment", "artifact", "audio", "video"):
+            p = direct or str(node.get("filename") or "")
+            if p:
+                push(p, name=name, mime=src_mime, typ=typ)
+        elif direct and (_MEDIA_EXT_RE.search(direct) or str(node.get("file_type") or "").lower() == "image" or src_mime.startswith(("image/", "video/", "audio/"))):
+            push(direct, name=name, mime=src_mime, typ=typ)
+
+        if typ == "tool_result" and isinstance(node.get("content"), str):
+            raw_c = node["content"].strip()
+            if len(raw_c) <= 262_144 and (raw_c.startswith("{") or raw_c.startswith("[")):
+                try:
+                    inspect(json.loads(raw_c), depth + 1)
+                except ValueError:
+                    pass
+        for k in _MEDIA_CONTAINERS:
+            v = node.get(k)
+            if isinstance(v, (dict, list)):
+                inspect(v, depth + 1)
+
+    inspect(payload, 0)
+    return out
+
+
 def _extract_muse_text(payload: dict[str, Any]) -> str:
     # Check payload.transcript.messages[].content[].text first
     transcript = payload.get("transcript")
@@ -586,6 +744,7 @@ class _MuseJob:
     error: str = ""
     auth_error: bool = False
     tools: list[dict[str, Any]] = field(default_factory=list)
+    media: list[dict[str, Any]] = field(default_factory=list)
     event: asyncio.Event = field(default_factory=asyncio.Event)
     task: Optional[asyncio.Task] = None
 
@@ -659,6 +818,7 @@ class MuseEngine:
         job.error = ""
         job.auth_error = False
         job.tools = []
+        job.media = []
         job.event.clear()
         job.task = asyncio.get_running_loop().create_task(self._run_turn(job, auth, text))
         return {"ok": True, "job": job_id}
@@ -683,6 +843,8 @@ class MuseEngine:
         }
         if job.status != "running":
             out["response"] = job.response
+            if job.media:
+                out["media"] = list(job.media)
             if job.error:
                 out["error"] = job.error
             if job.auth_error:
@@ -734,13 +896,72 @@ class MuseEngine:
                 send_cs, recv_cs = hs.split()
                 nt = NoiseTransport(send_cs, recv_cs)
 
-                def _req_headers() -> list[tuple[str, str]]:
-                    return [
-                        ("Content-Type", "application/json"),
+                def _req_headers(json_body: bool = True) -> list[tuple[str, str]]:
+                    hdrs = [
                         ("x-request-id", str(uuid.uuid4())),
                         ("x-app-id", MUSE_APP_ID),
                         ("Accept-Language", "en-US"),
                     ]
+                    if json_body:
+                        hdrs.insert(0, ("Content-Type", "application/json"))
+                    return hdrs
+
+                async def _fetch_fs_raw(fs_path: str) -> tuple[bytes, str]:
+                    enc_path = "/".join(quote(seg, safe="") for seg in fs_path.split("/") if seg)
+                    fid, fframes = nt.encrypt_request("daemon", "GET", f"/fs/raw/{enc_path}", _req_headers(json_body=False))
+                    for fr in fframes:
+                        await ws.send(fr)
+                    chunks: list[bytes] = []
+                    total = 0
+                    ctype = ""
+                    dl_deadline = time.monotonic() + 60.0
+                    while time.monotonic() < dl_deadline:
+                        raw_f = await asyncio.wait_for(ws.recv(), timeout=20.0)
+                        if not isinstance(raw_f, (bytes, bytearray)):
+                            continue
+                        fr_dec = nt.decrypt(bytes(raw_f))
+                        if not fr_dec or fr_dec["stream_id"] != fid:
+                            continue
+                        if fr_dec["kind"] == "reset":
+                            break
+                        if fr_dec["kind"] == "response":
+                            if fr_dec.get("status", 200) >= 400:
+                                return b"", ""
+                            for hk, hv in fr_dec.get("headers") or []:
+                                if hk.lower() == "content-type":
+                                    ctype = hv.split(";", 1)[0].strip()
+                            b = fr_dec.get("body") or b""
+                            if b:
+                                total += len(b)
+                                if total > _MAX_NOISE_FILE_BYTES:
+                                    return b"", ""
+                                chunks.append(b)
+                            if fr_dec.get("end_body"):
+                                return b"".join(chunks), ctype
+                        elif fr_dec["kind"] == "body_chunk":
+                            b = fr_dec.get("data") or b""
+                            if b:
+                                total += len(b)
+                                if total > _MAX_NOISE_FILE_BYTES:
+                                    return b"", ""
+                                chunks.append(b)
+                            if fr_dec.get("end_body"):
+                                return b"".join(chunks), ctype
+                    return b"".join(chunks), ctype
+
+                async def _materialize_media() -> None:
+                    for item in job.media[:20]:
+                        fs_p = str(item.get("fs_path") or "").strip()
+                        if not fs_p or item.get("url") or item.get("data_uri") or item.get("data_bytes"):
+                            continue
+                        try:
+                            data_b, ctype = await _fetch_fs_raw(fs_p)
+                            if data_b:
+                                item["data_bytes"] = data_b
+                                if ctype and not item.get("content_type"):
+                                    item["content_type"] = ctype
+                        except Exception as ex:  # noqa: BLE001
+                            log.debug("muse fs.raw %s failed: %r", fs_p, ex)
 
                 # 2) Open chat.subscribe stream
                 sub_body = json.dumps({"capabilities": MUSE_CHAT_CAPABILITIES}).encode("utf-8")
@@ -782,6 +1003,7 @@ class MuseEngine:
                         raw = await asyncio.wait_for(ws.recv(), timeout=wait_s)
                     except asyncio.TimeoutError:
                         if _combined_text() and is_idle and (all_done or (last_text_at and time.monotonic() - last_text_at >= 4.0)):
+                            await _materialize_media()
                             job.response = _combined_text()
                             job.status = "turn_done"
                             job.event.set()
@@ -850,6 +1072,7 @@ class MuseEngine:
                             full_txt = _extract_muse_text(payload)
                             if full_txt and len(full_txt) >= len(msg_texts[mid_s]):
                                 msg_texts[mid_s] = full_txt
+                            parse_muse_media(payload, job.media)
                             done_ids.add(mid_s)
                             last_text_at = time.monotonic()
                         elif ename in ("agent.status", "agent_status", "presence.status"):
@@ -860,17 +1083,20 @@ class MuseEngine:
                                     job.tools.append({"tool": "muse", "arg": code})
                                     job.event.set()
                                 elif _combined_text() and all(m in done_ids for m in msg_order):
+                                    await _materialize_media()
                                     job.response = _combined_text()
                                     job.status = "turn_done"
                                     job.event.set()
                                     return
                         elif "tool" in ename:
+                            parse_muse_media(payload, job.media)
                             tname = str(payload.get("name") or payload.get("tool_name") or ename)
                             job.tools.append({"tool": tname[:60], "arg": str(payload.get("summary") or "")[:200]})
                             job.event.set()
                     line_bufs[sid] = buf
 
-                if _combined_text():
+                if _combined_text() or job.media:
+                    await _materialize_media()
                     job.response = _combined_text()
                     job.status = "turn_done"
                 else:

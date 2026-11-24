@@ -42,9 +42,9 @@ ENGINES = {
                   "desc": "腾讯 CodeBuddy Code，WorkBuddy 的命令行版，同一个账号", "login": "codebuddy"},
     "grok": {"id": "grok", "title": "Grok Build", "short": "grok", "available": True,
              "desc": "xAI Grok Build（grok -p）", "login": "grok login --device-auth"},
-    "muse": {"id": "muse", "title": "Meta Muse", "short": "muse", "available": True,
-             "desc": "Meta Muse CLI（muse exec --json，本地工作区，使用 META_API_KEY）", "login": "在密钥库配置 META_API_KEY"},
-    # Cloud engine (runs on aiw-api, for discussion/research only; never edits local code)
+    # Cloud engines (run on aiw-api, for discussion/research only; never edit local code)
+    "muse": {"id": "muse", "title": "Meta Muse", "short": "muse", "available": True, "cloud": True,
+             "desc": "Meta Muse 云端 Agent（muse.ai 原生 Noise 网关，支持手动从浏览器读取登录态）", "login": "muse.ai"},
     "cue": {"id": "cue", "title": "Cue", "short": "cue", "available": True, "cloud": True,
             "desc": "Cue by Manus 云端 Agent（默认官方 Manus API v2，用于调研/讨论）", "login": "Manus API Key"},
 }
@@ -477,20 +477,13 @@ class Bots:
         shared: set = set()
         from .cloud_auth import CloudAuthStore
         from .cue_engine import CueEngine
+        from .muse_engine import MuseEngine
         self.secrets = secrets
         self.auth_store = CloudAuthStore(store, secrets)
-
-        def _muse_env() -> dict:
-            key = ""
-            if secrets is not None:
-                key = secrets.get("META_API_KEY") or secrets.get("meta_api_key") or ""
-            key = key or os.environ.get("META_API_KEY") or ""
-            return {"META_API_KEY": key} if key else {}
-
         self.engines = {
             "agy": AgyEngine(sh),
             **{e: CliEngine(e, sh, shared) for e in ("codex", "claude", "codebuddy", "grok")},
-            "muse": CliEngine("muse", sh, shared, env_fn=_muse_env),
+            "muse": MuseEngine(self.auth_store, shell=sh, default_machine=self.default_machine),
             "cue": CueEngine(self.auth_store, shell=sh, default_machine=self.default_machine),
         }
         self.queues: dict[str, list] = {}
@@ -1324,13 +1317,13 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     @app.get("/api/bots/engines/{bot}/auth", dependencies=dep)
     async def bots_auth_get(bot: str):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（cue）需要凭据设置；Muse 请在密钥库配置 META_API_KEY")
+            raise HTTPException(400, "只有云端引擎（muse / cue）需要凭据设置")
         return bots.auth_store.public_view(bot)
 
     @app.put("/api/bots/engines/{bot}/auth", dependencies=dep)
     async def bots_auth_put(bot: str, body: CloudAuthIn):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（cue）支持凭据设置")
+            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据设置")
         patch = {k: v for k, v in body.model_dump().items() if k != "verify" and v is not None}
         if patch:
             patch["source"] = "manual"
@@ -1345,22 +1338,25 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     @app.delete("/api/bots/engines/{bot}/auth", dependencies=dep)
     async def bots_auth_del(bot: str):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（cue）支持凭据设置")
+            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据设置")
         bots.auth_store.clear(bot)
         return {"ok": True, "auth": bots.auth_store.public_view(bot)}
 
     @app.post("/api/bots/engines/{bot}/auth/browser", dependencies=dep)
     async def bots_auth_browser(bot: str, body: Optional[CloudBrowserIn] = None):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（cue）支持从浏览器读取")
+            raise HTTPException(400, "只有云端引擎（muse / cue）支持从浏览器读取")
         from .browser_cookies import read_browser_cookies
         mid = (body.machine_id if body else "") or bots.default_machine()
         res = await read_browser_cookies(bot, shell=bots.sh, machine_id=mid)
         if not res.get("ok") or not res.get("creds"):
-            raise HTTPException(404, "未在本机或连接电脑的浏览器里找到 cue.im 的登录 Cookie；请先在 Chrome / Arc / Edge / BrowserOS 登录 cue.im 后重试。")
-        patch = {**res["creds"], "source": res.get("source") or "browser", "experimental_native": True}
-        if not bots.auth_store.load("cue").get("api_key"):
-            patch["mode"] = "native"
+            site = "muse.ai" if bot == "muse" else "cue.im"
+            raise HTTPException(404, f"未在本机或连接电脑的浏览器里找到 {site} 的登录 Cookie；请先在 Chrome / Arc / Edge / BrowserOS 登录 {site} 后重试。")
+        patch = {**res["creds"], "source": res.get("source") or "browser"}
+        if bot == "cue":
+            patch["experimental_native"] = True
+            if not bots.auth_store.load("cue").get("api_key"):
+                patch["mode"] = "native"
         bots.auth_store.save(bot, patch)
         out: dict = {"ok": True, "source": res.get("source") or "browser",
                      "cookie_count": res["creds"].get("cookie_count", 0),
@@ -1374,7 +1370,7 @@ def mount(app, bots: Bots, auth, chat=None) -> None:
     @app.post("/api/bots/engines/{bot}/auth/test", dependencies=dep)
     async def bots_auth_test(bot: str):
         if not is_cloud_engine(bot):
-            raise HTTPException(400, "只有云端引擎（cue）支持凭据测试")
+            raise HTTPException(400, "只有云端引擎（muse / cue）支持凭据测试")
         eng = bots.engines.get(bot)
         if not eng or not hasattr(eng, "verify"):
             raise HTTPException(404, "不支持验证")

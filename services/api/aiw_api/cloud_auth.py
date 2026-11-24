@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-CLOUD_BOTS = ("cue",)
+CLOUD_BOTS = ("cue", "muse")
 
 
 def _secret_key(bot: str) -> str:
@@ -57,6 +57,8 @@ class CloudAuthStore:
                     cur.pop(k, None)
             else:
                 cur[k] = v
+        if bot == "muse" and not cur.get("node_id"):
+            cur["node_id"] = str(uuid.uuid4())
         if bot == "cue" and not cur.get("device_id"):
             cur["device_id"] = str(uuid.uuid4())
         cur["updated_at"] = time.time()
@@ -83,6 +85,19 @@ class CloudAuthStore:
         if bot not in CLOUD_BOTS:
             return {"bot": bot, "configured": False}
         d = self.load(bot)
+        if bot == "muse":
+            has_cookie = bool(d.get("cookie_header"))
+            return {
+                "bot": "muse",
+                "configured": has_cookie,
+                "has_cookie": has_cookie,
+                "cookie_preview": _mask(d.get("cookie_header", "")),
+                "node_id": d.get("node_id") or "",
+                "proxy_url": d.get("proxy_url") or "",
+                "viewer_id": d.get("viewer_id") or "",
+                "source": d.get("source") or "",
+                "updated_at": d.get("updated_at") or 0,
+            }
         has_key = bool(d.get("api_key"))
         has_token = bool(d.get("access_token"))
         has_cookie = bool(d.get("cookie_header"))

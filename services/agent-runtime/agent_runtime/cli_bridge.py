@@ -23,7 +23,6 @@ Ops (each prints exactly one line `CLIRESULT {json}` as its last stdout line):
   diff  JOB [--full]       git status / diff of the folder
   models ENGINE            the models this computer's CLI can use (its own list when it has one, else its config)
   list                     jobs on this computer
-  setenv ENGINE --text-b64 B64  save that engine's secrets (JSON) to ~/.config/aiw/cli/env/ENGINE.json (0600)
   daemon JOB               (internal)
 
 Job state lives in ~/.config/aiw/cli/jobs/<job>/ (job.json, state.json, events.jsonl, inbox/, turn-N.stderr).
@@ -65,18 +64,13 @@ ENGINES = {
     "grok": {"title": "Grok Build", "bins": ("grok",), "env": "AIW_GROK_BIN", "stdin": False,
              "install": "curl -fsSL https://x.ai/cli/install.sh | bash，然后运行一次 grok login --device-auth",
              "efforts": ["low", "medium", "high"]},
-    "muse": {"title": "Meta Muse", "bins": ("muse",), "env": "AIW_MUSE_BIN", "stdin": False,
-             "install": "curl -fsSL https://dev.meta.ai/install.sh | bash，并在 AIW 密钥库里配置 META_API_KEY",
-             "efforts": ["low", "medium", "high", "xhigh", "max"]},
 }
-
-MUSE_EFFORT_STEPS = {"minimal": 12, "low": 20, "medium": 50, "high": 100, "xhigh": 200, "max": 400}
 
 # What no engine may run (the same lines as agy's deny rules). Claude-style engines take them as deny rules; Codex
 # runs in its workspace-write sandbox instead, and AIW's prompt rules forbid the rest.
 DENY_SHELL = ["git push", "git reset --hard", "git clean", "git checkout .", "git restore .", "sudo", "rm -rf /",
               "rm -rf ~", "rm -rf $HOME"]
-DENY_PATHS = ["~/.config/aiw/**", "~/.codex/**", "~/.claude/**", "~/.codebuddy/**", "~/.grok/**", "~/.gemini/**", "~/.muse/**"]
+DENY_PATHS = ["~/.config/aiw/**", "~/.codex/**", "~/.claude/**", "~/.codebuddy/**", "~/.grok/**", "~/.gemini/**"]
 STATIC_MODELS = {   # shown when the CLI has no model list of its own; any model id the account has also works
     "claude": [("opus", "Opus（最新）"), ("sonnet", "Sonnet（最新）"), ("haiku", "Haiku（最新）")],
     # v3.9.63: CodeBuddy only lists models inside its TUI (/model), per WorkBuddy account; this is the list a
@@ -163,92 +157,20 @@ def clip(s, n: int) -> str:
     return s if len(s) <= n else s[: n - 20] + f"…(+{len(s) - n + 20})"
 
 
-def run_env(extra: dict | None = None) -> dict:
+def run_env() -> dict:
     env = dict(os.environ)
     home = os.path.expanduser("~")
     env["PATH"] = ":".join([f"{home}/.local/bin", f"{home}/bin", f"{home}/.npm-global/bin", f"{home}/.grok/bin",
-                            f"{home}/.muse/bin", "/usr/local/bin", env.get("PATH", "/usr/bin:/bin")])
+                            "/usr/local/bin", env.get("PATH", "/usr/bin:/bin")])
     env.setdefault("GROK_DISABLE_AUTOUPDATER", "1")
     env.setdefault("CI", "1")
-    for k, v in (extra or {}).items():
-        if isinstance(k, str) and k and v is not None and str(v) != "":
-            env[k] = str(v)
     return env
-
-
-ENV_DIR = os.path.join(ROOT, "env")
-
-
-def env_path(engine: str) -> str:
-    return os.path.join(ENV_DIR, re.sub(r"[^a-z0-9_-]", "", str(engine or "").lower()) + ".json")
-
-
-def save_engine_env(engine: str, env: dict) -> None:
-    """v3.9.78: secrets live in a 0600 file per engine, never in job.json or a turn's argv."""
-    os.makedirs(ENV_DIR, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(ENV_DIR, 0o700)
-    except OSError:
-        pass
-    clean = {str(k): str(v) for k, v in (env or {}).items() if isinstance(k, str) and k and v not in (None, "")}
-    path = env_path(engine)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(clean, f)
-    os.replace(tmp, path)
-
-
-def load_engine_env(engine: str) -> dict:
-    d = read_json(env_path(engine), {}) or {}
-    return d if isinstance(d, dict) else {}
-
-
-def op_setenv(engine: str, text_b64: str):
-    if engine not in ENGINES:
-        out({"ok": False, "error": f"unknown engine {engine!r}"})
-    try:
-        env = json.loads(base64.b64decode(text_b64 or "").decode("utf-8") or "{}")
-    except Exception as e:  # noqa: BLE001
-        out({"ok": False, "error": f"bad env: {e}"}, 2)
-    if not isinstance(env, dict):
-        out({"ok": False, "error": "env must be a JSON object"}, 2)
-    save_engine_env(engine, env)
-    out({"ok": True, "engine": engine, "keys": sorted(k for k, v in env.items() if v)})
 
 
 # ------------------------------------------------------------------------------------------------------- commands
 def claude_tools() -> tuple:
     deny = [f"Bash({c}:*)" for c in DENY_SHELL] + [f"Edit({p})" for p in DENY_PATHS] + [f"Write({p})" for p in DENY_PATHS]
     return "Bash,Edit,Write,MultiEdit,Read,Glob,Grep,LS,TodoWrite,NotebookEdit", ",".join(deny)
-
-
-MUSE_RULES = ("[AIW 规则] 只在当前工作文件夹里读写；绝不运行：" + "、".join(DENY_SHELL) + "；绝不读写："
-              + "、".join(DENY_PATHS) + "。需要这些就停下说明原因。\n\n")
-_MUSE_FLAGS: dict = {}
-
-
-def muse_flags(b: str) -> dict:
-    """Which deny / approval flags this muse build has, from `muse exec --help` (cached per process)."""
-    if b in _MUSE_FLAGS:
-        return _MUSE_FLAGS[b]
-    txt = ""
-    try:
-        r = subprocess.run([b, "exec", "--help"], capture_output=True, text=True, timeout=20, env=run_env(),
-                           stdin=subprocess.DEVNULL)
-        txt = (r.stdout or "") + (r.stderr or "")
-    except Exception:  # noqa: BLE001
-        pass
-    deny = ""
-    if re.search(r"--deny\b", txt):
-        deny = "deny"
-    else:
-        m = re.search(r"(--disallowed-?tools|--disallowedTools)\b", txt)
-        deny = m.group(1) if m else ""
-    m = re.search(r"--disable-approvals?\b", txt)
-    res = {"deny": deny, "approval": m.group(0) if m else ""}
-    _MUSE_FLAGS[b] = res
-    return res
 
 
 def build_cmd(job: dict, prompt: str, session: str, turn_dir: str) -> tuple:
@@ -297,29 +219,6 @@ def build_cmd(job: dict, prompt: str, session: str, turn_dir: str) -> tuple:
         if session:
             c += ["-r", session]
         return c, None
-    if e == "muse":
-        # muse exec --json, never --yolo. v3.9.78: the deny list goes in as real flags when this muse has them
-        # (read from `muse exec --help`), headless approval prompts are turned off so a turn can't hang or
-        # silently refuse every write, and the same rules lead the prompt as a backstop.
-        flags = muse_flags(b)
-        c = [b, "exec", "--json"]
-        if flags["deny"] == "deny":
-            for cmd in DENY_SHELL:
-                c += ["--deny", f"Bash({cmd}*)"]
-            for p in DENY_PATHS:
-                c += ["--deny", f"Edit({p})", "--deny", f"Write({p})"]
-        elif flags["deny"]:
-            c += [flags["deny"], claude_tools()[1]]
-        if flags["approval"]:
-            c += [flags["approval"]]
-        if model:
-            c += ["--model", model]
-        steps = MUSE_EFFORT_STEPS.get(effort)
-        if steps:
-            c += ["--max-model-steps", str(steps)]
-        if session:
-            c += ["--session-id", session]
-        return c + [MUSE_RULES + prompt], None
     raise ValueError(f"unknown engine {e}")
 
 
@@ -378,12 +277,7 @@ class Turn:
         except ValueError:
             return
         if isinstance(e, dict):
-            if self.engine == "codex":
-                self.codex(e)
-            elif self.engine == "muse":
-                self.muse(e)
-            else:
-                self.messages(e)
+            (self.codex if self.engine == "codex" else self.messages)(e)
 
     # ---- Claude Code / CodeBuddy / Grok (Messages stream-json)
     def messages(self, e: dict):
@@ -487,55 +381,6 @@ class Turn:
                 self.failed = True
                 self.error = clip(m.get("message"), 400)
 
-    # ---- Meta Muse (`muse exec --json`)
-    def muse(self, e: dict):
-        sid = e.get("session_id") or e.get("sessionId") or e.get("thread_id")
-        if not sid and isinstance(e.get("session"), dict):
-            sid = e["session"].get("id")
-        if sid:
-            self.session = str(sid)
-        t = str(e.get("type") or e.get("event") or "").lower()
-        if t in ("assistant", "user", "result"):
-            self.messages(e)
-            return
-        if t in ("thread.started", "item.completed", "turn.completed", "turn.failed"):
-            self.codex(e)
-            return
-        if t in ("session", "session.started", "session_started", "init"):
-            return
-        if t in ("message", "assistant_message", "text", "output"):
-            txt = e.get("text") or e.get("content") or (e.get("message") if isinstance(e.get("message"), str) else "")
-            if not txt and isinstance(e.get("message"), dict):
-                txt = block_text(e["message"].get("content"))
-            self.say(txt)
-        elif t in ("final", "done", "completed", "turn_done", "response"):
-            self.got_result = True
-            txt = e.get("result") or e.get("response") or e.get("text") or e.get("content") or ""
-            if isinstance(txt, str) and txt.strip():
-                self.final = txt.strip()
-            if e.get("usage"):
-                self.usage = e.get("usage")
-            if e.get("is_error") or e.get("error"):
-                self.failed = True
-                self.error = clip(e.get("error") or e.get("message") or "error", 400)
-        elif t in ("tool_use", "tool_call", "tool.start"):
-            tid = str(e.get("id") or e.get("tool_call_id") or len(self.pending))
-            name = str(e.get("name") or e.get("tool") or "tool")
-            self.pending[tid] = (name, tool_arg(e.get("input") or e.get("arguments") or e.get("args")))
-        elif t in ("tool_result", "tool.end", "tool_output"):
-            tid = str(e.get("tool_use_id") or e.get("tool_call_id") or e.get("id") or "")
-            name, arg = self.pending.pop(tid, (str(e.get("name") or e.get("tool") or "?"), tool_arg(e.get("input"))))
-            txt = block_text(e.get("output") if "output" in e else e.get("content"))
-            err = str(e.get("error") or (txt if e.get("is_error") else ""))
-            if err and re.search(r"permission|not allowed|denied|requires approval", err, re.I):
-                self.denied.append({"action": "command" if name.lower() in ("bash", "shell", "exec") else "write_file",
-                                    "tool": name, "target": arg, "outside_worktree": False, "why": clip(err, 200)})
-            self.tool(name, arg, "" if err else txt, err)
-        elif t == "error":
-            self.failed = True
-            err = e.get("message") or e.get("error") or "error"
-            self.error = clip(err.get("message") if isinstance(err, dict) else err, 400)
-
     def response(self) -> str:
         if self.final and str(self.final).strip():
             return str(self.final).strip()
@@ -565,8 +410,7 @@ def op_check(engine: str, probe: bool):
         job = {"engine": engine, "bin": b, "workdir": d}
         argv, stdin = build_cmd(job, "Reply with exactly: ok", "", d)
         try:
-            r = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=150, cwd=d,
-                               env=run_env(load_engine_env(engine)),
+            r = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=150, cwd=d, env=run_env(),
                                stdin=None if stdin is not None else subprocess.DEVNULL)
             t = Turn(engine, lambda rec: None)
             for line in (r.stdout or "").splitlines():
@@ -718,16 +562,8 @@ def op_start(job_b64: str):
     if os.path.exists(d):
         out({"ok": False, "error": f"job {jid} exists"})
     os.makedirs(os.path.join(d, "inbox"), exist_ok=True)
-    if isinstance(job.get("env"), dict):   # v3.9.78: an older AIW may still send env in the job; keep it out of job.json
-        save_engine_env(engine, job.pop("env"))
-    job.pop("env", None)
     job.update({"id": jid, "bin": b, "workdir": wd, "worktree": wd, "branch": "", "base": "", "created": time.time()})
-    job_path = os.path.join(d, "job.json")
-    write_json(job_path, job)
-    try:
-        os.chmod(job_path, 0o600)
-    except OSError:
-        pass
+    write_json(os.path.join(d, "job.json"), job)
     write_json(os.path.join(d, "state.json"), {"status": "starting", "turn": 0, "events": 0, "ts": time.time(),
                                                "conversation_id": job.get("session") or ""})
     with open(os.path.join(d, "inbox", f"{time.time():.6f}.json"), "w", encoding="utf-8") as f:
@@ -801,7 +637,7 @@ class Daemon:
         errf = open(err_path, "w", encoding="utf-8")
         try:
             proc = subprocess.Popen(argv, cwd=j["workdir"], stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1, env=run_env(load_engine_env(j["engine"])),
+                                    stdout=subprocess.PIPE, stderr=errf, text=True, bufsize=1, env=run_env(),
                                     start_new_session=True)
         except Exception as e:  # noqa: BLE001
             self.save(status="turn_failed", error=f"cannot start {j['engine']}: {e}", response="")
@@ -1069,8 +905,6 @@ def main():
         op_diff(a.job, a.full)
     elif a.op == "list":
         op_list()
-    elif a.op == "setenv":
-        op_setenv(a.job or "", a.text_b64 or "")
     else:
         out({"ok": False, "error": f"unknown op {a.op}"}, 2)
 

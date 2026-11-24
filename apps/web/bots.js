@@ -520,7 +520,7 @@ function btGroupToggleGit() {
 function btGroupNew() {
   const boxes = BT.engines.filter((e) => e.available).map((e) => `<label class="bt-chk"><input type="checkbox" name="m" value="${esc(e.id)}" onchange="btGroupToggleGit()" ${["codex", "claude"].includes(e.id) ? "checked" : ""}/>${esc(e.title)}${e.cloud ? "（云端）" : ""}</label>`).join("");
   modal(`<form class="callnote bt-form" onsubmit="btGroupCreate(event)"><h3>新群聊</h3>
-      <div class="muted">本地代码引擎（含 Meta Muse）各开独立分支并行开发；云端引擎（Cue）仅参与讨论、调研与评审，不改本地代码。</div>
+      <div class="muted">本地代码引擎各开独立分支并行开发；云端引擎（Meta Muse / Cue）仅参与讨论、调研与评审，不改本地代码。</div>
       <div class="bt-fl">成员<div class="bt-chks">${boxes}</div></div>
       <label>标题<input name="title" placeholder="例如 登录页改版" /></label>
       <div id="btGrpGit">
@@ -616,7 +616,7 @@ function btGroupAddMembers() {
   if (!avail.length) { toast("所有引擎都已在群里"); return; }
   const boxes = avail.map((e) => `<label class="bt-chk"><input type="checkbox" name="m" value="${esc(e.id)}" ${e.cloud ? "checked" : ""}/>${esc(e.title)}${e.cloud ? "（云端）" : ""}</label>`).join("");
   modal(`<form class="callnote bt-form" onsubmit="btGroupAddSubmit(event)"><h3>添加成员到「${esc(g.title)}」</h3>
-      <div class="muted">云端引擎（Cue）会直接加入讨论；本地代码引擎（含 Meta Muse）会自动补建独立工作树。</div>
+      <div class="muted">云端引擎（Meta Muse / Cue）会直接加入讨论；本地代码引擎会自动补建独立工作树。</div>
       <div class="bt-fl">选择引擎<div class="bt-chks">${boxes}</div></div>
       <div class="row gap"><button class="btn primary">添加</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
     </form>`);
@@ -635,25 +635,35 @@ async function btCloudAuth(bot) {
   const eng = btEngine(bot);
   let info = {};
   try { info = await api("GET", `/api/bots/engines/${bot}/auth`); } catch (e) { toast("读取凭据状态失败：" + e.message); return; }
+  const isCue = bot === "cue";
   const statusLine = info.configured
-    ? `<b>已配置</b>${info.handle ? " · " + esc(info.handle) : ""}${info.source ? " · 来源：" + esc(info.source) : ""}`
+    ? `<b>已配置</b>${info.handle ? " · " + esc(info.handle) : info.viewer_id ? " · " + esc(info.viewer_id) : ""}${info.source ? " · 来源：" + esc(info.source) : ""}`
     : `<span class="muted">尚未配置</span>`;
   const expOn = !!info.experimental_native;
   modal(`<form class="callnote bt-form" onsubmit="btCloudAuthSave(event, '${esc(bot)}')">
       <h3>${esc(eng.title)} 凭据设置</h3>
       <div class="small" id="btAuthStatus">状态：${statusLine}</div>
-      <label>Manus API Key（推荐，官方 API v2）<input name="api_key" type="password" placeholder="${info.has_api_key ? esc(info.api_key_preview) + "（留空保持不变）" : "粘贴 Manus API Key"}" /><small>默认仅使用官方 Manus OpenAPI v2，不会自动读取浏览器 Cookie。</small></label>
-      <label>代理地址（可选）<input name="proxy_url" value="${esc(info.proxy_url || "")}" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></label>
-      <details style="margin:6px 0" ${expOn ? "open" : ""}>
-        <summary class="small muted" style="cursor:pointer">实验选项：非公开实时通道（api.manus.im + 浏览器登录态）</summary>
-        <div style="padding-top:8px">
-          <label class="bt-chk"><input type="checkbox" name="experimental_native" ${expOn ? "checked" : ""} />启用实验实时通道（随时可能因上游变更失效）</label>
-          <div class="row gap" style="margin:6px 0">
-            <button type="button" class="btn sm" onclick="btCloudAuthBrowser('${esc(bot)}')">手动从浏览器读取 cue.im Cookie</button>
+      ${isCue ? `
+        <label>Manus API Key（推荐，官方 API v2）<input name="api_key" type="password" placeholder="${info.has_api_key ? esc(info.api_key_preview) + "（留空保持不变）" : "粘贴 Manus API Key"}" /><small>默认仅使用官方 Manus OpenAPI v2，不会自动读取浏览器 Cookie。</small></label>
+        <label>代理地址（可选）<input name="proxy_url" value="${esc(info.proxy_url || "")}" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></label>
+        <details style="margin:6px 0" ${expOn ? "open" : ""}>
+          <summary class="small muted" style="cursor:pointer">实验选项：非公开实时通道（api.manus.im + 浏览器登录态）</summary>
+          <div style="padding-top:8px">
+            <label class="bt-chk"><input type="checkbox" name="experimental_native" ${expOn ? "checked" : ""} />启用实验实时通道（随时可能因上游变更失效）</label>
+            <div class="row gap" style="margin:6px 0">
+              <button type="button" class="btn sm" onclick="btCloudAuthBrowser('${esc(bot)}')">手动从浏览器读取 cue.im Cookie</button>
+            </div>
+            <label>手动粘贴 Cookie / Token（可选）<textarea name="cookie_header" rows="2" placeholder="${info.has_cookie ? "已保存（留空保持不变）" : "cue_session_id=..."}"></textarea></label>
           </div>
-          <label>手动粘贴 Cookie / Token（可选）<textarea name="cookie_header" rows="2" placeholder="${info.has_cookie ? "已保存（留空保持不变）" : "cue_session_id=..."}"></textarea></label>
+        </details>
+      ` : `
+        <div class="row gap" style="margin:6px 0">
+          <button type="button" class="btn sm primary" onclick="btCloudAuthBrowser('${esc(bot)}')">手动从浏览器读取 muse.ai Cookie</button>
         </div>
-      </details>
+        <small class="muted">先在 Chrome / Arc / Edge / BrowserOS 登录 muse.ai，再点击上方按钮读取（不会后台自动读取）。</small>
+        <label>手动粘贴 Muse Cookie（可选）<textarea name="cookie_header" rows="3" placeholder="${info.has_cookie ? esc(info.cookie_preview) + "（留空保持不变）" : "从 muse.ai 请求头复制 Cookie"}"></textarea></label>
+        <label>代理地址（可选）<input name="proxy_url" value="${esc(info.proxy_url || "")}" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></label>
+      `}
       <div class="row gap">
         <button class="btn primary">保存并测试</button>
         <button type="button" class="btn" onclick="btCloudAuthTest('${esc(bot)}')">测试连接</button>
@@ -663,7 +673,8 @@ async function btCloudAuth(bot) {
     </form>`);
 }
 async function btCloudAuthBrowser(bot) {
-  const st = $("btAuthStatus"); if (st) st.innerHTML = "正在从本机/连接电脑的浏览器读取 cue.im 登录态…";
+  const site = bot === "muse" ? "muse.ai" : "cue.im";
+  const st = $("btAuthStatus"); if (st) st.innerHTML = `正在从本机/连接电脑的浏览器读取 ${site} 登录态…`;
   try {
     const r = await api("POST", `/api/bots/engines/${bot}/auth/browser`, { verify: true });
     const v = r.verify || {};
@@ -678,8 +689,12 @@ async function btCloudAuthBrowser(bot) {
 async function btCloudAuthSave(ev, bot) {
   ev.preventDefault();
   const f = ev.target;
-  const expOn = !!(f.experimental_native && f.experimental_native.checked);
-  const body = { proxy_url: f.proxy_url ? f.proxy_url.value.trim() : "", experimental_native: expOn, mode: expOn ? "native" : "openapi", verify: true };
+  const body = { proxy_url: f.proxy_url ? f.proxy_url.value.trim() : "", verify: true };
+  if (bot === "cue") {
+    const expOn = !!(f.experimental_native && f.experimental_native.checked);
+    body.experimental_native = expOn;
+    body.mode = expOn ? "native" : "openapi";
+  }
   if (f.api_key && f.api_key.value.trim()) body.api_key = f.api_key.value.trim();
   if (f.cookie_header && f.cookie_header.value.trim()) body.cookie_header = f.cookie_header.value.trim();
   try {

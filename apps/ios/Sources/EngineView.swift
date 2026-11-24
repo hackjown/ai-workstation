@@ -22,6 +22,48 @@ func engineColor(_ bot: String, _ cs: ColorScheme) -> Color {
     }
 }
 
+/// Renders cloud-engine generated images, videos, audio, and files (`data.media`) inline in engine chats & groups.
+private struct EngineMediaView: View {
+    let media: [JSON]
+    var body: some View {
+        let visual: [JSON] = media.compactMap { m in
+            let p = m.s("path")
+            let k = m.s("kind")
+            guard !p.isEmpty, k == "image" || k == "video" else { return nil }
+            return ["artifact": p, "name": m.s("name"), "kind": k]
+        }
+        let others: [JSON] = media.filter { m in
+            let p = m.s("path")
+            let k = m.s("kind")
+            return p.isEmpty || (k != "image" && k != "video")
+        }
+        VStack(alignment: .leading, spacing: 6) {
+            if !visual.isEmpty {
+                AttachmentPreviews(attachments: visual)
+            }
+            ForEach(others.indices, id: \.self) { i in
+                let m = others[i]
+                let name = m.s("name").isEmpty ? "文件" : m.s("name")
+                let link: URL? = !m.s("path").isEmpty ? API.shared.artifactURL(m.s("path"), download: false) : URL(string: m.s("url"))
+                if let u = link {
+                    Link(destination: u) {
+                        HStack(spacing: 6) {
+                            Image(systemName: m.s("kind") == "audio" ? "waveform" : fileIcon(name)).foregroundColor(amber)
+                            Text(name).lineLimit(1).truncationMode(.middle)
+                            Text("预览 / 下载").foregroundColor(.secondary)
+                        }
+                        .font(.caption).padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color(.secondarySystemBackground)))
+                    }
+                } else {
+                    Text(name + (m.s("error").isEmpty ? "" : "（\(m.s("error"))）"))
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+}
+
 /// v3.9.69: the engine's round avatar, the same as the web page: an amber ring like AIW's own, its real logo on white
 /// (engines/eng-<id>.png in the bundle, copied by build-ipa.sh; LobeHub Icons, MIT). Unknown ids show their first letters.
 struct EngineAvatar: View {
@@ -659,6 +701,10 @@ struct EngineConvView: View {
                     .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(["error", "failed", "blocked"].contains(st) ? Color.red.opacity(0.1) : Color(.secondarySystemBackground)))
             }
+            let media = d.a("media")
+            if !running && !media.isEmpty {
+                EngineMediaView(media: media)
+            }
             if !steps.isEmpty {
                 DisclosureGroup("\(running ? "正在做" : "做了") \(stepCount(d, steps.count)) 步") {
                     VStack(alignment: .leading, spacing: 3) {
@@ -1283,6 +1329,10 @@ struct EngineGroupView: View {
                     .font(.callout).padding(.horizontal, 12).padding(.vertical, 8)
                     .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(bad ? Color.red.opacity(0.12) : Color(.secondarySystemBackground)))
+                let media = d.a("media")
+                if !media.isEmpty {
+                    EngineMediaView(media: media)
+                }
                 if !files.isEmpty {
                     Text("改动：" + files.prefix(8).joined(separator: "，")).font(.caption2).foregroundColor(.secondary).lineLimit(2)
                 }

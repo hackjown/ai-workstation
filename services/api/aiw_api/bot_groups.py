@@ -820,7 +820,7 @@ class Groups:
         bot = c["bot"]
         self.add(gid, "bot", bot, obj.get("text") or "", {
             "status": d.get("status"), "changes": d.get("changes"), "denied": d.get("denied"),
-            "steps": len(d.get("steps") or []), "conv": c["id"]}, src=obj["id"])
+            "media": d.get("media"), "steps": len(d.get("steps") or []), "conv": c["id"]}, src=obj["id"])
         pending = [b for b in g["pending"] if b != bot]
         g = self.set_group(gid, pending=pending)
         if not pending and g["status"] in ("working", "fixing"):

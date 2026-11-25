@@ -44,9 +44,16 @@ jobs:
           name: AIWorkstation-ipa
           path: apps/ios/AIWorkstation.ipa
       - name: Publish to "latest" release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ipa-latest
-          name: Aiw iOS (native, latest)
-          prerelease: true
-          files: apps/ios/AIWorkstation.ipa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in 1 2 3; do
+            if gh release view ipa-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release upload ipa-latest apps/ios/AIWorkstation.ipa --clobber --repo "$GITHUB_REPOSITORY" && exit 0
+            else
+              gh release create ipa-latest apps/ios/AIWorkstation.ipa --title "Aiw iOS (native, latest)" --prerelease --repo "$GITHUB_REPOSITORY" && exit 0
+            fi
+            echo "Release publish attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          exit 1

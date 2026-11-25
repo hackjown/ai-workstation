@@ -9,7 +9,7 @@ def test_ios_group_project_ui():
     ev = (SRC / "EngineView.swift").read_text()
     assert "/api/bots/groups/\\(gid)/project" in ev
     assert "var projectBar" in ev and "func actions(_ m: JSON)" in ev and "askDeliver" in ev
-    assert ev.count("EngineMediaList(media:") >= 3   # engine conv, group bot rows, 管家 rows
+    assert ev.count("EngineMediaList(media:") >= 2 and "EngineMediaView(media: media)" in ev   # group bot + 管家 rows; engine conv uses upstream EngineMediaView
 
 
 def test_ios_media_list():

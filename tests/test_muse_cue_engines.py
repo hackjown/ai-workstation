@@ -520,3 +520,111 @@ async def test_local_media_extraction_and_manager_self_find_media(tmp_path):
     media = aiw_msgs[0]["data"].get("media") or []
     assert [m["name"] for m in media] == ["agy-ui.png", "cbc-ui.png"]
     assert [m["kind"] for m in media] == ["image", "image"]
+
+
+@pytest.mark.asyncio
+async def test_cue_waiting_with_reply_is_turn_done_and_group_assign_passes_history(tmp_path):
+    # 1. Cue returning assistant_message + agent_status=waiting is a normal turn_done (NOT blocked/denied)
+    store = Store(str(tmp_path / "aiw.db"))
+    auth_store = CloudAuthStore(store, SecretBox(store, str(tmp_path)))
+    auth_store.save("cue", {"api_key": "sk-manus-test", "mode": "openapi", "source": "manual"})
+
+    def waiting_reply_handler(req: httpx.Request) -> httpx.Response:
+        p = req.url.path
+        if p.endswith("/task.sendMessage"):
+            return httpx.Response(200, json={"ok": True, "task_id": "t-wreply"})
+        if p.endswith("/task.listMessages"):
+            if req.url.params.get("order") == "desc":
+                return httpx.Response(200, json={"ok": True, "messages": []})
+            return httpx.Response(200, json={"ok": True, "messages": [
+                {"id": "u1", "type": "user_message", "user_message": {"content": "看下设计"}},
+                {"id": "a1", "type": "assistant_message", "assistant_message": {"content": "设计我看完了，建议选方案A。你觉得呢？"}},
+                {"id": "w1", "type": "status_update", "status_update": {"agent_status": "waiting"}},
+            ]})
+        return httpx.Response(404, json={"ok": False})
+
+    eng = CueEngine(auth_store, transport=httpx.MockTransport(waiting_reply_handler), poll_backoff=(0.01,))
+    st = await eng.start("cloud", {"model": "", "session": ""}, "看下设计")
+    res = await eng.wait("cloud", st["job"], 0, seconds=5)
+    assert res["status"] == "turn_done"
+    assert "方案A" in res["response"]
+    assert not res.get("denied") and not res.get("waiting_confirm")
+
+    # 2. Group @cue direct assign receives recent chat history + posted image labels & attachment
+    img_file = tmp_path / "agy-design.png"
+    img_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+    bots = B.Bots(store, secrets=SecretBox(store, str(tmp_path)))
+    groups = G.Groups(bots)
+    g = await groups.create("home-inventory", "", ["cue", "muse"])
+    gid = g["id"]
+    groups.add(gid, "bot", "agy", "这是首页桌面端设计稿", {"media": [{"name": "agy-design.png", "path": str(img_file), "kind": "image", "label": "Antigravity · 首页"}]})
+
+    sent_calls = []
+    bots.send = lambda cid, text, role="user", **kw: (sent_calls.append((cid, text, kw)), {"id": "m1"})[1]
+    await groups.send(gid, "@cue 看看群里聊天记录和截图，点评一下")
+    assert len(sent_calls) == 1
+    _cid, prompt_sent, kw = sent_calls[0]
+    assert "这是首页桌面端设计稿" in prompt_sent
+    assert "Antigravity · 首页" in prompt_sent
+    atts = kw.get("attachments") or []
+    assert any(a.get("artifact") == str(img_file) for a in atts)
+
+
+@pytest.mark.asyncio
+async def test_group_multi_owner_steps_cloud_reroute_no_merge_and_unread(tmp_path):
+    # 1. parse_steps expands multiple @mentions on a single step line
+    steps = G.parse_steps(
+        "第 1 步 @agy @cbc @cue @muse 各自设计前端\n第 2 步 @管家 汇总对比并向我提问",
+        ["agy", "codebuddy", "cue", "muse"],
+    )
+    assert [s["bot"] for s in steps] == ["agy", "codebuddy", "cue", "muse", G.MANAGER_ID]
+
+    # 2. _reroute_cloud_local_plan prevents assigning local-path verification to cloud engines (muse/cue)
+    bad_plan = {
+        "steps": [
+            {"bot": "agy", "task": "在 ~/workspace/demo 开发前端", "step": "开发"},
+            {"bot": "muse", "task": "验收 ~/workspace/demo 里的本地代码和文件", "step": "验收"},
+            {"bot": "cue", "task": "讨论配色方案和体验建议", "step": "讨论"},
+        ],
+        "assign": {},
+        "report": "计划",
+    }
+    fixed = G._reroute_cloud_local_plan(bad_plan, ["agy", "codebuddy", "muse", "cue"])
+    assert fixed["steps"][0]["bot"] == "agy"
+    assert fixed["steps"][1]["bot"] == "codebuddy"   # rerouted from muse to local engine (avoiding agy)
+    assert fixed["steps"][2]["bot"] == "cue"         # pure discussion stays on cloud engine
+
+    # 3. Cloud-only reply in a mixed group does NOT trigger auto_merge, and group unread count works
+    store = Store(str(tmp_path / "aiw.db"))
+    store.upsert_machine({"id": "ai-linux-001", "provider": "local", "provider_vm_id": "v1",
+                          "name": "Local PC", "agent_endpoint": "ws://localhost:8001"})
+    secrets = SecretBox(store, str(tmp_path))
+
+    async def fake_shell(mid: str, cmd: str, timeout: int) -> str:
+        return "DIRTY 0\nGROUP_OK main\n"
+
+    bots = B.Bots(store, shell=fake_shell, secrets=secrets)
+    groups = G.Groups(bots)
+    app = FastAPI()
+    G.mount(app, groups, lambda: None)
+    client = TestClient(app)
+
+    g = await groups.create("mixed-grp", "~/workspace/demo", ["agy", "cue"], "main", auto_merge=True)
+    gid = g["id"]
+    merged_called = []
+    groups.merge = lambda _gid: (merged_called.append(_gid), {"ok": True})[1]
+
+    # Simulate user @cue and cue replying
+    groups.add(gid, "user", "我", "@cue 看看记录")
+    groups.set_group(gid, status="working", pending=["cue"])
+    cue_conv = groups.member(g, "cue")["conv"]
+    cue_msg = bots.add(cue_conv, "bot", "我看完了", {"status": "done"})
+    groups._on_bot("message", cue_msg)
+    assert merged_called == []
+    assert groups.group(gid)["status"] == "idle"
+    assert groups.group(gid)["unread"] == 1
+
+    # Opening group clears unread to 0
+    r = client.get(f"/api/bots/groups/{gid}")
+    assert r.status_code == 200 and r.json()["group"]["unread"] == 0
+    assert groups.group(gid)["unread"] == 0

@@ -22,45 +22,30 @@ func engineColor(_ bot: String, _ cs: ColorScheme) -> Color {
     }
 }
 
-/// Renders cloud-engine generated images, videos, audio, and files (`data.media`) inline in engine chats & groups.
+/// Renders engine-generated images, videos, audio, and files (`data.media`) inline with zoomable preview & download.
 private struct EngineMediaView: View {
     let media: [JSON]
     var body: some View {
-        let visual: [JSON] = media.compactMap { m in
-            let p = m.s("path")
-            let k = m.s("kind")
-            guard !p.isEmpty, k == "image" || k == "video" else { return nil }
-            return ["artifact": p, "name": m.s("name"), "kind": k]
-        }
-        let others: [JSON] = media.filter { m in
-            let p = m.s("path")
-            let k = m.s("kind")
-            return p.isEmpty || (k != "image" && k != "video")
-        }
-        VStack(alignment: .leading, spacing: 6) {
-            if !visual.isEmpty {
-                AttachmentPreviews(attachments: visual)
+        EngineMediaList(media: media)
+    }
+}
+
+private struct MemberPulseRing: View {
+    let color: Color
+    let active: Bool
+    @State private var pulse = false
+    var body: some View {
+        Circle()
+            .stroke(color, lineWidth: active ? (pulse ? 2.4 : 1.2) : 1.8)
+            .scaleEffect(active && pulse ? 1.16 : 1.0)
+            .opacity(active && pulse ? 0.45 : 0.9)
+            .onAppear {
+                if active { withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) { pulse = true } }
             }
-            ForEach(others.indices, id: \.self) { i in
-                let m = others[i]
-                let name = m.s("name").isEmpty ? "文件" : m.s("name")
-                let link: URL? = !m.s("path").isEmpty ? API.shared.artifactURL(m.s("path"), download: false) : URL(string: m.s("url"))
-                if let u = link {
-                    Link(destination: u) {
-                        HStack(spacing: 6) {
-                            Image(systemName: m.s("kind") == "audio" ? "waveform" : fileIcon(name)).foregroundColor(amber)
-                            Text(name).lineLimit(1).truncationMode(.middle)
-                            Text("预览 / 下载").foregroundColor(.secondary)
-                        }
-                        .font(.caption).padding(.horizontal, 10).padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color(.secondarySystemBackground)))
-                    }
-                } else {
-                    Text(name + (m.s("error").isEmpty ? "" : "（\(m.s("error"))）"))
-                        .font(.caption2).foregroundColor(.secondary)
-                }
+            .onChange(of: active) { on in
+                if on { withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) { pulse = true } }
+                else { pulse = false }
             }
-        }
     }
 }
 
@@ -301,6 +286,13 @@ struct EngineSheet: View {
                 Task { await load() }
             }
         }
+        .onChange(of: openGroup) { id in
+            if let id = id {
+                if let idx = groups.firstIndex(where: { $0.s("id") == id }) { groups[idx]["unread"] = 0 }
+            } else {
+                Task { await load() }
+            }
+        }
         .sheet(item: $cfgBot) { t in
             EngineCfgSheet(engine: engines.first { $0.s("id") == t.id } ?? ["id": t.id, "title": t.id]) { Task { await load() } }
         }
@@ -417,12 +409,19 @@ struct EngineSheet: View {
         let names = g.a("members").map { m in engines.first { $0.s("id") == m.s("bot") }?.s("title") ?? m.s("bot") }
         let last = g.o("last")
         let st = engineGroupStatus[g.s("status")] ?? ""
+        let unread = Int(g.d("unread"))
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Image(systemName: "person.3").font(.caption).foregroundColor(amber)
                 Text(g.s("title")).font(.subheadline.weight(.semibold)).lineLimit(1)
                 if g.b("busy") { ProgressView().controlSize(.mini) }
                 Spacer()
+                if unread > 0 {
+                    Text(unread > 99 ? "99+" : "\(unread)")
+                        .font(.system(size: 10, weight: .bold)).foregroundColor(.white)
+                        .padding(.horizontal, 6).frame(minWidth: 18, minHeight: 18)
+                        .background(Color.red).clipShape(Capsule())
+                }
                 Text(when(g.d("updated_at"))).font(.caption2).foregroundColor(.secondary)
             }
             if !g.s("needs").isEmpty {                 // v3.9.88 需要你
@@ -1327,10 +1326,21 @@ struct EngineGroupView: View {
     @State private var groupSig = ""
     @State private var initialScrolled = false
     @State private var wantScroll = false
-    @State private var pulse = false
+    @State private var showAddMembers = false
+    @State private var attach: [JSON] = []
+    @State private var uploading = false
+    @State private var photos: [PhotosPickerItem] = []
+    @State private var showPhotos = false
 
     var project: JSON { group.o("project") }
     var live: Bool { group.b("busy") || (!group.s("status").isEmpty && group.s("status") != "idle") }
+    var groupSubtitle: String {
+        group.s("repo").isEmpty ? "云端协作群" : "\(group.s("repo")) · \(group.s("base"))"
+    }
+    var addableEngines: [JSON] {
+        let cur = Set(group.a("members").map { $0.s("bot") })
+        return engines.filter { $0.b("available") && !cur.contains($0.s("id")) }
+    }
     func title(_ bot: String) -> String { engines.first { $0.s("id") == bot }?.s("title") ?? bot }
     func shortName(_ bot: String) -> String {
         let e = engines.first { $0.s("id") == bot }
@@ -1341,14 +1351,14 @@ struct EngineGroupView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 12) {
                     if msgs.isEmpty && !group.isEmpty {
                         Text("说要做什么：不 @ 就由 AIW 管家分工；@codex 只发给它。每个引擎在自己的分支上改，做完管家合并。\n以「项目规划：」开头发一份规划，就按 讨论 → 设计 → 开发 → 评审 → 验收 → 实测截图 → 交付 走完。")
                             .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
                     }
                     ForEach(msgs.indices.map { HRowKey(i: $0, id: msgs[$0].s("id")) }, id: \.id) { k in row(msgs[k.i]) }
                     if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red) }
-                    Color.clear.frame(height: 1).id("end")
+                    Color.clear.frame(height: 24).id("end")
                 }.padding(.horizontal, 14).padding(.vertical, 10)
             }
             .scrollDismissesKeyboard(.interactively)
@@ -1357,7 +1367,7 @@ struct EngineGroupView: View {
             .onChange(of: msgs.count) { n in
                 if n > 0 && (!initialScrolled || wantScroll) {
                     initialScrolled = true; wantScroll = false
-                    DispatchQueue.main.async { proxy.scrollTo("end", anchor: .bottom) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { proxy.scrollTo("end", anchor: .bottom) }
                 }
             }
         }
@@ -1366,12 +1376,17 @@ struct EngineGroupView: View {
             ToolbarItem(placement: .principal) {
                 VStack(spacing: 0) {
                     Text(group.s("title").isEmpty ? "群聊" : group.s("title")).font(.subheadline.weight(.bold)).lineLimit(1)
-                    Text(group.s("repo") + " · " + group.s("base")).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                    Text(groupSubtitle).font(.caption2).foregroundColor(.secondary).lineLimit(1)
                 }
             }
             ToolbarItem(placement: .navigationBarTrailing) {
                 Menu {
-                    Button { Task { await act("POST", "/merge") } } label: { Label("合并", systemImage: "arrow.triangle.merge") }
+                    if !addableEngines.isEmpty {
+                        Button { showAddMembers = true } label: { Label("添加成员", systemImage: "person.badge.plus") }
+                    }
+                    if !group.s("repo").isEmpty {
+                        Button { Task { await act("POST", "/merge") } } label: { Label("合并", systemImage: "arrow.triangle.merge") }
+                    }
                     if !group.o("merge").isEmpty {
                         Button { diff = GroupDiffSheet(msg: "", whole: true) } label: { Label("和 \(group.s("base")) 整体对比", systemImage: "plusminus") }
                     }
@@ -1382,6 +1397,17 @@ struct EngineGroupView: View {
                     }
                     Button(role: .destructive) { confirmDelete = true } label: { Label("删除群聊", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle").font(.system(size: 18)) }.accessibilityLabel("更多")
+            }
+        }
+        .photosPicker(isPresented: $showPhotos, selection: $photos, maxSelectionCount: 6, matching: .any(of: [.images, .videos]))
+        .onChange(of: photos) { items in
+            guard !items.isEmpty else { return }
+            let list = items; photos = []
+            Task { for it in list { await addGroupPhoto(it) } }
+        }
+        .sheet(isPresented: $showAddMembers) {
+            EngineGroupAddMemberSheet(gid: gid, available: addableEngines) {
+                showAddMembers = false; groupSig = ""; Task { await load() }; changed()
             }
         }
         .navigationDestination(isPresented: Binding(get: { openConv != nil }, set: { on in if !on { openConv = nil } })) {
@@ -1430,7 +1456,6 @@ struct EngineGroupView: View {
 
     var memberBar: some View {
         let members = group.a("members")
-        let anyBusy = members.contains { $0.s("state") == "busy" || $0.b("busy") }
         return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {
                 ForEach(members.indices, id: \.self) { i in
@@ -1443,13 +1468,7 @@ struct EngineGroupView: View {
                         HStack(spacing: 5) {
                             EngineAvatar(bot: bot, size: 26)
                                 .saturation(st == "off" ? 0.3 : 1).opacity(st == "off" ? 0.65 : 1)
-                                .overlay(
-                                    Circle()
-                                        .stroke(st == "busy" ? amber : (st == "error" ? Color.red : Color.clear),
-                                                lineWidth: st == "busy" ? (pulse ? 2.5 : 1.2) : 1.8)
-                                        .scaleEffect(st == "busy" && pulse ? 1.16 : 1.0)
-                                        .opacity(st == "busy" && pulse ? 0.45 : 0.9)
-                                )
+                                .overlay(MemberPulseRing(color: st == "busy" ? amber : (st == "error" ? Color.red : Color.clear), active: st == "busy"))
                                 .overlay(
                                     Circle().fill(dot).frame(width: 8, height: 8)
                                         .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 1.5)),
@@ -1469,13 +1488,6 @@ struct EngineGroupView: View {
             .padding(.horizontal, 12).padding(.vertical, 6)
         }
         .background(.bar)
-        .onAppear {
-            if anyBusy && !pulse { withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) { pulse = true } }
-        }
-        .onChange(of: anyBusy) { on in
-            if on { withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) { pulse = true } }
-            else { pulse = false }
-        }
     }
 
     /// v3.9.86 项目模式: which stage the project is at, the design picked, rework rounds, what was delivered
@@ -1564,15 +1576,38 @@ struct EngineGroupView: View {
     }
 
     var composer: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("说要做什么，@muse @cue @codex @claude @grok @cbc @agy 指定谁做…", text: $text, axis: .vertical)
-                .lineLimit(1...5).padding(.horizontal, 12).padding(.vertical, 8)
-                .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemBackground)))
-            Button { Task { await send() } } label: {
-                Image(systemName: sending ? "hourglass" : "arrow.up.circle.fill").font(.system(size: 30)).foregroundColor(amber)
-            }.disabled(sending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        VStack(spacing: 6) {
+            if !attach.isEmpty || uploading {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        if uploading { ProgressView().controlSize(.small) }
+                        ForEach(attach.indices, id: \.self) { i in
+                            let a = attach[i]
+                            HStack(spacing: 4) {
+                                Image(systemName: a.s("kind") == "video" ? "film" : "photo").font(.caption2).foregroundColor(amber)
+                                Text(a.s("name")).font(.caption2).lineLimit(1)
+                                Button { attach.remove(at: i) } label: { Image(systemName: "xmark.circle.fill").font(.caption2).foregroundColor(.secondary) }
+                            }
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(Capsule().fill(Color(.secondarySystemBackground)))
+                        }
+                    }.padding(.horizontal, 12)
+                }
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                Button { showPhotos = true } label: {
+                    Image(systemName: "plus.circle.fill").font(.system(size: 26)).foregroundColor(.secondary)
+                }.disabled(uploading).accessibilityLabel("发图片或视频")
+                TextField("说要做什么，@muse @cue @codex @claude @grok @cbc @agy 指定谁做…", text: $text, axis: .vertical)
+                    .lineLimit(1...5).padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemBackground)))
+                Button { Task { await send() } } label: {
+                    Image(systemName: sending ? "hourglass" : "arrow.up.circle.fill").font(.system(size: 30)).foregroundColor(amber)
+                }.disabled(sending || uploading || (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attach.isEmpty))
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
         }
-        .padding(.horizontal, 12).padding(.vertical, 8).background(.bar)
+        .background(.bar)
     }
 
     @ViewBuilder func row(_ m: JSON) -> some View {
@@ -1588,6 +1623,7 @@ struct EngineGroupView: View {
                 .font(.callout).foregroundColor(role == "aiw" ? .primary : hInk)
                 .padding(.horizontal, 12).padding(.vertical, 8)
                 .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(role == "aiw" ? amber.opacity(0.15) : hAmber))
+                if !m.o("data").a("attachments").isEmpty { AttachmentPreviews(attachments: m.o("data").a("attachments")) }
                 if !m.o("data").a("media").isEmpty { EngineMediaList(media: m.o("data").a("media")) }
                 actions(m)
                 Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
@@ -1663,13 +1699,33 @@ struct EngineGroupView: View {
     }
     @MainActor func send() async {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if body.isEmpty { return }
+        if body.isEmpty && attach.isEmpty { return }
         sending = true; defer { sending = false }
+        let sendText = body.isEmpty ? "（发送了图片/视频）" : body
+        let sendAtt = attach
         do {
-            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/send", ["text": body])
-            text = ""; err = ""; wantScroll = true
+            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/send", ["text": sendText, "attachments": sendAtt])
+            text = ""; attach = []; err = ""; wantScroll = true; msgsSig = ""
             await load()
         } catch let e { err = "没发出去：\(e.localizedDescription)" }
+    }
+    @MainActor func addGroupPhoto(_ item: PhotosPickerItem) async {
+        uploading = true; defer { uploading = false }
+        guard let d = try? await item.loadTransferable(type: Data.self) else { err = "读不了这张照片"; return }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let img = UIImage(data: d)
+        let payload = img?.jpegData(compressionQuality: 0.85) ?? d
+        let name = img == nil ? "media-\(stamp).mp4" : "photo-\(stamp).jpg"
+        let ctype = img == nil ? "video/mp4" : "image/jpeg"
+        let dst = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try payload.write(to: dst, options: .atomic)
+            let q = name.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? name
+            let mid = API.shared.machine.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? ""
+            var r = try await API.shared.postFile("/api/uploads/raw?name=\(q)&machine_id=\(mid)&local_only=true", file: dst, contentType: ctype) { _ in }
+            if r.s("kind").isEmpty { r["kind"] = img == nil ? "video" : "image" }
+            attach.append(r)
+        } catch { err = "上传失败：\(error.localizedDescription)" }
     }
     @MainActor func projectAct(_ action: String, _ value: String, reason: String = "") async {
         do {
@@ -1692,6 +1748,54 @@ struct EngineGroupView: View {
 
 /// v3.9.88 只看这一轮: one member turn's own changes (its commits only, merges it pulled in left out), or the whole
 /// result against the base branch, coloured like a review.
+struct EngineGroupAddMemberSheet: View {
+    let gid: String
+    let available: [JSON]
+    let done: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var picked: Set<String> = []
+    @State private var busy = false
+    @State private var err = ""
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(header: Text("选择要加入的引擎")) {
+                    ForEach(available.indices, id: \.self) { i in
+                        let e = available[i], id = e.s("id")
+                        Button {
+                            if picked.contains(id) { picked.remove(id) } else { picked.insert(id) }
+                        } label: {
+                            HStack(spacing: 10) {
+                                EngineAvatar(bot: id, size: 28)
+                                Text(e.s("title") + (e.b("cloud") ? "（云端）" : "")).foregroundColor(.primary)
+                                Spacer()
+                                if picked.contains(id) { Image(systemName: "checkmark.circle.fill").foregroundColor(amber) }
+                            }
+                        }
+                    }
+                }
+                if !err.isEmpty { Section { Text(err).foregroundColor(.red).font(.footnote) } }
+            }
+            .navigationTitle("添加成员").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    if busy { ProgressView() } else {
+                        Button("加入") { Task { await submit() } }.bold().disabled(picked.isEmpty)
+                    }
+                }
+            }
+        }
+    }
+    @MainActor func submit() async {
+        busy = true; defer { busy = false }
+        do {
+            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/members", ["members": Array(picked)])
+            done()
+        } catch let e { err = "添加失败：\(e.localizedDescription)" }
+    }
+}
+
 struct GroupDiffSheet: Identifiable { let msg: String; let whole: Bool; var id: String { whole ? "whole" : msg } }
 
 struct GroupDiffView: View {

@@ -37,7 +37,21 @@ struct AttachmentPreviews: View {
     }
 }
 
-struct AttViewing: Identifiable { let path: String; let name: String; let video: Bool; var id: String { path } }
+struct AttViewing: Identifiable {
+    let path: String
+    let name: String
+    let video: Bool
+    var url: String = ""
+    var id: String { path.isEmpty ? url : path }
+    var mediaURL: URL? {
+        if !path.isEmpty { return API.shared.artifactURL(path, download: false) }
+        return URL(string: url)
+    }
+    var downloadURL: URL? {
+        if !path.isEmpty { return API.shared.artifactURL(path, download: true) }
+        return URL(string: url)
+    }
+}
 
 struct ImageThumb: View {
     let path: String
@@ -87,28 +101,139 @@ struct AttViewer: View {
     let v: AttViewing
     @Environment(\.dismiss) private var dismiss
     @State private var player: AVPlayer?
+    @State private var image: UIImage?
+    @State private var loading = true
+    @State private var scale: CGFloat = 1.0
+    @State private var lastScale: CGFloat = 1.0
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+    @State private var saving = false
+    @State private var shareFile: URL?
+    @State private var saveMsg = ""
+
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack {
             Color.black.ignoresSafeArea()
             if v.video {
-                if let p = player { VideoPlayer(player: p).ignoresSafeArea() } else { ProgressView().tint(.white).frame(maxWidth: .infinity, maxHeight: .infinity) }
+                if let p = player { VideoPlayer(player: p).ignoresSafeArea() }
+                else { ProgressView().tint(.white).frame(maxWidth: .infinity, maxHeight: .infinity) }
+            } else if let img = image {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFit()
+                    .scaleEffect(scale)
+                    .offset(offset)
+                    .gesture(
+                        MagnificationGesture()
+                            .onChanged { val in
+                                scale = min(max(lastScale * val, 1.0), 5.0)
+                            }
+                            .onEnded { _ in
+                                if scale <= 1.02 { scale = 1.0; offset = .zero; lastOffset = .zero }
+                                lastScale = scale
+                            }
+                    )
+                    .simultaneousGesture(
+                        DragGesture()
+                            .onChanged { g in
+                                guard scale > 1.01 else { return }
+                                offset = CGSize(width: lastOffset.width + g.translation.width,
+                                                height: lastOffset.height + g.translation.height)
+                            }
+                            .onEnded { _ in
+                                if scale > 1.01 { lastOffset = offset }
+                            }
+                    )
+                    .onTapGesture(count: 2) {
+                        withAnimation(.spring(response: 0.25)) {
+                            if scale > 1.1 {
+                                scale = 1.0; lastScale = 1.0; offset = .zero; lastOffset = .zero
+                            } else {
+                                scale = 2.5; lastScale = 2.5
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if loading {
+                ProgressView().tint(.white).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                AsyncImage(url: API.shared.artifactURL(v.path, download: false)) { img in
-                    img.resizable().scaledToFit()
-                } placeholder: { ProgressView().tint(.white) }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Text("图片加载失败").foregroundColor(.white.opacity(0.8))
             }
-            Button { player?.pause(); dismiss() } label: {
-                Image(systemName: "xmark.circle.fill").font(.system(size: 30)).foregroundColor(.white.opacity(0.9)).padding()
-            }.accessibilityLabel("关闭")
+
+            VStack {
+                HStack(spacing: 12) {
+                    if !v.name.isEmpty {
+                        Text(v.name).font(.caption).foregroundColor(.white.opacity(0.85)).lineLimit(1).truncationMode(.middle)
+                            .padding(.horizontal, 10).padding(.vertical, 6).background(Capsule().fill(Color.black.opacity(0.5)))
+                    }
+                    Spacer()
+                    Button { Task { await downloadAndShare() } } label: {
+                        if saving {
+                            ProgressView().tint(.white).frame(width: 34, height: 34).background(Circle().fill(Color.black.opacity(0.55)))
+                        } else {
+                            Image(systemName: "square.and.arrow.down").font(.system(size: 16, weight: .semibold)).foregroundColor(.white)
+                                .frame(width: 34, height: 34).background(Circle().fill(Color.black.opacity(0.55)))
+                        }
+                    }.disabled(saving).accessibilityLabel("下载")
+                    Button { player?.pause(); dismiss() } label: {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 30)).foregroundColor(.white.opacity(0.92))
+                    }.accessibilityLabel("关闭")
+                }
+                .padding(.horizontal, 16).padding(.top, 12)
+                Spacer()
+                if !saveMsg.isEmpty {
+                    Text(saveMsg).font(.caption).foregroundColor(.white)
+                        .padding(.horizontal, 12).padding(.vertical, 6).background(Capsule().fill(Color.black.opacity(0.75)))
+                        .padding(.bottom, 24)
+                }
+            }
         }
-        .onAppear {
-            if v.video, player == nil, let u = API.shared.artifactURL(v.path, download: false) {
-                let p = AVPlayer(url: u); player = p; p.play()
+        .sheet(isPresented: Binding(get: { shareFile != nil }, set: { if !$0 { shareFile = nil } })) {
+            if let u = shareFile { ActivityView(items: [u]) }
+        }
+        .task {
+            if v.video {
+                if player == nil, let u = v.mediaURL {
+                    let p = AVPlayer(url: u); player = p; p.play()
+                }
+                loading = false
+            } else if let u = v.mediaURL {
+                loading = true
+                if let (data, _) = try? await URLSession.shared.data(from: u), let ui = UIImage(data: data) {
+                    image = ui
+                }
+                loading = false
+            } else {
+                loading = false
             }
         }
         .onDisappear { player?.pause() }
     }
+
+    @MainActor func downloadAndShare() async {
+        guard let u = v.downloadURL ?? v.mediaURL else { return }
+        saving = true; defer { saving = false }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: u)
+            let fallback = v.video ? "video.mp4" : "image.png"
+            let rawName = v.name.isEmpty ? (u.lastPathComponent.isEmpty ? fallback : u.lastPathComponent) : v.name
+            let safe = rawName.replacingOccurrences(of: "/", with: "_")
+            let dst = FileManager.default.temporaryDirectory.appendingPathComponent(safe)
+            try data.write(to: dst, options: .atomic)
+            shareFile = dst
+        } catch {
+            saveMsg = "下载失败：\(error.localizedDescription)"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { saveMsg = "" }
+        }
+    }
+}
+
+private struct ActivityView: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 
@@ -120,16 +245,22 @@ struct EngineMediaList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(media.indices, id: \.self) { i in
-                let x = media[i], kind = x.s("kind"), path = x.s("path")
+                let x = media[i], kind = x.s("kind"), path = x.s("path"), url = x.s("url")
                 VStack(alignment: .leading, spacing: 3) {
-                    if (kind == "image" || kind == "video") && !path.isEmpty {
-                        Button { viewing = AttViewing(path: path, name: x.s("name"), video: kind == "video") } label: {
-                            if kind == "video" { VideoThumb(path: path) } else { ShotThumb(path: path) }
-                        }.buttonStyle(.plain).accessibilityLabel((kind == "video" ? "播放视频 " : "查看图片 ") + (x.s("label").isEmpty ? x.s("name") : x.s("label")))
-                    } else if let u = path.isEmpty ? URL(string: x.s("url")) : API.shared.artifactURL(path, download: true) {
+                    if (kind == "image" || kind == "video") && (!path.isEmpty || !url.isEmpty) {
+                        Group {
+                            if kind == "video" { VideoThumb(path: path) } else { ShotThumb(path: path, fallbackURL: url) }
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            viewing = AttViewing(path: path, name: x.s("name"), video: kind == "video", url: url)
+                        }
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityLabel((kind == "video" ? "播放视频 " : "查看图片 ") + (x.s("label").isEmpty ? x.s("name") : x.s("label")))
+                    } else if let u = path.isEmpty ? URL(string: url) : API.shared.artifactURL(path, download: true) {
                         Link(destination: u) {
                             HStack(spacing: 6) {
-                                Image(systemName: fileIcon(x.s("name"))).foregroundColor(amber)
+                                Image(systemName: kind == "audio" ? "waveform" : fileIcon(x.s("name"))).foregroundColor(amber)
                                 Text(x.s("name").isEmpty ? "文件" : x.s("name")).lineLimit(1).truncationMode(.middle)
                                 Text("下载").foregroundColor(.secondary)
                             }.font(.caption)
@@ -148,13 +279,18 @@ struct EngineMediaList: View {
 /// A screenshot keeps its shape (a page is wide, a phone design is tall); tap for full screen.
 struct ShotThumb: View {
     let path: String
+    var fallbackURL: String = ""
+    var url: URL? {
+        if !path.isEmpty { return API.shared.artifactURL(path, download: false) }
+        return URL(string: fallbackURL)
+    }
     var body: some View {
-        AsyncImage(url: API.shared.artifactURL(path, download: false)) { img in
+        AsyncImage(url: url) { img in
             img.resizable().scaledToFit()
         } placeholder: {
-            ZStack { Color(.secondarySystemBackground); ProgressView() }.frame(width: 240, height: 160)
+            ZStack { Color(.secondarySystemBackground); ProgressView() }.frame(width: 220, height: 150)
         }
-        .frame(maxWidth: 280, maxHeight: 380, alignment: .leading)
+        .frame(maxWidth: 280, maxHeight: 340, alignment: .leading)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.secondary.opacity(0.25)))
     }

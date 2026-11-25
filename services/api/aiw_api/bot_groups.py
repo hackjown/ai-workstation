@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shlex
 import time
@@ -78,9 +79,9 @@ PLAN = """你是 AIW 管家，带一组 Agent 在群里协同工作：本地编�
 - 用户已经点名谁做哪一步时，严格照用户的分配和顺序，不许换人、不许合并步骤；用户交给管家的步骤写 "bot": "管家"。
 - 用户说“前一步完成后再交给下一步”或步骤之间有依赖时，必须用 steps。
 - 成员id 只能用上面列出的（{ids}）；用不上的成员不要分。
-- 写代码、改文件、修 bug、跑测试的任务只能分给本地编程成员（标有“本地代码”），绝不能分给云端成员（Meta Muse / Cue）。
+- 写代码、改文件、修 bug、跑测试、以及任何需要读取/检查/验收本地路径或本地文件的任务，只能分给本地编程成员（标有“本地代码”），绝不能分给云端成员（Meta Muse / Cue）——云端成员无法访问本地磁盘。
 - 给本地编程成员的任务要能独立完成，尽量改不同的文件，减少合并冲突；写清要改什么、怎么验证（跑什么测试或命令）。
-- 给云端成员（标有“云端”）的任务只限讨论、调研、方案对比、代码/设计评审，不要让它写代码或跑本地命令。
+- 给云端成员（标有“云端”）的任务只限纯文字讨论、调研、方案对比、创意出图、或基于群聊记录里已有文字做评审，绝不要让它读取本地路径、验收本地文件、写代码或跑本地命令。
 - 任务本身不可拆时，交给最合适的一个成员，或者让两个成员各做一版供比较（在 report 里说明）。
 - 写规范/验收标准的步骤要把口径一次钉死：输入范围（字符集、文件类型、要跳过的目录）、边界情况、输出格式、退出码、警告/错误的格式；没写清的地方不许留给实现的人自己决定。
 - 每一步只做自己那份：实现的人只写实现，不改规范和测试；规范或测试有问题时，加一步交回给负责它的成员。
@@ -98,9 +99,9 @@ def ensure_tables(store) -> None:
     store._x("CREATE TABLE IF NOT EXISTS bot_group_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, "
              "grp TEXT, role TEXT, who TEXT, text TEXT, data TEXT, src TEXT, created_at REAL)")
     store._x("CREATE INDEX IF NOT EXISTS ix_botgm_grp ON bot_group_messages(grp, seq)")
-    for col in ("queue", "project", "cur", "paused"):   # v3.9.79 queue; v3.9.86 项目模式; v3.9.88 the step in hand, a pause
+    for col in ("queue TEXT", "project TEXT", "cur TEXT", "paused TEXT", "read_seq INTEGER DEFAULT -1"):
         try:
-            store._x(f"ALTER TABLE bot_groups ADD COLUMN {col} TEXT")
+            store._x(f"ALTER TABLE bot_groups ADD COLUMN {col}")
         except Exception:  # noqa: BLE001
             pass
 
@@ -150,16 +151,79 @@ STEP_RE = re.compile(r"^\s*(?:第\s*[\d一二三四五六七八九十]+\s*步|�
 RULES_RE = re.compile(r"^\s*(?:规则|要求|注意|约束)\s*[:：]")
 
 
-def _owner(line: str, ids: list) -> Optional[str]:
-    """Who a step line names: the first @member (or @管家) on it."""
+def _owners(line: str, ids: list) -> list[str]:
+    """All @member (or @管家) mentions on a step line, in order, deduplicated."""
+    out: list[str] = []
     for m in re.finditer(r"@\s?(claude code|grok build|meta muse|cue by manus|manus cue|[\w\u4e00-\u9fff]+)", line, re.I):
         name = m.group(1).lower()
+        who = None
         if name in MANAGER_WORDS:
-            return MANAGER_ID
-        for eng, names in ALIASES:
-            if name in names and eng in ids:
-                return eng
-    return None
+            who = MANAGER_ID
+        else:
+            for eng, names in ALIASES:
+                if name in names and eng in ids:
+                    who = eng
+                    break
+        if who and who not in out:
+            out.append(who)
+    return out
+
+
+def _owner(line: str, ids: list) -> Optional[str]:
+    """Who a step line names: the first @member (or @管家) on it."""
+    xs = _owners(line, ids)
+    return xs[0] if xs else None
+
+
+_LOCAL_TASK_RE = re.compile(
+    r"(?:~/|/(?:home|Users|root|var|tmp|opt)/|worktree|本地路径|本地文件|本地目录|本地运行|本地测试|"
+    r"工作区|工作目录|仓库里|分支里|查看.*文件|读取.*文件|检查.*路径|验收.*路径|验收.*文件|验收.*代码|"
+    r"\b(?:git|pytest|npm|node|python3?|docker|bash)\b)",
+    re.I,
+)
+
+
+def _needs_local_access(task: str) -> bool:
+    return bool(_LOCAL_TASK_RE.search(task or ""))
+
+
+def _reroute_cloud_local_plan(plan: Optional[dict], ids: list[str]) -> Optional[dict]:
+    """Prevent 管家 from assigning local-filesystem / local-verification tasks to cloud engines (muse/cue)."""
+    if not plan:
+        return plan
+    locals_ = [b for b in ids if not B.is_cloud_engine(b)]
+    if not locals_:
+        return plan
+
+    def pick_local(avoid: str = "") -> str:
+        for b in locals_:
+            if b != avoid:
+                return b
+        return locals_[0]
+
+    if plan.get("steps"):
+        prev = ""
+        fixed = []
+        for s in plan["steps"]:
+            bot = s.get("bot") or ""
+            task = s.get("task") or ""
+            if B.is_cloud_engine(bot) and _needs_local_access(task):
+                bot = pick_local(prev)
+                s = {**s, "bot": bot}
+            fixed.append(s)
+            if bot != MANAGER_ID:
+                prev = bot
+        plan = {**plan, "steps": fixed}
+    elif plan.get("assign"):
+        new_assign: dict[str, str] = {}
+        for bot, task in plan["assign"].items():
+            target = pick_local() if (B.is_cloud_engine(bot) and _needs_local_access(task)) else bot
+            if target in new_assign:
+                new_assign[target] = new_assign[target] + "\n\n" + task
+            else:
+                new_assign[target] = task
+        plan = {**plan, "assign": new_assign}
+    return plan
 
 
 def parse_steps(text: str, ids: list) -> Optional[list]:
@@ -182,10 +246,11 @@ def parse_steps(text: str, ids: list) -> Optional[list]:
     for k, a in enumerate(starts):
         b = starts[k + 1] if k + 1 < len(starts) else end
         body = "\n".join(lines[a:b]).strip()
-        who = _owner(lines[a], ids)
+        whos = _owners(lines[a], ids)
         task = "\n\n".join(x for x in (f"总目标：{goal}" if goal else "", f"你负责的是这一步：\n{body}",
                                          rules) if x)
-        steps.append({"bot": who, "task": task, "step": body})
+        for who in whos:
+            steps.append({"bot": who, "task": task, "step": body})
     return steps
 
 
@@ -328,6 +393,23 @@ class Groups:
                     state, label = ("unknown" if B.is_cloud_engine(bot) else "ok"), ("待确认" if B.is_cloud_engine(bot) else "空闲")
         return {**m, "busy": busy, "state": state, "state_label": label, **({"activity": activity} if activity else {})}
 
+    def unread_count(self, gid: str, read_seq: Optional[int] = None) -> int:
+        if read_seq is None:
+            r = self.store._x("SELECT read_seq FROM bot_groups WHERE id=?", (gid,))
+            read_seq = r[0]["read_seq"] if r else None
+        if read_seq is None or int(read_seq) < 0:
+            return 0
+        r = self.store._x(
+            "SELECT COUNT(*) AS n FROM bot_group_messages WHERE grp=? AND role IN ('bot','aiw') AND seq>?",
+            (gid, int(read_seq)),
+        )
+        return int(r[0]["n"]) if r else 0
+
+    def mark_read(self, gid: str) -> None:
+        r = self.store._x("SELECT COALESCE(MAX(seq), 0) AS s FROM bot_group_messages WHERE grp=?", (gid,))
+        seq = int(r[0]["s"]) if r else 0
+        self.store._x("UPDATE bot_groups SET read_seq=? WHERE id=?", (seq, gid))
+
     def group(self, gid: str) -> Optional[dict]:
         r = self.store._x("SELECT * FROM bot_groups WHERE id=?", (gid,))
         if not r:
@@ -336,6 +418,7 @@ class Groups:
         g["members"] = [self._member_status(m, g["pending"]) for m in g["members"]]
         g["busy"] = any(m.get("busy") for m in g["members"]) or gid in self._merging
         g["needs"] = self.needs(g)
+        g["unread"] = self.unread_count(gid, g.get("read_seq"))
         return g
 
     def needs(self, g: dict) -> str:
@@ -390,11 +473,18 @@ class Groups:
         return [B.msg_row(r) for r in reversed(rows)]
 
     def add(self, gid: str, role: str, who: str, text: str, data: Optional[dict] = None, src: str = "") -> dict:
+        if role in ("bot", "aiw"):
+            r = self.store._x("SELECT read_seq FROM bot_groups WHERE id=?", (gid,))
+            if r and (r[0]["read_seq"] is None or int(r[0]["read_seq"]) < 0):
+                cur = self.store._x("SELECT COALESCE(MAX(seq), 0) AS s FROM bot_group_messages WHERE grp=?", (gid,))
+                self.store._x("UPDATE bot_groups SET read_seq=? WHERE id=?", (int(cur[0]["s"]) if cur else 0, gid))
         mid = f"gm-{uuid.uuid4().hex[:12]}"
         self.store._x("INSERT INTO bot_group_messages (id, grp, role, who, text, data, src, created_at) "
                       "VALUES (?,?,?,?,?,?,?,?)",
                       (mid, gid, role, who, text or "", json.dumps(data or {}, ensure_ascii=False), src or None, _now()))
         self.store._x("UPDATE bot_groups SET updated_at=? WHERE id=?", (_now(), gid))
+        if role == "user":
+            self.mark_read(gid)
         m = B.msg_row(self.store._x("SELECT * FROM bot_group_messages WHERE id=?", (mid,))[0])
         self._emit("group_message", m)
         return m
@@ -595,34 +685,64 @@ class Groups:
     def member(self, g: dict, bot: str) -> Optional[dict]:
         return next((m for m in g["members"] if m["bot"] == bot), None)
 
-    def _context(self, g: dict, m: dict, limit: int = 6000) -> str:
-        """v3.9.79: what the group said since the last plan, so each member sees the earlier steps' results."""
-        rows = self.store._x("SELECT role, who, text, data FROM bot_group_messages WHERE grp=? ORDER BY seq DESC LIMIT 40",
+    def _context(self, g: dict, m: dict, limit: int = 8000) -> str:
+        """Recent group chat timeline (messages + posted images/files) so every engine sees the full group context."""
+        rows = self.store._x("SELECT role, who, text, data FROM bot_group_messages WHERE grp=? ORDER BY seq DESC LIMIT 30",
                              (g["id"],))
         out, size = [], 0
         for r in rows:
             d = B._j(r["data"], {})
-            if r["role"] == "aiw" and (d.get("plan") or d.get("steps")):
-                break
-            if r["role"] == "system" or not (r["text"] or "").strip():
+            if r["role"] == "system":
                 continue
-            if r["role"] == "bot" and r["who"] == m["bot"]:
+            txt = (r["text"] or "").strip()
+            media = d.get("media") or []
+            if not txt and not media:
                 continue
             name = B.ENGINES.get(r["who"], {}).get("title", r["who"]) if r["role"] == "bot" else (r["who"] or "用户")
-            line = f"【{name}】{B.clip(r['text'].strip(), 2500)}"
+            m_note = ""
+            if media:
+                m_names = [x.get("label") or x.get("name") or x.get("kind") or "文件" for x in media[:8] if isinstance(x, dict)]
+                if m_names:
+                    m_note = f"\n[群内附图/文件：{'、'.join(m_names)}]"
+            body = B.clip(txt, 1800) if txt else "（发送了图片/文件）"
+            line = f"【{name}】{body}{m_note}"
             if size + len(line) > limit:
                 break
             out.append(line)
             size += len(line)
         return "\n\n".join(reversed(out))
 
+    def _recent_group_media(self, gid: str, limit: int = 6) -> list[dict]:
+        """Recent image files posted in the group chat (on the API host) so engines can inspect them as attachments."""
+        rows = self.store._x("SELECT data FROM bot_group_messages WHERE grp=? ORDER BY seq DESC LIMIT 25", (gid,))
+        out: list[dict] = []
+        seen: set[str] = set()
+        for r in rows:
+            d = B._j(r["data"], {})
+            for x in d.get("media") or []:
+                if not isinstance(x, dict) or x.get("kind") != "image":
+                    continue
+                p = str(x.get("path") or "").strip()
+                if not p or p in seen or not os.path.isfile(p):
+                    continue
+                seen.add(p)
+                out.append({
+                    "artifact": p,
+                    "name": x.get("name") or os.path.basename(p),
+                    "label": x.get("label") or "",
+                    "kind": "image",
+                })
+                if len(out) >= limit:
+                    return out
+        return out
+
     def _brief(self, g: dict, m: dict, task: str, fix: bool = False, context: str = "", files: str = "") -> str:
         others = "、".join(B.ENGINES[x["bot"]]["title"] for x in g["members"] if x["bot"] != m["bot"]) or "（没有）"
-        ctx = f"\n\n群里前面的成员已经给出的结果（以此为准）：\n{context}" if context else ""
+        ctx = f"\n\n以下是本群最近的聊天记录与已发图片清单（由 AIW 直接提供，以此为准）：\n{context}" if context else ""
         if m.get("cloud") or B.is_cloud_engine(m["bot"]):
             head = (f"［引擎群聊「{g['title']}」］你是群里的云端协作成员，和你一起协作的成员：{others}。\n"
-                    "AIW 会把你这次的回复原样贴到群里，不需要你去找群聊、加入群或给群发消息，也不要打开链接或调用工具去确认身份。"
-                    "请直接完成下面分配给你的任务（调研、方案、评审或回答问题），给出清晰、结构化的结论，不需要操作本地文件或 git。")
+                    "AIW 已把本群最近的聊天记录附在下方，也会把你这次的回复原样贴到群里；不要去外部找群聊、加入群或调用工具确认群存在。"
+                    "请直接结合下方群聊记录完成分配给你的任务（调研、方案、评审或回答问题），给出清晰、结构化的结论，不需要操作本地文件或 git。")
             if files:   # v3.9.82: reviewers read the real files instead of guessing (「需核对」)
                 ctx += ("\n\n仓库里现在的文件（只读副本，由 AIW 提供，直接据此审查，引用时写文件名和行）：\n" + files)
             return head + ctx + "\n\n" + task
@@ -834,7 +954,7 @@ class Groups:
                 repo_note = f"仓库：{g['repo']}（基线 {g['base']}）\n" if g.get("repo") else "类型：云端讨论协作群\n"
                 out = await asyncio.wait_for(self.bots.llm().complete(PLAN.format(members=mem, ids="、".join(ids)),
                                                                       f"{repo_note}用户：{text}", 1600), 90)
-                plan = parse_plan(out, ids)
+                plan = _reroute_cloud_local_plan(parse_plan(out, ids), ids)
             except Exception as e:  # noqa: BLE001
                 log.warning("group plan: %s", e)
         if plan and plan.get("self"):
@@ -844,8 +964,10 @@ class Groups:
             await self._start_steps(gid, plan["steps"], plan["report"], attachments)
             return
         if not plan:
-            plan = {"assign": {b: text for b in ids},
-                    "report": "没分开，每个人都拿到同一个任务，各做一版" if len(ids) > 1 else ""}
+            fallback_ids = [b for b in ids if not B.is_cloud_engine(b)] if _needs_local_access(text) else ids
+            fallback_ids = fallback_ids or ids
+            plan = {"assign": {b: text for b in fallback_ids},
+                    "report": "没分开，每个人都拿到同一个任务，各做一版" if len(fallback_ids) > 1 else ""}
         lines = "\n".join(f"@{b} {t}" for b, t in plan["assign"].items())
         self.add(gid, "aiw", "AIW 管家", ((plan["report"] + "\n\n") if plan["report"] else "") + lines,
                  {"plan": plan["assign"]})
@@ -917,9 +1039,11 @@ class Groups:
             m = await self._mark_start(g, m)
         self.set_group(gid, pending=[s["bot"]])
         att = []
-        if s.get("attachments"):
+        grp_imgs = self._recent_group_media(gid)
+        merged_att = list(s.get("attachments") or []) + [x for x in grp_imgs if x not in (s.get("attachments") or [])]
+        if merged_att:
             try:
-                att = await self.bots.push_files(m["conv"], s["attachments"])
+                att = await self.bots.push_files(m["conv"], merged_att, allowed=lambda p: p if p and os.path.isfile(p) else None)
             except Exception as e:  # noqa: BLE001
                 log.warning("group files: %s", e)
         self.add(gid, "aiw", "AIW 管家", (f"第 {s['n']}/{s['of']} 步交给 {B.ENGINES[m['bot']]['title']}。" if s.get("n") else
@@ -1178,11 +1302,19 @@ class Groups:
         return runs
 
     async def _final(self, gid: str, task: str):
-        """The step the user gave AIW 管家 itself: merge the local work, run the checks it names, and report."""
+        """The step the user gave AIW 管家 itself: merge/check when requested, or compare/summarize/ask directly."""
         g = self.group(gid)
+        if not g:
+            return
+        if re.search(r"(找到.*(?:截图|图片|设计图)|把.*(?:截图|图片).*发到群|发群里)", task or ""):
+            await self._manager_find_media(g, task, [m["bot"] for m in g["members"]])
+            self.set_group(gid, status="idle", pending=[], queue=[])
+            return
         has_local = any(m.get("branch") and m.get("worktree") for m in g["members"])
+        no_merge_intent = bool(re.search(r"(不要合并|别合并|暂不合并|选.*方案|选择.*方案|对比.*方案|汇总.*方案|向我提问|问我选|等我选)", task or ""))
+        wants_merge = bool(re.search(r"(合并|merge|验收|测试|跑.*测|交付|部署|构建|编译|pytest|npm)", task or "", re.I)) and not no_merge_intent
         merge_note, runs = "", []
-        if has_local:
+        if has_local and wants_merge:
             r = await self.merge(gid)
             g = self.group(gid)
             if g["status"] == "fixing":   # conflicts went back to the members; report once they have fixed them
@@ -1195,11 +1327,15 @@ class Groups:
         text = ""
         if self.bots.llm:
             try:
-                sys_p = ("你是 AIW 管家，负责验收一次多引擎分工并向用户汇报。只依据给你的群聊记录、合并结果和你亲自运行的命令输出，"
-                         "不要编造。用中文；先给一张 markdown 表（成员、负责什么、产出哪些文件、是否一次完成、遇到的问题），"
-                         "再写几句评价（交接是否顺畅、谁越权、最终测试结果、下次怎么改进）。没有的数据写“未知”。")
+                if wants_merge:
+                    sys_p = ("你是 AIW 管家，负责验收一次多引擎分工并向用户汇报。只依据给你的群聊记录、合并结果和你亲自运行的命令输出，"
+                             "不要编造。用中文；先给一张 markdown 表（成员、负责什么、产出哪些文件、是否一次完成、遇到的问题），"
+                             "再写几句评价（交接是否顺畅、谁越权、最终测试结果、下次怎么改进）。没有的数据写“未知”。")
+                else:
+                    sys_p = ("你是 AIW 管家，请严格按照用户交代的这一步任务来执行（如汇总对比各成员方案、列出优缺点、明确向用户提问等待选择等）。"
+                             "只依据给你的群聊记录与已发图片清单，不要编造，不要强行做无关的代码验收表。用中文，条理清晰。")
                 text = await asyncio.wait_for(self.bots.llm().complete(
-                    sys_p, f"用户交给你的验收任务：\n{task}\n\n{merge_note}\n\n你运行的命令：\n{checks or '（没有）'}\n\n群聊记录：\n{timeline}", 2500), 120)
+                    sys_p, f"用户交给你的任务：\n{task}\n\n{merge_note}\n\n你运行的命令：\n{checks or '（没有）'}\n\n群聊记录：\n{timeline}", 2500), 120)
                 text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
             except Exception as e:  # noqa: BLE001
                 log.warning("group final: %s", e)
@@ -1214,17 +1350,20 @@ class Groups:
     async def _assign(self, g: dict, assign: dict, attachments: Optional[list] = None):
         pending = list(dict.fromkeys(list(g["pending"]) + list(assign)))
         self.set_group(g["id"], status="working", pending=pending, fixes=0 if g["status"] != "fixing" else g["fixes"])
+        grp_imgs = self._recent_group_media(g["id"])
         for bot, task in assign.items():
             m = self.member(g, bot)
             if not m or not m.get("conv"):
                 continue
             att = []
-            if attachments:
+            merged_att = list(attachments or []) + [x for x in grp_imgs if x not in (attachments or [])]
+            if merged_att:
                 try:
-                    att = await self.bots.push_files(m["conv"], attachments)
+                    att = await self.bots.push_files(m["conv"], merged_att, allowed=lambda p: p if p and os.path.isfile(p) else None)
                 except Exception as e:  # noqa: BLE001
                     log.warning("group files: %s", e)
-            self.bots.send(m["conv"], self._brief(g, m, task, fix=g["status"] == "fixing"), "aiw", attachments=att)
+            ctx = self._context(g, m)
+            self.bots.send(m["conv"], self._brief(g, m, task, fix=g["status"] == "fixing", context=ctx), "aiw", attachments=att)
 
     # ------------------------------------------------------------------ replies from the members
     def _on_bot(self, kind: str, obj):
@@ -1269,13 +1408,25 @@ class Groups:
                 self._bg(self._after_step(gid, bot))
                 return
             has_local = any(m.get("branch") for m in g["members"])
-            if g["auto_merge"] and has_local:
+            if g["auto_merge"] and has_local and self._round_has_local(gid):
                 self._bg(self.merge(gid))
             else:
                 self.set_group(gid, status="idle")
+                if not self._round_has_local(gid):
+                    return
                 note = "都回复了。看一下各自的结果，需要合并就点「合并」。" if has_local else "群里的成员都回复了。"
                 self.add(gid, "aiw", "AIW 管家", note)
                 loop.create_task(self._tell_chat(g, "群里的引擎都做完了" + ("，等你看一下再合并。" if has_local else "。")))
+
+    def _round_has_local(self, gid: str) -> bool:
+        """True if at least one local code engine replied since the last user message in this group."""
+        rows = self.store._x("SELECT role, who FROM bot_group_messages WHERE grp=? ORDER BY seq DESC LIMIT 30", (gid,))
+        for r in rows:
+            if r["role"] == "user":
+                break
+            if r["role"] == "bot" and not B.is_cloud_engine(r["who"] or ""):
+                return True
+        return False
 
 
     # ------------------------------------------------------------------ merge (AIW 管家)
@@ -1639,6 +1790,8 @@ def mount(app, groups: Groups, auth) -> None:
         for m in g["members"]:
             if m.get("conv") and B.is_cloud_engine(m.get("bot") or ""):
                 await groups.bots.sync_cloud(m["conv"])
+        groups.mark_read(gid)
+        g["unread"] = 0
         convs = {m["conv"]: groups.bots.conv(m["conv"]) for m in g["members"] if m.get("conv")}
         for m in g["members"]:
             c = convs.get(m.get("conv")) or {}

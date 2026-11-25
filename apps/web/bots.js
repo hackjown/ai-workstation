@@ -236,6 +236,12 @@ async function btRefresh(scroll) {
       }
       btRenderList();
     }).catch(() => {});
+    api("GET", "/api/bots/groups").then((res) => {
+      if (res && Array.isArray(res.groups)) {
+        BT.groups = res.groups.map((g) => (g.id === BT.gid ? { ...g, unread: 0 } : g));
+        btRenderList();
+      }
+    }).catch(() => {});
   }
   const box = $("btMsgs"), near = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 160;
   btRenderConv();
@@ -283,25 +289,53 @@ async function btFile(raw) {
 // Range), with a download button; other kinds keep downloading (Office / html / md go through mdpreview.js).
 function btMediaPreview(r) {
   const n = String(r.name || "").toLowerCase();
-  const kind = /\.(mp4|m4v|mov|webm)$/.test(n) ? "video" : /\.(png|jpe?g|gif|webp|svg|bmp)$/.test(n) ? "img"
-    : /\.pdf$/.test(n) ? "pdf" : /\.(mp3|wav|m4a|aac|ogg|flac)$/.test(n) ? "audio" : "";
+  const explicit = String(r.kind || "").toLowerCase();
+  const kind = explicit === "video" || /\.(mp4|m4v|mov|webm)$/.test(n) ? "video"
+    : explicit === "image" || explicit === "img" || /\.(png|jpe?g|gif|webp|svg|bmp)$/.test(n) ? "img"
+    : explicit === "pdf" || /\.pdf$/.test(n) ? "pdf"
+    : explicit === "audio" || /\.(mp3|wav|m4a|aac|ogg|flac)$/.test(n) ? "audio" : "";
   if (!kind) return false;
-  const src = artUrl(r.path), dl = artUrl(r.path, true);
-  const inner = kind === "video" ? `<video src="${esc(src)}" controls autoplay playsinline style="max-width:100%;max-height:78vh;background:#000"></video>`
-    : kind === "img" ? `<img src="${esc(src)}" alt="${esc(r.name)}" style="max-width:100%;max-height:78vh;object-fit:contain">`
+  const src = r.path ? artUrl(r.path) : (r.url || "");
+  const dl = r.path ? artUrl(r.path, true) : (r.url || "");
+  if (!src) return false;
+  const name = r.name || (kind === "video" ? "video.mp4" : "image.png");
+  const inner = kind === "video" ? `<video src="${esc(src)}" controls autoplay playsinline style="max-width:96vw;max-height:78vh;background:#000;border-radius:8px"></video>`
+    : kind === "img" ? `<div class="bt-zwrap"><img class="bt-zimg" src="${esc(src)}" alt="${esc(name)}" style="max-width:94vw;max-height:78vh;object-fit:contain;cursor:zoom-in;transition:transform .15s ease"></div>`
     : kind === "audio" ? `<audio src="${esc(src)}" controls autoplay style="width:min(560px,90vw)"></audio>`
-    : `<iframe src="${esc(src)}" title="${esc(r.name)}" style="width:min(1000px,94vw);height:80vh;border:0;background:#fff"></iframe>`;
+    : `<iframe src="${esc(src)}" title="${esc(name)}" style="width:min(1000px,94vw);height:80vh;border:0;background:#fff"></iframe>`;
   const m = document.createElement("div");
-  m.className = "bt-media";
-  m.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.82);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:16px";
-  m.innerHTML = `${inner}<div style="display:flex;gap:10px;align-items:center;color:#fff;font-size:13px"><span>${esc(r.name)} · ${size(r.size || 0)}</span>
-    <a class="btn sm primary" href="${esc(dl)}" download="${esc(r.name)}">下载</a><button class="btn sm" type="button">关闭</button></div>`;
+  m.className = "bt-lightbox";
+  m.style.cssText = "position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.86);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px";
+  const sz = r.size ? ` · ${size(r.size)}` : "";
+  const zoomBtn = kind === "img" ? `<button class="btn sm" type="button" data-zoom="1">放大</button>` : "";
+  m.innerHTML = `${inner}<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center;color:#fff;font-size:13px"><span>${esc(name)}${sz}</span>
+    ${zoomBtn}<a class="btn sm primary" href="${esc(dl)}" download="${esc(name)}">下载</a><button class="btn sm" type="button" data-close="1">关闭</button></div>`;
+  let scale = 1;
+  const img = m.querySelector(".bt-zimg");
+  const zbtn = m.querySelector("[data-zoom]");
+  const setScale = (s) => {
+    scale = Math.max(0.5, Math.min(4, s));
+    if (img) {
+      img.style.transform = `scale(${scale})`;
+      img.style.cursor = scale > 1.05 ? "zoom-out" : "zoom-in";
+    }
+    if (zbtn) zbtn.textContent = scale > 1.05 ? `还原 (${Math.round(scale * 100)}%)` : "放大";
+  };
+  if (img) {
+    img.addEventListener("click", (e) => { e.stopPropagation(); setScale(scale > 1.05 ? 1 : 2); });
+    m.addEventListener("wheel", (e) => { e.preventDefault(); setScale(scale + (e.deltaY < 0 ? 0.25 : -0.25)); }, { passive: false });
+  }
+  if (zbtn) zbtn.addEventListener("click", (e) => { e.stopPropagation(); setScale(scale > 1.05 ? 1 : 2); });
   const close = () => { const v = m.querySelector("video,audio"); if (v) v.pause(); m.remove(); document.removeEventListener("keydown", key); };
   const key = (e) => { if (e.key === "Escape") close(); };
-  m.addEventListener("click", (e) => { if (e.target === m || e.target.tagName === "BUTTON") close(); });
+  m.addEventListener("click", (e) => { if (e.target === m || e.target.dataset.close) close(); });
   document.addEventListener("keydown", key);
   document.body.appendChild(m);
   return true;
+}
+function btOpenMedia(el) {
+  const ds = el.dataset || {};
+  btMediaPreview({ path: ds.path || "", url: ds.url || "", name: ds.name || "", kind: ds.kind || "", size: Number(ds.size) || 0 });
 }
 document.addEventListener("click", (e) => {
   const a = e.target.closest && e.target.closest('a[href^="#aiwfile="]');
@@ -343,16 +377,26 @@ function btMsg(m) {
     <div class="bt-name ${esc((BT.conv || {}).bot || "agy")}">${esc(eng.title)}${d.status === "blocked" ? " · 被权限挡住" : d.status === "stopped" ? " · 已停止" : ""}</div>
     ${body}${media}${files ? `<div class="bt-files">${files}</div>` : ""}${stepHtml}${den}${permit}${ch}<div class="meta">${hTime(m.created_at)}${running ? "" : acts}</div></div></div>`;
 }
-// v3.9.85: pictures, videos, sounds and files a cloud engine (Cue) made, copied to AIW: shown right in the reply
+// v3.9.85: pictures, videos, sounds and files made by engines, copied to AIW: zoomable preview + download
 function btMedia(list) {
   if (!(list || []).length) return "";
   return `<div class="bt-media">` + list.map((x) => {
     const src = x.path ? artUrl(x.path) : (x.url || ""), dl = x.path ? artUrl(x.path, true) : (x.url || "");
     if (!src) return "";
-    if (x.kind === "image") return `<a class="bt-mimg" href="${esc(src)}" target="_blank" rel="noopener"><img src="${esc(src)}" alt="${esc(x.name)}" loading="lazy"></a>`;
-    if (x.kind === "video") return `<video class="bt-mvid" src="${esc(src)}" controls playsinline preload="metadata"></video>`;
-    if (x.kind === "audio") return `<audio src="${esc(src)}" controls preload="metadata"></audio>`;
-    return `<a class="bt-file" href="${esc(dl)}" download="${esc(x.name)}">${icon("file")}<span>${esc(x.name)}</span><i>下载</i></a>`;
+    const name = x.name || (x.kind === "video" ? "video.mp4" : "file");
+    const attrs = `data-path="${esc(x.path || "")}" data-url="${esc(x.url || "")}" data-name="${esc(name)}" data-kind="${esc(x.kind || "")}" data-size="${Number(x.size) || 0}"`;
+    if (x.kind === "image") {
+      return `<div class="bt-mitem"><button type="button" class="bt-mimg" ${attrs} onclick="btOpenMedia(this)" title="点击放大预览 / 下载"><img src="${esc(src)}" alt="${esc(name)}" loading="lazy"></button>
+        <div class="bt-mbar">${x.label ? `<span class="bt-mlbl">${esc(x.label)}</span>` : ""}<span><button type="button" class="link small" ${attrs} onclick="btOpenMedia(this)">放大</button> · <a class="link small" href="${esc(dl)}" download="${esc(name)}">下载</a></span></div></div>`;
+    }
+    if (x.kind === "video") {
+      return `<div class="bt-mitem"><video class="bt-mvid" src="${esc(src)}" controls playsinline preload="metadata"></video>
+        <div class="bt-mbar">${x.label ? `<span class="bt-mlbl">${esc(x.label)}</span>` : ""}<span><button type="button" class="link small" ${attrs} onclick="btOpenMedia(this)">全屏播放</button> · <a class="link small" href="${esc(dl)}" download="${esc(name)}">下载视频</a></span></div></div>`;
+    }
+    if (x.kind === "audio") {
+      return `<div class="bt-mitem"><audio src="${esc(src)}" controls preload="metadata"></audio><div class="bt-mbar"><a class="link small" href="${esc(dl)}" download="${esc(name)}">下载音频</a></div></div>`;
+    }
+    return `<a class="bt-file" href="${esc(dl)}" download="${esc(name)}">${icon("file")}<span>${esc(name)}</span><i>下载</i></a>`;
   }).join("") + `</div>`;
 }
 function btRenderConv() {
@@ -655,8 +699,10 @@ function btGroupItems() {
   const list = [...BT.groups].sort((a, b) => (b.needs ? 1 : 0) - (a.needs ? 1 : 0));
   return `<div class="small muted pad" style="padding-bottom:0">群聊任务${need ? ` · <b class="bt-need">${need} 个需要你</b>` : ""}</div>` + list.map((g) => {
     const st = BT_GST[g.status] || "";
+    const unread = g.id === BT.gid ? 0 : Math.max(0, Number(g.unread) || 0);
+    const badge = unread > 0 ? `<i class="bt-unread">${unread > 99 ? "99+" : unread}</i>` : "";
     return `<button class="bt-it ${g.id === BT.gid ? "on" : ""}" onclick="btGroupOpen('${g.id}')">
-      <span class="bt-av grp">${g.members.length}</span>
+      <span class="bt-it-av"><span class="bt-av grp">${g.members.length}</span>${badge}</span>
       <span class="grow"><span class="t1">${esc(g.title)}</span><span class="t2">${g.needs ? `<b class="bt-need">需要你：${esc(g.needs)}</b> · ` : ""}${st ? `<b>${st}</b> · ` : ""}${g.last ? esc((g.last.role === "bot" ? btEngine(g.last.who).title + "：" : "") + g.last.text) : esc(g.members.map((m) => btEngine(m.bot).title).join("、"))}</span></span></button>`;
   }).join("") + `<div class="small muted pad" style="padding-bottom:0">任务</div>`;
 }
@@ -695,6 +741,8 @@ async function btGroupCreate(ev) {
 async function btGroupOpen(id, quiet) {
   if (BT.gid !== id) { BT.gmsgs = []; BT.quote = null; BT.attach = []; BT.skills = []; btRenderAttach(); btRenderTokens(); }
   BT.cid = null; BT.conv = null; BT.gid = id; localStorage.setItem("aiw_bot_conv", "g:" + id);
+  const gi = BT.groups.findIndex((g) => g.id === id);
+  if (gi >= 0) BT.groups[gi].unread = 0;
   btShowConv(true); btRenderList();
   await btGroupRefresh(true);
   if (!quiet) { const el = $("btPrompt"); if (el && matchMedia("(hover:hover)").matches) el.focus(); }
@@ -762,12 +810,7 @@ function btBoard(p) {
   return `<div class="bt-board">${steps}${extra ? `<span class="small muted">${esc(extra)}</span>` : ""}${p.pr ? ` <a class="small" href="${esc(p.pr)}" target="_blank" rel="noopener">打开 PR ›</a>` : ""}</div>`;
 }
 function btGMedia(list) {
-  if (!(list || []).length) return "";
-  return `<div class="bt-media">` + list.map((x) => {
-    const src = x.path ? artUrl(x.path) : (x.url || ""); if (!src) return "";
-    if (x.kind === "image") return `<figure class="bt-shot"><a href="${esc(src)}" target="_blank" rel="noopener"><img src="${esc(src)}" alt="${esc(x.label || x.name)}" loading="lazy"></a>${x.label ? `<figcaption>${esc(x.label)}</figcaption>` : ""}</figure>`;
-    return btMedia([x]).replace(/^<div class="bt-media">|<\/div>$/g, "");
-  }).join("") + `</div>`;
+  return btMedia(list);
 }
 // v3.9.88: each choice says what it does (desc); some take a reason; 重试 / 跳过 a step that stopped
 function btActLive(a) {

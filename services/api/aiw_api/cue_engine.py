@@ -655,6 +655,7 @@ class CueEngine:
         step = 0
         last_reply = ""
         rate_hits = 0
+        transient_hits = 0
         while True:
             delay = self.poll_backoff[min(step, len(self.poll_backoff) - 1)]
             await asyncio.sleep(delay)
@@ -672,9 +673,17 @@ class CueEngine:
                 continue
             rate_hits = 0
 
+            if state.get("transient") and transient_hits < 4:
+                transient_hits += 1
+                wait_s = min(3.0 * transient_hits, 15.0)
+                job.tools.append({"tool": "cue", "arg": f"网络波动（重试 {transient_hits}/4），{int(wait_s)} 秒后重连"})
+                job.event.set()
+                await asyncio.sleep(wait_s)
+                continue
             if state["error"]:
                 self._finish(job, "turn_failed", error=state["error"], auth_error=state["auth_error"])
                 return
+            transient_hits = 0
             if state.get("last_event_id"):
                 job.last_event_id = state["last_event_id"]
             if state["reply"] and state["reply"] != last_reply:
@@ -683,7 +692,12 @@ class CueEngine:
             if state["waiting"]:
                 if job.conv_id and job.last_event_id:
                     self._save_sync(job.conv_id, job.last_event_id, state.get("seen_ids"))
-                msg = last_reply or "Cue 正在等待你的输入或确认，请打开 Manus 查看或继续回复。"
+                # When Cue already sent a reply/media and transitioned to 'waiting', it is simply waiting for
+                # the user's next conversational message — NOT blocked by a permission gate.
+                if last_reply or job.media:
+                    self._finish(job, "turn_done", response=last_reply or "（生成好了）")
+                    return
+                msg = "Cue 正在等待你的输入或确认，请打开 Manus 查看或继续回复。"
                 job.denied = [{
                     "action": "confirm",
                     "tool": "cue",
@@ -724,9 +738,10 @@ class CueEngine:
                         "seen_ids": seen_ids, "error": "", "auth_error": False, "rate_limited": True, "retry_after": retry_after}
             if not ok:
                 reason = _extract_error_reason(data)
+                transient = (st == 0 or st >= 500 or st == 408)
                 return {"done": False, "waiting": False, "reply": assistant_reply, "last_event_id": last_event_id,
                         "seen_ids": seen_ids, "error": f"轮询 Cue 回复失败（HTTP {st}）" + (f"：{reason}" if reason else ""),
-                        "auth_error": st in (401, 403), "rate_limited": False, "retry_after": None}
+                        "auth_error": st in (401, 403), "rate_limited": False, "retry_after": None, "transient": transient}
             for ev in data.get("messages") or []:
                 if not isinstance(ev, dict):
                     continue

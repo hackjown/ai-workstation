@@ -1313,7 +1313,9 @@ struct EngineGroupView: View {
     @State private var sending = false
     @State private var confirmDelete = false
     @State private var openConv: String? = nil
+    @State private var askDeliver: String? = nil     // v3.9.86: push / merge wait for a second tap
 
+    var project: JSON { group.o("project") }
     var live: Bool { group.b("busy") || (!group.s("status").isEmpty && group.s("status") != "idle") }
     func title(_ bot: String) -> String { engines.first { $0.s("id") == bot }?.s("title") ?? bot }
 
@@ -1322,7 +1324,7 @@ struct EngineGroupView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     if msgs.isEmpty && !group.isEmpty {
-                        Text("说要做什么：不 @ 就由 AIW 管家分工；@codex 只发给它。每个引擎在自己的分支上改，做完管家合并。")
+                        Text("说要做什么：不 @ 就由 AIW 管家分工；@codex 只发给它。每个引擎在自己的分支上改，做完管家合并。\n以「项目规划：」开头发一份规划，就按 讨论 → 设计 → 开发 → 评审 → 验收 → 实测截图 → 交付 走完。")
                             .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
                     }
                     ForEach(msgs.indices, id: \.self) { i in row(msgs[i]) }
@@ -1366,10 +1368,74 @@ struct EngineGroupView: View {
                 }
             }
         } message: { Text("电脑上的仓库、分支和工作树不会删。") }
+        .confirmationDialog(askDeliver == "push" ? "把分支推送到 origin？" : "把成果合入 \(group.s("base"))？",
+                            isPresented: Binding(get: { askDeliver != nil }, set: { on in if !on { askDeliver = nil } }), titleVisibility: .visible) {
+            Button(askDeliver == "push" ? "推送" : "合入") { let v = askDeliver ?? ""; Task { await projectAct("deliver", v) } }
+        } message: { Text(askDeliver == "push" ? "推送 aiw/\(gid)/merge，不会动 \(group.s("base"))。" : "只有你的仓库正停在 \(group.s("base")) 且没有未提交改动时才会合。") }
         .task { await poll() }
     }
 
     @ViewBuilder var statusBar: some View {
+        VStack(spacing: 0) {
+            if !project.s("phase").isEmpty { projectBar }
+            workingBar
+        }
+    }
+
+    /// v3.9.86 项目模式: which stage the project is at, the design picked, rework rounds, what was delivered
+    var projectBar: some View {
+        let order = ["discuss", "design", "dev", "accept", "run", "deliver"]
+        let names = ["discuss": "讨论", "design": "设计", "pick": "选设计", "confirm": "确认", "dev": "开发", "rework": "返工",
+                     "accept": "验收", "fix": "返修", "run": "实测", "deliver": "交付", "stopped": "已停止"]
+        let alias = ["pick": "design", "confirm": "design", "rework": "dev", "fix": "accept"]
+        let ph = project.s("phase"), cur = order.firstIndex(of: alias[ph] ?? ph) ?? -1
+        let done = ((project["delivered"] as? [String]) ?? []).map { ["patch": "补丁", "push": "推送", "merge": "合入"][$0] ?? $0 }
+        var extra: [String] = []
+        if ph == "stopped" { extra.append("已停止") } else if !order.contains(ph), let n = names[ph] { extra.append("现在：" + n) }
+        if !project.s("pick").isEmpty { extra.append("设计：方案 " + project.s("pick")) }
+        if project.d("rework") > 0 { extra.append("返工 \(Int(project.d("rework"))) 轮") }
+        if project.d("fixes") > 0 { extra.append("验收返修 \(Int(project.d("fixes"))) 次") }
+        if !done.isEmpty { extra.append("已交付：" + done.joined(separator: "、")) }
+        return VStack(alignment: .leading, spacing: 4) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(order.indices, id: \.self) { i in
+                        if i > 0 { Text("›").font(.caption2).foregroundColor(.secondary) }
+                        Text(names[order[i]] ?? "").font(.caption2.weight(i == cur ? .bold : .regular))
+                            .foregroundColor(i == cur ? Color(red: 0.16, green: 0.10, blue: 0.02) : .primary)
+                            .opacity(i <= cur ? 1 : 0.55)
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(Capsule().fill(i == cur ? amber : Color.secondary.opacity(0.12)))
+                    }
+                }
+            }
+            if !extra.isEmpty { Text(extra.joined(separator: " · ")).font(.caption2).foregroundColor(.secondary).lineLimit(1) }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12).padding(.vertical, 6).background(.bar)
+    }
+
+    /// the buttons on AIW 管家's newest message that asks something (开工 / 用方案 X / 交付), live only at that stage
+    @ViewBuilder func actions(_ m: JSON) -> some View {
+        let acts = m.o("data").a("actions")
+        let last = msgs.last { !$0.o("data").a("actions").isEmpty }
+        if !acts.isEmpty, let l = last, l.s("id") == m.s("id") {
+            let live = ["go": "confirm", "pick": "pick", "deliver": "deliver"]
+            HStack(spacing: 8) {
+                ForEach(acts.indices, id: \.self) { i in
+                    let a = acts[i], on = project.s("phase") == live[a.s("id")]
+                    let primary = a.s("id") != "deliver" || a.s("value") == "patch"
+                    Button {
+                        if a.s("id") == "deliver" && a.s("value") != "patch" { askDeliver = a.s("value") }
+                        else { Task { await projectAct(a.s("id"), a.s("value")) } }
+                    } label: { Text(a.s("label")).font(.caption.weight(.semibold)) }
+                        .buttonStyle(.bordered).tint(primary ? amber : Color.secondary).disabled(!on)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder var workingBar: some View {
         let pending = (group["pending"] as? [String]) ?? []
         if !pending.isEmpty || group.s("status") == "merging" {
             VStack(alignment: .leading, spacing: 2) {
@@ -1409,6 +1475,8 @@ struct EngineGroupView: View {
                 .font(.callout).foregroundColor(role == "aiw" ? .primary : hInk)
                 .padding(.horizontal, 12).padding(.vertical, 8)
                 .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(role == "aiw" ? amber.opacity(0.15) : hAmber))
+                if !m.o("data").a("media").isEmpty { EngineMediaList(media: m.o("data").a("media")) }
+                actions(m)
                 Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
             }.frame(maxWidth: .infinity, alignment: .trailing)
         } else {
@@ -1423,10 +1491,7 @@ struct EngineGroupView: View {
                     .font(.callout).padding(.horizontal, 12).padding(.vertical, 8)
                     .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(bad ? Color.red.opacity(0.12) : Color(.secondarySystemBackground)))
-                let media = d.a("media")
-                if !media.isEmpty {
-                    EngineMediaView(media: media)
-                }
+                if !d.a("media").isEmpty { EngineMediaList(media: d.a("media")) }
                 if !files.isEmpty {
                     Text("改动：" + files.prefix(8).joined(separator: "，")).font(.caption2).foregroundColor(.secondary).lineLimit(2)
                 }
@@ -1461,6 +1526,12 @@ struct EngineGroupView: View {
             text = ""; err = ""
             await load()
         } catch let e { err = "没发出去：\(e.localizedDescription)" }
+    }
+    @MainActor func projectAct(_ action: String, _ value: String) async {
+        do {
+            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/project", ["action": action, "value": value])
+            err = ""; await load()
+        } catch let e { err = e.localizedDescription }
     }
     @MainActor func act(_ method: String, _ path: String) async {
         do { _ = try await API.shared.obj(method, "/api/bots/groups/\(gid)\(path)"); await load(); changed() }

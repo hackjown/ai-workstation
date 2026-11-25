@@ -39,7 +39,7 @@ struct AttachmentPreviews: View {
 
 struct AttViewing: Identifiable { let path: String; let name: String; let video: Bool; var id: String { path } }
 
-private struct ImageThumb: View {
+struct ImageThumb: View {
     let path: String
     var body: some View {
         AsyncImage(url: API.shared.artifactURL(path, download: false)) { img in
@@ -52,7 +52,7 @@ private struct ImageThumb: View {
     }
 }
 
-private struct VideoThumb: View {
+struct VideoThumb: View {
     let path: String
     @State private var frame: UIImage?
     var body: some View {
@@ -83,7 +83,7 @@ func videoFrame(_ path: String) async -> UIImage? {
     return img
 }
 
-private struct AttViewer: View {
+struct AttViewer: View {
     let v: AttViewing
     @Environment(\.dismiss) private var dismiss
     @State private var player: AVPlayer?
@@ -108,5 +108,54 @@ private struct AttViewer: View {
             }
         }
         .onDisappear { player?.pause() }
+    }
+}
+
+
+/// v3.9.86: pictures, videos and files an engine or AIW 管家 put in a message (data.media: name, path on the API host,
+/// kind image|video|audio|file, optional label such as 「方案 A」): design options, run screenshots, a patch file.
+struct EngineMediaList: View {
+    let media: [JSON]
+    @State private var viewing: AttViewing?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(media.indices, id: \.self) { i in
+                let x = media[i], kind = x.s("kind"), path = x.s("path")
+                VStack(alignment: .leading, spacing: 3) {
+                    if (kind == "image" || kind == "video") && !path.isEmpty {
+                        Button { viewing = AttViewing(path: path, name: x.s("name"), video: kind == "video") } label: {
+                            if kind == "video" { VideoThumb(path: path) } else { ShotThumb(path: path) }
+                        }.buttonStyle(.plain).accessibilityLabel((kind == "video" ? "播放视频 " : "查看图片 ") + (x.s("label").isEmpty ? x.s("name") : x.s("label")))
+                    } else if let u = path.isEmpty ? URL(string: x.s("url")) : API.shared.artifactURL(path, download: true) {
+                        Link(destination: u) {
+                            HStack(spacing: 6) {
+                                Image(systemName: fileIcon(x.s("name"))).foregroundColor(amber)
+                                Text(x.s("name").isEmpty ? "文件" : x.s("name")).lineLimit(1).truncationMode(.middle)
+                                Text("下载").foregroundColor(.secondary)
+                            }.font(.caption)
+                            .padding(.horizontal, 10).padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemBackground)))
+                        }
+                    }
+                    if !x.s("label").isEmpty { Text(x.s("label")).font(.caption2.weight(.semibold)).foregroundColor(.secondary) }
+                }
+            }
+        }
+        .fullScreenCover(item: $viewing) { v in AttViewer(v: v) }
+    }
+}
+
+/// A screenshot keeps its shape (a page is wide, a phone design is tall); tap for full screen.
+struct ShotThumb: View {
+    let path: String
+    var body: some View {
+        AsyncImage(url: API.shared.artifactURL(path, download: false)) { img in
+            img.resizable().scaledToFit()
+        } placeholder: {
+            ZStack { Color(.secondarySystemBackground); ProgressView() }.frame(width: 240, height: 160)
+        }
+        .frame(maxWidth: 280, maxHeight: 380, alignment: .leading)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.secondary.opacity(0.25)))
     }
 }

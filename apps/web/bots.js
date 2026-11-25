@@ -651,11 +651,13 @@ async function btLoadGroups() {
 }
 function btGroupItems() {
   if (!BT.groups.length) return "";
-  return `<div class="small muted pad" style="padding-bottom:0">群聊任务</div>` + BT.groups.map((g) => {
+  const need = BT.groups.filter((g) => g.needs).length;   // v3.9.88 需要你: groups waiting on the user come first
+  const list = [...BT.groups].sort((a, b) => (b.needs ? 1 : 0) - (a.needs ? 1 : 0));
+  return `<div class="small muted pad" style="padding-bottom:0">群聊任务${need ? ` · <b class="bt-need">${need} 个需要你</b>` : ""}</div>` + list.map((g) => {
     const st = BT_GST[g.status] || "";
     return `<button class="bt-it ${g.id === BT.gid ? "on" : ""}" onclick="btGroupOpen('${g.id}')">
       <span class="bt-av grp">${g.members.length}</span>
-      <span class="grow"><span class="t1">${esc(g.title)}</span><span class="t2">${st ? `<b>${st}</b> · ` : ""}${g.last ? esc((g.last.role === "bot" ? btEngine(g.last.who).title + "：" : "") + g.last.text) : esc(g.members.map((m) => btEngine(m.bot).title).join("、"))}</span></span></button>`;
+      <span class="grow"><span class="t1">${esc(g.title)}</span><span class="t2">${g.needs ? `<b class="bt-need">需要你：${esc(g.needs)}</b> · ` : ""}${st ? `<b>${st}</b> · ` : ""}${g.last ? esc((g.last.role === "bot" ? btEngine(g.last.who).title + "：" : "") + g.last.text) : esc(g.members.map((m) => btEngine(m.bot).title).join("、"))}</span></span></button>`;
   }).join("") + `<div class="small muted pad" style="padding-bottom:0">任务</div>`;
 }
 function btGroupToggleGit() {
@@ -723,6 +725,7 @@ function btGroupRender() {
       <div class="small muted">${sub}${st ? " · <b>" + st + "</b>" : ""}</div></div>
     <span class="row gap">${chips}</span>
     ${canAdd ? `<button class="btn sm" onclick="btGroupAddMembers()" title="添加其他引擎（如 Muse / Cue）加入群聊">+ 成员</button>` : ""}
+    ${hasLocal && g.merge ? `<button class="btn sm" onclick="btGDiff('', true)" title="合并结果和 ${esc(g.base)} 的整体对比">整体对比</button>` : ""}
     ${hasLocal ? `<button class="btn sm primary" onclick="btGroupMerge()" ${g.status === "merging" ? "disabled" : ""} title="提交各分支的改动，合并到 aiw/${esc(g.id)}/merge">合并</button>` : ""}
     ${live ? `<button class="btn sm" onclick="btGroupStop()">停止</button>` : ""}
     <button class="icon" onclick="btGroupDelete()" aria-label="删除群聊" title="删除群聊">${icon("x")}</button>`;
@@ -735,18 +738,19 @@ function btGroupRender() {
 }
 // v3.9.86 项目模式: the stage strip, design / screenshot pictures with their option label, and the buttons
 const BT_PHASES = [["discuss", "讨论"], ["design", "设计"], ["pick", "选设计"], ["confirm", "确认"], ["dev", "开发"],
-  ["rework", "返工"], ["accept", "验收"], ["fix", "返修"], ["run", "实测"], ["deliver", "交付"]];
+  ["rework", "返工"], ["accept", "验收"], ["fix", "返修"], ["run", "实测"], ["deliver", "交付"], ["ci", "修 PR"]];
 function btBoard(p) {
   if (!p || !p.phase) return "";
   const order = ["discuss", "design", "dev", "accept", "run", "deliver"];
-  const alias = { pick: "design", confirm: "design", rework: "dev", fix: "accept" };
+  const alias = { pick: "design", confirm: "design", rework: "dev", fix: "accept", ci: "deliver" };
   const cur = order.indexOf(alias[p.phase] || p.phase);
   const name = Object.fromEntries(BT_PHASES);
   const steps = order.map((k, i) => `<span class="bt-ph ${i < cur ? "done" : i === cur ? "on" : ""}">${name[k]}</span>`).join("<i>›</i>");
   const extra = [p.phase === "stopped" ? "已停止" : name[p.phase] && !order.includes(p.phase) ? "现在：" + name[p.phase] : "",
     p.pick ? "设计：方案 " + p.pick : "", p.rework ? `返工 ${p.rework} 轮` : "", p.fixes ? `验收返修 ${p.fixes} 次` : "",
-    (p.delivered || []).length ? "已交付：" + p.delivered.map((x) => ({ patch: "补丁", push: "推送", merge: "合入" })[x] || x).join("、") : ""].filter(Boolean).join(" · ");
-  return `<div class="bt-board">${steps}${extra ? `<span class="small muted">${esc(extra)}</span>` : ""}</div>`;
+    (p.delivered || []).length ? "已交付：" + p.delivered.map((x) => ({ patch: "补丁", push: "推送", merge: "合入", pr: "PR" })[x] || x).join("、") : "",
+    p.watch && p.watch.on ? "管家在盯 PR" : ""].filter(Boolean).join(" · ");
+  return `<div class="bt-board">${steps}${extra ? `<span class="small muted">${esc(extra)}</span>` : ""}${p.pr ? ` <a class="small" href="${esc(p.pr)}" target="_blank" rel="noopener">打开 PR ›</a>` : ""}</div>`;
 }
 function btGMedia(list) {
   if (!(list || []).length) return "";
@@ -756,19 +760,48 @@ function btGMedia(list) {
     return btMedia([x]).replace(/^<div class="bt-media">|<\/div>$/g, "");
   }).join("") + `</div>`;
 }
+// v3.9.88: each choice says what it does (desc); some take a reason; 重试 / 跳过 a step that stopped
+function btActLive(a) {
+  const g = BT.group || {}, p = g.project || {};
+  if (a.id === "resume") return !!g.paused;
+  return p.phase === ({ go: "confirm", revise: "confirm", pick: "pick", redesign: "pick", deliver: "deliver" })[a.id];
+}
 function btGActs(m, d) {
-  const p = (BT.group || {}).project || {};
   if (!(d.actions || []).length) return "";
-  const live = { go: "confirm", pick: "pick", deliver: "deliver" };
   const last = [...BT.gmsgs].reverse().find((x) => (x.data || {}).actions);
   if (!last || last.id !== m.id) return "";
-  return `<div class="bt-permit">` + d.actions.map((a) => `<button class="btn sm ${a.id === "deliver" && a.value !== "patch" ? "" : "primary"}" ${p.phase !== live[a.id] ? "disabled" : ""}
-    onclick="btProjectAct('${esc(a.id)}','${esc(a.value || "")}')">${esc(a.label)}</button>`).join("") + `</div>`;
+  const primary = (a) => ["go", "pick"].includes(a.id) || (a.id === "deliver" && ["pr", "patch"].includes(a.value)) || (a.id === "resume" && a.value === "retry");
+  return `<div class="bt-acts">` + d.actions.map((a, i) => `<div class="bt-act"><button class="btn sm ${primary(a) ? "primary" : ""}" ${btActLive(a) ? "" : "disabled"}
+    title="${esc(a.desc || "")}" onclick="btProjectAct('${esc(a.id)}','${esc(a.value || "")}',${a.reason ? "true" : "false"})">${esc(a.label)}${a.reason ? "…" : ""}</button>${a.desc ? `<span class="small muted">${esc(a.desc)}</span>` : ""}</div>`).join("") + `</div>`;
 }
-async function btProjectAct(act, value) {
+async function btProjectAct(act, value, needReason) {
+  let reason = "";
+  if (needReason) {
+    reason = (prompt(act === "redesign" ? "为什么都不要？写清想要什么样（设计的人会带着这个理由重做）" : "方案要怎么改？") || "").trim();
+    if (!reason) return;
+  }
   if (act === "deliver" && value === "merge" && !confirm(`把成果合入 ${(BT.group || {}).base || "基线分支"}？只有你的仓库正停在这个分支、没有未提交改动时才会合。`)) return;
   if (act === "deliver" && value === "push" && !confirm("把分支推送到 origin？")) return;
-  try { await api("POST", `/api/bots/groups/${BT.gid}/project`, { action: act, value }); toast("交给管家了"); setTimeout(() => btGroupRefresh(true), 800); }
+  if (act === "deliver" && value === "pr" && !confirm("推送分支并开 PR？之后管家会盯 CI 和评论，有问题交回给成员修了再推。")) return;
+  try { await api("POST", `/api/bots/groups/${BT.gid}/project`, { action: act, value, reason }); toast("交给管家了"); setTimeout(() => btGroupRefresh(true), 800); }
+  catch (e) { toast(e.message); }
+}
+// v3.9.88 只看这一轮: a member turn's own changes, or the whole result against the base branch
+async function btGDiff(mid, whole) {
+  modal(`<div class="callnote bt-diffbox"><h3>改动</h3><div class="muted">正在从电脑上读…</div></div>`);
+  let r;
+  try { r = await api("GET", `/api/bots/groups/${BT.gid}/diff?` + (whole ? "whole=true" : "msg=" + encodeURIComponent(mid))); }
+  catch (e) { modal(`<div class="callnote"><h3>改动</h3><div class="muted">${esc(e.message)}</div><div class="row gap"><button class="btn" onclick="closeOverlays()">关闭</button></div></div>`); return; }
+  const lines = (r.diff || "").split("\n").map((l) => {
+    const c = l.startsWith("diff --git") || l.startsWith("index ") ? "h" : l.startsWith("@@") ? "at" : l.startsWith("+++") || l.startsWith("---") ? "h" : l.startsWith("+") ? "add" : l.startsWith("-") ? "del" : "";
+    return `<span class="${c}">${esc(l) || " "}</span>`;
+  }).join("\n");
+  modal(`<div class="callnote bt-diffbox"><h3>${esc(r.title || "改动")}</h3><div class="small muted">${esc(r.stat || "")}${r.truncated ? "（太长，只显示前一部分）" : ""}</div>
+    <pre class="bt-diff">${lines || "（没有改动）"}</pre><div class="row gap"><button class="btn" onclick="closeOverlays()">关闭</button></div></div>`);
+}
+async function btGPermit(bot, mode, rule) {
+  if (mode === "allow") { rule = prompt("允许这类命令（写进 agy 的权限设置，以后也算数）：", rule || ""); if (rule === null) return; }
+  try { await api("POST", `/api/bots/groups/${BT.gid}/permit`, { bot, mode, rule: rule || "" }); toast(mode === "deny" ? "已拒绝" : "已允许，接着做"); btGroupRefresh(true); }
   catch (e) { toast(e.message); }
 }
 function btGMsg(m) {
@@ -784,10 +817,16 @@ function btGMsg(m) {
   const eng = btEngine(m.who);
   const ch = d.changes && (d.changes.files || []).length ? `<div class="small muted">改动：${esc(d.changes.files.slice(0, 8).join("，"))}${d.changes.files.length > 8 ? " …" : ""}</div>` : "";
   const den = (d.denied || []).length ? `<div class="bt-denied">被拒绝的操作：${d.denied.map((x) => `${esc(x.tool || "")} ${esc(x.target || "")}`).join("；")}</div>` : "";
+  const pz = (BT.group || {}).paused;
+  const rule = ((d.denied || []).slice(-1)[0] || {}).rule || "";
+  const permit = pz && pz.why === "blocked" && pz.bot === m.who && pz.msg === m.src
+    ? (m.who === "agy" ? `<div class="bt-permit"><button class="btn sm primary" onclick="btGPermit('agy','allow','${esc(rule).replace(/'/g, "&#39;")}')">允许这类命令再试</button><button class="btn sm" onclick="btGPermit('agy','once')">这一轮放开权限重跑</button><button class="btn sm" onclick="btGPermit('agy','deny')">拒绝</button></div>`
+      : `<div class="small muted">${esc(eng.title)} 的权限要在它自己的对话里处理${d.conv ? ` · <button class="link" onclick="btOpen('${d.conv}')">去处理 ›</button>` : ""}</div>`) : "";
+  const df = d.diff ? ` · <button class="link" onclick="btGDiff('${m.id}')">看这一轮改动（${(d.diff.files || []).length} 个文件）</button>` : "";
   return `<div class="bt-row bot">${btAv(m.who)}<div class="bt-col">
     <div class="bt-name ${esc(m.who)}">${esc(eng.title)}${["error", "failed", "blocked"].includes(d.status) ? " · 没做成" : d.status === "stopped" ? " · 已停止" : ""}</div>
-    <div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text || "（没有文字）")}</div>${btMedia(d.media)}${ch}${den}
-    <div class="meta">${hTime(m.created_at)}${d.conv ? ` · <button class="link" onclick="btOpen('${d.conv}')">看它的对话 ›</button>` : ""}</div></div></div>`;
+    <div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text || "（没有文字）")}</div>${btMedia(d.media)}${ch}${den}${permit}
+    <div class="meta">${hTime(m.created_at)}${df}${d.conv ? ` · <button class="link" onclick="btOpen('${d.conv}')">看它的对话 ›</button>` : ""}</div></div></div>`;
 }
 async function btGroupMerge() { try { await api("POST", `/api/bots/groups/${BT.gid}/merge`); toast("管家开始合并"); setTimeout(() => btGroupRefresh(true), 800); } catch (e) { toast("合并失败：" + e.message); } }
 async function btGroupStop() { try { await api("POST", `/api/bots/groups/${BT.gid}/stop`); toast("已停止"); btGroupRefresh(true); } catch (e) { toast("停止失败：" + e.message); } }

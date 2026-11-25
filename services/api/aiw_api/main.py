@@ -266,6 +266,12 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             await app.state.v3924.on_start()
         except Exception as e:  # noqa: BLE001
             log.warning("v3924 start: %s", e)
+        try:   # v3.9.88: groups a restart interrupted carry on from the step in hand; PR watches start again
+            bg = getattr(app.state, "bot_groups", None)
+            if bg:
+                await bg.recover()
+        except Exception as e:  # noqa: BLE001
+            log.warning("groups recover: %s", e)
         for e in cloud.list():  # a setup interrupted by an API restart carries on
             if e.get("status") in ("adding", "creating", "installing"):
                 cloud.start_setup(e["id"])

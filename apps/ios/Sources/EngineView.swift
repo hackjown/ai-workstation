@@ -264,8 +264,9 @@ struct EngineSheet: View {
                 }
                 if !groups.isEmpty {
                     Section(header: Text("群聊任务")) {
-                        ForEach(groups.indices, id: \.self) { i in
-                            let g = groups[i]
+                        let sorted = groups.filter { !$0.s("needs").isEmpty } + groups.filter { $0.s("needs").isEmpty }
+                        ForEach(sorted.indices, id: \.self) { i in
+                            let g = sorted[i]
                             NavigationLink(tag: g.s("id"), selection: $openGroup) {
                                 EngineGroupView(gid: g.s("id"), engines: engines) { Task { await load() } }
                             } label: { groupRow(g) }
@@ -423,6 +424,9 @@ struct EngineSheet: View {
                 if g.b("busy") { ProgressView().controlSize(.mini) }
                 Spacer()
                 Text(when(g.d("updated_at"))).font(.caption2).foregroundColor(.secondary)
+            }
+            if !g.s("needs").isEmpty {                 // v3.9.88 需要你
+                Text("需要你：" + g.s("needs")).font(.caption.weight(.semibold)).foregroundColor(amber).lineLimit(1)
             }
             Text(names.joined(separator: "、") + (st.isEmpty ? "" : " · " + st)).font(.caption).foregroundColor(.secondary).lineLimit(1)
             if !last.isEmpty { Text(last.s("text")).font(.caption).foregroundColor(.secondary).lineLimit(2) }
@@ -1314,6 +1318,11 @@ struct EngineGroupView: View {
     @State private var confirmDelete = false
     @State private var openConv: String? = nil
     @State private var askDeliver: String? = nil     // v3.9.86: push / merge wait for a second tap
+    @State private var reasonAct: JSON? = nil         // v3.9.88: a choice that takes a reason (都不要，重做 / 改一下方案)
+    @State private var reasonText = ""
+    @State private var permitRule = ""
+    @State private var showPermitRule = false
+    @State private var diff: GroupDiffSheet? = nil
 
     var project: JSON { group.o("project") }
     var live: Bool { group.b("busy") || (!group.s("status").isEmpty && group.s("status") != "idle") }
@@ -1348,6 +1357,9 @@ struct EngineGroupView: View {
             ToolbarItem(placement: .navigationBarTrailing) {
                 Menu {
                     Button { Task { await act("POST", "/merge") } } label: { Label("合并", systemImage: "arrow.triangle.merge") }
+                    if !group.o("merge").isEmpty {
+                        Button { diff = GroupDiffSheet(msg: "", whole: true) } label: { Label("和 \(group.s("base")) 整体对比", systemImage: "plusminus") }
+                    }
                     if live { Button { Task { await act("POST", "/stop") } } label: { Label("停止", systemImage: "stop.circle") } }
                     ForEach(group.a("members").indices, id: \.self) { i in
                         let m = group.a("members")[i]
@@ -1368,10 +1380,28 @@ struct EngineGroupView: View {
                 }
             }
         } message: { Text("电脑上的仓库、分支和工作树不会删。") }
-        .confirmationDialog(askDeliver == "push" ? "把分支推送到 origin？" : "把成果合入 \(group.s("base"))？",
+        .confirmationDialog(askDeliver == "pr" ? "推送分支并开 PR？" : askDeliver == "push" ? "把分支推送到 origin？" : "把成果合入 \(group.s("base"))？",
                             isPresented: Binding(get: { askDeliver != nil }, set: { on in if !on { askDeliver = nil } }), titleVisibility: .visible) {
-            Button(askDeliver == "push" ? "推送" : "合入") { let v = askDeliver ?? ""; Task { await projectAct("deliver", v) } }
-        } message: { Text(askDeliver == "push" ? "推送 aiw/\(gid)/merge，不会动 \(group.s("base"))。" : "只有你的仓库正停在 \(group.s("base")) 且没有未提交改动时才会合。") }
+            Button(askDeliver == "pr" ? "开 PR" : askDeliver == "push" ? "推送" : "合入") { let v = askDeliver ?? ""; Task { await projectAct("deliver", v) } }
+        } message: {
+            Text(askDeliver == "pr" ? "说明里带验收报告、审阅导览和截图。之后管家盯 CI 和评论，有问题交回给成员修了再推送。" :
+                 askDeliver == "push" ? "推送 aiw/\(gid)/merge，不会动 \(group.s("base"))。" : "只有你的仓库正停在 \(group.s("base")) 且没有未提交改动时才会合。")
+        }
+        .alert(reasonAct?.s("id") == "redesign" ? "为什么都不要？" : "方案要怎么改？",
+               isPresented: Binding(get: { reasonAct != nil }, set: { on in if !on { reasonAct = nil } })) {
+            TextField(reasonAct?.s("id") == "redesign" ? "例如 太花了，要简洁的深色风格" : "例如 导出要支持 CSV", text: $reasonText)
+            Button("发给管家") {
+                let a = reasonAct ?? [:], r = reasonText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !r.isEmpty { Task { await projectAct(a.s("id"), a.s("value"), reason: r) } }
+            }
+            Button("取消", role: .cancel) {}
+        } message: { Text(reasonAct?.s("desc") ?? "") }
+        .alert("允许这类命令", isPresented: $showPermitRule) {
+            TextField("规则", text: $permitRule)
+            Button("允许并再试") { Task { await permit("allow", permitRule) } }
+            Button("取消", role: .cancel) {}
+        } message: { Text("这条规则会写进 agy 的权限设置，以后也算数。") }
+        .sheet(item: $diff) { d in GroupDiffView(gid: gid, sheet: d) }
         .task { await poll() }
     }
 
@@ -1386,16 +1416,17 @@ struct EngineGroupView: View {
     var projectBar: some View {
         let order = ["discuss", "design", "dev", "accept", "run", "deliver"]
         let names = ["discuss": "讨论", "design": "设计", "pick": "选设计", "confirm": "确认", "dev": "开发", "rework": "返工",
-                     "accept": "验收", "fix": "返修", "run": "实测", "deliver": "交付", "stopped": "已停止"]
-        let alias = ["pick": "design", "confirm": "design", "rework": "dev", "fix": "accept"]
+                     "accept": "验收", "fix": "返修", "run": "实测", "deliver": "交付", "ci": "修 PR", "stopped": "已停止"]
+        let alias = ["pick": "design", "confirm": "design", "rework": "dev", "fix": "accept", "ci": "deliver"]
         let ph = project.s("phase"), cur = order.firstIndex(of: alias[ph] ?? ph) ?? -1
-        let done = ((project["delivered"] as? [String]) ?? []).map { ["patch": "补丁", "push": "推送", "merge": "合入"][$0] ?? $0 }
+        let done = ((project["delivered"] as? [String]) ?? []).map { ["patch": "补丁", "push": "推送", "merge": "合入", "pr": "PR"][$0] ?? $0 }
         var extra: [String] = []
         if ph == "stopped" { extra.append("已停止") } else if !order.contains(ph), let n = names[ph] { extra.append("现在：" + n) }
         if !project.s("pick").isEmpty { extra.append("设计：方案 " + project.s("pick")) }
         if project.d("rework") > 0 { extra.append("返工 \(Int(project.d("rework"))) 轮") }
         if project.d("fixes") > 0 { extra.append("验收返修 \(Int(project.d("fixes"))) 次") }
         if !done.isEmpty { extra.append("已交付：" + done.joined(separator: "、")) }
+        if project.o("watch").b("on") { extra.append("管家在盯 PR") }
         return VStack(alignment: .leading, spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
@@ -1409,27 +1440,43 @@ struct EngineGroupView: View {
                     }
                 }
             }
-            if !extra.isEmpty { Text(extra.joined(separator: " · ")).font(.caption2).foregroundColor(.secondary).lineLimit(1) }
+            HStack(spacing: 8) {
+                if !extra.isEmpty { Text(extra.joined(separator: " · ")).font(.caption2).foregroundColor(.secondary).lineLimit(1) }
+                if let u = URL(string: project.s("pr")), !project.s("pr").isEmpty { Link("打开 PR ›", destination: u).font(.caption2) }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 12).padding(.vertical, 6).background(.bar)
     }
 
     /// the buttons on AIW 管家's newest message that asks something (开工 / 用方案 X / 交付), live only at that stage
+    /// a choice is live only at its stage: 开工 / 改方案 at confirm, 方案 / 重做 at pick, 交付 at deliver, 重试 / 跳过 while paused
+    func actLive(_ a: JSON) -> Bool {
+        if a.s("id") == "resume" { return !group.o("paused").isEmpty }
+        let at = ["go": "confirm", "revise": "confirm", "pick": "pick", "redesign": "pick", "deliver": "deliver"]
+        return project.s("phase") == at[a.s("id")]
+    }
+
+    /// v3.9.86/88: the buttons on AIW 管家's newest message that asks something, each with what it does
     @ViewBuilder func actions(_ m: JSON) -> some View {
         let acts = m.o("data").a("actions")
         let last = msgs.last { !$0.o("data").a("actions").isEmpty }
         if !acts.isEmpty, let l = last, l.s("id") == m.s("id") {
-            let live = ["go": "confirm", "pick": "pick", "deliver": "deliver"]
-            HStack(spacing: 8) {
+            VStack(alignment: .trailing, spacing: 6) {
                 ForEach(acts.indices, id: \.self) { i in
-                    let a = acts[i], on = project.s("phase") == live[a.s("id")]
-                    let primary = a.s("id") != "deliver" || a.s("value") == "patch"
-                    Button {
-                        if a.s("id") == "deliver" && a.s("value") != "patch" { askDeliver = a.s("value") }
-                        else { Task { await projectAct(a.s("id"), a.s("value")) } }
-                    } label: { Text(a.s("label")).font(.caption.weight(.semibold)) }
-                        .buttonStyle(.bordered).tint(primary ? amber : Color.secondary).disabled(!on)
+                    let a = acts[i], id = a.s("id"), v = a.s("value")
+                    let primary = ["go", "pick"].contains(id) || (id == "deliver" && ["pr", "patch"].contains(v)) || (id == "resume" && v == "retry")
+                    HStack(spacing: 8) {
+                        if !a.s("desc").isEmpty {
+                            Text(a.s("desc")).font(.caption2).foregroundColor(.secondary).multilineTextAlignment(.trailing).lineLimit(2)
+                        }
+                        Button {
+                            if a.b("reason") { reasonText = ""; reasonAct = a }
+                            else if id == "deliver" && v != "patch" { askDeliver = v }
+                            else { Task { await projectAct(id, v) } }
+                        } label: { Text(a.s("label") + (a.b("reason") ? "…" : "")).font(.caption.weight(.semibold)) }
+                            .buttonStyle(.bordered).tint(primary ? amber : Color.secondary).disabled(!actLive(a))
+                    }
                 }
             }
         }
@@ -1495,8 +1542,26 @@ struct EngineGroupView: View {
                 if !files.isEmpty {
                     Text("改动：" + files.prefix(8).joined(separator: "，")).font(.caption2).foregroundColor(.secondary).lineLimit(2)
                 }
+                let pz = group.o("paused")
+                if pz.s("why") == "blocked" && pz.s("bot") == m.s("who") && pz.s("msg") == m.s("src") {   // v3.9.88: answer it here
+                    if m.s("who") == "agy" {
+                        HStack(spacing: 8) {
+                            Button { permitRule = (d.a("denied").last ?? [:]).s("rule"); showPermitRule = true } label: {
+                                Text("允许这类命令再试").font(.caption.weight(.semibold)) }.buttonStyle(.borderedProminent).tint(amber)
+                            Button { Task { await permit("once", "") } } label: { Text("这一轮放开").font(.caption) }.buttonStyle(.bordered)
+                            Button { Task { await permit("deny", "") } } label: { Text("拒绝").font(.caption) }.buttonStyle(.bordered)
+                        }
+                    } else if !d.s("conv").isEmpty {
+                        Button("\(title(m.s("who"))) 的权限要在它的对话里处理 ›") { openConv = d.s("conv") }.font(.caption2)
+                    }
+                }
                 HStack(spacing: 8) {
                     Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+                    if !d.o("diff").isEmpty {
+                        Button("看这一轮改动（\((d.o("diff")["files"] as? [String])?.count ?? 0) 个文件）") {
+                            diff = GroupDiffSheet(msg: m.s("id"), whole: false)
+                        }.font(.caption2)
+                    }
                     if !d.s("conv").isEmpty { Button("看它的对话 ›") { openConv = d.s("conv") }.font(.caption2) }
                 }
             }
@@ -1527,14 +1592,66 @@ struct EngineGroupView: View {
             await load()
         } catch let e { err = "没发出去：\(e.localizedDescription)" }
     }
-    @MainActor func projectAct(_ action: String, _ value: String) async {
+    @MainActor func projectAct(_ action: String, _ value: String, reason: String = "") async {
         do {
-            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/project", ["action": action, "value": value])
+            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/project", ["action": action, "value": value, "reason": reason])
+            err = ""; await load()
+        } catch let e { err = e.localizedDescription }
+    }
+    @MainActor func permit(_ mode: String, _ rule: String) async {
+        do {
+            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/permit", ["bot": "agy", "mode": mode, "rule": rule])
             err = ""; await load()
         } catch let e { err = e.localizedDescription }
     }
     @MainActor func act(_ method: String, _ path: String) async {
         do { _ = try await API.shared.obj(method, "/api/bots/groups/\(gid)\(path)"); await load(); changed() }
         catch let e { err = e.localizedDescription }
+    }
+}
+
+
+/// v3.9.88 只看这一轮: one member turn's own changes (its commits only, merges it pulled in left out), or the whole
+/// result against the base branch, coloured like a review.
+struct GroupDiffSheet: Identifiable { let msg: String; let whole: Bool; var id: String { whole ? "whole" : msg } }
+
+struct GroupDiffView: View {
+    let gid: String
+    let sheet: GroupDiffSheet
+    @Environment(\.dismiss) private var dismiss
+    @State private var r: JSON = [:]
+    @State private var err = ""
+    var lines: [String] { r.s("diff").components(separatedBy: "\n") }
+    var body: some View {
+        NavigationStack {
+            Group {
+                if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red).padding() }
+                else if r.isEmpty { ProgressView("正在从电脑上读…") }
+                else {
+                    ScrollView([.vertical, .horizontal]) {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            if !r.s("stat").isEmpty { Text(r.s("stat")).font(.caption).foregroundColor(.secondary).padding(.bottom, 6) }
+                            ForEach(lines.indices, id: \.self) { i in
+                                let l = lines[i]
+                                let head = l.hasPrefix("diff --git") || l.hasPrefix("index ") || l.hasPrefix("+++") || l.hasPrefix("---")
+                                Text(l.isEmpty ? " " : l)
+                                    .font(.system(size: 11, design: .monospaced).weight(head ? .semibold : .regular))
+                                    .foregroundColor(head ? .secondary : l.hasPrefix("@@") ? .purple : l.hasPrefix("+") ? .green : l.hasPrefix("-") ? .red : .primary)
+                                    .fixedSize(horizontal: true, vertical: false)
+                            }
+                            if r.b("truncated") { Text("（太长，只显示前一部分）").font(.caption).foregroundColor(.secondary).padding(.top, 6) }
+                        }.padding(12)
+                    }
+                }
+            }
+            .navigationTitle(r.s("title").isEmpty ? "改动" : r.s("title")).navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+        }
+        .task {
+            do {
+                let q = sheet.whole ? "whole=true" : "msg=" + (sheet.msg.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? sheet.msg)
+                r = try await API.shared.obj("GET", "/api/bots/groups/\(gid)/diff?" + q)
+            } catch let e { err = e.localizedDescription }
+        }
     }
 }

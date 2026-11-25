@@ -119,7 +119,14 @@ def test_failed_step_pauses(tmp_path):
         g._on_bot("message", {"role": "bot", "id": "m0", "conv": "c-cue", "text": "没做成", "data": {"status": "turn_failed"}})
         await asyncio.sleep(0.05)
         assert len(b.sent) == 1 and "继续" in g.messages("bg-1")[-1]["text"]
-        await g.send("bg-1", "@管家 继续")
+        assert g.group("bg-1")["paused"]["bot"] == "cue" and g.group("bg-1")["needs"]
+        await g.send("bg-1", "@管家 继续")          # v3.9.88: 继续 = the step that stopped runs again
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+        assert b.sent[-1][0] == "c-cue" and len(b.sent) == 2
+        g._on_bot("message", {"role": "bot", "id": "m1", "conv": "c-cue", "text": "又没做成", "data": {"status": "turn_failed"}})
+        await asyncio.sleep(0.05)
+        await g.send("bg-1", "@管家 跳过")
         for _ in range(50):
             await asyncio.sleep(0.01)
         assert b.sent[-1][0] == "c-agy"

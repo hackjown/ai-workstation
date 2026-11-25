@@ -151,3 +151,15 @@ html[data-theme=dark] .bt-av.grok { background:#e9e9e9; color:#111; }
 .bt-shot { margin:0; }
 .bt-shot img { display:block; max-width:min(420px, 100%); max-height:320px; border-radius:10px; border:1px solid var(--line); }
 .bt-shot figcaption { font-size:12px; opacity:.7; margin-top:3px; }
+
+/* v3.9.88: choices with what they do, 需要你, a turn's own diff */
+.bt-acts { display:flex; flex-direction:column; gap:6px; margin-top:6px; align-items:flex-end; }
+.bt-act { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.bt-act .small { max-width:340px; text-align:right; }
+.bt-need { color:var(--acc, #c77d00); }
+.bt-diffbox { max-width:min(1000px, 94vw); width:94vw; }
+.bt-diff { max-height:68vh; overflow:auto; font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--bg2, #f6f6f6); padding:10px; border-radius:8px; white-space:pre; }
+.bt-diff .add { color:#1a7f37; background:rgba(46,160,67,.12); display:inline-block; min-width:100%; }
+.bt-diff .del { color:#cf222e; background:rgba(248,81,73,.12); display:inline-block; min-width:100%; }
+.bt-diff .at { color:#8250df; }
+.bt-diff .h { color:var(--muted, #888); font-weight:600; }

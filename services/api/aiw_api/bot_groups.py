@@ -95,7 +95,7 @@ def ensure_tables(store) -> None:
     store._x("CREATE TABLE IF NOT EXISTS bot_group_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, "
              "grp TEXT, role TEXT, who TEXT, text TEXT, data TEXT, src TEXT, created_at REAL)")
     store._x("CREATE INDEX IF NOT EXISTS ix_botgm_grp ON bot_group_messages(grp, seq)")
-    for col in ("queue", "project"):   # v3.9.79: serial steps waiting their turn; v3.9.86: 项目模式 state
+    for col in ("queue", "project", "cur", "paused"):   # v3.9.79 queue; v3.9.86 项目模式; v3.9.88 the step in hand, a pause
         try:
             store._x(f"ALTER TABLE bot_groups ADD COLUMN {col} TEXT")
         except Exception:  # noqa: BLE001
@@ -260,6 +260,8 @@ class Groups:
         d["merge"] = B._j(d.get("merge"), None)
         d["queue"] = B._j(d.get("queue"), [])
         d["project"] = B._j(d.get("project"), None)
+        d["cur"] = B._j(d.get("cur"), None)
+        d["paused"] = B._j(d.get("paused"), None)
         d["auto_merge"] = bool(d.get("auto_merge"))
         return d
 
@@ -269,7 +271,23 @@ class Groups:
             return None
         g = self._row(r[0])
         g["busy"] = any(self.bots.busy(m["conv"]) for m in g["members"] if m.get("conv")) or gid in self._merging
+        g["needs"] = self.needs(g)
         return g
+
+    def needs(self, g: dict) -> str:
+        """v3.9.88 需要你: what this group waits on the user for, in a few words ("" when nothing)."""
+        if g.get("paused"):
+            return "处理没做成的一步" if g["paused"].get("why") != "blocked" else "允许被拦的命令"
+        p = g.get("project") or {}
+        return {"confirm": "确认方案", "pick": "选设计方案",
+                "deliver": "" if p.get("delivered") else "选怎么交付"}.get(p.get("phase") or "", "")
+
+    def needs_list(self) -> list:
+        out = []
+        for g in self.groups():
+            if g.get("needs"):
+                out.append({"id": g["id"], "title": g["title"], "needs": g["needs"], "since": g.get("updated_at")})
+        return out
 
     def groups(self) -> list[dict]:
         out = []
@@ -282,7 +300,7 @@ class Groups:
         return out
 
     def set_group(self, gid: str, **kw) -> Optional[dict]:
-        for k in ("members", "pending", "merge", "queue", "project"):
+        for k in ("members", "pending", "merge", "queue", "project", "cur", "paused"):
             if k in kw:
                 kw[k] = json.dumps(kw[k], ensure_ascii=False) if kw[k] is not None else None
         kw["updated_at"] = _now()
@@ -290,6 +308,17 @@ class Groups:
         g = self.group(gid)
         self._emit("group", g)
         return g
+
+    def patch_msg(self, mid: str, **data):
+        """v3.9.88: add keys to a group message's data (the turn's diff range)."""
+        r = self.store._x("SELECT * FROM bot_group_messages WHERE id=?", (mid,))
+        if not r:
+            return None
+        d = {**B._j(r[0]["data"], {}), **data}
+        self.store._x("UPDATE bot_group_messages SET data=? WHERE id=?", (json.dumps(d, ensure_ascii=False), mid))
+        m = B.msg_row(self.store._x("SELECT * FROM bot_group_messages WHERE id=?", (mid,))[0])
+        self._emit("group_message", m)
+        return m
 
     def messages(self, gid: str, after: int = 0, limit: int = 300) -> list[dict]:
         rows = self.store._x("SELECT * FROM bot_group_messages WHERE grp=? AND seq>? ORDER BY seq DESC LIMIT ?",
@@ -492,10 +521,11 @@ class Groups:
                 except Exception as e:  # noqa: BLE001
                     log.warning("group stop %s: %s", m["conv"], e)
         self.add(gid, "system", "", "已停止")
-        p = g.get("project")
+        self.project.unwatch(gid)
+        p = (self.group(gid) or {}).get("project")
         if p and p.get("phase") not in ("deliver", "stopped"):
             p["phase"] = "stopped"
-        return self.set_group(gid, status="idle", pending=[], queue=[], **({"project": p} if p else {}))
+        return self.set_group(gid, status="idle", pending=[], queue=[], paused=None, **({"project": p} if p else {}))
 
     # ------------------------------------------------------------------ talking
     def member(self, g: dict, bot: str) -> Optional[dict]:
@@ -550,8 +580,11 @@ class Groups:
         to, manager, rest = mentions(text, ids)
         um = self.add(gid, by, "我" if by == "user" else "AIW 管家", text,
                       {"to": to, "manager": manager or not to, **({"attachments": attachments} if attachments else {})})
-        if g.get("queue") and re.fullmatch(r"\s*(继续|接着做|下一步|continue)\s*[。.!！]?\s*", rest or ""):
-            self._bg(self._run_next(gid))
+        if g.get("queue") and re.fullmatch(r"\s*(继续|接着做|下一步|重试|continue)\s*[。.!！]?\s*", rest or ""):
+            self._bg(self.resume(gid, "retry"))
+            return um
+        if g.get("paused") and g.get("queue") and re.fullmatch(r"\s*(跳过|跳过这一步|skip)\s*[。.!！]?\s*", rest or ""):
+            self._bg(self.resume(gid, "skip"))
             return um
         if g.get("project") and await self.project.on_text(gid, rest or text):   # v3.9.86: 开工 / 选 B / 推送
             return um
@@ -637,7 +670,7 @@ class Groups:
             return
         q = list(g["queue"])
         s = q.pop(0)
-        g = self.set_group(gid, queue=q, status="working")
+        g = self.set_group(gid, queue=q, status="working", cur=s, paused=None)   # v3.9.88: survives a restart
         done = [r["who"] for r in self.store._x(
             "SELECT DISTINCT who FROM bot_group_messages WHERE grp=? AND role='bot'", (gid,))]
         if s["bot"] == MANAGER_ID:
@@ -710,6 +743,7 @@ class Groups:
             log.warning("group scope: %s", e)
             return
         mine = [x.strip() for x in (out or "").splitlines() if x.strip() and not x.startswith(("fatal", "error"))]
+        await self._turn_diff(g, m)
         owner = {}
         for x in g["members"]:
             if x["bot"] != bot:
@@ -725,6 +759,150 @@ class Groups:
             parts = "；".join(f"{B.ENGINES.get(o, {}).get('title', o)} 负责的 {'、'.join(fs[:6])}" for o, fs in hit.items())
             self.add(gid, "aiw", "AIW 管家", f"注意：{who} 这一步改了 {parts}。这些改动建议让原负责人复核，确认没有为了通过而放宽。",
                      {"scope": {"bot": bot, "touched": hit}})
+
+    async def _turn_diff(self, g: dict, m: dict):
+        """v3.9.88 只看这一轮: the files this turn's own commits changed (merges it pulled in left out), on its message."""
+        cmd = (f"W={qp(m['worktree'])}; echo HEAD $(git -C \"$W\" rev-parse HEAD); "
+               f"git -C \"$W\" log --no-merges --name-only --format= {shlex.quote(m['start'])}..HEAD | sort -u")
+        try:
+            out = await self._sh(g["machine_id"], cmd, 60)
+        except Exception as e:  # noqa: BLE001
+            log.warning("group turn diff: %s", e)
+            return
+        h = re.search(r"^HEAD ([0-9a-f]{40})", out or "", re.M)
+        files = [x.strip() for x in (out or "").splitlines()
+                 if x.strip() and not x.startswith(("HEAD ", "fatal", "error", "warning"))]
+        r = self.store._x("SELECT id FROM bot_group_messages WHERE grp=? AND role='bot' AND who=? ORDER BY seq DESC LIMIT 1",
+                          (g["id"], m["bot"]))
+        if h and r:
+            self.patch_msg(r[0]["id"], diff={"from": m["start"], "to": h.group(1), "files": files[:200]})
+
+    async def diff(self, gid: str, mid: str = "", whole: bool = False, limit: int = 400000) -> dict:
+        """v3.9.88: one turn's own changes (its message's range, only the files its commits touched), or the whole
+        result against the base branch."""
+        g = self.group(gid)
+        if not g:
+            raise KeyError(gid)
+        if whole:
+            mb = f"aiw/{gid}/merge"
+            cmd = (f"R={qp(g['repo'])}; git -C \"$R\" rev-parse -q --verify {shlex.quote(mb)} >/dev/null || "
+                   f"{{ echo 'NO_MERGE'; exit 0; }}; git -C \"$R\" diff --stat {shlex.quote(g['base'])}...{shlex.quote(mb)} | tail -n 1; "
+                   f"echo '=====DIFF'; git -C \"$R\" diff {shlex.quote(g['base'])}...{shlex.quote(mb)}")
+            title = f"{g['base']} → {mb}"
+        else:
+            r = self.store._x("SELECT * FROM bot_group_messages WHERE grp=? AND id=?", (gid, mid))
+            d = B._j(r[0]["data"], {}) if r else {}
+            rng = d.get("diff") or {}
+            m = self.member(g, r[0]["who"]) if r else None
+            if not rng or not m or not m.get("worktree"):
+                raise ValueError("这条回复没有记下改动范围")
+            if not rng.get("files"):
+                return {"title": "这一轮没有提交改动", "stat": "", "diff": "", "files": []}
+            files = " ".join(shlex.quote(f) for f in rng["files"])
+            cmd = (f"W={qp(m['worktree'])}; git -C \"$W\" diff --stat {rng['from']} {rng['to']} -- {files} | tail -n 1; "
+                   f"echo '=====DIFF'; git -C \"$W\" diff {rng['from']} {rng['to']} -- {files}")
+            title = f"{B.ENGINES.get(m['bot'], {}).get('title', m['bot'])} 这一轮"
+        out = await self._sh(g["machine_id"], "bash -c " + shlex.quote(cmd), 120)
+        if "NO_MERGE" in (out or "")[:200]:
+            raise ValueError("还没有合并分支，先合并")
+        stat, _, body = (out or "").partition("=====DIFF")
+        return {"title": title, "stat": stat.strip(), "diff": B.clip(body.lstrip("\n"), limit),
+                "truncated": len(body) > limit}
+
+    async def resume(self, gid: str, how: str = "retry"):
+        """v3.9.88: carry on after a pause. retry: the step that stopped runs again (it is back at the head of the
+        queue); skip: drop it and go on with the next."""
+        g = self.group(gid)
+        if not g or not g.get("queue"):
+            raise ValueError("没有等着继续的步骤")
+        q = list(g["queue"])
+        if how == "skip":
+            s = q.pop(0)
+            self.add(gid, "aiw", "AIW 管家", f"跳过「{s.get('step') or B.clip(s.get('task', ''), 40)}」，接着做下一步。")
+            if not q:
+                self.set_group(gid, queue=[], status="idle", paused=None)
+                return
+        self.set_group(gid, queue=q, paused=None)
+        await self._run_next(gid)
+
+    async def permit(self, gid: str, bot: str, mode: str, rule: str = "") -> dict:
+        """v3.9.88: a member's blocked command answered in the group (the same rules as its own chat). allow / once
+        rerun it there; its reply comes back here and the steps go on."""
+        g = self.group(gid)
+        m = self.member(g, bot) if g else None
+        if not m or not m.get("conv"):
+            raise ValueError("群里没有这个成员")
+        await self.bots.permit(m["conv"], mode, rule)
+        name = B.ENGINES.get(bot, {}).get("title", bot)
+        if mode == "deny":
+            self.add(gid, "aiw", "AIW 管家", f"已拒绝 {name} 被拦的命令。这一步停着：可以「重试这一步」或「跳过这一步」。",
+                     {"actions": self.pause_actions()})
+            return self.group(gid)
+        q = list(g.get("queue") or [])
+        if q and q[0].get("bot") == bot:
+            q.pop(0)              # it reruns in its own chat; its reply carries the steps on
+        self.add(gid, "aiw", "AIW 管家", f"{'已允许' if mode == 'allow' else '这一轮放开了权限'}，{name} 接着做。")
+        return self.set_group(gid, queue=q, pending=[bot], status="working", paused=None)
+
+    @staticmethod
+    def pause_actions() -> list:
+        return [{"id": "resume", "value": "retry", "label": "重试这一步", "desc": "把这一步重新交给它"},
+                {"id": "resume", "value": "skip", "label": "跳过这一步", "desc": "不做这一步，接着做下一步"}]
+
+    async def recover(self):
+        """v3.9.88 可恢复: at startup, carry on every group a restart interrupted. The step in hand is kept (cur):
+        a manager step runs again; a member whose reply already came is caught up; a member whose turn the restart
+        cut off gets the step again. A project still watching its pull request starts watching again."""
+        for row in self.store._x("SELECT id FROM bot_groups"):
+            gid = row["id"]
+            try:
+                await self._recover_one(gid)
+            except Exception as e:  # noqa: BLE001
+                log.warning("group recover %s: %s", gid, e)
+
+    async def _recover_one(self, gid: str):
+        g = self.group(gid)
+        if not g:
+            return
+        p = g.get("project") or {}
+        if (p.get("watch") or {}).get("on"):
+            self.project.watch(gid)
+        if g["status"] not in ("working", "fixing", "merging"):
+            return
+        cur = g.get("cur") or {}
+        if g["status"] == "merging" or (cur.get("bot") == MANAGER_ID and not g["pending"]):
+            if cur:
+                self.set_group(gid, queue=[cur] + list(g.get("queue") or []), status="working")
+                self.add(gid, "aiw", "AIW 管家", f"服务重启过，从「{cur.get('step') or '这一步'}」接着做。")
+                self._bg(self._run_next(gid))
+            else:
+                self.set_group(gid, status="idle")
+            return
+        for bot in list(g["pending"]):
+            m = self.member(g, bot)
+            if not m or not m.get("conv"):
+                continue
+            last = next((x for x in reversed(self.bots.messages(m["conv"], limit=10)) if x["role"] == "bot"), None)
+            if last and (last.get("data") or {}).get("status") not in (None, "running"):
+                self._on_bot("message", last)          # its reply came while the API was down: catch up
+                continue
+            if self.bots.busy(m["conv"]):
+                continue
+            try:
+                await self.bots.stop(m["conv"])        # the turn the restart cut off
+            except Exception as e:  # noqa: BLE001
+                log.warning("recover stop %s: %s", bot, e)
+            g = self.group(gid)
+            self.set_group(gid, pending=[b for b in g["pending"] if b != bot])
+            if cur.get("bot") == bot:
+                self.set_group(gid, queue=[cur] + list(self.group(gid).get("queue") or []), status="working")
+                self.add(gid, "aiw", "AIW 管家", f"服务重启打断了 {B.ENGINES.get(bot, {}).get('title', bot)} 的「{cur.get('step') or '这一步'}」，重新交给它。")
+                self._bg(self._run_next(gid))
+            else:
+                self.add(gid, "aiw", "AIW 管家", f"服务重启打断了 {B.ENGINES.get(bot, {}).get('title', bot)} 这一轮，"
+                         "它的结果没收到。需要的话再 @ 它说一次。")
+                if not self.group(gid)["pending"]:
+                    self.set_group(gid, status="idle")
 
     async def _snapshot(self, g: dict, done: list, limit: int = 40000) -> str:
         """What the earlier local steps produced, as text a cloud reviewer can read (it has no access to the computer)."""
@@ -860,9 +1038,14 @@ class Groups:
                 return
             if g.get("queue"):
                 if g["status"] == "working" and d.get("status") in ("turn_failed", "blocked", "failed", "error"):
-                    self.set_group(gid, status="idle")
-                    self.add(gid, "aiw", "AIW 管家", f"{B.ENGINES.get(bot, {}).get('title', bot)} 这一步没做成，后面的步骤先停下。"
-                             "处理好后说「@管家 继续」接着往下做。")
+                    cur = g.get("cur") or {}   # v3.9.88: the step stays at the head of the queue: 重试 runs it again
+                    q = ([cur] if cur.get("bot") == bot else []) + list(g["queue"])
+                    why = "blocked" if d.get("status") == "blocked" else "failed"
+                    self.set_group(gid, status="idle", queue=q, paused={"bot": bot, "why": why, "msg": obj["id"]})
+                    name = B.ENGINES.get(bot, {}).get('title', bot)
+                    self.add(gid, "aiw", "AIW 管家", (f"{name} 被权限拦住了，后面的步骤先停下。在它的回复上点「允许」让它接着做，" if why == "blocked"
+                             else f"{name} 这一步没做成，后面的步骤先停下。") + "点「重试这一步」（或说「@管家 继续」）重新交给它，或跳过这一步。",
+                             {"actions": self.pause_actions()})
                     loop.create_task(self._tell_chat(g, f"{B.ENGINES.get(bot, {}).get('title', bot)} 没做成，分工暂停了。"))
                     return
                 self._bg(self._after_step(gid, bot))
@@ -1182,6 +1365,13 @@ class GroupIn(BaseModel):
 class GroupProjectIn(BaseModel):
     action: str
     value: str = ""
+    reason: str = ""
+
+
+class GroupPermitIn(BaseModel):
+    bot: str
+    mode: str
+    rule: str = ""
 
 
 class GroupSendIn(BaseModel):
@@ -1207,6 +1397,11 @@ def mount(app, groups: Groups, auth) -> None:
     @app.get("/api/bots/groups", dependencies=dep)
     async def groups_list():
         return {"groups": groups.groups()}
+
+    @app.get("/api/bots/groups-needs", dependencies=dep)
+    async def groups_needs():
+        """v3.9.88 需要你: every group waiting on the user, and for what."""
+        return {"needs": groups.needs_list()}
 
     @app.post("/api/bots/groups", dependencies=dep)
     async def groups_create(body: GroupIn):
@@ -1256,9 +1451,32 @@ def mount(app, groups: Groups, auth) -> None:
         """v3.9.86: 开工 (go) / 用方案 X (pick) / 交付 (deliver: patch|push|merge)."""
         need(gid)
         try:
-            return await groups.project.action(gid, body.action, body.value)
+            if body.action == "resume":   # v3.9.88: 重试 / 跳过 the step that stopped (any group, project or not)
+                groups._bg(groups.resume(gid, body.value or "retry"))
+                return {"ok": True}
+            return await groups.project.action(gid, body.action, body.value, body.reason)
         except ValueError as e:
             raise HTTPException(400, str(e))
+
+    @app.post("/api/bots/groups/{gid}/permit", dependencies=dep)
+    async def groups_permit(gid: str, body: GroupPermitIn):
+        """v3.9.88: allow / once / deny a member's blocked command from the group."""
+        need(gid)
+        try:
+            return await groups.permit(gid, body.bot, body.mode, body.rule)
+        except (ValueError, KeyError) as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/api/bots/groups/{gid}/diff", dependencies=dep)
+    async def groups_diff(gid: str, msg: str = "", whole: bool = False):
+        """v3.9.88: one member turn's own changes (msg), or the whole result against the base branch (whole)."""
+        need(gid)
+        try:
+            return await groups.diff(gid, msg, whole)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"电脑没有响应：{B.clip(e, 200)}")
 
     @app.post("/api/bots/groups/{gid}/merge", dependencies=dep)
     async def groups_merge(gid: str):

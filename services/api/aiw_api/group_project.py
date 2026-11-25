@@ -15,7 +15,13 @@
          checkout is on the base branch and clean). Nothing is pushed or merged without that tap.
 
 State lives in bot_groups.project (JSON). The work runs through the group's queue: the manager's own steps carry
-an "op" (synth / designs / review_check / accept / shots).
+an "op" (synth / designs / review_check / accept / shots / repush).
+
+v3.9.88 (ideas from t3code): the step in hand survives a restart (Groups.recover); a manager step that fails retries
+by itself (30 s, 2 min, 10 min) and a member that fails pauses for 重试 / 跳过; a question can take a reason
+(「都不要，重做」 with why, 「改一下方案」); 开 PR writes its title and description from the report, the review
+guide and the screenshots, then AIW watches the PR: a failing check or a conflict goes back to its owner, a new
+comment is handed out, and the fix is pushed again.
 """
 from __future__ import annotations
 
@@ -34,6 +40,10 @@ log = logging.getLogger("aiw.group_project")
 MANAGER_ID = "管家"
 MAX_REWORK = 2
 MAX_ACCEPT_FIX = 2
+MAX_REDESIGN = 3
+MAX_CI_FIX = 3
+OP_RETRY = (30, 120, 600)          # a manager step that fails runs again after these many seconds
+WATCH_EVERY = 120                  # PR check interval
 LETTERS = "ABCDEFGH"
 
 TRIGGER = re.compile(r"^\s*(?:[@＠]\s*管家\s*)?(?:/项目|项目规划|项目计划|开发项目|新项目|项目)\s*[:：\n ]")
@@ -70,6 +80,23 @@ ACCEPT_FIX = """你是 AIW 管家。验收命令失败了。根据失败输出�
 开发成员和各自负责的步骤：
 {owners}
 只输出 JSON：{{"bot": "开发成员id", "fix": "要修什么（引用关键报错）"}}"""
+
+
+GUIDE = """你是 AIW 管家，给用户写一份“审阅导览”：按阅读顺序带他走一遍这次的改动，不用逐行读 diff。
+只输出 JSON：{"stops": [{"title": "这一站讲什么", "files": ["相关文件"], "why": "看什么、为什么，一两句", "careful": true/false}],
+"mechanical": ["纯机械改动的文件（改名、生成文件、快照、锁文件）"]}
+规则：3～8 站，按理解顺序（先核心数据/接口，再逻辑，再界面，最后测试）；careful=true 只给需要人拍板的地方
+（安全、数据丢失、接口变化、和定稿方案不一致、为了过测试放宽的地方）；每个改动文件都要出现在某一站或 mechanical 里。用中文。"""
+
+PR_TEXT = """你是 AIW 管家，为这次改动写 GitHub Pull Request 的标题和说明。只依据给你的材料。
+只输出 JSON：{"title": "一行标题，不超过 70 字", "body": "markdown 说明：概述、改了什么（按模块）、怎么验证的（列出跑过的命令和结果）、遗留问题"}
+用中文。"""
+
+PR_FEEDBACK = """你是 AIW 管家。PR 上有新的评论或评审。判断哪些需要改代码，并交给负责的开发成员。
+开发成员和各自负责的步骤：
+{owners}
+只输出 JSON：{{"issues": [{{"bot": "开发成员id", "fix": "要怎么改，引用评论"}}], "reply": "一句话概括这些评论"}}
+只是提问、感谢、无需改代码的评论不要放进 issues。"""
 
 
 def _json(out: str) -> Optional[dict]:
@@ -269,7 +296,7 @@ class Project:
     # ------------------------------------------------------------------ manager ops (called from Groups._run_next)
     async def op(self, gid: str, s: dict):
         fn = {"synth": self.synth, "designs": self.designs, "review_check": self.review_check,
-              "accept": self.accept, "shots": self.shots}.get(s.get("op") or "")
+              "accept": self.accept, "shots": self.shots, "repush": self.repush}.get(s.get("op") or "")
         if not fn:
             await self.g._run_next(gid)
             return
@@ -277,9 +304,27 @@ class Project:
             await fn(gid, s)
         except Exception as e:  # noqa: BLE001
             log.exception("project op %s", s.get("op"))
-            self.g.set_group(gid, status="idle", queue=[], pending=[])
-            self.say(gid, f"管家在「{s.get('step') or s.get('op')}」这一步出错了：{B.clip(e, 300)}。说「@管家 继续」重试这一步。")
-            self.g.set_group(gid, queue=[s])
+            n = int(s.get("tries") or 0)
+            rest = list((self.g.group(gid) or {}).get("queue") or [])
+            if n < len(OP_RETRY):   # v3.9.88: a manager step is plain code: it retries on its own
+                wait = OP_RETRY[n]
+                s2 = {**s, "tries": n + 1}
+                self.g.set_group(gid, status="working", pending=[], queue=[s2] + rest, cur=s2)
+                self.say(gid, f"管家在「{s.get('step') or s.get('op')}」这一步出错了：{B.clip(e, 300)}。"
+                              f"{wait // 60 and f'{wait // 60} 分钟' or f'{wait} 秒'}后自动重试（第 {n + 1}/{len(OP_RETRY)} 次）。")
+                self.g._bg(self._retry_later(gid, s2, wait))
+                return
+            self.g.set_group(gid, status="idle", pending=[], queue=[s] + rest,
+                             paused={"bot": MANAGER_ID, "why": "failed", "op": s.get("op")})
+            self.say(gid, f"管家在「{s.get('step') or s.get('op')}」这一步出错了：{B.clip(e, 300)}，自动重试 {len(OP_RETRY)} 次都没成。"
+                          "处理好后点「重试这一步」，或跳过它。", {"actions": self.g.pause_actions()})
+
+    async def _retry_later(self, gid: str, s: dict, wait: float):
+        await asyncio.sleep(wait)
+        g = self.g.group(gid)
+        q = (g or {}).get("queue") or []
+        if g and g["status"] == "working" and q and q[0].get("op") == s.get("op") and q[0].get("tries") == s.get("tries"):
+            await self.g._run_next(gid)
 
     async def synth(self, gid: str, s: dict):
         g = self.g.group(gid)
@@ -289,7 +334,9 @@ class Project:
                        for m in g["members"])
         out = await self.llm(SYNTH.format(members=mem, local="、".join(local)),
                              f"仓库：{g['repo']}（基线 {g['base']}）\n\n项目规划：\n{p.get('brief')}\n\n"
-                             f"讨论：\n{self.g._context(g, {'bot': ''}, 14000)}", 4000)
+                             + (f"上一版定稿方案：\n{B.clip(p.get('summary', ''), 5000)}\n\n用户要求这样改（必须照做）：\n- "
+                                + "\n- ".join(p.get("feedback") or []) + "\n\n" if p.get("feedback") else "")
+                             + f"讨论：\n{self.g._context(g, {'bot': ''}, 14000)}", 4000)
         plan = _json(out) or {}
         steps = [x for x in (plan.get("steps") or []) if isinstance(x, dict) and x.get("bot") in local and x.get("task")]
         if not steps:
@@ -314,18 +361,7 @@ class Project:
         self.say(gid, f"**定稿方案**\n\n{summary}\n\n**分工**\n{lines}{tail}", {"project_plan": True})
         if has_ui and designers:
             self.put(gid, phase="design")
-            dsteps = []
-            for b in designers:
-                if B.is_cloud_engine(b):
-                    t = ("【设计方案】按定稿方案为这个项目的界面出一套视觉设计：主要页面的布局、配色、字体、组件风格，"
-                         "并生成 1～3 张主要页面的效果图。不要写代码。\n\n定稿方案：\n" + summary)
-                else:
-                    t = (f"【设计方案，这一步只做设计稿】按定稿方案为项目界面做一份设计稿：新建 design/{b}.html，"
-                         "一个自包含的静态页面（样式写在页面里，不引用网络资源和图片 URL，可以用 CSS/SVG），"
-                         "把主要页面并排或上下排在这一个文件里，内容用真实感的示例数据。只改 design/ 目录，不写功能代码。"
-                         "做完 git add 并 commit。回复里写一句设计思路。\n\n定稿方案：\n" + summary)
-                dsteps.append({"bot": b, "task": t, "step": "出设计方案", "design": True})
-            dsteps.append({"bot": MANAGER_ID, "op": "designs", "task": "截图设计方案给用户选", "step": "截图设计方案"})
+            dsteps = self.design_steps(designers, summary)
             self.g.set_group(gid, queue=dsteps + list(self.g.group(gid).get("queue") or []))
             n = len(designers)
             self.say(gid, f"有前端，先请 {'、'.join(self.title(b) for b in designers)} 各出一套设计方案（{n} 套），截图后给你选。")
@@ -333,11 +369,48 @@ class Project:
             return
         self.put(gid, phase="confirm")
         self.g.set_group(gid, status="idle", pending=[], queue=[])
-        self.say(gid, "方案定了。没问题就点「开工」（或回复“开工”）；要改就直接说，我改了再开工。",
-                 {"actions": [{"id": "go", "label": "开工"}]})
+        self.say(gid, "方案定了。没问题就点「开工」（或回复“开工”）；要改就点「改一下方案」写上怎么改，我改了再给你看。",
+                 {"actions": [{"id": "go", "label": "开工", "desc": "按这个方案分工开发"},
+                              {"id": "revise", "label": "改一下方案", "desc": "写上要怎么改，管家改完再给你确认", "reason": True}]})
         await self.g._tell_chat(self.g.group(gid), "项目方案定了，等你确认开工。")
 
     # ------------------------------------------------------------------ 2. 设计
+    def design_steps(self, designers: list, summary: str, why: str = "", prev: Optional[list] = None) -> list:
+        redo = ""
+        if why:
+            was = "；".join(f"方案 {d['label']}（{self.title(d['bot'])}）：{d.get('note', '')}" for d in prev or [])
+            redo = (f"【重做】用户看了上一轮的设计都不满意，理由：{why}\n上一轮：{B.clip(was, 1500)}\n"
+                    "这一轮必须针对理由改，和上一轮明显不同。\n\n")
+        out = []
+        for b in designers:
+            if B.is_cloud_engine(b):
+                t = (redo + "【设计方案】按定稿方案为这个项目的界面出一套视觉设计：主要页面的布局、配色、字体、组件风格，"
+                     "并生成 1～3 张主要页面的效果图。不要写代码。\n\n定稿方案：\n" + summary)
+            else:
+                t = (redo + f"【设计方案，这一步只做设计稿】按定稿方案为项目界面做一份设计稿：{'覆盖' if why else '新建'} design/{b}.html，"
+                     "一个自包含的静态页面（样式写在页面里，不引用网络资源和图片 URL，可以用 CSS/SVG），"
+                     "把主要页面并排或上下排在这一个文件里，内容用真实感的示例数据。只改 design/ 目录，不写功能代码。"
+                     "做完 git add 并 commit。回复里写一句设计思路。\n\n定稿方案：\n" + summary)
+            out.append({"bot": b, "task": t, "step": "重做设计方案" if why else "出设计方案", "design": True})
+        out.append({"bot": MANAGER_ID, "op": "designs", "task": "截图设计方案给用户选", "step": "截图设计方案"})
+        return out
+
+    async def redesign(self, gid: str, why: str):
+        p = self.state(gid)
+        n = int(p.get("redesigns") or 0) + 1
+        self.put(gid, phase="design", redesigns=n, design_why=(p.get("design_why") or []) + [why])
+        self.say(gid, f"好，都不要。带着你的理由请 {'、'.join(self.title(b) for b in p.get('designers') or [])} 重出一轮（第 {n}/{MAX_REDESIGN} 轮）。")
+        await self.g._start_steps(gid, self.design_steps(p.get("designers") or [], p.get("summary", ""), why, p.get("designs")),
+                                  "重做设计")
+
+    async def revise(self, gid: str, why: str):
+        p = self.state(gid)
+        self.put(gid, phase="discuss", feedback=(p.get("feedback") or []) + [why])
+        self.say(gid, "按你的意见改方案。")
+        self.g.set_group(gid, queue=[{"bot": MANAGER_ID, "op": "synth", "task": "按用户意见改定稿方案", "step": "改定稿方案"}],
+                         status="working", pending=[])
+        await self.g._run_next(gid)
+
     async def designs(self, gid: str, s: dict):
         g = self.g.group(gid)
         p = self.state(gid)
@@ -361,8 +434,13 @@ class Project:
                            + ("" if o["media"] else f"\n（没拿到截图{('：' + o['error']) if o.get('error') else ''}）")
                            for o in opts)
         media = [{**x, "label": f"方案 {o['label']}"} for o in opts for x in o["media"]]
-        self.say(gid, f"**设计方案，请选一个**\n\n{body}\n\n点下面的按钮，或回复“选 A”。也可以说想改哪里。",
-                 {"media": media, "actions": [{"id": "pick", "value": o["label"], "label": f"用方案 {o['label']}"} for o in opts]})
+        acts = [{"id": "pick", "value": o["label"], "label": f"用方案 {o['label']}",
+                 "desc": f"{self.title(o['bot'])} 的设计，按它开发"} for o in opts]
+        if int(p.get("redesigns") or 0) < MAX_REDESIGN:
+            acts.append({"id": "redesign", "label": "都不要，重做", "reason": True,
+                         "desc": "写上理由，设计的人带着理由重出一轮"})
+        self.say(gid, f"**设计方案，请选一个**\n\n{body}\n\n点下面的按钮，或回复“选 A”；都不满意就回复“都不要，理由是…”。",
+                 {"media": media, "actions": acts})
         await self.g._tell_chat(self.g.group(gid), f"项目有 {len(opts)} 套设计方案，等你选。")
 
     async def pick(self, gid: str, idx: int):
@@ -507,19 +585,290 @@ class Project:
             f"验收命令输出：\n{checks or '（没有）'}\n\n实测：{run_note}\n\n群聊记录：\n{self.g._context(g, {'bot': ''}, 9000)}", 3000)
         text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip() or (
             f"验收：{'通过' if ok else '有失败' if ok is False else '没有验收命令'}。{run_note}")
+        guide = await self.guide(g)
         mb = f"aiw/{gid}/merge"
-        self.put(gid, phase="deliver", passed=ok)
+        self.put(gid, phase="deliver", passed=ok, report=B.clip(text, 8000), guide=guide)
         self.g.set_group(gid, status="idle", pending=[], queue=[])
-        acts = [{"id": "deliver", "value": "patch", "label": "生成补丁"},
-                {"id": "deliver", "value": "push", "label": "推送分支"},
-                {"id": "deliver", "value": "merge", "label": f"合入 {g['base']}"}]
-        self.say(gid, f"**验收报告**\n\n{text}\n\n{('运行记录：' + chr(10) + checks) if checks else ''}\n\n"
+        acts = [{"id": "deliver", "value": "pr", "label": "开 PR", "desc": "推送分支并开 PR，说明里带验收报告、审阅导览和截图；之后管家盯 CI"},
+                {"id": "deliver", "value": "patch", "label": "生成补丁", "desc": "生成 .patch 文件下载，什么都不推送"},
+                {"id": "deliver", "value": "push", "label": "推送分支", "desc": f"只推送 {mb}，不开 PR"},
+                {"id": "deliver", "value": "merge", "label": f"合入 {g['base']}", "desc": "在电脑上把成果合进基线（仓库要停在基线且干净）"}]
+        gmd = self.guide_md(guide)
+        self.say(gid, f"**验收报告**\n\n{text}\n\n{('**审阅导览**' + chr(10) + chr(10) + gmd + chr(10) + chr(10)) if gmd else ''}"
+                      f"{('运行记录：' + chr(10) + checks) if checks else ''}\n\n"
                       f"实测：{run_note}\n\n成果在分支 {mb}，还没推送，{g['base']} 没动。选怎么交付：",
-                 {"report": True, "done": True, "media": sh.get("media") or [], "actions": acts})
+                 {"report": True, "done": True, "media": sh.get("media") or [], "actions": acts, "guide": guide})
         await self.g._tell_chat(self.g.group(gid), f"项目做完了，验收{'通过' if ok else '有问题' if ok is False else '完成'}，{run_note} 等你选怎么交付。")
+
+    # ------------------------------------------------------------------ 审阅导览
+    async def guide(self, g: dict) -> dict:
+        from .bot_groups import qp
+        mb, base = f"aiw/{g['id']}/merge", g["base"]
+        cmd = (f"R={qp(g['repo'])}; git -C \"$R\" diff --stat=200 {shlex.quote(base)}...{shlex.quote(mb)}; echo '=====DIFF'; "
+               f"git -C \"$R\" diff {shlex.quote(base)}...{shlex.quote(mb)} | head -c 60000")
+        try:
+            out = await self.g._sh(g["machine_id"], "bash -c " + shlex.quote(cmd), 120)
+        except Exception as e:  # noqa: BLE001
+            log.warning("guide: %s", e)
+            return {}
+        if not (out or "").strip():
+            return {}
+        v = _json(await self.llm(GUIDE, B.clip(out, 64000), 2500)) or {}
+        stops = [x for x in (v.get("stops") or []) if isinstance(x, dict) and x.get("title")][:8]
+        return {"stops": stops, "mechanical": [str(x) for x in (v.get("mechanical") or [])][:40]} if stops else {}
+
+    @staticmethod
+    def guide_md(gd: Optional[dict]) -> str:
+        if not gd or not gd.get("stops"):
+            return ""
+        lines = []
+        for i, x in enumerate(gd["stops"], 1):
+            lines.append(f"{i}. {'⚠️ **要仔细看** ' if x.get('careful') else ''}**{x.get('title')}**"
+                         + (f"（{'、'.join('`' + f + '`' for f in (x.get('files') or [])[:6])}）" if x.get("files") else "")
+                         + f"：{x.get('why', '')}")
+        if gd.get("mechanical"):
+            lines.append(f"{len(gd['stops']) + 1}. 机械改动：{'、'.join('`' + f + '`' for f in gd['mechanical'][:12])}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ 开 PR + 盯 PR
+    async def pr_text(self, g: dict, p: dict, shots: list) -> tuple:
+        runs = "\n".join(f"$ {c}\n{B.clip(o, 600)}" for c, o in p.get("runs") or [])
+        v = _json(await self.llm(PR_TEXT, f"项目：{g['title']}\n定稿方案：\n{B.clip(p.get('summary', ''), 4000)}\n\n"
+                                          f"验收报告：\n{B.clip(p.get('report', ''), 4000)}\n\n验收命令：\n{runs or '（没有）'}", 2000)) or {}
+        title = B.clip(str(v.get("title") or g["title"]).strip().splitlines()[0], 100)
+        body = str(v.get("body") or p.get("report") or "").strip()
+        gmd = self.guide_md(p.get("guide"))
+        if gmd:
+            body += "\n\n## 审阅导览\n\n" + gmd
+        if shots:
+            body += "\n\n## 实际运行截图\n\n" + "\n\n".join(f"**{n}**\n\n![{n}]({u})" for n, u in shots)
+        if p.get("pick"):
+            body += f"\n\n设计：用户选定方案 {p['pick']}。"
+        body += f"\n\n---\n由 AIW 管家开的 PR：评审返工 {p.get('rework', 0)} 轮，验收返修 {p.get('fixes', 0)} 次。"
+        return title, body
+
+    async def open_pr(self, g: dict) -> tuple:
+        """Push the branch, put the screenshots on a side branch (aiw/<gid>/shots) so the description can show them,
+        and open the PR with gh. Returns (ok, text, url)."""
+        from .bot_groups import qp
+        gid, p = g["id"], self.state(g["id"])
+        mb, base, sb = f"aiw/{gid}/merge", g["base"], f"aiw/{gid}/shots"
+        R = qp(g["repo"])
+        names = [(x.get("label") or x.get("name"), x.get("name")) for x in p.get("shots") or [] if x.get("kind") == "image"]
+        shot_dir = qp(self.wt(gid, "_shots/run"))
+        pre = (f'set -o pipefail; R={R}; git -C "$R" push -u origin {shlex.quote(mb)} 2>&1 | tail -n 5 || {{ echo "PUSH_FAIL"; exit 0; }}; '
+               'U=$(git -C "$R" remote get-url origin); echo "REMOTE $U"; ')
+        if names:
+            pre += (f'S={shot_dir}; if ls "$S"/*.png >/dev/null 2>&1; then T=$(mktemp -d); cp "$S"/*.png "$T"/; '
+                    'git -C "$T" init -q && git -C "$T" checkout -q -b ' + shlex.quote(sb) + ' && git -C "$T" add -A && '
+                    'git -C "$T" -c user.name=AIW -c user.email=aiw@localhost commit -q -m "AIW 实测截图" && '
+                    f'git -C "$T" push -q -f "$U" {shlex.quote(sb)} 2>&1 | tail -n 2 && echo SHOTS_OK; rm -rf "$T"; fi; ')
+        try:
+            out = await self.g._sh(g["machine_id"], "bash -c " + shlex.quote(pre), 300)
+        except Exception as e:  # noqa: BLE001
+            return False, f"推送失败：{e}", ""
+        if "PUSH_FAIL" in out:
+            return False, "推送失败：\n" + B.clip(out, 800), ""
+        remote = (re.search(r"^REMOTE (\S+)", out, re.M) or [None, ""])[1]
+        gh = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$", remote)
+        shots = []
+        if gh and "SHOTS_OK" in out:
+            shots = [(n, f"https://github.com/{gh[1]}/{gh[2]}/blob/{sb}/{f}?raw=true") for n, f in names]
+        title, body = await self.pr_text(g, p, shots)
+        import base64
+        b64 = base64.b64encode(body.encode()).decode()
+        cmd = (f'R={R}; cd "$R" || exit 0; command -v gh >/dev/null || {{ echo NO_GH; exit 0; }}; '
+               f'F=$(mktemp); echo {b64} | base64 -d > "$F"; '
+               f'U=$(gh pr view {shlex.quote(mb)} --json url -q .url 2>/dev/null); '
+               f'if [ -n "$U" ]; then gh pr edit {shlex.quote(mb)} --body-file "$F" >/dev/null 2>&1; echo "PR_URL $U"; '
+               f'else gh pr create --base {shlex.quote(base)} --head {shlex.quote(mb)} --title {shlex.quote(title)} --body-file "$F" 2>&1 | tail -n 3; fi; rm -f "$F"')
+        try:
+            o2 = await self.g._sh(g["machine_id"], "bash -c " + shlex.quote(cmd), 120)
+        except Exception as e:  # noqa: BLE001
+            o2 = f"gh 运行失败：{e}"
+        url = (re.search(r"https://\S+/pull/\d+", o2 or "") or [""])[0]
+        if url:
+            return True, f"PR：{url}\n标题：{title}" + ("（说明里带了截图）" if shots else ""), url
+        cmp = f"https://github.com/{gh[1]}/{gh[2]}/compare/{base}...{mb}?expand=1" if gh else ""
+        why = "电脑上没装 GitHub CLI（gh），" if "NO_GH" in (o2 or "") else f"gh 没开成：{B.clip(o2, 400)}\n"
+        return False, f"分支已推送，但 PR 没开成：{why}装好并 `gh auth login` 后再点「开 PR」" + (f"，或在这里手动开：{cmp}" if cmp else ""), ""
+
+    def watch(self, gid: str):
+        tasks = self.__dict__.setdefault("_watch", {})
+        t = tasks.get(gid)
+        if t and not t.done():
+            return
+        tasks[gid] = self.g._bg(self._watch_loop(gid))
+
+    def unwatch(self, gid: str):
+        t = self.__dict__.get("_watch", {}).pop(gid, None)
+        if t and not t.done():
+            t.cancel()
+        p = self.state(gid)
+        if (p.get("watch") or {}).get("on"):
+            self.put(gid, watch={**p["watch"], "on": False})
+
+    async def _watch_loop(self, gid: str):
+        while True:
+            await asyncio.sleep(WATCH_EVERY)
+            try:
+                if not await self.watch_tick(gid):
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("pr watch %s: %s", gid, e)
+
+    async def pr_state(self, g: dict) -> Optional[dict]:
+        from .bot_groups import qp
+        mb = f"aiw/{g['id']}/merge"
+        cmd = (f'cd {qp(g["repo"])} && echo "=====VIEW" && gh pr view {shlex.quote(mb)} --json state,mergeable,headRefOid,comments,reviews,url && '
+               f'echo "=====CHECKS" && gh pr checks {shlex.quote(mb)} --json name,bucket,link 2>/dev/null; echo "=====ME"; gh api user -q .login 2>/dev/null')
+        out = await self.g._sh(g["machine_id"], "bash -c " + shlex.quote(cmd), 90)
+        if "=====VIEW" not in (out or ""):
+            return None
+        view = _json(out.split("=====VIEW", 1)[1].split("=====CHECKS", 1)[0])
+        if not view:
+            return None
+        ck = out.split("=====CHECKS", 1)[1].split("=====ME", 1)[0].strip() if "=====CHECKS" in out else ""
+        try:
+            checks = json.loads(ck) if ck.startswith("[") else []
+        except ValueError:
+            checks = []
+        me = out.split("=====ME", 1)[1].strip() if "=====ME" in out else ""
+        return {**view, "checks": checks, "me": me}
+
+    async def watch_tick(self, gid: str) -> bool:
+        """One look at the PR. Returns False when watching is over."""
+        g = self.g.group(gid)
+        p = self.state(gid)
+        w = dict(p.get("watch") or {})
+        if not g or not w.get("on"):
+            return False
+        if g["status"] != "idle":          # a fix is under way; look again later
+            return True
+        st = await self.pr_state(g)
+        if not st:
+            w["fails"] = int(w.get("fails") or 0) + 1
+            self.put(gid, watch=w)
+            if w["fails"] >= 8:
+                self.say(gid, "连续 8 次读不到 PR 状态，不再盯了。")
+                self.unwatch(gid)
+                return False
+            return True
+        w["fails"] = 0
+        if st.get("state") in ("MERGED", "CLOSED"):
+            self.say(gid, f"PR {'已合并' if st['state'] == 'MERGED' else '已关闭'}，不再盯了。")
+            await self.g._tell_chat(g, f"项目的 PR {'已合并' if st['state'] == 'MERGED' else '已关闭'}。")
+            self.put(gid, watch={**w, "on": False})
+            return False
+        head = st.get("headRefOid") or ""
+        owners = [x["bot"] for x in p.get("steps") or []] or self.local_ids(g)
+        failed = [c for c in st.get("checks") or [] if c.get("bucket") == "fail"]
+        pending = [c for c in st.get("checks") or [] if c.get("bucket") == "pending"]
+        if failed and w.get("ci_sha") != head:
+            w["ci_sha"] = head
+            if int(w.get("ci_fixes") or 0) >= MAX_CI_FIX:
+                self.put(gid, watch=w)
+                self.say(gid, f"CI 还有 {len(failed)} 项失败，已经自动修了 {MAX_CI_FIX} 次，交给你看：{st.get('url')}")
+                await self.g._tell_chat(g, "项目 PR 的 CI 还是红的，需要你看一下。")
+                return True
+            log_out = await self.ci_log(g)
+            v = _json(await self.llm(ACCEPT_FIX.format(owners=self.owners(p)),
+                                     "CI 失败：" + "、".join(c.get("name", "") for c in failed) + "\n\n" + log_out, 800)) or {}
+            bot = v.get("bot") if v.get("bot") in owners else owners[-1]
+            w["ci_fixes"] = int(w.get("ci_fixes") or 0) + 1
+            self.put(gid, watch=w, phase="ci")
+            self.say(gid, f"PR 的 CI 红了（{'、'.join(c.get('name', '') for c in failed[:5])}），交给 {self.title(bot)} 修（第 {w['ci_fixes']}/{MAX_CI_FIX} 次）。")
+            await self.g._start_steps(gid, [
+                {"bot": bot, "task": f"【CI 修复】PR 的 CI 失败了。{v.get('fix') or ''}\n先执行 git merge aiw/{gid}/merge 拿到最新代码，"
+                                     f"修好、本地跑通相关测试、commit。\n\nCI 失败日志：\n{log_out}", "step": "修 CI"},
+                {"bot": MANAGER_ID, "op": "repush", "task": "合并并推送到 PR", "step": "推送修复"}], "")
+            return True
+        if st.get("mergeable") == "CONFLICTING" and w.get("conflict_sha") != head:
+            w["conflict_sha"] = head
+            bot = owners[-1]
+            self.put(gid, watch=w, phase="ci")
+            self.say(gid, f"PR 和 {g['base']} 冲突了，交给 {self.title(bot)} 合并解决。")
+            await self.g._start_steps(gid, [
+                {"bot": bot, "task": f"【解决 PR 冲突】先执行 git merge aiw/{gid}/merge，再 git fetch origin && git merge origin/{g['base']}，"
+                                     "解决冲突，跑通测试，commit。", "step": "解决 PR 冲突"},
+                {"bot": MANAGER_ID, "op": "repush", "task": "合并并推送到 PR", "step": "推送修复"}], "")
+            return True
+        notes = [c for c in st.get("comments") or [] if (c.get("author") or {}).get("login") not in ("", None, st.get("me"))]
+        notes += [r for r in st.get("reviews") or [] if (r.get("author") or {}).get("login") not in ("", None, st.get("me")) and r.get("body")]
+        seen = int(w.get("seen") or 0)
+        if len(notes) > seen:
+            new = notes[seen:]
+            w["seen"] = len(notes)
+            w["quiet"] = int(w.get("quiet") or 0) + 1
+            text = "\n".join(f"- {(c.get('author') or {}).get('login')}：{B.clip(c.get('body'), 400)}" for c in new)
+            v = _json(await self.llm(PR_FEEDBACK.format(owners=self.owners(p)), text, 1200)) or {}
+            issues = [i for i in (v.get("issues") or []) if isinstance(i, dict) and i.get("bot") in owners and i.get("fix")]
+            self.put(gid, watch=w)
+            self.say(gid, f"PR 有 {len(new)} 条新评论：\n{text}" + ("" if issues else "\n\n不需要改代码。"))
+            if issues:
+                by = {}
+                for i in issues:
+                    by.setdefault(i["bot"], []).append(i["fix"])
+                self.put(gid, phase="ci")
+                await self.g._start_steps(gid, [{"bot": b, "task": f"【PR 评论】先执行 git merge aiw/{gid}/merge，然后按评论改：\n- "
+                                                 + "\n- ".join(f) + "\n跑通测试后 commit。", "step": "按 PR 评论改"} for b, f in by.items()]
+                                          + [{"bot": MANAGER_ID, "op": "repush", "task": "合并并推送到 PR", "step": "推送修复"}], "")
+            if w["quiet"] >= 10:
+                self.say(gid, "连续 10 次只有评论，不再盯了。")
+                self.unwatch(gid)
+                return False
+            return True
+        if not failed and not pending and st.get("checks") and w.get("green_sha") != head:
+            w["green_sha"] = head
+            self.put(gid, watch=w)
+            self.say(gid, f"PR 的 CI 全部通过（{len(st['checks'])} 项）。{st.get('url') or ''}")
+            await self.g._tell_chat(g, "项目 PR 的 CI 全绿了，等你合并。")
+        else:
+            self.put(gid, watch=w)
+        return True
+
+    async def ci_log(self, g: dict) -> str:
+        from .bot_groups import qp
+        mb = f"aiw/{g['id']}/merge"
+        cmd = (f'cd {qp(g["repo"])} && I=$(gh run list --branch {shlex.quote(mb)} --limit 5 --json databaseId,conclusion '
+               "-q '[.[] | select(.conclusion==\"failure\")][0].databaseId' 2>/dev/null); "
+               '[ -n "$I" ] && gh run view "$I" --log-failed 2>/dev/null | tail -n 120')
+        try:
+            return B.clip(await self.g._sh(g["machine_id"], "bash -c " + shlex.quote(cmd), 120), 6000) or "（没拿到日志）"
+        except Exception as e:  # noqa: BLE001
+            return f"（没拿到日志：{e}）"
+
+    async def repush(self, gid: str, s: dict):
+        from .bot_groups import qp
+        r = await self.g.merge(gid)
+        g = self.g.group(gid)
+        if g["status"] == "fixing":
+            self.g.set_group(gid, queue=[s] + list(g.get("queue") or []))
+            return
+        if r.get("error"):
+            raise RuntimeError("合并没做成：" + str(r["error"]))
+        out = await self.g._sh(g["machine_id"], "bash -c " + shlex.quote(
+            f'git -C {qp(g["repo"])} push origin aiw/{gid}/merge 2>&1 | tail -n 4; echo "EXIT ${{PIPESTATUS[0]}}"'), 300)
+        if not re.search(r"EXIT 0\s*$", out.strip()):
+            raise RuntimeError("推送失败：" + B.clip(out, 400))
+        self.put(gid, phase="deliver")
+        self.g.set_group(gid, status="idle", pending=[], queue=[])
+        self.say(gid, "修复已推送到 PR，接着盯 CI。")
 
     async def deliver(self, gid: str, how: str):
         g = self.g.group(gid)
+        if how == "pr":
+            ok, text, url = await self.open_pr(g)
+            self.say(gid, f"开 PR：{'完成' if ok else '没成功'}。\n\n{text}", {"delivered": "pr" if ok else "", **({"pr": url} if url else {})})
+            if ok:
+                p = self.state(gid)
+                self.put(gid, delivered=sorted(set((p.get("delivered") or []) + ["push", "pr"])), pr=url,
+                         watch={"on": True, "url": url, "since": time.time()})
+                self.say(gid, "开始盯这个 PR：CI 失败、分支冲突、有人评论时，管家交回给负责的成员处理并重新推送。")
+                self.watch(gid)
+            return
         from .bot_groups import qp
         mb, base = f"aiw/{gid}/merge", g["base"]
         R, MW = qp(g["repo"]), qp(self.wt(gid))
@@ -558,29 +907,54 @@ class Project:
         if ph == "confirm" and re.fullmatch(r"(开工|开始|开始吧|确认|可以|没问题|好|go|ok)[。.!！]?", t, re.I):
             self.g._bg(self.go(gid))
             return True
+        m = re.match(r"^(?:都不要|都不行|重新设计|重做设计)[，,。:：\s]*(?:理由(?:是)?[:：]?)?\s*(.*)$", t, re.S)
+        if ph == "pick" and m:
+            if not m.group(1).strip():
+                self.say(gid, "说一下为什么都不要（比如“太花了，要简洁的深色风格”），设计的人才知道往哪改。")
+                return True
+            if int(p.get("redesigns") or 0) >= MAX_REDESIGN:
+                self.say(gid, f"已经重做了 {MAX_REDESIGN} 轮，请从现有方案里选一个，或者直接说想要的样子，选定后再改。")
+                return True
+            self.g._bg(self.redesign(gid, m.group(1).strip()))
+            return True
+        if ph == "confirm" and len(t) > 4 and not re.fullmatch(r"(开工|开始|开始吧|确认|可以|没问题|好|go|ok)[。.!！]?", t, re.I):
+            self.g._bg(self.revise(gid, t))
+            return True
         if ph == "pick":
             i = pick_of(t, p.get("designs") or [])
             if i is not None:
                 self.g._bg(self.pick(gid, i))
                 return True
         if ph == "deliver" and len(t) <= 20:
-            how = "patch" if re.search(r"补丁|patch", t, re.I) else "push" if re.search(r"推送|push", t, re.I) else \
+            how = "pr" if re.search(r"开\s*PR|pull request|提\s*PR", t, re.I) else \
+                "patch" if re.search(r"补丁|patch", t, re.I) else "push" if re.search(r"推送|push", t, re.I) else \
                 "merge" if re.search(r"合入|合并到|合进", t) else ""
             if how:
                 self.g._bg(self.deliver(gid, how))
                 return True
         return False
 
-    async def action(self, gid: str, act: str, value: str = "") -> dict:
+    async def action(self, gid: str, act: str, value: str = "", reason: str = "") -> dict:
         p = self.state(gid)
+        reason = (reason or "").strip()
+        if act in ("redesign", "revise") and not reason:
+            raise ValueError("这个选项要写理由")
         if act == "go" and p.get("phase") == "confirm":
             self.g._bg(self.go(gid))
+        elif act == "revise" and p.get("phase") == "confirm":
+            self.g._bg(self.revise(gid, reason))
+        elif act == "redesign" and p.get("phase") == "pick":
+            if int(p.get("redesigns") or 0) >= MAX_REDESIGN:
+                raise ValueError(f"已经重做了 {MAX_REDESIGN} 轮")
+            self.g._bg(self.redesign(gid, reason))
         elif act == "pick" and p.get("phase") == "pick":
             i = pick_of(value, p.get("designs") or [])
             if i is None:
                 raise ValueError("没有这个方案")
             self.g._bg(self.pick(gid, i))
         elif act == "deliver" and p.get("phase") == "deliver":
+            if value not in ("pr", "patch", "push", "merge"):
+                raise ValueError("不认识的交付方式")
             self.g._bg(self.deliver(gid, value))
         else:
             raise ValueError("项目现在不在这一步")

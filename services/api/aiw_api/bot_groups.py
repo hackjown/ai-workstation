@@ -71,7 +71,10 @@ PLAN = """你是 AIW 管家，带一组 Agent 在群里协同工作：本地编�
 {{"assign": {{"成员id": "发给它的具体任务", ...}}, "report": "一句话告诉用户怎么分的工"}}
 要按顺序做（后一步要用前一步的结果）时，改用：
 {{"steps": [{{"bot": "成员id 或 管家", "task": "这一步的具体任务"}}, ...], "report": "..."}}
+如果用户明确要求管家自己做（不要转派给其他引擎，例如找工作区截图发到群里、直接总结/查询/回答），改用：
+{{"self": true, "task": "管家自己要做的具体事", "report": ""}}
 规则：
+- 用户明确说让管家自己做、不要让别人做时，必须输出 {{"self": true, ...}}，绝不许派给群里成员。
 - 用户已经点名谁做哪一步时，严格照用户的分配和顺序，不许换人、不许合并步骤；用户交给管家的步骤写 "bot": "管家"。
 - 用户说“前一步完成后再交给下一步”或步骤之间有依赖时，必须用 steps。
 - 成员id 只能用上面列出的（{ids}）；用不上的成员不要分。
@@ -198,6 +201,8 @@ def parse_plan(out: str, ids: list) -> Optional[dict]:
     if not isinstance(d, dict):
         return None
     report = str(d.get("report") or "").strip()
+    if d.get("self"):
+        return {"self": True, "task": str(d.get("task") or "").strip(), "report": report, "assign": {}}
     st = d.get("steps")
     if isinstance(st, list):
         steps = []
@@ -241,6 +246,27 @@ def parse_merge(out: str) -> dict:
     return r
 
 
+MANAGER_SELF_RE = re.compile(
+    r"(?:不要|别|不用|无需)(?:让别人|让其他|派给|交给|找别人|叫别人|转派)"
+    r"|(?:你|管家)自己(?:来)?做|你亲自|由你(?:自己)?(?:来)?做|你自己(?:找|发|查|看|处理|搞定)"
+)
+
+
+def is_manager_self_task(text: str, manager: bool) -> bool:
+    return bool(manager and MANAGER_SELF_RE.search(text or ""))
+
+
+def mentioned_engines(text: str, ids: list) -> list[str]:
+    low = (text or "").lower()
+    hits: list[str] = []
+    for eng, names in ALIASES:
+        if eng not in ids:
+            continue
+        if any(re.search(r"(?<![a-z0-9])" + re.escape(n) + r"(?![a-z0-9])", low) for n in names):
+            hits.append(eng)
+    return hits
+
+
 class Groups:
     def __init__(self, bots: "B.Bots", chat=None):
         self.bots, self.store, self.chat = bots, bots.store, chat
@@ -265,12 +291,50 @@ class Groups:
         d["auto_merge"] = bool(d.get("auto_merge"))
         return d
 
+    def _member_status(self, m: dict, pending: list) -> dict:
+        bot = m.get("bot") or ""
+        cid = m.get("conv") or ""
+        busy = bool(cid and self.bots.busy(cid))
+        state, label, activity = "ok", "空闲", ""
+        if busy:
+            state, label = "busy", "干活中"
+            last = self.bots.messages(cid, limit=1)
+            if last and last[-1].get("role") == "bot":
+                d = last[-1].get("data") or {}
+                said = [x for x in (d.get("said") or []) if x]
+                steps = d.get("steps") or []
+                if said:
+                    activity = B.clip(said[-1], 60)
+                elif steps:
+                    st_last = steps[-1]
+                    activity = B.clip(f"{st_last.get('tool') or ''} {st_last.get('arg') or ''}".strip(), 60)
+        elif bot in pending:
+            state, label = "busy", "等待回复"
+        else:
+            last_bot = next((x for x in reversed(self.bots.messages(cid, limit=6)) if x.get("role") == "bot"), None) if cid else None
+            last_st = ((last_bot or {}).get("data") or {}).get("status") if last_bot else ""
+            if last_st == "blocked":
+                state, label = "error", "被权限拦住"
+            elif last_st in ("failed", "turn_failed", "error"):
+                state, label = "error", "出错/断线"
+            else:
+                auth = self.bots.auth_store.public_view(bot) if B.is_cloud_engine(bot) else None
+                rd, why = self.bots.ready_state(bot, auth)
+                if rd == "off":
+                    state, label = "off", why or "未登录/离线"
+                elif rd == "ok":
+                    state, label = "ok", "空闲"
+                else:
+                    state, label = ("unknown" if B.is_cloud_engine(bot) else "ok"), ("待确认" if B.is_cloud_engine(bot) else "空闲")
+        return {**m, "busy": busy, "state": state, "state_label": label, **({"activity": activity} if activity else {})}
+
     def group(self, gid: str) -> Optional[dict]:
         r = self.store._x("SELECT * FROM bot_groups WHERE id=?", (gid,))
         if not r:
             return None
         g = self._row(r[0])
-        g["busy"] = any(self.bots.busy(m["conv"]) for m in g["members"] if m.get("conv")) or gid in self._merging
+        g["members"] = [self._member_status(m, g["pending"]) for m in g["members"]]
+        g["busy"] = any(m.get("busy") for m in g["members"]) or gid in self._merging
         g["needs"] = self.needs(g)
         return g
 
@@ -566,7 +630,7 @@ class Groups:
                 f"（从 {g['base']} 开出" + ("，已经合入前面步骤的成果" if context else "") + f"）。其他成员：{others}；最后由 AIW 管家合并。\n"
                 "AIW 会把你的回复贴到群里。规则：只改当前文件夹里的文件；做完 git add 并 git commit（中文说明）；不要 push，不要切换分支，"
                 + ("" if fix else "不要合并别人的分支，") + "不要改仓库外的文件。只做这一步要求的改动：前面步骤由其他成员负责的文件（规范、测试等）不要改，"
-                "发现它们有问题就在回复里写明，由 AIW 管家交回给负责的成员。最后用几句话说明改了什么、怎么验证的。")
+                "发现它们有问题就在回复里写明，由 AIW 管家交回给负责的成员。如果生成了设计图或截图，请保存在当前工作目录并在回复里写出文件路径（AIW 会自动把图片直接发到群里）。最后用几句话说明改了什么、怎么验证的。")
         return head + ctx + "\n\n" + task
 
     async def send(self, gid: str, text: str, attachments: Optional[list] = None, by: str = "user") -> dict:
@@ -591,6 +655,9 @@ class Groups:
         if self.project_trigger(g, text):   # v3.9.86: a project plan -> 讨论 → 设计 → 开发 → 评审 → 验收 → 实测 → 交付
             self._bg(self.project.start(gid, text, attachments))
             return um
+        if is_manager_self_task(text, manager):
+            self._bg(self._manager_do(gid, rest or text))
+            return um
         steps = parse_steps(text, ids)
         if steps:
             self._bg(self._start_steps(gid, steps, "按你写的分工和顺序来，前一步做完再交给下一步。", attachments))
@@ -601,6 +668,154 @@ class Groups:
         # the planner sees the message with its @s, so who-does-what the user wrote survives
         self._bg(self._plan(gid, text if manager else (rest or text), attachments, prefer=to))
         return um
+
+    async def _manager_do(self, gid: str, task: str):
+        """Execute a direct task requested of AIW 管家 itself (never delegating to group engines)."""
+        g = self.group(gid)
+        if not g:
+            return
+        ids = [m["bot"] for m in g["members"]]
+        wants_media = bool(re.search(r"(截图|图片|设计图|效果图|快照|原型图|png|jpg|webp|发到群|发群里|发出来|贴到群|找到.*图)", task, re.I))
+        if wants_media:
+            await self._manager_find_media(g, task, ids)
+            return
+        # General self-task for 管家 (answer / summarize / inspect directly without dispatching)
+        timeline = self._context(g, {"bot": ""}, 10000)
+        text = ""
+        if self.bots.llm:
+            try:
+                sys_p = ("你是 AIW 管家，用户明确要求你自己直接完成这件事，不要把任务再派给群里的其他引擎。"
+                         "请直接根据群聊记录给出清晰、准确、简明的中文答复；不要编造没有看到的文件或结果。")
+                text = await asyncio.wait_for(
+                    self.bots.llm().complete(sys_p, f"用户的指令：\n{task}\n\n群聊记录：\n{timeline}", 2000), 90
+                )
+                text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+            except Exception as e:  # noqa: BLE001
+                log.warning("manager self task: %s", e)
+        self.add(gid, "aiw", "AIW 管家", text or "收到，这件事由我直接处理，没有转派给其他引擎。")
+
+    async def _manager_find_media(self, g: dict, task: str, ids: list):
+        """Find images/screenshots in the group's worktrees / repo and post them directly into the group."""
+        gid = g["id"]
+        target_bots = mentioned_engines(task, ids)
+        local_members = [m for m in g["members"] if m.get("worktree") and m.get("conv")]
+        if target_bots:
+            chosen = [m for m in local_members if m["bot"] in target_bots]
+            if not chosen:
+                chosen = local_members
+        else:
+            chosen = local_members
+        search_dirs: list[tuple[str, str, str]] = []   # (label_prefix, conv_id, dir_path)
+        for m in chosen:
+            title = B.ENGINES.get(m["bot"], {}).get("title", m["bot"])
+            search_dirs.append((title, m["conv"], m["worktree"]))
+        fallback_conv = next((m["conv"] for m in local_members if m.get("conv")), "")
+        if g.get("repo") and fallback_conv:
+            search_dirs.append(("仓库", fallback_conv, g["repo"]))
+        if fallback_conv:
+            search_dirs.append(("截图目录", fallback_conv, f"~/workspace/.aiw-worktrees/{gid}/_shots"))
+
+        if not search_dirs:
+            self.add(gid, "aiw", "AIW 管家", "这个群没有本地工作目录，找不到本地截图文件。")
+            return
+
+        # Scan for image/video files across the target directories on the computer (newest first, Linux & macOS safe)
+        py_scan = (
+            "import os, sys, json\n"
+            "exts = {'.png','.jpg','.jpeg','.webp','.gif','.bmp','.svg','.mp4','.mov','.webm'}\n"
+            "skip = {'.git','node_modules','.venv','__pycache__','dist','build'}\n"
+            "for idx, raw in enumerate(json.loads(sys.argv[1])):\n"
+            "  d = os.path.expanduser(raw)\n"
+            "  if not os.path.isdir(d): continue\n"
+            "  base_depth = d.rstrip('/').count('/')\n"
+            "  for root, dirs, files in os.walk(d):\n"
+            "    dirs[:] = [x for x in dirs if x not in skip and root.rstrip('/').count('/') - base_depth < 5]\n"
+            "    for fn in files:\n"
+            "      if os.path.splitext(fn)[1].lower() in exts:\n"
+            "        fp = os.path.join(root, fn)\n"
+            "        try: print(f'{idx}|{os.path.getmtime(fp)}|{fp}')\n"
+            "        except OSError: pass\n"
+        )
+        dir_json = json.dumps([dpath for _, _, dpath in search_dirs], ensure_ascii=False)
+        found: list[tuple[float, int, str]] = []
+        try:
+            out = await self._sh(g["machine_id"], f"python3 -c {shlex.quote(py_scan)} {shlex.quote(dir_json)}", 60)
+            for line in (out or "").splitlines():
+                parts = line.split("|", 2)
+                if len(parts) != 3:
+                    continue
+                try:
+                    idx, ts, fpath = int(parts[0]), float(parts[1]), parts[2].strip()
+                except ValueError:
+                    continue
+                if fpath:
+                    found.append((ts, idx, fpath))
+        except Exception as e:  # noqa: BLE001
+            log.warning("manager find media: %s", e)
+
+        found.sort(key=lambda x: x[0], reverse=True)
+        out_dir = self.bots._art_dir() if hasattr(self.bots, "_art_dir") else "workspace/artifacts"
+        media: list[dict] = []
+        seen_paths: set[str] = set()
+        for _ts, idx, fpath in found:
+            if len(media) >= 12:
+                break
+            lbl, conv_id, _ = search_dirs[idx]
+            rel = re.sub(r"^/(?:home/[^/]+|root)/workspace/", "~/workspace/", fpath)
+            if rel in seen_paths:
+                continue
+            seen_paths.add(rel)
+            try:
+                r = await self.bots.fetch_file(conv_id, rel, out_dir)
+                media.append({
+                    "name": r["name"],
+                    "path": r["path"],
+                    "size": r.get("size"),
+                    "kind": B.media_kind(r["name"]),
+                    "label": f"{lbl} · {r['name']}",
+                })
+            except Exception as e:  # noqa: BLE001
+                log.debug("manager fetch media %s: %s", rel, e)
+
+        # Fallback: if no images exist yet, check for HTML design files and screenshot them directly
+        if not media and chosen:
+            html_cmds = []
+            for idx, (lbl, _cid, dpath) in enumerate(search_dirs[:len(chosen)]):
+                html_cmds.append(
+                    f'D={qp(dpath)}; if [ -d "$D" ]; then '
+                    f'find "$D" -maxdepth 4 -type f -iname "*.html" '
+                    f'! -path "*/.git/*" ! -path "*/node_modules/*" ! -path "*/.venv/*" '
+                    f'-printf "{idx}|%T@|%p\\n" 2>/dev/null; fi'
+                )
+            html_hits: list[tuple[float, int, str]] = []
+            try:
+                hout = await self._sh(g["machine_id"], "bash -c " + shlex.quote("; ".join(html_cmds)), 60)
+                for line in (hout or "").splitlines():
+                    parts = line.split("|", 2)
+                    if len(parts) == 3:
+                        try:
+                            html_hits.append((float(parts[1]), int(parts[0]), parts[2].strip()))
+                        except ValueError:
+                            pass
+            except Exception as e:  # noqa: BLE001
+                log.debug("manager find html: %s", e)
+            html_hits.sort(key=lambda x: x[0], reverse=True)
+            shot_items = []
+            for i, (_ts, idx, hp) in enumerate(html_hits[:6]):
+                lbl = search_dirs[idx][0]
+                stem = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{lbl}-{i+1}")
+                shot_items.append((stem, "file://" + hp))
+            if shot_items:
+                sh = await self.project.screenshots(g, "manager-find", shot_items)
+                media = sh.get("media") or []
+
+        if media:
+            names = "、".join(m.get("label") or m.get("name") or "" for m in media[:8])
+            more = f" 等共 {len(media)} 个文件" if len(media) > 8 else f"（共 {len(media)} 张）"
+            self.add(gid, "aiw", "AIW 管家", f"已亲自从工作区找到并发送到群里：{names}{more}。", {"media": media})
+        else:
+            dirs_txt = "、".join(f"{lbl}（{dp}）" for lbl, _, dp in search_dirs)
+            self.add(gid, "aiw", "AIW 管家", f"我已亲自检查了工作区（{dirs_txt}），目前没有找到图片或截图文件。")
 
     def project_trigger(self, g: dict, text: str) -> bool:
         from .group_project import is_trigger
@@ -622,6 +837,9 @@ class Groups:
                 plan = parse_plan(out, ids)
             except Exception as e:  # noqa: BLE001
                 log.warning("group plan: %s", e)
+        if plan and plan.get("self"):
+            await self._manager_do(gid, plan.get("task") or text)
+            return
         if plan and plan.get("steps"):
             await self._start_steps(gid, plan["steps"], plan["report"], attachments)
             return

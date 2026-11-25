@@ -297,6 +297,7 @@ def vm_file_path(raw: str, workdir: str) -> str:
         raise ValueError("没有文件路径")
     if not p.startswith(("/", "~")):
         p = (workdir or "~/workspace").rstrip("/") + "/" + p
+    p = re.sub(r"^/(?:home/[^/]+|root)/workspace/", "~/workspace/", p)
     if p.startswith("~/workspace/"):
         p = p[len("~/workspace/"):]
     elif p.startswith("~"):
@@ -304,6 +305,49 @@ def vm_file_path(raw: str, workdir: str) -> str:
     if ".." in p.split("/"):
         raise ValueError("路径不对")
     return p
+
+
+LOCAL_MEDIA_EXTS = ("png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "mp4", "mov", "webm", "m4v")
+_LOCAL_MEDIA_EXT_RE = "|".join(LOCAL_MEDIA_EXTS)
+_LOCAL_ABS_MEDIA_RE = re.compile(
+    r"file://(/[^\s)\]<>&\"'`]+\.(?:" + _LOCAL_MEDIA_EXT_RE + r"))|"
+    r"((?:~|/(?:home/[\w.-]+|root))/workspace/[^\s)\]<>&\"'`，。；]+\.(?:" + _LOCAL_MEDIA_EXT_RE + r"))",
+    re.I,
+)
+_LOCAL_MD_MEDIA_RE = re.compile(
+    r"!?\[[^\]]*\]\(\s*([^)\s]+\.(?:" + _LOCAL_MEDIA_EXT_RE + r"))\s*\)",
+    re.I,
+)
+_LOCAL_TICK_MEDIA_RE = re.compile(
+    r"`([^`\n]+\.(?:" + _LOCAL_MEDIA_EXT_RE + r"))`",
+    re.I,
+)
+
+
+def extract_local_media_paths(text: str, changes: Optional[dict] = None, limit: int = 12) -> list[str]:
+    """Extract candidate image/video file paths generated in the workspace by a local engine."""
+    out: list[str] = []
+
+    def add_path(raw: str) -> None:
+        p = (raw or "").strip().strip("<>`'\".,;:")
+        if not p or p.startswith(("http://", "https://", "data:", "#")):
+            return
+        ext = p.rsplit(".", 1)[-1].lower() if "." in p else ""
+        if ext not in LOCAL_MEDIA_EXTS:
+            return
+        if p not in out:
+            out.append(p)
+
+    for f in (changes or {}).get("files") or []:
+        if isinstance(f, str):
+            add_path(f)
+    for m in _LOCAL_ABS_MEDIA_RE.finditer(text or ""):
+        add_path(m.group(1) or m.group(2) or "")
+    for m in _LOCAL_MD_MEDIA_RE.finditer(text or ""):
+        add_path(m.group(1) or "")
+    for m in _LOCAL_TICK_MEDIA_RE.finditer(text or ""):
+        add_path(m.group(1) or "")
+    return out[:limit]
 
 
 ONE_SHOT = 30 * 1024 * 1024      # v3.9.76: vm-agent files.read sends at most 40 MB in one reply
@@ -1191,6 +1235,10 @@ class Bots:
         if res.get("media"):   # v3.9.85: Cue's images / videos / files: copied here, shown in the reply
             data["media"] = await self.save_media(cid, res["media"])
             text = media_text(text, data["media"])
+        elif not is_cloud_engine(c["bot"]) and self.sessions:
+            local_media = await self.collect_local_media(cid, text, res.get("changes"))
+            if local_media:
+                data["media"] = local_media
         if data["status"] == "blocked":
             den = (data["denied"] or [{}])[-1]
             for x in data["denied"]:
@@ -1511,6 +1559,31 @@ class Bots:
                 with contextlib.suppress(OSError):
                     os.remove(tmp)
         return {"path": path, "name": name, "size": os.path.getsize(path)}
+
+    async def collect_local_media(self, cid: str, text: str, changes: Optional[dict] = None) -> list[dict]:
+        """Auto-copy workspace images/videos produced by a local engine so they render inline in chat & groups."""
+        paths = extract_local_media_paths(text, changes)
+        if not paths:
+            return []
+        out_dir = self._art_dir()
+        out: list[dict] = []
+        seen_paths: set[str] = set()
+        for raw in paths:
+            try:
+                r = await self.fetch_file(cid, raw, out_dir)
+                if r["path"] in seen_paths:
+                    continue
+                seen_paths.add(r["path"])
+                out.append({
+                    "name": r["name"],
+                    "path": r["path"],
+                    "size": r.get("size"),
+                    "kind": media_kind(r["name"]),
+                    "src": raw,
+                })
+            except Exception as e:  # noqa: BLE001
+                log.debug("collect local media %s (%s): %s", cid, raw, e)
+        return out
 
     async def permit(self, cid: str, mode: str, rule: str = "") -> dict:
         """v3.9.67: the user's answer to a step the permission rules stopped. allow: add `rule` (or the suggested one)

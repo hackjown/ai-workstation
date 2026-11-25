@@ -718,7 +718,16 @@ function btGroupRender() {
   const hasLocal = (g.members || []).some((m) => !!m.branch);
   const existingIds = new Set((g.members || []).map((m) => m.bot));
   const canAdd = BT.engines.some((e) => e.available && !existingIds.has(e.id));
-  const chips = g.members.map((m) => `<button class="link small" onclick="btOpen('${m.conv}')" title="打开 ${esc(btEngine(m.bot).title)} 的对话${m.branch ? `（分支 ${esc(m.branch)}）` : "（云端）"}">${btAv(m.bot, "sm")}${m.busy ? "…" : ""}</button>`).join(" ");
+  const chips = g.members.map((m) => {
+    const eng = btEngine(m.bot);
+    const mst = m.state || (m.busy ? "busy" : "ok");
+    const slbl = m.state_label || (mst === "busy" ? "干活中" : mst === "error" ? "出错/断线" : mst === "off" ? "离线" : "空闲");
+    const tip = `${eng.title} · ${slbl}${m.activity ? "（" + m.activity + "）" : ""}${m.branch ? ` · 分支 ${m.branch}` : " · 云端"} · 点击看对话`;
+    const tag = mst === "busy" ? `<span class="bt-gm-st busy">${esc(slbl)}</span>`
+      : mst === "error" ? `<span class="bt-gm-st err">断线/出错</span>`
+      : mst === "off" ? `<span class="bt-gm-st off">离线</span>` : "";
+    return `<button class="bt-gm ${esc(mst)}" onclick="btOpen('${m.conv}')" title="${esc(tip)}"><span class="bt-gm-av">${btAv(m.bot, "sm")}<i class="bt-dot ${esc(mst === "error" ? "err" : mst)}"></i></span>${tag}</button>`;
+  }).join("");
   const sub = g.repo ? `${esc(g.repo)} · 基线 ${esc(g.base)}` : "云端协作群";
   $("btHead").innerHTML = `<button class="icon only-mobile" onclick="btBack()" aria-label="返回">${icon("back")}</button>
     <div class="grow"><div class="heading">${esc(g.title)}</div>

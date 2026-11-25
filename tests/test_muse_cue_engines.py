@@ -454,3 +454,69 @@ def test_dm_unread_badge_lifecycle(tmp_path):
     assert res.status_code == 200 and res.json()["conv"]["unread"] == 0
     eng_map = {e["id"]: e for e in client.get("/api/bots").json()["engines"]}
     assert eng_map["cue"]["unread"] == 0
+
+
+@pytest.mark.asyncio
+async def test_local_media_extraction_and_manager_self_find_media(tmp_path):
+    # 1. vm_file_path normalizes /home/<user>/workspace/... and extract_local_media_paths finds workspace images
+    assert B.vm_file_path("/home/aiw/workspace/groups/bg-1/design.png", "~/workspace/groups/bg-1") == "groups/bg-1/design.png"
+    assert B.vm_file_path("file:///home/aiw/workspace/groups/bg-1/shot.webp", "~/workspace/groups/bg-1") == "groups/bg-1/shot.webp"
+    paths = B.extract_local_media_paths(
+        "设计图已保存到 `/home/aiw/workspace/groups/bg-1/agy.png` 和 ![预览](shots/cbc.webp)",
+        {"files": ["design/home.png", "src/app.ts"]},
+    )
+    assert paths == ["design/home.png", "/home/aiw/workspace/groups/bg-1/agy.png", "shots/cbc.webp"]
+
+    # 2. Group member live status & @管家 self-execution without delegating to engines
+    store = Store(str(tmp_path / "aiw.db"))
+    store.upsert_machine({"id": "ai-linux-001", "provider": "local", "provider_vm_id": "v1",
+                          "name": "Local PC", "agent_endpoint": "ws://localhost:8001"})
+    secrets = SecretBox(store, str(tmp_path))
+    shell_cmds = []
+
+    async def fake_shell(mid: str, cmd: str, timeout: int) -> str:
+        shell_cmds.append(cmd)
+        if "python3 -c" in cmd:
+            return (
+                "0|1700000200|/home/aiw/workspace/.aiw-worktrees/bg/agy/design/agy-ui.png\n"
+                "1|1700000100|/home/aiw/workspace/.aiw-worktrees/bg/codebuddy/design/cbc-ui.png\n"
+            )
+        return "DIRTY 0\nGROUP_OK main\n"
+
+    bots = B.Bots(store, shell=fake_shell, secrets=secrets)
+    groups = G.Groups(bots)
+    g = await groups.create("home-inventory", "~/workspace/demo", ["agy", "codebuddy", "cue"], "main")
+    gid = g["id"]
+
+    # Simulate cue failed/disconnected -> member status shows "error"
+    cue_m = groups.member(g, "cue")
+    bots.add(cue_m["conv"], "bot", "连接超时", {"status": "failed"})
+    g_st = groups.group(gid)
+    by_bot = {m["bot"]: m for m in g_st["members"]}
+    assert by_bot["cue"]["state"] == "error" and "出错" in by_bot["cue"]["state_label"]
+    assert by_bot["agy"]["state"] == "ok"
+
+    # Mock fetch_file and track bots.send calls to verify 管家 NEVER delegates to agy/codebuddy
+    delegated = []
+    orig_send = bots.send
+    bots.send = lambda *a, **kw: (delegated.append((a, kw)), orig_send(*a, **kw))[1]
+
+    async def fake_fetch(cid, raw, out_dir):
+        name = raw.rsplit("/", 1)[-1]
+        return {"path": str(tmp_path / name), "name": name, "size": 456}
+
+    bots.fetch_file = fake_fetch
+
+    assert G.is_manager_self_task("@管家 把agy和cbc设计的截图找到，发到群里，不要让别人做，你自己来做", True) is True
+    await groups.send(gid, "@管家 把agy和cbc设计的截图找到，发到群里，不要让别人做，你自己来做")
+    # Wait for background _manager_do task to finish
+    import asyncio
+    await asyncio.gather(*list(groups._tasks))
+
+    assert delegated == []   # 管家 did it itself, zero delegation to agy/codebuddy!
+    gmsgs = groups.messages(gid)
+    aiw_msgs = [m for m in gmsgs if m["role"] == "aiw"]
+    assert len(aiw_msgs) == 1
+    media = aiw_msgs[0]["data"].get("media") or []
+    assert [m["name"] for m in media] == ["agy-ui.png", "cbc-ui.png"]
+    assert [m["kind"] for m in media] == ["image", "image"]

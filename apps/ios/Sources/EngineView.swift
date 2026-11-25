@@ -1323,10 +1323,20 @@ struct EngineGroupView: View {
     @State private var permitRule = ""
     @State private var showPermitRule = false
     @State private var diff: GroupDiffSheet? = nil
+    @State private var msgsSig = ""
+    @State private var groupSig = ""
+    @State private var initialScrolled = false
+    @State private var wantScroll = false
+    @State private var pulse = false
 
     var project: JSON { group.o("project") }
     var live: Bool { group.b("busy") || (!group.s("status").isEmpty && group.s("status") != "idle") }
     func title(_ bot: String) -> String { engines.first { $0.s("id") == bot }?.s("title") ?? bot }
+    func shortName(_ bot: String) -> String {
+        let e = engines.first { $0.s("id") == bot }
+        let s = e?.s("short") ?? ""
+        return s.isEmpty ? (e?.s("title") ?? bot) : s
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -1336,7 +1346,7 @@ struct EngineGroupView: View {
                         Text("说要做什么：不 @ 就由 AIW 管家分工；@codex 只发给它。每个引擎在自己的分支上改，做完管家合并。\n以「项目规划：」开头发一份规划，就按 讨论 → 设计 → 开发 → 评审 → 验收 → 实测截图 → 交付 走完。")
                             .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
                     }
-                    ForEach(msgs.indices, id: \.self) { i in row(msgs[i]) }
+                    ForEach(msgs.indices.map { HRowKey(i: $0, id: msgs[$0].s("id")) }, id: \.id) { k in row(msgs[k.i]) }
                     if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red) }
                     Color.clear.frame(height: 1).id("end")
                 }.padding(.horizontal, 14).padding(.vertical, 10)
@@ -1344,7 +1354,12 @@ struct EngineGroupView: View {
             .scrollDismissesKeyboard(.interactively)
             .safeAreaInset(edge: .top) { statusBar }
             .safeAreaInset(edge: .bottom) { composer }
-            .onChange(of: msgs.count) { _ in withAnimation { proxy.scrollTo("end", anchor: .bottom) } }
+            .onChange(of: msgs.count) { n in
+                if n > 0 && (!initialScrolled || wantScroll) {
+                    initialScrolled = true; wantScroll = false
+                    DispatchQueue.main.async { proxy.scrollTo("end", anchor: .bottom) }
+                }
+            }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -1407,8 +1422,59 @@ struct EngineGroupView: View {
 
     @ViewBuilder var statusBar: some View {
         VStack(spacing: 0) {
+            if !group.a("members").isEmpty { memberBar }
             if !project.s("phase").isEmpty { projectBar }
             workingBar
+        }
+    }
+
+    var memberBar: some View {
+        let members = group.a("members")
+        let anyBusy = members.contains { $0.s("state") == "busy" || $0.b("busy") }
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(members.indices, id: \.self) { i in
+                    let m = members[i]
+                    let bot = m.s("bot")
+                    let st = m.s("state").isEmpty ? (m.b("busy") ? "busy" : "ok") : m.s("state")
+                    let slbl = m.s("state_label").isEmpty ? (st == "busy" ? "干活中" : st == "error" ? "出错/断线" : st == "off" ? "离线" : "空闲") : m.s("state_label")
+                    let dot: Color = st == "busy" ? amber : (st == "error" ? .red : (st == "ok" ? .green : .gray))
+                    Button { openConv = m.s("conv") } label: {
+                        HStack(spacing: 5) {
+                            EngineAvatar(bot: bot, size: 26)
+                                .saturation(st == "off" ? 0.3 : 1).opacity(st == "off" ? 0.65 : 1)
+                                .overlay(
+                                    Circle()
+                                        .stroke(st == "busy" ? amber : (st == "error" ? Color.red : Color.clear),
+                                                lineWidth: st == "busy" ? (pulse ? 2.5 : 1.2) : 1.8)
+                                        .scaleEffect(st == "busy" && pulse ? 1.16 : 1.0)
+                                        .opacity(st == "busy" && pulse ? 0.45 : 0.9)
+                                )
+                                .overlay(
+                                    Circle().fill(dot).frame(width: 8, height: 8)
+                                        .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 1.5)),
+                                    alignment: .bottomTrailing
+                                )
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(shortName(bot)).font(.caption2.weight(.semibold)).foregroundColor(.primary).lineLimit(1)
+                                Text(slbl).font(.system(size: 10, weight: st == "busy" || st == "error" ? .semibold : .regular))
+                                    .foregroundColor(st == "busy" ? amber : (st == "error" ? .red : .secondary)).lineLimit(1)
+                            }
+                        }
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(Capsule().fill(Color(.secondarySystemBackground).opacity(0.85)))
+                    }.buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+        }
+        .background(.bar)
+        .onAppear {
+            if anyBusy && !pulse { withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) { pulse = true } }
+        }
+        .onChange(of: anyBusy) { on in
+            if on { withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) { pulse = true } }
+            else { pulse = false }
         }
     }
 
@@ -1569,10 +1635,23 @@ struct EngineGroupView: View {
         }
     }
 
+    func sigGroup(_ g: JSON) -> String {
+        let ms = g.a("members").map { "\($0.s("bot")):\($0.s("state")):\($0.s("state_label")):\($0.b("busy"))" }.joined(separator: ",")
+        let pend = ((g["pending"] as? [String]) ?? []).joined(separator: ",")
+        return "\(g.s("status"))|\(g.b("busy"))|\(pend)|\(g.o("project").s("phase"))|\(g.o("paused").s("msg"))|\(ms)"
+    }
+    func sigMsgs(_ arr: [JSON]) -> String {
+        guard let last = arr.last else { return "0" }
+        let d = last.o("data")
+        return "\(arr.count)|\(last.s("id"))|\(last.s("text").count)|\(d.a("media").count)|\(d.a("actions").count)|\(d.o("diff").s("to"))"
+    }
     @MainActor func load() async {
         do {
             let r = try await API.shared.obj("GET", "/api/bots/groups/\(gid)?after=0")
-            group = r.o("group"); msgs = r.a("messages")
+            let ng = r.o("group"), nm = r.a("messages")
+            let gs = sigGroup(ng), ms = sigMsgs(nm)
+            if gs != groupSig { groupSig = gs; group = ng }
+            if ms != msgsSig { msgsSig = ms; msgs = nm }
             if err.hasPrefix("读不到") { err = "" }
         } catch let e { err = "读不到这个群聊：\(e.localizedDescription)" }
     }
@@ -1588,7 +1667,7 @@ struct EngineGroupView: View {
         sending = true; defer { sending = false }
         do {
             _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/send", ["text": body])
-            text = ""; err = ""
+            text = ""; err = ""; wantScroll = true
             await load()
         } catch let e { err = "没发出去：\(e.localizedDescription)" }
     }

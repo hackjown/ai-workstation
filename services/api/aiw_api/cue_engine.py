@@ -142,6 +142,26 @@ def _collect_media(am: dict[str, Any], sink: list) -> None:
         sink.append(row)
 
 
+def _estimate_tokens(text: str) -> int:
+    """Conservative token estimator matching Manus/Cue's 5000-token message limit (CJK ~1.5 tok, ASCII ~0.35 tok)."""
+    cjk = sum(1 for ch in text if ord(ch) > 0x7F)
+    asc = len(text) - cjk
+    return int(cjk * 1.5 + asc * 0.35) + 16
+
+
+def _trim_for_cue(text: str, max_tokens: int = 4200) -> str:
+    """Trim oversized group prompts so Cue's task.sendMessage never fails with HTTP 400 (5000 token limit).
+    Preserves the opening role header and the trailing user task, trimming the middle context/snapshot."""
+    if _estimate_tokens(text) <= max_tokens:
+        return text
+    # Target char budget proportionally from current density
+    ratio = max_tokens / max(1, _estimate_tokens(text))
+    budget = max(800, int(len(text) * ratio * 0.92))
+    head_len = min(int(budget * 0.28), 1000)
+    tail_len = max(400, budget - head_len - 40)
+    return text[:head_len].rstrip() + "\n\n……（上下文过长已自动截断，以适配 Cue 单条消息 5000 token 限制）……\n\n" + text[-tail_len:].lstrip()
+
+
 def _extract_error_reason(ev: dict[str, Any]) -> str:
     """Extract human-readable error details from Cue error_message or status_update events."""
     for container_key in ("error_message", "status_update", "error"):
@@ -622,11 +642,21 @@ class CueEngine:
             before_msgs = before.get("messages") or []
             job.after_id = str(before_msgs[0].get("id") or "") if before_msgs and isinstance(before_msgs[0], dict) else ""
 
+            send_text = _trim_for_cue(prompt, max_tokens=4200)
+            job.expected_user_text = send_text
             ok_s, st_s, sent, _ = await self._openapi_req(
                 auth, "task.sendMessage",
-                {"task_id": task_id, "message": {"content": prompt}},
+                {"task_id": task_id, "message": {"content": send_text}},
                 client=client,
             )
+            if not ok_s and st_s == 400 and "token" in _extract_error_reason(sent).lower():
+                send_text = _trim_for_cue(prompt, max_tokens=2600)
+                job.expected_user_text = send_text
+                ok_s, st_s, sent, _ = await self._openapi_req(
+                    auth, "task.sendMessage",
+                    {"task_id": task_id, "message": {"content": send_text}},
+                    client=client,
+                )
             if not ok_s:
                 reason = _extract_error_reason(sent)
                 self._finish(job, "turn_failed", auth_error=st_s in (401, 403),

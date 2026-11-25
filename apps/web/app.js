@@ -606,21 +606,55 @@ async function exportTask(tid, copy) {
 }
 
 /* ---------------------------------------------------------------- activity */
+const BOT_LABELS = { agy: "Antigravity", codex: "Codex", claude: "Claude Code", codebuddy: "CodeBuddy", grok: "Grok Build", muse: "Meta Muse", cue: "Cue" };
+function openBotResult(id) {
+  if (!id) return;
+  if (String(id).startsWith("bc-")) { go("bots"); setTimeout(() => { if (typeof btOpen === "function") btOpen(id); }, 150); return; }
+  if (String(id).startsWith("bg-")) { go("bots"); setTimeout(() => { if (typeof btGroupOpen === "function") btGroupOpen(id); }, 150); return; }
+  openThread(id);
+}
 async function loadActivity() {
-  try { S.tasks = await api("GET", "/api/tasks?limit=100"); } catch (e) { return; }
-  const need = S.tasks.filter((t) => ["waiting_confirm", "waiting_input"].includes(t.status)).length;
-  $("needBadge").textContent = need || "";
+  let botsR = { convs: [] }, grpR = { groups: [] };
+  try {
+    [S.tasks, botsR, grpR] = await Promise.all([
+      api("GET", "/api/tasks?limit=100"),
+      api("GET", "/api/bots").catch(() => ({ convs: [] })),
+      api("GET", "/api/bots/groups").catch(() => ({ groups: [] })),
+    ]);
+  } catch (e) { return; }
+  const bConvs = (botsR.convs || []).filter((c) => c.busy || c.status === "running" || c.status === "blocked" || c.status === "failed");
+  const bGroups = (grpR.groups || []).filter((g) => g.busy || g.status !== "idle" || g.needs);
+  const needTasks = S.tasks.filter((t) => ["waiting_confirm", "waiting_input"].includes(t.status)).length;
+  const needBots = bConvs.filter((c) => c.status === "blocked").length + bGroups.filter((g) => g.needs).length;
+  $("needBadge").textContent = (needTasks + needBots) || "";
   const f = S.actFilter;
+  const gRows = bGroups.filter((g) => f === "all" || (f === "live" && (g.busy || g.status !== "idle")) || (f === "need" && !!g.needs)).map((g) => {
+    const st = g.needs ? `<span class="chip warn">需要你：${esc(g.needs)}</span>` : `<span class="chip">${esc(g.status === "merging" ? "合并中" : "群聊干活中")}</span>`;
+    return `<div class="item"><div class="iconbox sm">${icon("monitor")}</div><div class="grow" style="cursor:pointer" onclick="openBotResult('${esc(g.id)}')">
+      <div><b>[引擎群聊] ${esc(g.title)}</b></div>
+      <div class="small">${esc((g.members || []).map((m) => BOT_LABELS[m.bot] || m.bot).join("、"))} · ${when(g.updated_at)}</div>
+      ${g.last ? `<div class="muted" style="margin-top:4px">${esc(g.last.text || "")}</div>` : ""}</div>
+      <div class="acts">${st}</div></div>`;
+  });
+  const cRows = bConvs.filter((c) => f === "all" || (f === "live" && (c.busy || c.status === "running")) || (f === "need" && c.status === "blocked") || (f === "failed" && c.status === "failed")).map((c) => {
+    const st = c.status === "blocked" ? `<span class="chip warn">需要你确认</span>` : (c.busy || c.status === "running") ? `<span class="chip">运行中</span>` : chip(c.status);
+    return `<div class="item"><div class="iconbox sm">${icon("monitor")}</div><div class="grow" style="cursor:pointer" onclick="openBotResult('${esc(c.id)}')">
+      <div><b>[${esc(BOT_LABELS[c.bot] || c.bot)}] ${esc(c.title)}</b></div>
+      <div class="small">${c.kind === "dm" ? "单聊" : "任务"} · ${when(c.updated_at)}</div>
+      ${c.last ? `<div class="muted" style="margin-top:4px">${esc(c.last.text || "")}</div>` : ""}</div>
+      <div class="acts">${st}</div></div>`;
+  });
   const list = S.tasks.filter((t) => f === "all" || (f === "live" && LIVE.includes(t.status)) || (f === "need" && ["waiting_confirm", "waiting_input"].includes(t.status))
     || (f === "failed" && ["failed", "stopped", "interrupted"].includes(t.status)) || (f === "queued" && t.status === "queued"));
-  $("actList").innerHTML = list.map((t) => {
+  const tRows = list.map((t) => {
     const p = t.plan && t.plan.steps ? `${(t.plan.done || []).length}/${t.plan.steps.length} 步` : "";
     return `<div class="item"><div class="iconbox sm">${icon(t.source === "routine" ? "clock" : "bolt")}</div><div class="grow" style="cursor:pointer" onclick="openThread('${t.thread_id}')">
       <div><b>${esc(t.prompt.slice(0, 90))}</b></div><div class="small">${esc(t.thread_title || "")} · ${when(t.created_at)} ${p ? "· " + p : ""}</div>
       ${t.result ? `<div class="muted" style="margin-top:4px">${esc(t.result.slice(0, 160))}</div>` : ""}</div>
       <div class="acts">${chip(t.status)}${["failed", "stopped", "interrupted"].includes(t.status) ? `<button class="btn sm" onclick="retry('${t.id}').then(()=>go('chat'))">重试</button>` : ""}
       ${t.status === "queued" ? `<button class="btn sm" onclick="cancelQueued('${t.id}').then(loadActivity)">取消</button>` : ""}</div></div>`;
-  }).join("") || `<div class="empty">这里会显示所有任务的进度、需要你处理的请求和失败记录</div>`;
+  });
+  $("actList").innerHTML = [...gRows, ...cRows, ...tRows].join("") || `<div class="empty">这里会显示所有任务、引擎和群聊的进度、需要你处理的请求和失败记录</div>`;
 }
 $("actFilter").addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; S.actFilter = b.dataset.f;
   $("actFilter").querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b)); loadActivity(); });
@@ -651,20 +685,20 @@ async function delRow(kind, id, after) { if (!confirm("确定删除？")) return
 async function loadRoutines() {
   const rs = await api("GET", "/api/routines");
   $("routineList").innerHTML = rs.map((r) => `<div class="item"><div class="iconbox sm">${icon("clock")}</div><div class="grow">
-    <div><b>${esc(r.name)}</b> <span class="chip">${esc(r.schedule)}</span> ${r.enabled ? "" : '<span class="chip">已暂停</span>'}</div>
+    <div><b>${esc(r.name)}</b> <span class="chip">${esc(r.schedule)}</span> ${r.bot ? `<span class="chip ok">${esc(BOT_LABELS[r.bot] || r.bot)}</span>` : ""} ${r.enabled ? "" : '<span class="chip">已暂停</span>'}</div>
     <div class="muted">${esc(r.prompt)}</div><div class="small">下次 ${when(r.next_run)} · 上次 ${when(r.last_run)}</div></div>
     <div class="acts"><button class="btn sm primary" onclick="runRoutine('${r.id}')">现在运行</button>
-    ${r.thread_id ? `<button class="btn sm" onclick="openThread('${r.thread_id}')">结果</button>` : ""}
+    ${r.thread_id ? `<button class="btn sm" onclick="openBotResult('${esc(r.thread_id)}')">结果</button>` : ""}
     <button class="btn sm" onclick="toggleRoutine(${esc(JSON.stringify(r))})">${r.enabled ? "暂停" : "启用"}</button>
     <button class="btn sm danger" onclick="delRow('routines','${r.id}',loadRoutines)">删除</button></div></div>`).join("") || `<div class="empty">还没有例程</div>`;
 }
 async function addRoutine(e) {
   e.preventDefault(); const f = e.target;
-  try { await api("POST", "/api/routines", { name: f.name.value, prompt: f.prompt.value, schedule: f.schedule.value, machine_id: MID }); f.reset(); toast("例程已添加"); loadRoutines(); }
+  try { await api("POST", "/api/routines", { name: f.name.value, prompt: f.prompt.value, schedule: f.schedule.value, machine_id: MID, bot: f.bot ? f.bot.value : "" }); f.reset(); toast("例程已添加"); loadRoutines(); }
   catch (err) { toast(err.message); }
 }
-async function runRoutine(id) { const r = await api("POST", `/api/routines/${id}/run`); openThread(r.thread_id); }
-async function toggleRoutine(r) { await api("PUT", `/api/routines/${r.id}`, { name: r.name, prompt: r.prompt, schedule: r.schedule, machine_id: r.machine_id, enabled: !r.enabled }); loadRoutines(); }
+async function runRoutine(id) { const r = await api("POST", `/api/routines/${id}/run`); openBotResult(r.conv_id || r.thread_id); }
+async function toggleRoutine(r) { await api("PUT", `/api/routines/${r.id}`, { name: r.name, prompt: r.prompt, schedule: r.schedule, machine_id: r.machine_id, bot: r.bot || "", enabled: !r.enabled }); loadRoutines(); }
 
 /* ---------------------------------------------------------------- computer */
 let deskLoaded = { small: null, big: null };

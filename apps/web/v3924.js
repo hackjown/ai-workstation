@@ -360,26 +360,32 @@ async function v24Tunnel(op) { toast(op === "start" ? "正在开启，约 5-15 �
 async function v24TunnelInstall() { toast("下载中（约 30 MB）…"); await v24Do(() => api("POST", "/api/remote/tunnel/install"), "已安装"); V24_RENDER.remote(); }
 
 /* ------------------------------------------------------------------ 自动签到 */
+const V24_BOTS = [["", "小秘（默认）"], ["agy", "Antigravity (agy)"], ["codex", "Codex"], ["claude", "Claude Code"], ["codebuddy", "CodeBuddy (cbc)"], ["grok", "Grok Build"], ["muse", "Meta Muse（云端）"], ["cue", "Cue（云端）"]];
+const v24BotOpts = (cur, includeFollow) => (includeFollow ? `<option value="">跟随默认</option>` : "")
+  + V24_BOTS.filter(([k]) => !includeFollow || k).map(([k, n]) => `<option value="${k}" ${cur === k ? "selected" : ""}>${q24(n)}</option>`).join("");
+const v24BotName = (k) => (V24_BOTS.find(([id]) => id === k) || [k, k])[1];
 V24_RENDER.checkin = async function () {
   const [d, ms, runs] = await Promise.all([api("GET", "/api/checkin/sites"), api("GET", "/api/machines").catch(() => []), api("GET", "/api/checkin/runs?limit=40")]);
-  const st = { ok: "✅ 成功", already: "☑️ 已签过", failed: "❌ 失败", replay_failed: "⚠️ 重放失败", human: "🖐 需要你", pending: "⏳ Agent 处理中" };
+  const st = { ok: "✅ 成功", already: "☑️ 已签过", failed: "❌ 失败", replay_failed: "⚠️ 重放失败", human: "🖐 需要你", pending: "⏳ 处理中" };
   const names = Object.fromEntries(d.sites.map((s) => [s.id, s.name]));
   v24Body(`${d.env_off ? '<div class="v24-warn">AIW_CHECKIN=0：定时签到已关闭（手动「立即签到」仍可用）</div>' : ""}
     <div class="card v24-card"><div class="v24-bar"><label class="v24-sw"><input type="checkbox" ${d.settings.enabled ? "checked" : ""} onchange="api('PUT','/api/checkin/settings',{enabled:this.checked}).then(()=>toast('已保存'))" />开启自动签到</label>
-      <label class="v24-sw">默认随机延后 0–<input type="number" min="0" max="180" value="${d.settings.jitter_min}" style="width:70px" onchange="api('PUT','/api/checkin/settings',{jitter_min:+this.value}).then(()=>toast('已保存'))" /> 分钟</label></div>
-      <div class="v24-note">第一次由 Agent 在电脑上已登录的浏览器里签到并录下「配方」；之后每天按配方自动重放，不用模型。重放失败就交给 Agent；遇到验证码/滑块会请你接管，绝不绕过。每批签到只推送一条 Bark 汇总。</div></div>
+      <label class="v24-sw">默认随机延后 0–<input type="number" min="0" max="180" value="${d.settings.jitter_min}" style="width:70px" onchange="api('PUT','/api/checkin/settings',{jitter_min:+this.value}).then(()=>toast('已保存'))" /> 分钟</label>
+      <label class="v24-sw">默认执行引擎<select onchange="api('PUT','/api/checkin/settings',{bot:this.value}).then(()=>toast('已保存'))">${v24BotOpts(d.settings.bot || "", false)}</select></label></div>
+      <div class="v24-note">第一次由选定的 Agent / 引擎在电脑上已登录的浏览器里签到；有配方时每天自动重放，重放失败或未选配方时交给选定引擎处理；遇到验证码/滑块会请你接管，绝不绕过。每批签到只推送一条 Bark 汇总。</div></div>
     <div class="card v24-card"><h3>添加网站</h3><form onsubmit="v24CkAdd(event)"><div class="v24-g2"><label class="v24-f">名称<input name="name" placeholder="如 某论坛" /></label><label class="v24-f">签到页网址<input name="url" required placeholder="https://…" /></label>
       <label class="v24-f">时间（cron / daily 08:30 / every 12h）<input name="schedule" value="daily 08:30" /></label><label class="v24-f">随机延后（分钟）<input name="jitter_min" type="number" value="${d.settings.jitter_min}" /></label>
-      <label class="v24-f">在哪台电脑<select name="machine_id"><option value="">默认</option>${ms.map((m) => `<option value="${q24(m.id)}">${q24(m.name || m.id)}</option>`).join("")}</select></label></div>
-      <label class="v24-f">说明（可选，告诉 Agent 签到入口在哪）<input name="note" placeholder="如 右上角头像 → 每日签到" /></label>
+      <label class="v24-f">在哪台电脑<select name="machine_id"><option value="">默认</option>${ms.map((m) => `<option value="${q24(m.id)}">${q24(m.name || m.id)}</option>`).join("")}</select></label>
+      <label class="v24-f">指定执行引擎<select name="bot">${v24BotOpts("", true)}</select></label></div>
+      <label class="v24-f">说明（可选，告诉引擎签到入口在哪）<input name="note" placeholder="如 右上角头像 → 每日签到" /></label>
       <div class="v24-bar"><button class="btn sm primary">添加</button></div></form></div>
-    <div class="card v24-card"><h3>网站</h3>${d.sites.map((s) => `<div class="v24-item"><div class="v24-grow"><b>${q24(s.name)}</b> ${s.enabled ? "" : '<span class="chip">停用</span>'} ${s.has_recipe ? `<span class="chip ok">有配方 · ${q24(s.recipe.kind)}</span>` : '<span class="chip">待录制</span>'}
+    <div class="card v24-card"><h3>网站</h3>${d.sites.map((s) => `<div class="v24-item"><div class="v24-grow"><b>${q24(s.name)}</b> ${s.bot ? `<span class="chip ok">${q24(v24BotName(s.bot))}</span>` : (d.settings.bot ? `<span class="chip">${q24(v24BotName(d.settings.bot))}</span>` : "")} ${s.enabled ? "" : '<span class="chip">停用</span>'} ${s.has_recipe ? `<span class="chip ok">有配方 · ${q24(s.recipe.kind)}</span>` : '<span class="chip">待录制</span>'}
         <div class="v24-note v24-mono">${q24(s.url)}</div><div class="v24-note">${q24(s.schedule)} + 0–${s.jitter_min} 分 · 下次 ${t24(s.next_run)} · 上次 ${t24(s.last_run)} ${st[s.last_status] || ""} ${q24(s.last_message || "")}</div></div>
         <div class="v24-bar"><button class="btn sm primary" onclick="v24CkRun('${s.id}')">立即签到</button><button class="btn sm" onclick="v24CkRerec('${s.id}')">重新录制</button>
         <button class="btn sm" onclick="v24CkToggle('${s.id}',${s.enabled ? 0 : 1})">${s.enabled ? "停用" : "启用"}</button><button class="btn sm ghost" style="color:var(--bad)" onclick="v24CkDel('${s.id}')">删除</button></div></div>`).join("") || '<div class="v24-note">还没有网站（不预置任何站点）</div>'}</div>
-    <div class="card v24-card"><h3>历史</h3><table><tr><th>时间</th><th>网站</th><th>方式</th><th>结果</th></tr>${runs.map((r) => `<tr><td>${t24(r.ts)}</td><td>${q24(names[r.site_id] || r.site_id)}</td><td>${q24({ replay: "重放", agent_record: "Agent 录制", agent_escalate: "Agent 接手" }[r.mode] || r.mode)}</td><td>${st[r.status] || q24(r.status)} <span class="v24-note">${q24(r.message)}</span></td></tr>`).join("") || '<tr><td colspan="4" class="v24-note">没有记录</td></tr>'}</table></div>`);
+    <div class="card v24-card"><h3>历史</h3><table><tr><th>时间</th><th>网站</th><th>方式</th><th>结果</th></tr>${runs.map((r) => `<tr><td>${t24(r.ts)}</td><td>${q24(names[r.site_id] || r.site_id)}</td><td>${q24({ replay: "重放", agent_record: "Agent 录制", agent_escalate: "Agent 接手" }[r.mode] || (String(r.mode || "").startsWith("bot_") ? "引擎 " + v24BotName(r.mode.slice(4)) : r.mode))}</td><td>${st[r.status] || q24(r.status)} <span class="v24-note">${q24(r.message)}</span></td></tr>`).join("") || '<tr><td colspan="4" class="v24-note">没有记录</td></tr>'}</table></div>`);
 };
-async function v24CkAdd(e) { e.preventDefault(); const f = e.target; await v24Do(() => api("POST", "/api/checkin/sites", { name: f.name.value, url: f.url.value, schedule: f.schedule.value, jitter_min: +f.jitter_min.value, machine_id: f.machine_id.value || null, note: f.note.value }), "已添加"); V24_RENDER.checkin(); }
+async function v24CkAdd(e) { e.preventDefault(); const f = e.target; await v24Do(() => api("POST", "/api/checkin/sites", { name: f.name.value, url: f.url.value, schedule: f.schedule.value, jitter_min: +f.jitter_min.value, machine_id: f.machine_id.value || null, bot: f.bot ? f.bot.value : "", note: f.note.value }), "已添加"); V24_RENDER.checkin(); }
 async function v24CkRun(id) { toast("签到中…"); const r = await v24Do(() => api("POST", `/api/checkin/sites/${id}/run`)); toast(r.pending ? "已交给 Agent，完成后推送" : "完成"); V24_RENDER.checkin(); }
 async function v24CkRerec(id) { if (!confirm("删掉现有配方，下次由 Agent 重新录制？")) return; await v24Do(() => api("POST", `/api/checkin/sites/${id}/rerecord`), "下次重新录制"); V24_RENDER.checkin(); }
 async function v24CkToggle(id, on) { await v24Do(() => api("PUT", `/api/checkin/sites/${id}`, { enabled: !!on })); V24_RENDER.checkin(); }

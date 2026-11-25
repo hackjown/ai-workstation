@@ -223,6 +223,12 @@ def _reroute_cloud_local_plan(plan: Optional[dict], ids: list[str]) -> Optional[
             else:
                 new_assign[target] = task
         plan = {**plan, "assign": new_assign}
+        if plan.get("report"):
+            used = "、".join(B.ENGINES.get(b, {}).get("title", b) for b in new_assign)
+            if any(B.is_cloud_engine(b) for b in (plan.get("assign") or {})):
+                pass
+            elif any(n in plan["report"] for n in ("Muse", "Cue", "云端")):
+                plan["report"] = f"因涉及本地内容，已改派给本地成员（{used}）处理。"
     return plan
 
 
@@ -652,6 +658,34 @@ class Groups:
         self.add(gid, "system", "", f"已添加 {added_names} 加入群聊。")
         return self.group(gid)
 
+    async def remove_member(self, gid: str, bot: str) -> dict:
+        """Remove an engine member from an existing group (keeps its local git branch/worktree intact)."""
+        g = self.group(gid)
+        if not g:
+            raise KeyError(gid)
+        bot = str(bot or "").strip().lower()
+        target = next((m for m in g["members"] if m["bot"] == bot), None)
+        if not target:
+            raise ValueError(f"群里没有这个引擎：{bot}")
+        if len(g["members"]) <= 1:
+            raise ValueError("群里至少要保留一个引擎成员")
+        if target.get("conv") and self.bots.busy(target["conv"]):
+            try:
+                await self.bots.stop(target["conv"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("group remove_member stop %s: %s", bot, e)
+        raw_members = B._j(self.store._x("SELECT members FROM bot_groups WHERE id=?", (gid,))[0]["members"], [])
+        new_members = [m for m in raw_members if m.get("bot") != bot]
+        new_pending = [b for b in (g.get("pending") or []) if b != bot]
+        new_queue = [s for s in (g.get("queue") or []) if s.get("bot") != bot]
+        kw: dict = {"members": new_members, "pending": new_pending, "queue": new_queue}
+        if not new_pending and g.get("status") == "working" and not new_queue:
+            kw["status"] = "idle"
+        self.set_group(gid, **kw)
+        title = B.ENGINES.get(bot, {}).get("title", bot)
+        self.add(gid, "system", "", f"已将 {title} 移出群聊（本地分支和工作树未删除）。")
+        return self.group(gid)
+
     def delete(self, gid: str) -> bool:
         g = self.group(gid)
         if not g:
@@ -796,6 +830,13 @@ class Groups:
             return
         ids = [m["bot"] for m in g["members"]]
         wants_media = bool(re.search(r"(截图|图片|设计图|效果图|快照|原型图|png|jpg|webp|发到群|发群里|发出来|贴到群|找到.*图)", task, re.I))
+        wants_cards = bool(re.search(r"(选.*方案|选择.*方案|对比.*方案|汇总.*方案|供我选|让我选|向我提问|问我选|给我选|卡片)", task, re.I))
+        if wants_cards:
+            cards = await self._build_option_cards(g, task)
+            if cards:
+                intro = f"已整理好 {len(cards)} 套方案（含效果图与要点），请直接点击下方卡片选择："
+                self.add(gid, "aiw", "AIW 管家", intro, {"report": True, "done": True, "cards": cards})
+                return
         if wants_media:
             await self._manager_find_media(g, task, ids)
             return
@@ -1034,7 +1075,8 @@ class Groups:
                              "，解决冲突后提交。\n\n" + s["task"])
         files = ""
         if m.get("cloud") or B.is_cloud_engine(m["bot"]):
-            files = await self._snapshot(g, done)
+            snap_limit = 1600 if m["bot"] == "cue" else 16000
+            files = await self._snapshot(g, done, limit=snap_limit)
         else:
             m = await self._mark_start(g, m)
         self.set_group(gid, pending=[s["bot"]])
@@ -1048,7 +1090,8 @@ class Groups:
                 log.warning("group files: %s", e)
         self.add(gid, "aiw", "AIW 管家", (f"第 {s['n']}/{s['of']} 步交给 {B.ENGINES[m['bot']]['title']}。" if s.get("n") else
                                           f"{s.get('step') or '下一步'}：交给 {B.ENGINES[m['bot']]['title']}。"))
-        self.bots.send(m["conv"], self._brief(g, m, s["task"], context=self._context(g, m), files=files), "aiw", attachments=att)
+        ctx_limit = 2200 if m["bot"] == "cue" else 8000
+        self.bots.send(m["conv"], self._brief(g, m, s["task"], context=self._context(g, m, limit=ctx_limit), files=files), "aiw", attachments=att)
 
     # ------------------------------------------------------------------ v3.9.82: who owns which file, read-only copies
     def _put_member(self, gid: str, bot: str, **kw) -> dict:
@@ -1084,7 +1127,8 @@ class Groups:
         except Exception as e:  # noqa: BLE001
             log.warning("group scope: %s", e)
             return
-        mine = [x.strip() for x in (out or "").splitlines() if x.strip() and not x.startswith(("fatal", "error"))]
+        mine = [x.strip() for x in (out or "").splitlines()
+                if x.strip() and not x.startswith(("fatal", "error", "uploads/", ".aiw-context/"))]
         await self._turn_diff(g, m)
         owner = {}
         for x in g["members"]:
@@ -1310,6 +1354,15 @@ class Groups:
             await self._manager_find_media(g, task, [m["bot"] for m in g["members"]])
             self.set_group(gid, status="idle", pending=[], queue=[])
             return
+        wants_cards = bool(re.search(r"(选.*方案|选择.*方案|对比.*方案|汇总.*方案|供我选|让我选|向我提问|问我选|给我选|卡片)", task or ""))
+        if wants_cards:
+            cards = await self._build_option_cards(g, task)
+            if cards:
+                self.set_group(gid, status="idle", pending=[], queue=[])
+                intro = f"已整理好 {len(cards)} 套方案（含效果图与要点），请直接点击下方卡片选择："
+                self.add(gid, "aiw", "AIW 管家", intro, {"report": True, "done": True, "cards": cards})
+                await self._tell_chat(self.group(gid), intro)
+                return
         has_local = any(m.get("branch") and m.get("worktree") for m in g["members"])
         no_merge_intent = bool(re.search(r"(不要合并|别合并|暂不合并|选.*方案|选择.*方案|对比.*方案|汇总.*方案|向我提问|问我选|等我选)", task or ""))
         wants_merge = bool(re.search(r"(合并|merge|验收|测试|跑.*测|交付|部署|构建|编译|pytest|npm)", task or "", re.I)) and not no_merge_intent
@@ -1347,6 +1400,111 @@ class Groups:
         self.add(gid, "aiw", "AIW 管家", text, {"report": True, "done": True})
         await self._tell_chat(self.group(gid), B.clip(text, 400))
 
+    async def _build_option_cards(self, g: dict, task: str) -> list[dict]:
+        """Build structured choice cards (A/B/C..., each with images + summary) from recent member proposals."""
+        gid = g["id"]
+        rows = self.store._x(
+            "SELECT role, who, text, data FROM bot_group_messages WHERE grp=? ORDER BY seq DESC LIMIT 60", (gid,)
+        )
+        # Collect latest substantive text and images per engine member
+        by_bot: dict[str, dict] = {}
+        manager_media: list[dict] = []
+        for r in reversed(rows):
+            d = B._j(r["data"], {})
+            role, who = r["role"], r["who"] or ""
+            txt = (r["text"] or "").strip()
+            media = [x for x in (d.get("media") or []) if isinstance(x, dict) and x.get("kind") == "image"]
+            if role == "bot" and who:
+                st = d.get("status") or ""
+                if st in ("failed", "turn_failed", "error", "blocked") and not media:
+                    continue
+                slot = by_bot.setdefault(who, {"bot": who, "texts": [], "media": []})
+                if txt:
+                    slot["texts"].append(txt)
+                for img in media:
+                    key = img.get("path") or img.get("url") or img.get("name")
+                    if key and not any((x.get("path") or x.get("url") or x.get("name")) == key for x in slot["media"]):
+                        slot["media"].append(img)
+            elif role == "aiw" and media:
+                manager_media.extend(media)
+
+        # Match manager-posted screenshots (e.g. labeled "Antigravity · xxx.png") back to each engine
+        for img in manager_media:
+            lbl = (img.get("label") or img.get("name") or "").lower()
+            for eng, names in ALIASES:
+                title_low = B.ENGINES.get(eng, {}).get("title", "").lower()
+                if eng in by_bot or any(m["bot"] == eng for m in g["members"]):
+                    if any(n in lbl for n in names) or (title_low and title_low in lbl):
+                        slot = by_bot.setdefault(eng, {"bot": eng, "texts": [], "media": []})
+                        key = img.get("path") or img.get("url") or img.get("name")
+                        if key and not any((x.get("path") or x.get("url") or x.get("name")) == key for x in slot["media"]):
+                            slot["media"].append(img)
+                        break
+
+        if not by_bot:
+            return []
+
+        ordered = [m["bot"] for m in g["members"] if m["bot"] in by_bot] + [b for b in by_bot if b not in {m["bot"] for m in g["members"]}]
+        labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        cards: list[dict] = []
+        for idx, bot in enumerate(ordered[:len(labels)]):
+            slot = by_bot[bot]
+            eng_title = B.ENGINES.get(bot, {}).get("title", bot)
+            raw_txt = "\n\n".join(slot["texts"][-2:]).strip()
+            summary = B.clip(re.sub(r"\s+\n", "\n", raw_txt), 260) if raw_txt else f"{eng_title} 提交的设计方案（见上方效果图）。"
+            cards.append({
+                "id": labels[idx],
+                "bot": bot,
+                "title": f"方案 {labels[idx]} · {eng_title}",
+                "summary": summary,
+                "media": slot["media"][:4],
+            })
+
+        # Ask LLM to distill crisp 2-3 bullet summaries per card if available
+        if self.bots.llm and len(cards) >= 2:
+            try:
+                brief = "\n\n".join(
+                    f"【{c['id']} - {c['title']}】（附 {len(c['media'])} 张图）\n{B.clip(by_bot[c['bot']]['texts'][-1] if by_bot[c['bot']]['texts'] else '', 1200)}"
+                    for c in cards
+                )
+                sys_p = ("你是 AIW 管家。把群里每个方案浓缩成卡片简介供用户快速对比选择。"
+                         "只输出 JSON：{\"summaries\": {\"A\": \"核心风格、亮点与主要取舍（60-120字中文）\", ...}}，不要其他文字。")
+                out = await asyncio.wait_for(self.bots.llm().complete(sys_p, f"任务：{task}\n\n{brief}", 1200), 60)
+                m = re.search(r"\{.*\}", re.sub(r"<think>.*?</think>", "", out or "", flags=re.S), re.S)
+                if m:
+                    parsed = json.loads(m.group(0))
+                    sums = parsed.get("summaries") if isinstance(parsed, dict) else None
+                    if isinstance(sums, dict):
+                        for c in cards:
+                            s = str(sums.get(c["id"]) or "").strip()
+                            if s:
+                                c["summary"] = s
+            except Exception as e:  # noqa: BLE001
+                log.debug("option cards summarize: %s", e)
+        return cards
+
+    async def choose_card(self, gid: str, msg_id: str, card_id: str) -> dict:
+        """Record the user's choice from an option-card message and notify the group."""
+        g = self.group(gid)
+        if not g:
+            raise KeyError(gid)
+        r = self.store._x("SELECT * FROM bot_group_messages WHERE grp=? AND id=?", (gid, msg_id))
+        if not r:
+            raise ValueError("找不到这条方案卡片消息")
+        d = B._j(r[0]["data"], {})
+        cards = d.get("cards") or []
+        hit = next((c for c in cards if str(c.get("id")) == str(card_id)), None)
+        if not hit:
+            raise ValueError(f"没有方案 {card_id}")
+        self.patch_msg(msg_id, picked=card_id)
+        title = hit.get("title") or f"方案 {card_id}"
+        if (g.get("project") or {}).get("phase") == "pick":
+            return await self.project.act(gid, "pick", card_id)
+        self.add(gid, "user", "我", f"我选择：{title}", {"choice": {"msg_id": msg_id, "card_id": card_id, "bot": hit.get("bot") or ""}})
+        self.add(gid, "aiw", "AIW 管家", f"已确认采用 **{title}**。你可以直接发下一阶段指令，或让我按这个方案继续推进。",
+                 {"picked": card_id, "bot": hit.get("bot") or ""})
+        return self.group(gid)
+
     async def _assign(self, g: dict, assign: dict, attachments: Optional[list] = None):
         pending = list(dict.fromkeys(list(g["pending"]) + list(assign)))
         self.set_group(g["id"], status="working", pending=pending, fixes=0 if g["status"] != "fixing" else g["fixes"])
@@ -1362,7 +1520,7 @@ class Groups:
                     att = await self.bots.push_files(m["conv"], merged_att, allowed=lambda p: p if p and os.path.isfile(p) else None)
                 except Exception as e:  # noqa: BLE001
                     log.warning("group files: %s", e)
-            ctx = self._context(g, m)
+            ctx = self._context(g, m, limit=2200 if bot == "cue" else 8000)
             self.bots.send(m["conv"], self._brief(g, m, task, fix=g["status"] == "fixing", context=ctx), "aiw", attachments=att)
 
     # ------------------------------------------------------------------ replies from the members
@@ -1752,6 +1910,11 @@ class GroupMembersIn(BaseModel):
     members: list = []
 
 
+class GroupChooseIn(BaseModel):
+    msg_id: str
+    card_id: str
+
+
 def mount(app, groups: Groups, auth) -> None:
     from fastapi import Depends, HTTPException
 
@@ -1809,11 +1972,27 @@ def mount(app, groups: Groups, auth) -> None:
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f"添加成员失败：{B.clip(e, 200)}")
 
+    @app.delete("/api/bots/groups/{gid}/members/{bot}", dependencies=dep)
+    async def groups_remove_member(gid: str, bot: str):
+        need(gid)
+        try:
+            return await groups.remove_member(gid, bot)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
     @app.post("/api/bots/groups/{gid}/send", dependencies=dep)
     async def groups_send(gid: str, body: GroupSendIn):
         need(gid)
         try:
             return await groups.send(gid, body.text, body.attachments)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/bots/groups/{gid}/choose", dependencies=dep)
+    async def groups_choose(gid: str, body: GroupChooseIn):
+        need(gid)
+        try:
+            return await groups.choose_card(gid, body.msg_id, body.card_id)
         except ValueError as e:
             raise HTTPException(400, str(e))
 

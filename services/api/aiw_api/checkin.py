@@ -54,7 +54,7 @@ OK_STATUSES = ("ok", "already")
 
 
 def settings(store) -> dict:
-    return {"enabled": True, "jitter_min": 15, **(store.kv_get(KV, {}) or {})}
+    return {"enabled": True, "jitter_min": 15, "bot": "", **(store.kv_get(KV, {}) or {})}
 
 
 def _json(v, default=None):
@@ -111,10 +111,15 @@ asyncio.run(main())
 class Checkin:
     def __init__(self, store, sessions, notifier, secrets):
         self.store, self.sessions, self.notifier, self.secrets = store, sessions, notifier, secrets
+        self.bots = None
         self.running: set[str] = set()
         self._batches: dict[str, dict] = {}   # batch id -> {"sites": n, "results": [...]}
         with store.lock:
             store.db.executescript(SCHEMA)
+            try:
+                store.db.execute("ALTER TABLE checkin_sites ADD COLUMN bot TEXT")
+            except Exception:  # noqa: BLE001  already there
+                pass
             store.db.commit()
         sessions.listeners.append(self.on_task_event)
 
@@ -147,9 +152,11 @@ class Checkin:
         schedule = str(body.get("schedule") or "daily 08:30").strip()
         cron.next_run(schedule, time.time())   # ValueError on a bad schedule
         jit = int(body.get("jitter_min") if body.get("jitter_min") is not None else settings(self.store)["jitter_min"])
+        bot = str(body.get("bot") or "").strip().lower() or None
         row = {"name": name or re.sub(r"^https?://(www\.)?", "", url).split("/")[0], "url": url,
                "note": str(body.get("note") or "")[:500], "enabled": 1 if body.get("enabled", True) else 0,
-               "schedule": schedule, "jitter_min": max(0, min(jit, 180)), "machine_id": body.get("machine_id") or None}
+               "schedule": schedule, "jitter_min": max(0, min(jit, 180)), "machine_id": body.get("machine_id") or None,
+               "bot": bot}
         row["next_run"] = self.next_time(schedule, row["jitter_min"], time.time())
         if body.get("recipe"):
             row["recipe"] = json.dumps(validate_recipe(body["recipe"]), ensure_ascii=False)
@@ -161,9 +168,9 @@ class Checkin:
         if not cur:
             return None
         f = {}
-        for k in ("name", "url", "note", "machine_id"):
+        for k in ("name", "url", "note", "machine_id", "bot"):
             if k in body:
-                f[k] = str(body[k] or "")[:500] or (None if k == "machine_id" else "")
+                f[k] = str(body[k] or "").strip()[:500] or (None if k in ("machine_id", "bot") else "")
         if "url" in f and not re.match(r"^https?://", f["url"]):
             raise ValueError("网址要以 http:// 或 https:// 开头")
         if "enabled" in body:
@@ -350,6 +357,25 @@ class Checkin:
             "\n5. 最后用一句话汇报：成功 / 已签过 / 失败（原因）。")
 
     async def _agent(self, s: dict, batch: str, mode: str, why: str = "", human: bool = False) -> dict:
+        bot = str(s.get("bot") or settings(self.store).get("bot") or "").strip().lower()
+        if bot and self.bots is not None:
+            from . import bots as _bots_mod
+            if bot in _bots_mod.ENGINES:
+                kv_key = f"checkin_conv:{s['id']}:{bot}"
+                cid = str(self.store.kv_get(kv_key, "") or "")
+                c = self.bots.conv(cid) if cid else None
+                if not c or c.get("bot") != bot:
+                    c = self.bots.create(bot, f"✅ 签到 · {s['name']}", machine_id=s.get("machine_id") or "")
+                    self.store.kv_set(kv_key, c["id"])
+                eng_title = _bots_mod.ENGINES[bot].get("title", bot)
+                prompt = (f"请给网站「{s['name']}」（{s['url']}）完成今日自动签到。\n"
+                          + (f"说明：{s['note']}\n" if s.get("note") else "")
+                          + (f"背景：原配方重放失败（{why}）。\n" if mode == "escalate" and why else "")
+                          + "要求：1. 打开网站完成签到（已签到也算完成）；2. 遇到验证码/滑块/短信验证请直接说明需要人工处理，不要绕过；3. 最后用一句话汇报结果（成功 / 已签过 / 失败及原因）。")
+                m = self.bots.send(c["id"], prompt, "user")
+                self.store.kv_set(f"checkin_bot:{c['id']}", {"site_id": s["id"], "batch": batch, "mode": mode, "task_id": m["id"]})
+                row = self._run_row(s, batch, "bot_" + bot, "pending", f"交给 {eng_title} 签到", m["id"])
+                return {**row, "status": "pending", "bot": bot, "conv_id": c["id"]}
         res = await self.sessions.submit(self.prompt(s, mode, why, human), s.get("machine_id") or None,
                                          source="checkin", title=f"✅ 签到 · {s['name']}")
         tid = res["task"]["id"]
@@ -362,6 +388,44 @@ class Checkin:
                 log.warning("checkin push: %s", e)
         row = self._run_row(s, batch, "agent_" + mode, "pending", "交给 Agent：" + (why or "首次签到，录制配方"), tid)
         return {**row, "status": "pending"}
+
+    def on_bot_event(self, kind: str, obj) -> None:
+        """Record completion when an engine (agy/codex/cue/muse/...) finishes a check-in turn."""
+        if kind != "message" or not obj or obj.get("role") != "bot":
+            return
+        d = obj.get("data") or {}
+        st = d.get("status")
+        if st in (None, "running"):
+            return
+        cid = obj.get("conv") or ""
+        meta = self.store.kv_get(f"checkin_bot:{cid}")
+        if not meta:
+            return
+        self.store.kv_set(f"checkin_bot:{cid}", None)
+        site = self.site(meta["site_id"])
+        if not site:
+            return
+        txt = (obj.get("text") or "").strip()
+        if st in ("failed", "turn_failed", "error", "blocked"):
+            result = "failed"
+        elif HUMAN_RE.search(txt):
+            result = "human"
+        elif re.search(r"已签过|已经签过|已经签到|今天已签|already", txt, re.I):
+            result = "already"
+        elif re.search(r"失败|无法|没能|出错|未登录", txt) and not re.search(r"成功|完成", txt):
+            result = "failed"
+        else:
+            result = "ok"
+        msg = (txt[:200] or {"ok": "签到成功", "already": "今天已经签过", "human": "需要人工验证"}.get(result, "签到失败"))
+        self.store._x("UPDATE checkin_runs SET status=?, message=? WHERE task_id=?", (result, msg[:500], meta.get("task_id") or ""))
+        self.store.update("checkin_sites", site["id"], last_status=result, last_message=msg[:500], last_run=time.time())
+        b = self._batches.get(meta.get("batch") or "")
+        if b is not None:
+            b["results"][site["id"]] = (site, {"status": result, "message": msg, "mode": "bot"})
+            try:
+                asyncio.get_running_loop().create_task(self._maybe_push(meta["batch"]))
+            except RuntimeError:
+                pass
 
     def tool(self, task_id: str):
         """checkin_save_recipe, offered to check-in tasks only."""
@@ -491,5 +555,7 @@ def mount(app, ck: Checkin, auth) -> None:
             cur["enabled"] = bool(body["enabled"])
         if "jitter_min" in (body or {}):
             cur["jitter_min"] = max(0, min(int(body["jitter_min"]), 180))
+        if "bot" in (body or {}):
+            cur["bot"] = str(body["bot"] or "").strip().lower()
         ck.store.kv_set(KV, cur)
         return cur

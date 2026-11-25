@@ -222,7 +222,17 @@
             </select>
             <textarea name="prompt" rows="2" class="span2" placeholder="要做什么，例如：打开 Hacker News，挑 5 条有意思的新闻写成 news.docx 发给我" required></textarea>
             <input name="schedule" placeholder="daily 09:00 / every 30m / cron: 0 9 * * 1-5" required />
-            <button class="btn primary"><i data-i="plus"></i>添加例程</button>
+            <select name="bot" title="执行者">
+              <option value="">执行者：小秘（默认）</option>
+              <option value="agy">Antigravity (agy)</option>
+              <option value="codex">Codex</option>
+              <option value="claude">Claude Code</option>
+              <option value="codebuddy">CodeBuddy (cbc)</option>
+              <option value="grok">Grok Build</option>
+              <option value="muse">Meta Muse（云端）</option>
+              <option value="cue">Cue（云端）</option>
+            </select>
+            <button class="btn primary span2"><i data-i="plus"></i>添加例程</button>
           </form>
         </div>
         <div id="routineList" class="list"></div>

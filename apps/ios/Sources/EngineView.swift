@@ -1381,9 +1381,7 @@ struct EngineGroupView: View {
             }
             ToolbarItem(placement: .navigationBarTrailing) {
                 Menu {
-                    if !addableEngines.isEmpty {
-                        Button { showAddMembers = true } label: { Label("添加成员", systemImage: "person.badge.plus") }
-                    }
+                    Button { showAddMembers = true } label: { Label("管理成员", systemImage: "person.2") }
                     if !group.s("repo").isEmpty {
                         Button { Task { await act("POST", "/merge") } } label: { Label("合并", systemImage: "arrow.triangle.merge") }
                     }
@@ -1406,8 +1404,8 @@ struct EngineGroupView: View {
             Task { for it in list { await addGroupPhoto(it) } }
         }
         .sheet(isPresented: $showAddMembers) {
-            EngineGroupAddMemberSheet(gid: gid, available: addableEngines) {
-                showAddMembers = false; groupSig = ""; Task { await load() }; changed()
+            EngineGroupAddMemberSheet(gid: gid, current: group.a("members"), allEngines: engines, available: addableEngines) {
+                groupSig = ""; Task { await load() }; changed()
             }
         }
         .navigationDestination(isPresented: Binding(get: { openConv != nil }, set: { on in if !on { openConv = nil } })) {
@@ -1624,7 +1622,13 @@ struct EngineGroupView: View {
                 .padding(.horizontal, 12).padding(.vertical, 8)
                 .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(role == "aiw" ? amber.opacity(0.15) : hAmber))
                 if !m.o("data").a("attachments").isEmpty { AttachmentPreviews(attachments: m.o("data").a("attachments")) }
-                if !m.o("data").a("media").isEmpty { EngineMediaList(media: m.o("data").a("media")) }
+                if !m.o("data").a("cards").isEmpty {
+                    EngineOptionCards(gid: gid, msgId: m.s("id"), cards: m.o("data").a("cards"), picked: m.o("data").s("picked")) {
+                        msgsSig = ""; Task { await load() }
+                    }
+                } else if !m.o("data").a("media").isEmpty {
+                    EngineMediaList(media: m.o("data").a("media"))
+                }
                 actions(m)
                 Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
             }.frame(maxWidth: .infinity, alignment: .trailing)
@@ -1750,38 +1754,61 @@ struct EngineGroupView: View {
 /// result against the base branch, coloured like a review.
 struct EngineGroupAddMemberSheet: View {
     let gid: String
+    let current: [JSON]
+    let allEngines: [JSON]
     let available: [JSON]
     let done: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var picked: Set<String> = []
     @State private var busy = false
     @State private var err = ""
+    func title(_ bot: String) -> String { allEngines.first { $0.s("id") == bot }?.s("title") ?? bot }
     var body: some View {
         NavigationStack {
             Form {
-                Section(header: Text("选择要加入的引擎")) {
-                    ForEach(available.indices, id: \.self) { i in
-                        let e = available[i], id = e.s("id")
-                        Button {
-                            if picked.contains(id) { picked.remove(id) } else { picked.insert(id) }
-                        } label: {
-                            HStack(spacing: 10) {
-                                EngineAvatar(bot: id, size: 28)
-                                Text(e.s("title") + (e.b("cloud") ? "（云端）" : "")).foregroundColor(.primary)
-                                Spacer()
-                                if picked.contains(id) { Image(systemName: "checkmark.circle.fill").foregroundColor(amber) }
+                Section(header: Text("当前成员")) {
+                    ForEach(current.indices, id: \.self) { i in
+                        let m = current[i], id = m.s("bot")
+                        HStack(spacing: 10) {
+                            EngineAvatar(bot: id, size: 28)
+                            Text(title(id)).foregroundColor(.primary)
+                            Spacer()
+                            if current.count > 1 {
+                                Button("移出", role: .destructive) { Task { await remove(id) } }
+                                    .font(.caption.weight(.semibold)).disabled(busy)
+                            } else {
+                                Text("至少保留 1 个").font(.caption2).foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+                if !available.isEmpty {
+                    Section(header: Text("添加新成员")) {
+                        ForEach(available.indices, id: \.self) { i in
+                            let e = available[i], id = e.s("id")
+                            Button {
+                                if picked.contains(id) { picked.remove(id) } else { picked.insert(id) }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    EngineAvatar(bot: id, size: 28)
+                                    Text(e.s("title") + (e.b("cloud") ? "（云端）" : "")).foregroundColor(.primary)
+                                    Spacer()
+                                    if picked.contains(id) { Image(systemName: "checkmark.circle.fill").foregroundColor(amber) }
+                                }
                             }
                         }
                     }
                 }
                 if !err.isEmpty { Section { Text(err).foregroundColor(.red).font(.footnote) } }
             }
-            .navigationTitle("添加成员").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("管理成员").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    if busy { ProgressView() } else {
-                        Button("加入") { Task { await submit() } }.bold().disabled(picked.isEmpty)
+                ToolbarItem(placement: .cancellationAction) { Button("完成") { dismiss() } }
+                if !available.isEmpty {
+                    ToolbarItem(placement: .confirmationAction) {
+                        if busy { ProgressView() } else {
+                            Button("加入") { Task { await submit() } }.bold().disabled(picked.isEmpty)
+                        }
                     }
                 }
             }
@@ -1791,8 +1818,80 @@ struct EngineGroupAddMemberSheet: View {
         busy = true; defer { busy = false }
         do {
             _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/members", ["members": Array(picked)])
-            done()
+            done(); dismiss()
         } catch let e { err = "添加失败：\(e.localizedDescription)" }
+    }
+    @MainActor func remove(_ bot: String) async {
+        busy = true; defer { busy = false }
+        do {
+            _ = try await API.shared.call("DELETE", "/api/bots/groups/\(gid)/members/\(bot)")
+            done(); dismiss()
+        } catch let e { err = "移出失败：\(e.localizedDescription)" }
+    }
+}
+
+struct EngineOptionCards: View {
+    let gid: String
+    let msgId: String
+    let cards: [JSON]
+    let picked: String
+    let onPicked: () -> Void
+    @State private var busyId = ""
+    @State private var err = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(cards.indices, id: \.self) { i in
+                let c = cards[i]
+                let cid = c.s("id")
+                let isPicked = !picked.isEmpty && picked == cid
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Text("方案 \(cid)")
+                            .font(.caption2.weight(.bold)).foregroundColor(amber)
+                            .padding(.horizontal, 7).padding(.vertical, 2)
+                            .background(Capsule().fill(amber.opacity(0.16)))
+                        Text(c.s("title")).font(.subheadline.weight(.semibold)).lineLimit(1)
+                        Spacer()
+                        if isPicked {
+                            Label("已选", systemImage: "checkmark.circle.fill").font(.caption2.weight(.bold)).foregroundColor(.green)
+                        }
+                    }
+                    if !c.a("media").isEmpty {
+                        EngineMediaList(media: c.a("media"))
+                    }
+                    if !c.s("summary").isEmpty {
+                        RichText(text: c.s("summary")).font(.footnote)
+                    }
+                    Button {
+                        Task { await choose(cid) }
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if busyId == cid { ProgressView().controlSize(.small) }
+                            else { Text(isPicked ? "✓ 已选择方案 \(cid)" : "选择方案 \(cid)").font(.caption.weight(.semibold)) }
+                            Spacer()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(isPicked ? .green : amber)
+                    .disabled(!picked.isEmpty || !busyId.isEmpty)
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color(.secondarySystemBackground)))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(isPicked ? amber : Color.secondary.opacity(0.25), lineWidth: isPicked ? 1.5 : 1))
+            }
+            if !err.isEmpty { Text(err).font(.caption2).foregroundColor(.red) }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @MainActor func choose(_ cardId: String) async {
+        busyId = cardId; defer { busyId = "" }
+        do {
+            _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/choose", ["msg_id": msgId, "card_id": cardId])
+            err = ""; onPicked()
+        } catch let e { err = "选择失败：\(e.localizedDescription)" }
     }
 }
 

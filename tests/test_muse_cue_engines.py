@@ -628,3 +628,101 @@ async def test_group_multi_owner_steps_cloud_reroute_no_merge_and_unread(tmp_pat
     r = client.get(f"/api/bots/groups/{gid}")
     assert r.status_code == 200 and r.json()["group"]["unread"] == 0
     assert groups.group(gid)["unread"] == 0
+
+
+def test_cue_prompt_trim_under_5000_tokens():
+    from aiw_api.cue_engine import _estimate_tokens, _trim_for_cue
+
+    huge = "头部角色说明\n" + ("这是一段很长的群聊历史和仓库文件内容。" * 800) + "\n最终任务：请设计首页界面。"
+    assert _estimate_tokens(huge) > 5000
+    trimmed = _trim_for_cue(huge, max_tokens=4200)
+    assert _estimate_tokens(trimmed) <= 4500
+    assert "头部角色说明" in trimmed and "请设计首页界面" in trimmed
+
+
+@pytest.mark.asyncio
+async def test_group_option_cards_with_images_and_choose(tmp_path):
+    store = Store(str(tmp_path / "aiw.db"))
+    secrets = SecretBox(store, str(tmp_path))
+    bots = B.Bots(store, secrets=secrets)
+    groups = G.Groups(bots)
+    app = FastAPI()
+    G.mount(app, groups, lambda: None)
+    client = TestClient(app)
+
+    g = await groups.create("ui-pick", "", ["muse", "cue"])
+    gid = g["id"]
+    groups.add(gid, "bot", "muse", "极简浅色方案，卡片清晰", {"status": "done", "media": [{"name": "muse.png", "path": "/tmp/muse.png", "kind": "image"}]})
+    groups.add(gid, "bot", "cue", "暗黑仪表盘方案，信息密度高", {"status": "done", "media": [{"name": "cue.png", "path": "/tmp/cue.png", "kind": "image"}]})
+
+    await groups._final(gid, "汇总对比以上方案并做成卡片供我选择")
+    msgs = groups.messages(gid)
+    card_msg = next((m for m in msgs if (m.get("data") or {}).get("cards")), None)
+    assert card_msg is not None
+    cards = card_msg["data"]["cards"]
+    assert len(cards) == 2
+    assert [c["id"] for c in cards] == ["A", "B"]
+    assert cards[0]["media"][0]["name"] == "muse.png"
+    assert cards[1]["media"][0]["name"] == "cue.png"
+
+    # Choose card B via HTTP endpoint
+    r = client.post(f"/api/bots/groups/{gid}/choose", json={"msg_id": card_msg["id"], "card_id": "B"})
+    assert r.status_code == 200
+    updated_msgs = groups.messages(gid)
+    picked_msg = next(m for m in updated_msgs if m["id"] == card_msg["id"])
+    assert picked_msg["data"].get("picked") == "B"
+    assert any("方案 B" in m["text"] for m in updated_msgs if m["role"] == "aiw")
+
+
+@pytest.mark.asyncio
+async def test_group_remove_member_and_routine_checkin_engine_dispatch(tmp_path):
+    from aiw_api.checkin import Checkin
+    from aiw_api.scheduler import Scheduler
+
+    store = Store(str(tmp_path / "aiw.db"))
+    secrets = SecretBox(store, str(tmp_path))
+    bots = B.Bots(store, secrets=secrets)
+    groups = G.Groups(bots)
+
+    app = FastAPI()
+    G.mount(app, groups, lambda: None)
+    client = TestClient(app)
+
+    # 1. Remove member from group (and reject removing the last member)
+    g = await groups.create("rm-test", "", ["muse", "cue"])
+    gid = g["id"]
+    r = client.delete(f"/api/bots/groups/{gid}/members/cue")
+    assert r.status_code == 200
+    assert [m["bot"] for m in r.json()["members"]] == ["muse"]
+    r2 = client.delete(f"/api/bots/groups/{gid}/members/muse")
+    assert r2.status_code == 400
+
+    # 2. Routine with bot="cue" dispatches to Bots instead of sessions
+    sent = []
+    bots.send = lambda cid, text, role="user", **kw: (sent.append((cid, text)), {"id": "bm-1"})[1]
+
+    class DummySessions:
+        listeners = []
+        async def submit(self, *a, **kw):
+            raise AssertionError("should dispatch to Bots, not sessions")
+
+    sched = Scheduler(store, DummySessions(), None)
+    sched.bots = bots
+    routine = store.insert("routines", {
+        "name": "每日调研", "prompt": "总结今日 AI 新闻", "schedule": "daily 09:00",
+        "bot": "cue", "enabled": 1, "next_run": 0,
+    })
+    res = await sched.fire_routine(routine, advance=False)
+    assert res["bot"] == "cue" and res["conv_id"].startswith("bc-")
+    assert len(sent) == 1 and "AI 新闻" in sent[0][1]
+
+    # 3. Checkin with bot="agy" dispatches to Bots and on_bot_event records completion
+    ck = Checkin(store, DummySessions(), None, secrets)
+    ck.bots = bots
+    site = ck.add({"name": "测试论坛", "url": "https://example.com/checkin", "bot": "agy"})
+    res_ck = await ck._agent(site, "cb-1", "record")
+    assert res_ck["status"] == "pending" and res_ck["bot"] == "agy"
+    cid = res_ck["conv_id"]
+    ck.on_bot_event("message", {"conv": cid, "role": "bot", "text": "今天已经签过啦", "data": {"status": "done"}})
+    updated_site = ck.site(site["id"])
+    assert updated_site["last_status"] == "already"

@@ -439,8 +439,11 @@ class Project:
         if int(p.get("redesigns") or 0) < MAX_REDESIGN:
             acts.append({"id": "redesign", "label": "都不要，重做", "reason": True,
                          "desc": "写上理由，设计的人带着理由重出一轮"})
-        self.say(gid, f"**设计方案，请选一个**\n\n{body}\n\n点下面的按钮，或回复“选 A”；都不满意就回复“都不要，理由是…”。",
-                 {"media": media, "actions": acts})
+        cards = [{"id": o["label"], "bot": o["bot"], "title": f"方案 {o['label']} · {self.title(o['bot'])}",
+                  "summary": (o["note"] or "（没有说明）") + ("" if o["media"] else f"\n（没拿到截图{('：' + o['error']) if o.get('error') else ''}）"),
+                  "media": o["media"][:4]} for o in opts]
+        self.say(gid, f"**设计方案，请选一个**\n\n{body}\n\n点下面的卡片按钮，或回复“选 A”；都不满意就回复“都不要，理由是…”。",
+                 {"media": media, "cards": cards, "actions": acts})
         await self.g._tell_chat(self.g.group(gid), f"项目有 {len(opts)} 套设计方案，等你选。")
 
     async def pick(self, gid: str, idx: int):

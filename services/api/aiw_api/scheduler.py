@@ -60,8 +60,13 @@ def evaluate(watch: dict, text: str) -> tuple[bool, str, str]:
 class Scheduler:
     def __init__(self, store, sessions, notifier, tick: float = 20.0):
         self.store, self.sessions, self.notifier, self.tick = store, sessions, notifier, tick
+        self.bots = None
         self._task: asyncio.Task | None = None
         self.extra_ticks: list = []   # v3.9.24: async fn(now) run each tick (自动签到)
+        try:
+            self.store._x("ALTER TABLE routines ADD COLUMN bot TEXT")
+        except Exception:  # noqa: BLE001  already there
+            pass
         try:  # 京东/淘宝 watches keep their own columns on the watches table
             from . import shopwatch
             shopwatch.ensure_columns(store)
@@ -101,13 +106,25 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001
                 log.warning("extra tick failed: %s", e)
 
-    async def fire_routine(self, r: dict, now: float | None = None) -> dict:
+    async def fire_routine(self, r: dict, now: float | None = None, advance: bool = True) -> dict:
         now = now or time.time()
-        try:
-            nxt = cron.next_run(r["schedule"], now)
-        except ValueError:
-            nxt = None
-        self.store.update("routines", r["id"], last_run=now, next_run=nxt)
+        if advance:
+            try:
+                nxt = cron.next_run(r["schedule"], now)
+            except ValueError:
+                nxt = None
+            self.store.update("routines", r["id"], last_run=now, next_run=nxt)
+        else:
+            self.store.update("routines", r["id"], last_run=now)
+        bot = str(r.get("bot") or "").strip()
+        if bot and self.bots is not None:
+            tid = str(r.get("thread_id") or "")
+            c = self.bots.conv(tid) if tid.startswith("bc-") else None
+            if not c or c.get("bot") != bot:
+                c = self.bots.create(bot, f"⏰ {r['name']}", machine_id=r.get("machine_id") or "")
+            m = self.bots.send(c["id"], r["prompt"], "user")
+            self.store.update("routines", r["id"], last_task_id=m["id"], thread_id=c["id"])
+            return {"bot": bot, "conv_id": c["id"], "thread_id": c["id"], "task": {"id": m["id"], "thread_id": c["id"]}}
         res = await self.sessions.submit(r["prompt"], r.get("machine_id") or None, thread_id=r.get("thread_id"),
                                          source="routine", title=f"⏰ {r['name']}")
         self.store.update("routines", r["id"], last_task_id=res["task"]["id"], thread_id=res["task"]["thread_id"])

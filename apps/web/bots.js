@@ -781,7 +781,7 @@ function btGroupRender() {
     <div class="grow"><div class="heading">${esc(g.title)}</div>
       <div class="small muted">${sub}${st ? " · <b>" + st + "</b>" : ""}</div></div>
     <span class="row gap">${chips}</span>
-    ${canAdd ? `<button class="btn sm" onclick="btGroupAddMembers()" title="添加其他引擎（如 Muse / Cue）加入群聊">+ 成员</button>` : ""}
+    <button class="btn sm" onclick="btGroupAddMembers()" title="管理群聊成员（添加或移出引擎）">${canAdd ? "+ 成员" : "管理成员"}</button>
     ${hasLocal && g.merge ? `<button class="btn sm" onclick="btGDiff('', true)" title="合并结果和 ${esc(g.base)} 的整体对比">整体对比</button>` : ""}
     ${hasLocal ? `<button class="btn sm primary" onclick="btGroupMerge()" ${g.status === "merging" ? "disabled" : ""} title="提交各分支的改动，合并到 aiw/${esc(g.id)}/merge">合并</button>` : ""}
     ${live ? `<button class="btn sm" onclick="btGroupStop()">停止</button>` : ""}
@@ -856,14 +856,46 @@ async function btGPermit(bot, mode, rule) {
   try { await api("POST", `/api/bots/groups/${BT.gid}/permit`, { bot, mode, rule: rule || "" }); toast(mode === "deny" ? "已拒绝" : "已允许，接着做"); btGroupRefresh(true); }
   catch (e) { toast(e.message); }
 }
+function btGCards(m, d) {
+  const cards = d.cards || [];
+  if (!cards.length) return "";
+  const picked = String(d.picked || "");
+  return `<div class="bt-cards">` + cards.map((c) => {
+    const isPicked = picked && picked === String(c.id || "");
+    const imgs = (c.media || []).filter((x) => x && x.kind === "image" && (x.path || x.url));
+    const imgHtml = imgs.length ? `<div class="bt-card-imgs">` + imgs.map((x) => {
+      const src = x.path ? artUrl(x.path) : (x.url || "");
+      const name = x.name || `${c.id || "plan"}.png`;
+      const attrs = `data-path="${esc(x.path || "")}" data-url="${esc(x.url || "")}" data-name="${esc(name)}" data-kind="image" data-size="${Number(x.size) || 0}"`;
+      return `<button type="button" class="bt-card-img" ${attrs} onclick="btOpenMedia(this)" title="点击放大预览 / 下载"><img src="${esc(src)}" alt="${esc(x.label || name)}" loading="lazy"></button>`;
+    }).join("") + `</div>` : "";
+    const btn = isPicked
+      ? `<button type="button" class="btn sm primary" disabled>✓ 已选方案 ${esc(c.id)}</button>`
+      : `<button type="button" class="btn sm ${picked ? "" : "primary"}" ${picked ? "disabled" : ""} onclick="btGroupChoose('${esc(m.id)}','${esc(c.id)}')">选择方案 ${esc(c.id)}</button>`;
+    return `<div class="bt-card ${isPicked ? "picked" : ""}">
+      <div class="bt-card-h"><span class="bt-card-id">方案 ${esc(c.id)}</span><b>${esc((c.title || "").replace(/^方案\s*[A-Z]\s*·?\s*/i, "") || c.title || "")}</b>${isPicked ? '<span class="bt-card-ok">已选</span>' : ""}</div>
+      ${imgHtml}
+      <div class="bt-card-b hmd">${hMd(c.summary || "")}</div>
+      <div class="bt-card-f">${btn}</div>
+    </div>`;
+  }).join("") + `</div>`;
+}
+async function btGroupChoose(msgId, cardId) {
+  try {
+    await api("POST", `/api/bots/groups/${BT.gid}/choose`, { msg_id: msgId, card_id: cardId });
+    toast(`已选择方案 ${cardId}`);
+    btGroupRefresh(true);
+  } catch (e) { toast("选择失败：" + e.message); }
+}
 function btGMsg(m) {
   const d = m.data || {};
   if (m.role === "system") return `<div class="bt-sys">${esc(m.text)}</div>`;
   if (m.role === "user" || m.role === "aiw") {
+    const hasCards = (d.cards || []).length > 0;
     return `<div class="bt-row me ${m.role}"><div class="bt-col">${m.role === "aiw" ? `<div class="bt-name">AIW 管家</div>` : ""}
       <div class="bubble ${m.role === "aiw" ? "bt-aiw hmd" : ""}">${m.role === "aiw" ? hMd(m.text) : esc(m.text)}</div>
       ${(d.attachments || []).length && typeof hAttPreview === "function" ? hAttPreview(d.attachments) : ""}
-      ${btGMedia(d.media)}${btGActs(m, d)}
+      ${hasCards ? btGCards(m, d) : btGMedia(d.media)}${btGActs(m, d)}
       <div class="meta">${hTime(m.created_at)}</div></div></div>`;
   }
   const eng = btEngine(m.who);
@@ -888,15 +920,34 @@ async function btGroupDelete() {
 }
 function btGroupAddMembers() {
   const g = BT.group; if (!g) return;
-  const existing = new Set((g.members || []).map((m) => m.bot));
+  const members = g.members || [];
+  const existing = new Set(members.map((m) => m.bot));
   const avail = BT.engines.filter((e) => e.available && !existing.has(e.id));
-  if (!avail.length) { toast("所有引擎都已在群里"); return; }
+  const curRows = members.map((m) => {
+    const e = btEngine(m.bot);
+    const del = members.length > 1
+      ? `<button type="button" class="btn sm ghost" style="color:var(--bad)" onclick="btGroupRemoveMember('${esc(m.bot)}')">移出</button>`
+      : `<span class="small muted">至少保留 1 个</span>`;
+    return `<div class="row gap" style="align-items:center;justify-content:space-between;padding:4px 0"><span class="row gap" style="align-items:center">${btAv(m.bot, "sm")}<b>${esc(e.title)}</b>${e.cloud ? '<span class="small muted">云端</span>' : ""}</span>${del}</div>`;
+  }).join("");
   const boxes = avail.map((e) => `<label class="bt-chk"><input type="checkbox" name="m" value="${esc(e.id)}" ${e.cloud ? "checked" : ""}/>${esc(e.title)}${e.cloud ? "（云端）" : ""}</label>`).join("");
-  modal(`<form class="callnote bt-form" onsubmit="btGroupAddSubmit(event)"><h3>添加成员到「${esc(g.title)}」</h3>
-      <div class="muted">云端引擎（Meta Muse / Cue）会直接加入讨论；本地代码引擎会自动补建独立工作树。</div>
-      <div class="bt-fl">选择引擎<div class="bt-chks">${boxes}</div></div>
-      <div class="row gap"><button class="btn primary">添加</button><button type="button" class="btn" onclick="closeOverlays()">取消</button></div>
+  modal(`<form class="callnote bt-form" onsubmit="btGroupAddSubmit(event)"><h3>管理「${esc(g.title)}」成员</h3>
+      <div class="bt-fl">当前成员<div>${curRows}</div></div>
+      ${avail.length ? `<div class="bt-fl">添加新引擎<div class="bt-chks">${boxes}</div></div>` : `<div class="small muted">所有可用引擎都已在群里</div>`}
+      <div class="row gap">${avail.length ? `<button class="btn primary">添加选中</button>` : ""}<button type="button" class="btn" onclick="closeOverlays()">关闭</button></div>
     </form>`);
+}
+async function btGroupRemoveMember(bot) {
+  const e = btEngine(bot);
+  if (!confirm(`把 ${e.title} 移出群聊？（电脑上的分支和工作树不会删）`)) return;
+  try {
+    const g = await api("DELETE", `/api/bots/groups/${BT.gid}/members/${encodeURIComponent(bot)}`);
+    BT.group = g;
+    const i = BT.groups.findIndex((x) => x.id === g.id); if (i >= 0) BT.groups[i] = g;
+    toast(`已将 ${e.title} 移出群聊`);
+    btGroupAddMembers();
+    btGroupRender(); btRenderList();
+  } catch (err) { toast("移出失败：" + err.message); }
 }
 async function btGroupAddSubmit(ev) {
   ev.preventDefault();

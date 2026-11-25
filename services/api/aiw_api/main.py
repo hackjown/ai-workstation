@@ -122,6 +122,7 @@ class RoutineIn(BaseModel):
     prompt: str
     schedule: str
     machine_id: Optional[str] = None
+    bot: Optional[str] = None
     enabled: bool = True
 
 class WatchIn(BaseModel):
@@ -342,6 +343,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     app.state.bots = _bots.Bots(store, sessions, notifier, llm=lambda: chat.llm("chat"),
                                 default_machine=lambda: settings.machines[0].id if settings.machines else "ai-linux-001",
                                 secrets=secrets)
+    scheduler.bots = app.state.bots
     _bots.mount(app, app.state.bots, auth, chat)
     from . import bot_groups as _groups   # v3.9.61 引擎群聊 (worktree per engine, 管家 merges) + 派活 from the chat
     app.state.bot_groups = _groups.Groups(app.state.bots, chat)
@@ -372,6 +374,9 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     from . import v3924 as _v3924   # v3.9.24: routing, review, webhooks, usage, apps, prompts, context, teach, remote, 签到
     ext24 = _v3924.mount(app, store, sessions, scheduler, notifier, secrets, settings, chat, auth)
     app.state.v3924 = ext24
+    if getattr(ext24, "checkin", None) is not None and getattr(app.state, "bots", None) is not None:
+        ext24.checkin.bots = app.state.bots
+        app.state.bots.listeners.append(ext24.checkin.on_bot_event)
     from . import omni_call as _omni   # v3.9.31: 视频通话 (/ws/omni-call, /api/omni/status, /api/omni/probe)
     _omni.setup_logging()   # v3.9.35: the call's lifecycle (aiw.omni, INFO) shows in docker logs
     _omni.mount(app, store, secrets, chat, auth, lambda ws: _ok(ws_token(ws)))
@@ -733,8 +738,13 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
             nxt = cron.next_run(body.schedule, time.time())
         except ValueError as e:
             raise HTTPException(400, str(e))
+        bot = (body.bot or "").strip().lower() or None
+        if bot:
+            from . import bots as _bots_mod
+            if bot not in _bots_mod.ENGINES:
+                raise HTTPException(400, f"没有这个引擎：{bot}")
         return {"name": body.name, "prompt": body.prompt, "schedule": body.schedule.strip(),
-                "machine_id": body.machine_id, "enabled": 1 if body.enabled else 0, "next_run": nxt if body.enabled else None}
+                "machine_id": body.machine_id, "bot": bot, "enabled": 1 if body.enabled else 0, "next_run": nxt if body.enabled else None}
 
     @app.post("/api/routines", dependencies=[Depends(auth)])
     async def add_routine(body: RoutineIn):
@@ -757,10 +767,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
         r = store.get("routines", rid)
         if not r:
             raise HTTPException(404)
-        res = await sessions.submit(r["prompt"], r.get("machine_id"), r.get("thread_id"), source="routine",
-                                    title=f"⏰ {r['name']}")
-        store.update("routines", rid, last_run=time.time(), last_task_id=res["task"]["id"], thread_id=res["thread_id"])
-        return res
+        return await scheduler.fire_routine(r, time.time(), advance=False)
 
     # v3.9.50: the brief's weather (brief_weather.py): city, which routines get it, and the text itself
     @app.get("/api/settings/weather", dependencies=[Depends(auth)])

@@ -185,6 +185,7 @@ def schema(creds: list[dict]) -> dict:
         "timeout you get the output so far with timed_out=true. Returns exit_code, stdout, stderr per command."),
         "parameters": {"type": "object", "properties": {
             "host": {"type": "string"}, "user": {"type": "string"}, "port": {"type": "integer"},
+            "password": {"type": "string", "description": "optional SSH password when the host is not pre-saved in remote_hosts"},
             "command": {"type": "string"}, "commands": {"type": "array", "items": {"type": "string"}},
             "script": {"type": "string", "description": "a script's text; uploaded to the host and run"},
             "interpreter": {"type": "string", "description": "how to run `script`, default sh (e.g. bash, python3)"},
@@ -216,7 +217,7 @@ def tool(store, secrets, pool: SSHPool, creds: list[dict], notifier=None, task=N
             raise ValueError("要给出 host（已知主机：" + ", ".join(sorted({c.get("host") for c in creds if c.get("host")})) + "）")
         user = (a.get("user") or next((c.get("user") for c in creds if (c.get("host") or "").lower() == host.lower() and c.get("user")), "") or "root")
         port = int(a.get("port") or 22)
-        pw = password_for(host, user)
+        pw = password_for(host, user) or (str(a.get("password") or "") or None)
         per = max(5, min(int(a.get("timeout") or 60), 1800))
         c, fresh = await pool.client(host, port, user, pw, timeout=15)
         cmds = []

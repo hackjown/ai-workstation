@@ -28,7 +28,7 @@ import re
 import shlex
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from . import bots as B
 
@@ -124,8 +124,18 @@ def ok_ref(r: str) -> bool:
     return bool(re.fullmatch(r"[\w./\-]{1,100}", r or "")) and ".." not in r and not r.startswith(("-", "/"))
 
 
+_ALL_MENTION_NAMES = sorted(
+    ["管家", "aiw", "all", "所有人", "大家"] + [n for _, names in ALIASES for n in names],
+    key=len, reverse=True,
+)
+_MENTION_RE = re.compile(
+    r"[@＠]\s?(" + "|".join(re.escape(n) for n in _ALL_MENTION_NAMES) + r")(?![A-Za-z0-9_])",
+    re.I,
+)
+
+
 def mentions(text: str, ids: list) -> tuple[list, bool, str]:
-    """(@members, @管家, the text without the @s)."""
+    """(@members, @管家, the text without the @s). Works even when Chinese follows immediately (@agy完成任务了吗)."""
     found, manager = [], False
 
     def sub(m):
@@ -142,7 +152,7 @@ def mentions(text: str, ids: list) -> tuple[list, bool, str]:
                     found.append(eng)
                 return ""
         return m.group(0)
-    rest = re.sub(r"@\s?(claude code|grok build|meta muse|cue by manus|manus cue|[\w\u4e00-\u9fff]+)", sub, text or "", flags=re.I)
+    rest = _MENTION_RE.sub(sub, text or "")
     return found, manager, re.sub(r"[ \t]{2,}", " ", rest).strip()
 
 
@@ -840,20 +850,153 @@ class Groups:
         if wants_media:
             await self._manager_find_media(g, task, ids)
             return
-        # General self-task for 管家 (answer / summarize / inspect directly without dispatching)
+        # General self-task for 管家 (now equipped with local_shell, read_local_file, and ssh_exec!)
         timeline = self._context(g, {"bot": ""}, 10000)
-        text = ""
-        if self.bots.llm:
-            try:
-                sys_p = ("你是 AIW 管家，用户明确要求你自己直接完成这件事，不要把任务再派给群里的其他引擎。"
-                         "请直接根据群聊记录给出清晰、准确、简明的中文答复；不要编造没有看到的文件或结果。")
-                text = await asyncio.wait_for(
-                    self.bots.llm().complete(sys_p, f"用户的指令：\n{task}\n\n群聊记录：\n{timeline}", 2000), 90
-                )
-                text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
-            except Exception as e:  # noqa: BLE001
-                log.warning("manager self task: %s", e)
+        work_info = self._manager_env_note(g)
+        sys_p = ("你是 AIW 管家，现在拥有真实的执行工具（local_shell、read_local_file、ssh_exec / remote_exec）。\n"
+                 "用户要求你自己完成任务，请主动调用工具获取真实输出（如查看本地文件、git status/remote/log/push、SSH 登录服务器查容器或部署等），"
+                 "严禁编造或假装执行。如果工具执行失败，如实汇报报错和原因。用中文，条理清晰，附上关键真实输出。")
+        text = await self._manager_run(g, sys_p, f"{work_info}\n\n用户的指令：\n{task}\n\n群聊记录：\n{timeline}")
         self.add(gid, "aiw", "AIW 管家", text or "收到，这件事由我直接处理，没有转派给其他引擎。")
+
+    _DANGEROUS_SH_RE = re.compile(
+        r"(?:rm\s+-[a-z]*r[a-z]*f\s+/(?:\s|$)|mkfs\.|dd\s+if=|:\(\)\{|git\s+push\b[^\n]*?(?:--force\b|-f\b)|git\s+reset\s+--hard)",
+        re.I,
+    )
+
+    def _manager_env_note(self, g: dict) -> str:
+        lines = [f"群聊：{g['title']}（ID: {g['id']}）"]
+        if g.get("repo"):
+            lines.append(f"本地仓库：{g['repo']}（基线分支 {g.get('base') or 'main'}，合并工作树 ~/workspace/.aiw-worktrees/{g['id']}/_merge）")
+        for m in g.get("members") or []:
+            if m.get("worktree"):
+                lines.append(f"- {B.ENGINES.get(m['bot'], {}).get('title', m['bot'])} 工作树：{m['worktree']}（分支 {m.get('branch') or ''}）")
+        return "\n".join(lines)
+
+    async def _manager_run(self, g: dict, sys_p: str, user_prompt: str, max_rounds: int = 8) -> str:
+        """Run AIW 管家 with real tools (local_shell, read_local_file, ssh_exec/remote_exec), falling back to complete()."""
+        if not self.bots.llm:
+            return ""
+        llm = self.bots.llm()
+        if not hasattr(llm, "chat"):
+            try:
+                out = await asyncio.wait_for(llm.complete(sys_p, user_prompt, 2500), 120)
+                return re.sub(r"<think>.*?</think>", "", out or "", flags=re.S).strip()
+            except Exception as e:  # noqa: BLE001
+                log.warning("manager complete: %s", e)
+                return ""
+
+        tools: dict[str, tuple[dict, Any]] = {}
+        mid = g.get("machine_id") or ""
+        has_machine = bool(mid and mid != B.CLOUD_MACHINE)
+
+        if has_machine:
+            async def _local_shell(a: dict) -> str:
+                cmd = str(a.get("command") or "").strip()
+                if not cmd:
+                    return "错误：缺少 command"
+                if self._DANGEROUS_SH_RE.search(cmd):
+                    return "已拦截高危命令（禁止强推、rm -rf /、git reset --hard 等破坏性操作）。"
+                wd = str(a.get("workdir") or g.get("repo") or "~/workspace").strip()
+                full = f"cd {qp(wd)} 2>/dev/null || cd ~/workspace; {cmd}"
+                to = max(10, min(int(a.get("timeout") or 120), 300))
+                try:
+                    out = await self._sh(mid, "bash -c " + shlex.quote(full), to)
+                    return B.clip((out or "").strip() or "（命令执行完成，无输出）", 6000)
+                except Exception as e:  # noqa: BLE001
+                    return f"命令执行失败：{e}"
+
+            async def _read_local_file(a: dict) -> str:
+                raw = str(a.get("path") or "").strip()
+                if not raw:
+                    return "错误：缺少 path"
+                if not raw.startswith(("/", "~")):
+                    base_dir = g.get("repo") or "~/workspace"
+                    raw = base_dir.rstrip("/") + "/" + raw
+                start = max(1, int(a.get("start_line") or 1))
+                end = max(start, min(int(a.get("end_line") or (start + 199)), start + 400))
+                cmd = f"P={qp(raw)}; [ -f \"$P\" ] && sed -n '{start},{end}p' \"$P\" || echo 'FILE_NOT_FOUND'"
+                try:
+                    out = await self._sh(mid, "bash -c " + shlex.quote(cmd), 30)
+                    if "FILE_NOT_FOUND" in (out or "")[:40]:
+                        return f"文件不存在：{raw}"
+                    return B.clip(out or "（空文件）", 8000)
+                except Exception as e:  # noqa: BLE001
+                    return f"读取文件失败：{e}"
+
+            tools["local_shell"] = ({
+                "name": "local_shell",
+                "description": "在连接电脑上执行 bash 命令（查看仓库/git status/remote/log/diff、跑测试、在用户明确要求时 git push、检查文件等）。",
+                "parameters": {"type": "object", "properties": {
+                    "command": {"type": "string", "description": "要执行的 bash 命令"},
+                    "workdir": {"type": "string", "description": "工作目录，默认群聊仓库路径"},
+                    "timeout": {"type": "integer", "description": "超时秒数，默认 120"},
+                }, "required": ["command"]},
+            }, _local_shell)
+            tools["read_local_file"] = ({
+                "name": "read_local_file",
+                "description": "直接读取电脑工作区或仓库里的文本文件内容（SPEC、代码、测试报告、日志等）。",
+                "parameters": {"type": "object", "properties": {
+                    "path": {"type": "string", "description": "文件路径（绝对路径、~/workspace/... 或相对仓库路径）"},
+                    "start_line": {"type": "integer", "description": "起始行号，默认 1"},
+                    "end_line": {"type": "integer", "description": "结束行号，默认起始行+199"},
+                }, "required": ["path"]},
+            }, _read_local_file)
+
+        ssh_pool = None
+        try:
+            from . import remote_hosts as _rh, ssh_exec as _sx
+            if self.bots.secrets and _rh.hosts(self.store):
+                tools["remote_exec"] = _rh.tool(self.store, self.bots.secrets)
+            ssh_pool = _sx.SSHPool()
+            hcreds = [{"key": f"remote_host_{h['id']}", "host": h["host"], "user": h.get("user") or "root"}
+                      for h in _rh.hosts(self.store)]
+            tools["ssh_exec"] = _sx.tool(self.store, self.bots.secrets, ssh_pool, hcreds)
+        except Exception as e:  # noqa: BLE001
+            log.debug("manager ssh_exec unavailable: %s", e)
+
+        schemas = [t[0] for t in tools.values()]
+        messages: list[dict] = [
+            {"role": "system", "content": sys_p},
+            {"role": "user", "content": user_prompt},
+        ]
+        parts: list[str] = []
+        try:
+            for rnd in range(max_rounds + 1):
+                r = await asyncio.wait_for(
+                    llm.chat(messages, schemas if (schemas and rnd < max_rounds) else None, 2500), 120
+                )
+                content = re.sub(r"<think>.*?</think>", "", str(r.get("content") or ""), flags=re.S).strip()
+                calls = r.get("tool_calls") or []
+                if content and not calls:
+                    parts.append(content)
+                if not calls:
+                    break
+                messages.append({
+                    "role": "assistant", "content": content,
+                    "tool_calls": [
+                        {"id": c["id"], "type": "function",
+                         "function": {"name": c["name"], "arguments": json.dumps(c.get("args") or {}, ensure_ascii=False)}}
+                        for c in calls
+                    ],
+                })
+                for c in calls:
+                    tdef = tools.get(c["name"])
+                    if not tdef:
+                        res_str = f"未知工具：{c['name']}"
+                    else:
+                        try:
+                            raw_res = await tdef[1](c.get("args") or {})
+                            res_str = raw_res if isinstance(raw_res, str) else json.dumps(raw_res, ensure_ascii=False)
+                        except Exception as e:  # noqa: BLE001
+                            res_str = f"工具出错：{type(e).__name__}: {e}"
+                    messages.append({"role": "tool", "tool_call_id": c["id"], "content": str(res_str)[:6000]})
+        except Exception as e:  # noqa: BLE001
+            log.warning("manager agent loop: %s", e)
+        finally:
+            if ssh_pool is not None:
+                ssh_pool.close()
+        return "\n\n".join(p for p in parts if p).strip()
 
     async def _manager_find_media(self, g: dict, task: str, ids: list):
         """Find images/screenshots in the group's worktrees / repo and post them directly into the group."""
@@ -1379,19 +1522,19 @@ class Groups:
         checks = "\n\n".join(f"$ {c}\n{B.clip(o, 2000)}" for c, o in runs)
         text = ""
         if self.bots.llm:
-            try:
-                if wants_merge:
-                    sys_p = ("你是 AIW 管家，负责验收一次多引擎分工并向用户汇报。只依据给你的群聊记录、合并结果和你亲自运行的命令输出，"
-                             "不要编造。用中文；先给一张 markdown 表（成员、负责什么、产出哪些文件、是否一次完成、遇到的问题），"
-                             "再写几句评价（交接是否顺畅、谁越权、最终测试结果、下次怎么改进）。没有的数据写“未知”。")
-                else:
-                    sys_p = ("你是 AIW 管家，请严格按照用户交代的这一步任务来执行（如汇总对比各成员方案、列出优缺点、明确向用户提问等待选择等）。"
-                             "只依据给你的群聊记录与已发图片清单，不要编造，不要强行做无关的代码验收表。用中文，条理清晰。")
-                text = await asyncio.wait_for(self.bots.llm().complete(
-                    sys_p, f"用户交给你的任务：\n{task}\n\n{merge_note}\n\n你运行的命令：\n{checks or '（没有）'}\n\n群聊记录：\n{timeline}", 2500), 120)
-                text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
-            except Exception as e:  # noqa: BLE001
-                log.warning("group final: %s", e)
+            work_info = self._manager_env_note(g)
+            if wants_merge:
+                sys_p = ("你是 AIW 管家，负责验收多引擎分工、执行必要的本地命令/测试或 SSH 实机部署验证并向用户汇报。"
+                         "你拥有 local_shell、read_local_file、ssh_exec 工具，可以直接核查文件、跑测试、查 git 状态或登录服务器验证，不要只凭自述猜测。"
+                         "用中文；先给一张 markdown 表（成员、负责什么、产出哪些文件、是否一次完成、遇到的问题），"
+                         "再写实测结果与结论。没有实测的数据写“未知”。")
+            else:
+                sys_p = ("你是 AIW 管家，请严格按照用户交代的这一步任务执行。你拥有 local_shell、read_local_file、ssh_exec 工具，"
+                         "需要核查本地文件、仓库状态或远程服务器时请直接调用工具拿真实结果，不要编造。用中文，条理清晰。")
+            text = await self._manager_run(
+                g, sys_p,
+                f"{work_info}\n\n用户交给你的任务：\n{task}\n\n{merge_note}\n\n已运行的验收命令：\n{checks or '（没有）'}\n\n群聊记录：\n{timeline}",
+            )
         if not text:
             text = "\n\n".join(x for x in (merge_note, checks) if x) or "都做完了。"
         elif checks:

@@ -1054,6 +1054,17 @@ class Chat:
                                  "task_id": {"type": "string"}}}},
                             self._task_status),
         }
+        try:   # direct SSH / remote_hosts tools right in main chat (小秘)
+            from . import remote_hosts as _rh, ssh_exec as _sx
+            if self.secrets and _rh.hosts(self.store):
+                out["remote_exec"] = _rh.tool(self.store, self.secrets)
+            if not hasattr(self, "_ssh_pool") or self._ssh_pool is None:
+                self._ssh_pool = _sx.SSHPool()
+            hcreds = [{"key": f"remote_host_{h['id']}", "host": h["host"], "user": h.get("user") or "root"}
+                      for h in _rh.hosts(self.store)]
+            out["ssh_exec"] = _sx.tool(self.store, self.secrets, self._ssh_pool, hcreds)
+        except Exception as e:  # noqa: BLE001
+            log.debug("chat ssh_exec unavailable: %s", e)
         self._image_on = bool(self._image_cfg())
         if self._image_on:   # v3.9.15: pictures made right in the chat (default endpoint, the other as fallback)
             out["generate_image"] = ({"name": "generate_image", "description": "用 AI 生图模型按文字生成新图片（插画、海报、头像、"
@@ -1275,7 +1286,8 @@ class Chat:
         return {"read_url": "正在读网页…", "read_file": "正在读文件…", "task_status": "正在查任务…",
                 "session_search": "正在翻以前的记录…", "generate_image": "正在画图…",
                 "edit_image": "正在改图…", "doc_ask": "正在读文档…", "engine_task": "正在交给引擎…",
-                "engine_convs": "正在翻引擎的对话…", "engine_status": "正在看引擎进度…", "engine_config": "正在改引擎设置…"}.get(name, "正在查…")
+                "engine_convs": "正在翻引擎的对话…", "engine_status": "正在看引擎进度…", "engine_config": "正在改引擎设置…",
+                "ssh_exec": "正在 SSH 连服务器…", "remote_exec": "正在连运维主机…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:

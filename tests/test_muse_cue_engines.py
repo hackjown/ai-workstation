@@ -726,3 +726,64 @@ async def test_group_remove_member_and_routine_checkin_engine_dispatch(tmp_path)
     ck.on_bot_event("message", {"conv": cid, "role": "bot", "text": "今天已经签过啦", "data": {"status": "done"}})
     updated_site = ck.site(site["id"])
     assert updated_site["last_status"] == "already"
+
+
+@pytest.mark.asyncio
+async def test_no_space_mentions_manager_tools_and_chat_ssh(tmp_path):
+    # 1. No-space mentions (@agy完成任务了吗？ / @管家看看仓库)
+    to, mgr, rest = G.mentions("@agy完成任务了吗？", ["agy", "codebuddy", "cue"])
+    assert to == ["agy"] and mgr is False and rest == "完成任务了吗？"
+    to2, mgr2, rest2 = G.mentions("@管家看看仓库", ["agy", "codebuddy"])
+    assert to2 == [] and mgr2 is True and rest2 == "看看仓库"
+
+    # 2. Manager agent loop executes local_shell + read_local_file and blocks dangerous commands
+    store = Store(str(tmp_path / "aiw.db"))
+    store.upsert_machine({"id": "ai-linux-001", "provider": "local", "provider_vm_id": "v1",
+                          "name": "Local PC", "agent_endpoint": "ws://localhost:8001"})
+    secrets = SecretBox(store, str(tmp_path))
+    sh_calls = []
+
+    async def fake_shell(mid: str, cmd: str, timeout: int) -> str:
+        sh_calls.append(cmd)
+        if "git remote -v" in cmd:
+            return "origin\thttps://github.com/hackjown/home-inventory.git (push)\n"
+        return "DIRTY 0\nGROUP_OK main\n"
+
+    class FakeToolLLM:
+        def __init__(self):
+            self.turn = 0
+        async def chat(self, messages, schemas, max_tokens=2500):
+            self.turn += 1
+            if self.turn == 1:
+                names = {s["name"] for s in (schemas or [])}
+                assert {"local_shell", "read_local_file", "ssh_exec"}.issubset(names)
+                return {
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "c1", "name": "local_shell", "args": {"command": "git remote -v"}},
+                        {"id": "c2", "name": "local_shell", "args": {"command": "git push --force origin main"}},
+                    ],
+                }
+            # Second turn sees tool outputs
+            tool_msgs = [m["content"] for m in messages if m.get("role") == "tool"]
+            assert any("home-inventory.git" in t for t in tool_msgs)
+            assert any("已拦截高危命令" in t for t in tool_msgs)
+            return {"content": "已核实远端仓库为 home-inventory.git。", "tool_calls": []}
+
+    fake_llm = FakeToolLLM()
+    bots = B.Bots(store, llm=lambda: fake_llm, shell=fake_shell, secrets=secrets)
+    groups = G.Groups(bots)
+    g = await groups.create("tool-grp", "~/workspace/demo", ["agy"], "main")
+    out = await groups._manager_run(g, "sys", "检查远端仓库")
+    assert "home-inventory.git" in out
+
+    # 3. Main chat exposes ssh_exec tool directly
+    from aiw_api.chat import Chat
+    from aiw_api.config import Settings
+
+    class _DummySess:
+        listeners = []
+
+    chat = Chat(store, _DummySess(), None, Settings(), secrets)
+    ctools = await chat.tools()
+    assert "ssh_exec" in ctools

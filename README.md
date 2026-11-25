@@ -559,3 +559,8 @@ docs/                      github-analysis.md、协议说明
 
 ## V1 之后
 Windows VM（参考 Dexbox 的 Desktop 接口做 `WindowsComputerProvider`）→ 剪映 / PS / PR → Video Agent；实时桌面升级 WebRTC。新后端只加 Provider，不改 Agent Runtime。
+
+
+## v3.9.86 引擎群聊项目模式
+
+群里以「项目规划：」开头发规划，管家按 讨论 → 设计方案（截图给你选）→ 开发 → 评审返工 → 验收返修 → 实际运行截图 → 交付（补丁 / 推送 / 合入，由你点）走完。详见 docs/v3.9.86.md。

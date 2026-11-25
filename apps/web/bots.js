@@ -726,12 +726,50 @@ function btGroupRender() {
     ${hasLocal ? `<button class="btn sm primary" onclick="btGroupMerge()" ${g.status === "merging" ? "disabled" : ""} title="提交各分支的改动，合并到 aiw/${esc(g.id)}/merge">合并</button>` : ""}
     ${live ? `<button class="btn sm" onclick="btGroupStop()">停止</button>` : ""}
     <button class="icon" onclick="btGroupDelete()" aria-label="删除群聊" title="删除群聊">${icon("x")}</button>`;
-  $("btTake").innerHTML = (g.pending || []).length ? `<div class="bt-tk"><b>${st || "在干活"}</b>：等 ${esc(g.pending.map((b) => btEngine(b).title).join("、"))} 回复${g.auto_merge && hasLocal ? "，都回复后管家自动合并" : ""}</div>` : "";
+  $("btTake").innerHTML = btBoard(g.project) + ((g.pending || []).length ? `<div class="bt-tk"><b>${st || "在干活"}</b>：等 ${esc(g.pending.map((b) => btEngine(b).title).join("、"))} 回复${g.auto_merge && hasLocal ? "，都回复后管家自动合并" : ""}</div>` : "");
   $("btMsgs").innerHTML = BT.gmsgs.length ? BT.gmsgs.map(btGMsg).join("")
-    : `<div class="muted pad center">说要做什么：不 @ 就由 AIW 管家分工；@muse @cue @codex 只发给指定成员。</div>`;
+    : `<div class="muted pad center">说要做什么：不 @ 就由 AIW 管家分工；@muse @cue @codex 只发给指定成员。<br>以「项目规划：」开头发一份规划，就按 讨论 → 设计 → 开发 → 评审 → 验收 → 实测截图 → 交付 走完。</div>`;
   $("btPrompt").placeholder = "说要做什么，@muse @cue @codex @claude @grok @cbc @agy 指定谁做，@管家 分工…";
   btQuoteRender();
   paintIcons($("btHead"));
+}
+// v3.9.86 项目模式: the stage strip, design / screenshot pictures with their option label, and the buttons
+const BT_PHASES = [["discuss", "讨论"], ["design", "设计"], ["pick", "选设计"], ["confirm", "确认"], ["dev", "开发"],
+  ["rework", "返工"], ["accept", "验收"], ["fix", "返修"], ["run", "实测"], ["deliver", "交付"]];
+function btBoard(p) {
+  if (!p || !p.phase) return "";
+  const order = ["discuss", "design", "dev", "accept", "run", "deliver"];
+  const alias = { pick: "design", confirm: "design", rework: "dev", fix: "accept" };
+  const cur = order.indexOf(alias[p.phase] || p.phase);
+  const name = Object.fromEntries(BT_PHASES);
+  const steps = order.map((k, i) => `<span class="bt-ph ${i < cur ? "done" : i === cur ? "on" : ""}">${name[k]}</span>`).join("<i>›</i>");
+  const extra = [p.phase === "stopped" ? "已停止" : name[p.phase] && !order.includes(p.phase) ? "现在：" + name[p.phase] : "",
+    p.pick ? "设计：方案 " + p.pick : "", p.rework ? `返工 ${p.rework} 轮` : "", p.fixes ? `验收返修 ${p.fixes} 次` : "",
+    (p.delivered || []).length ? "已交付：" + p.delivered.map((x) => ({ patch: "补丁", push: "推送", merge: "合入" })[x] || x).join("、") : ""].filter(Boolean).join(" · ");
+  return `<div class="bt-board">${steps}${extra ? `<span class="small muted">${esc(extra)}</span>` : ""}</div>`;
+}
+function btGMedia(list) {
+  if (!(list || []).length) return "";
+  return `<div class="bt-media">` + list.map((x) => {
+    const src = x.path ? artUrl(x.path) : (x.url || ""); if (!src) return "";
+    if (x.kind === "image") return `<figure class="bt-shot"><a href="${esc(src)}" target="_blank" rel="noopener"><img src="${esc(src)}" alt="${esc(x.label || x.name)}" loading="lazy"></a>${x.label ? `<figcaption>${esc(x.label)}</figcaption>` : ""}</figure>`;
+    return btMedia([x]).replace(/^<div class="bt-media">|<\/div>$/g, "");
+  }).join("") + `</div>`;
+}
+function btGActs(m, d) {
+  const p = (BT.group || {}).project || {};
+  if (!(d.actions || []).length) return "";
+  const live = { go: "confirm", pick: "pick", deliver: "deliver" };
+  const last = [...BT.gmsgs].reverse().find((x) => (x.data || {}).actions);
+  if (!last || last.id !== m.id) return "";
+  return `<div class="bt-permit">` + d.actions.map((a) => `<button class="btn sm ${a.id === "deliver" && a.value !== "patch" ? "" : "primary"}" ${p.phase !== live[a.id] ? "disabled" : ""}
+    onclick="btProjectAct('${esc(a.id)}','${esc(a.value || "")}')">${esc(a.label)}</button>`).join("") + `</div>`;
+}
+async function btProjectAct(act, value) {
+  if (act === "deliver" && value === "merge" && !confirm(`把成果合入 ${(BT.group || {}).base || "基线分支"}？只有你的仓库正停在这个分支、没有未提交改动时才会合。`)) return;
+  if (act === "deliver" && value === "push" && !confirm("把分支推送到 origin？")) return;
+  try { await api("POST", `/api/bots/groups/${BT.gid}/project`, { action: act, value }); toast("交给管家了"); setTimeout(() => btGroupRefresh(true), 800); }
+  catch (e) { toast(e.message); }
 }
 function btGMsg(m) {
   const d = m.data || {};
@@ -740,6 +778,7 @@ function btGMsg(m) {
     return `<div class="bt-row me ${m.role}"><div class="bt-col">${m.role === "aiw" ? `<div class="bt-name">AIW 管家</div>` : ""}
       <div class="bubble ${m.role === "aiw" ? "bt-aiw hmd" : ""}">${m.role === "aiw" ? hMd(m.text) : esc(m.text)}</div>
       ${(d.attachments || []).length && typeof hAttPreview === "function" ? hAttPreview(d.attachments) : ""}
+      ${btGMedia(d.media)}${btGActs(m, d)}
       <div class="meta">${hTime(m.created_at)}</div></div></div>`;
   }
   const eng = btEngine(m.who);
@@ -747,7 +786,7 @@ function btGMsg(m) {
   const den = (d.denied || []).length ? `<div class="bt-denied">被拒绝的操作：${d.denied.map((x) => `${esc(x.tool || "")} ${esc(x.target || "")}`).join("；")}</div>` : "";
   return `<div class="bt-row bot">${btAv(m.who)}<div class="bt-col">
     <div class="bt-name ${esc(m.who)}">${esc(eng.title)}${["error", "failed", "blocked"].includes(d.status) ? " · 没做成" : d.status === "stopped" ? " · 已停止" : ""}</div>
-    <div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text || "（没有文字）")}</div>${ch}${den}
+    <div class="bubble hmd ${["error", "failed", "blocked"].includes(d.status) ? "err" : ""}">${hMd(m.text || "（没有文字）")}</div>${btMedia(d.media)}${ch}${den}
     <div class="meta">${hTime(m.created_at)}${d.conv ? ` · <button class="link" onclick="btOpen('${d.conv}')">看它的对话 ›</button>` : ""}</div></div></div>`;
 }
 async function btGroupMerge() { try { await api("POST", `/api/bots/groups/${BT.gid}/merge`); toast("管家开始合并"); setTimeout(() => btGroupRefresh(true), 800); } catch (e) { toast("合并失败：" + e.message); } }

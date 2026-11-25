@@ -95,10 +95,11 @@ def ensure_tables(store) -> None:
     store._x("CREATE TABLE IF NOT EXISTS bot_group_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, "
              "grp TEXT, role TEXT, who TEXT, text TEXT, data TEXT, src TEXT, created_at REAL)")
     store._x("CREATE INDEX IF NOT EXISTS ix_botgm_grp ON bot_group_messages(grp, seq)")
-    try:   # v3.9.79: serial steps waiting their turn
-        store._x("ALTER TABLE bot_groups ADD COLUMN queue TEXT")
-    except Exception:  # noqa: BLE001
-        pass
+    for col in ("queue", "project"):   # v3.9.79: serial steps waiting their turn; v3.9.86: 项目模式 state
+        try:
+            store._x(f"ALTER TABLE bot_groups ADD COLUMN {col} TEXT")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def qp(path: str) -> str:
@@ -248,6 +249,8 @@ class Groups:
         self._merging: set = set()
         self._tasks: set = set()
         bots.listeners.append(self._on_bot)
+        from .group_project import Project
+        self.project = Project(self)
 
     # ------------------------------------------------------------------ storage
     def _row(self, r: dict) -> dict:
@@ -256,6 +259,7 @@ class Groups:
         d["pending"] = B._j(d.get("pending"), [])
         d["merge"] = B._j(d.get("merge"), None)
         d["queue"] = B._j(d.get("queue"), [])
+        d["project"] = B._j(d.get("project"), None)
         d["auto_merge"] = bool(d.get("auto_merge"))
         return d
 
@@ -278,7 +282,7 @@ class Groups:
         return out
 
     def set_group(self, gid: str, **kw) -> Optional[dict]:
-        for k in ("members", "pending", "merge", "queue"):
+        for k in ("members", "pending", "merge", "queue", "project"):
             if k in kw:
                 kw[k] = json.dumps(kw[k], ensure_ascii=False) if kw[k] is not None else None
         kw["updated_at"] = _now()
@@ -488,7 +492,10 @@ class Groups:
                 except Exception as e:  # noqa: BLE001
                     log.warning("group stop %s: %s", m["conv"], e)
         self.add(gid, "system", "", "已停止")
-        return self.set_group(gid, status="idle", pending=[], queue=[])
+        p = g.get("project")
+        if p and p.get("phase") not in ("deliver", "stopped"):
+            p["phase"] = "stopped"
+        return self.set_group(gid, status="idle", pending=[], queue=[], **({"project": p} if p else {}))
 
     # ------------------------------------------------------------------ talking
     def member(self, g: dict, bot: str) -> Optional[dict]:
@@ -546,6 +553,11 @@ class Groups:
         if g.get("queue") and re.fullmatch(r"\s*(继续|接着做|下一步|continue)\s*[。.!！]?\s*", rest or ""):
             self._bg(self._run_next(gid))
             return um
+        if g.get("project") and await self.project.on_text(gid, rest or text):   # v3.9.86: 开工 / 选 B / 推送
+            return um
+        if self.project_trigger(g, text):   # v3.9.86: a project plan -> 讨论 → 设计 → 开发 → 评审 → 验收 → 实测 → 交付
+            self._bg(self.project.start(gid, text, attachments))
+            return um
         steps = parse_steps(text, ids)
         if steps:
             self._bg(self._start_steps(gid, steps, "按你写的分工和顺序来，前一步做完再交给下一步。", attachments))
@@ -556,6 +568,10 @@ class Groups:
         # the planner sees the message with its @s, so who-does-what the user wrote survives
         self._bg(self._plan(gid, text if manager else (rest or text), attachments, prefer=to))
         return um
+
+    def project_trigger(self, g: dict, text: str) -> bool:
+        from .group_project import is_trigger
+        return bool(g.get("repo")) and is_trigger(text)
 
     async def _plan(self, gid: str, text: str, attachments: Optional[list] = None, prefer: Optional[list] = None):
         g = self.group(gid)
@@ -625,11 +641,14 @@ class Groups:
         done = [r["who"] for r in self.store._x(
             "SELECT DISTINCT who FROM bot_group_messages WHERE grp=? AND role='bot'", (gid,))]
         if s["bot"] == MANAGER_ID:
+            if s.get("op"):   # v3.9.86: a 项目模式 step of the manager's own
+                await self.project.op(gid, s)
+                return
             await self._final(gid, s["task"])
             return
         m = self.member(g, s["bot"])
         if not m or not m.get("conv"):
-            self.add(gid, "aiw", "AIW 管家", f"第 {s['n']} 步的 {s['bot']} 不在群里，跳过。")
+            self.add(gid, "aiw", "AIW 管家", f"{s.get('step') or '这一步'}的 {s['bot']} 不在群里，跳过。")
             await self._run_next(gid)
             return
         if not (m.get("cloud") or B.is_cloud_engine(m["bot"])):
@@ -652,7 +671,8 @@ class Groups:
                 att = await self.bots.push_files(m["conv"], s["attachments"])
             except Exception as e:  # noqa: BLE001
                 log.warning("group files: %s", e)
-        self.add(gid, "aiw", "AIW 管家", f"第 {s['n']}/{s['of']} 步交给 {B.ENGINES[m['bot']]['title']}。")
+        self.add(gid, "aiw", "AIW 管家", (f"第 {s['n']}/{s['of']} 步交给 {B.ENGINES[m['bot']]['title']}。" if s.get("n") else
+                                          f"{s.get('step') or '下一步'}：交给 {B.ENGINES[m['bot']]['title']}。"))
         self.bots.send(m["conv"], self._brief(g, m, s["task"], context=self._context(g, m), files=files), "aiw", attachments=att)
 
     # ------------------------------------------------------------------ v3.9.82: who owns which file, read-only copies
@@ -745,6 +765,22 @@ class Groups:
                     cmds.append(part)
         return cmds[:5]
 
+    async def _run_checks(self, g: dict, cmds: list) -> list:
+        """Run each check in the merged worktree; each output ends with EXIT <code>."""
+        runs = []
+        mwt = f"~/workspace/.aiw-worktrees/{g['id']}/_merge"
+        for c in cmds:
+            if not self.VERIFY_OK.match(c) or re.search(r"[;&|`$<>]", c):
+                runs.append((c, "这条命令不在允许的验收命令里，没跑。\nEXIT 126"))
+                continue
+            try:
+                out = await self._sh(g["machine_id"], "bash -c " + shlex.quote(   # v3.9.82: PIPESTATUS is bash-only
+                    f"cd {qp(mwt)} && timeout 300 {c} 2>&1 | tail -n 40; echo \"EXIT ${{PIPESTATUS[0]}}\""), 330)
+            except Exception as e:  # noqa: BLE001
+                out = f"运行失败：{e}\nEXIT 1"
+            runs.append((c, out.strip()))
+        return runs
+
     async def _final(self, gid: str, task: str):
         """The step the user gave AIW 管家 itself: merge the local work, run the checks it names, and report."""
         g = self.group(gid)
@@ -757,14 +793,7 @@ class Groups:
                 self.set_group(gid, queue=[{"bot": MANAGER_ID, "task": task, "step": task, "n": 0, "of": 0}])
                 return
             merge_note = f"合并：{'、'.join(r.get('merged') or []) or '无'}；{r.get('stat') or ''}"
-            mwt = f"~/workspace/.aiw-worktrees/{gid}/_merge"
-            for c in self._verify_cmds(task):
-                try:
-                    out = await self._sh(g["machine_id"], "bash -c " + shlex.quote(   # v3.9.82: PIPESTATUS is bash-only
-                        f"cd {qp(mwt)} && timeout 300 {c} 2>&1 | tail -n 40; echo \"EXIT ${{PIPESTATUS[0]}}\""), 330)
-                except Exception as e:  # noqa: BLE001
-                    out = f"运行失败：{e}"
-                runs.append((c, out.strip()))
+            runs = await self._run_checks(g, self._verify_cmds(task))
         timeline = self._context(g, {"bot": ""}, 12000)
         checks = "\n\n".join(f"$ {c}\n{B.clip(o, 2000)}" for c, o in runs)
         text = ""
@@ -820,7 +849,8 @@ class Groups:
         bot = c["bot"]
         self.add(gid, "bot", bot, obj.get("text") or "", {
             "status": d.get("status"), "changes": d.get("changes"), "denied": d.get("denied"),
-            "media": d.get("media"), "steps": len(d.get("steps") or []), "conv": c["id"]}, src=obj["id"])
+            "steps": len(d.get("steps") or []), "conv": c["id"], **({"media": d["media"]} if d.get("media") else {})},
+            src=obj["id"])
         pending = [b for b in g["pending"] if b != bot]
         g = self.set_group(gid, pending=pending)
         if not pending and g["status"] in ("working", "fixing"):
@@ -1149,6 +1179,11 @@ class GroupIn(BaseModel):
     goal: str = ""
 
 
+class GroupProjectIn(BaseModel):
+    action: str
+    value: str = ""
+
+
 class GroupSendIn(BaseModel):
     text: str = ""
     attachments: list = []
@@ -1213,6 +1248,15 @@ def mount(app, groups: Groups, auth) -> None:
         need(gid)
         try:
             return await groups.send(gid, body.text, body.attachments)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/bots/groups/{gid}/project", dependencies=dep)
+    async def groups_project(gid: str, body: GroupProjectIn):
+        """v3.9.86: 开工 (go) / 用方案 X (pick) / 交付 (deliver: patch|push|merge)."""
+        need(gid)
+        try:
+            return await groups.project.action(gid, body.action, body.value)
         except ValueError as e:
             raise HTTPException(400, str(e))
 

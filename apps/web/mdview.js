@@ -21,7 +21,11 @@
     md.renderer.rules.table_open = () => `<div class="mdv-tw"><table>\n`;
     md.renderer.rules.table_close = () => `</table></div>\n`;
     if (root.DOMPurify && !root.DOMPurify.__aiw) {
+      root.DOMPurify.addHook("uponSanitizeAttribute", (n, d) => {   // v3.9.92: aiw://task/<id> links (每日回顾) stay
+        if (d.attrName === "href" && /^aiw:\/\/(task|chat|monitor|bots)\b/i.test(d.attrValue || "")) d.forceKeepAttr = true;
+      });
       root.DOMPurify.addHook("afterSanitizeAttributes", (n) => {
+        if (n.tagName === "A" && /^aiw:/i.test(n.getAttribute("href") || "")) return;
         if (n.tagName === "A" && n.getAttribute("href")) { n.setAttribute("target", "_blank"); n.setAttribute("rel", "noopener noreferrer"); }
         if (n.tagName === "IMG" && !/^(https?:|data:image\/)/i.test(n.getAttribute("src") || "")) n.removeAttribute("src");
       });

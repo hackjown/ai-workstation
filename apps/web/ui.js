@@ -156,6 +156,7 @@ loadSettings = async function () {
     api("GET", "/api/settings/notify"), api("GET", "/api/integrations"), api("GET", "/api/secrets"), api("GET", "/api/settings/vm").catch(() => ({})), api("GET", "/api/machines").catch(() => [])]);
   S.profile = prof;
   const dep = await api("GET", "/api/deploy/config").catch(() => ({ config: {} }));
+  const revPrefs = await api("GET", "/api/review/prefs").catch(() => null);   // v3.9.92 每日回顾
   const rhosts = await api("GET", "/api/remote-hosts").catch(() => []);
   const bos = await api("GET", "/api/browseros").catch(() => ({ machines: [] }));
   const [skillList, upd, skJob] = await Promise.all([api("GET", "/api/skills").catch(() => []), api("GET", "/api/update").catch(() => null),
@@ -334,6 +335,18 @@ loadSettings = async function () {
       ${row("浏览器通知", "这台设备", "", `<button type="button" class="btn sm" onclick="Notification.requestPermission().then(p=>toast('浏览器通知：'+p))">允许</button>`)}
     </div>
   </form>
+
+  ${revPrefs ? `<form class="grp" id="g-review" onsubmit="saveReviewPrefs(event)">
+    <div class="grp-h"><h2>每日回顾</h2>${pill(!!revPrefs.enabled && !revPrefs.env_disabled, "已开启", "已关闭")}
+      <div class="act"><button type="button" class="btn sm" onclick="api('POST','/api/review/run',{}).then((r)=>toast(r.posted ? '已发到聊天' : '今天没有需要你处理的事'))">现在回顾</button><button class="btn sm primary">保存</button></div></div>
+    <div class="rows">
+      ${row("每晚回顾", "今天做了什么、之前哪里说错了、还剩什么；没事就不发", "", `<input type="checkbox" name="enabled" ${revPrefs.enabled ? "checked" : ""} aria-label="每日回顾" />`, "sw")}
+      ${row("时间", "", `<input name="time" type="time" value="${esc(revPrefs.time || "20:00")}" />`)}
+      ${row("不再提的话题", "逗号分隔；聊天里说「别再提 X」也会加到这里", `<input name="muted" value="${esc((revPrefs.muted_topics || []).join("，"))}" />`)}
+      ${row("日程开始前提醒", "分钟，0 = 不提醒；需要手机 App 打开「读取日历」", `<input name="lead" type="number" min="0" max="180" value="${esc(String(revPrefs.event_lead_min ?? 15))}" />`)}
+      ${row("健康小结", "每天这个时间；需要手机 App 打开「读取健康」，只存每天的汇总", `<input name="htime" type="time" value="${esc(revPrefs.health_summary_time && revPrefs.health_summary_time !== "off" ? revPrefs.health_summary_time : "21:30")}" />`, `<input type="checkbox" name="health" ${revPrefs.health_enabled && revPrefs.health_summary_time !== "off" ? "checked" : ""} aria-label="健康小结" />`)}
+    </div>
+  </form>` : ""}
 
   <section class="grp" id="g-me"><span id="sMem" hidden></span>
     <div class="grp-h"><h2>${secNo("g-me")}你和记忆</h2></div>

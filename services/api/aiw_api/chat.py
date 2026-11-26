@@ -293,6 +293,8 @@ class Chat:
         ensure_tables(store)
         self.llm_factory: Optional[Callable[[str], Any]] = None   # tests: role ("chat" | "small") -> router
         self.memory = None            # memory.Memory: prompt block + learning after each exchange
+        self.worklog = None           # v3.9.92 worklog.Worklog: a line per exchange for the daily review
+        self.review = None            # v3.9.92 review.Review: 每日回顾 buttons and 别再提 X
         self.tool_loader = None       # async () -> {name: (schema, fn)}: connectors (web search); default integrations
         self._lock = asyncio.Lock()
         self._compacting = False
@@ -852,6 +854,18 @@ class Chat:
                     await say("route", {"route": "memory"})
                     await say("message", m)
                     return {"route": "memory", "user": user, "messages": [m]}
+            if getattr(self, "review", None) is not None:   # v3.9.92: 别再提 X / 少推 X / 别再推荐 / 关掉每日回顾
+                from . import review as _rv
+                try:
+                    done = _rv.prefs_command(self.store, text)
+                except Exception as e:  # noqa: BLE001
+                    done = None
+                    log.warning("review prefs command: %s", e)
+                if done:
+                    m = self.add("assistant", "text", done, {"review_prefs": True})
+                    await say("route", {"route": "review_prefs"})
+                    await say("message", m)
+                    return {"route": "review_prefs", "user": user, "messages": [m]}
             disp = getattr(self, "engines", None)   # v3.9.82: only 「@codex 修一下登录」 goes straight to the engine
             p = disp.parse(text) if disp is not None and mode == "auto" and not SKILL_RE.match(text) else None
             if p:
@@ -979,6 +993,11 @@ class Chat:
                 await self.memory.learn(user, replies)
             except Exception as e:  # noqa: BLE001
                 log.warning("memory learn: %s", e)
+        if getattr(self, "worklog", None) is not None:   # v3.9.92 每日回顾: what was said / promised in this exchange
+            try:
+                await self.worklog.record_chat(user, replies)
+            except Exception as e:  # noqa: BLE001
+                log.warning("worklog chat: %s", e)
 
     def _chat_engine(self) -> str:
         """Optional engine (e.g. codebuddy / agy / claude / codex / grok / muse / cue) taking over main chat."""
@@ -2230,6 +2249,8 @@ class Chat:
         d = m["data"]
         if d.get("resolved"):
             raise ValueError("这个问题已经回答过了")
+        if d.get("review") and getattr(self, "review", None) is not None:   # v3.9.92 每日回顾的按钮
+            return await self.review.answer(self, m, (choice if choice is not None else text) or "")
         if d.get("watch_id"):           # a price watch's question (立即重试 / 暂停), not a task's
             from . import shopwatch
             return await shopwatch.answer_ask(self, m, (choice if choice is not None else text) or OPT_RETRY_WATCH)

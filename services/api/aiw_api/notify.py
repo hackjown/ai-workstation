@@ -41,7 +41,8 @@ TASK_KINDS = ("done", "failed", "confirm", "input")
 WAITING_KINDS = ("confirm", "input")
 WATCH_KINDS = ("watch", "watch_error")
 GROUPS = {"done": "任务", "failed": "任务", "confirm": "需要你", "input": "需要你", "watch": "价格监控",
-          "watch_error": "价格监控", "xhs_warning": "小红书", "xhs_login": "小红书"}
+          "watch_error": "价格监控", "xhs_warning": "小红书", "xhs_login": "小红书",
+          "review": "每日回顾"}
 
 
 # push -> the Bark ringtone (file name without .caf in apps/web/sounds/), and what it says

@@ -362,6 +362,19 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     sessions.lessons = lessons
     app.state.lessons = lessons
     _lessons.mount(app, lessons, auth)
+    from . import worklog as _worklog, review as _review   # v3.9.92 每日回顾 + 主动纠错
+    wl = _worklog.Worklog(store, llm=None if llm_factory else chat.llm)
+    sessions.worklog = wl
+    chat.worklog = wl
+    rv = _review.Review(store, wl, chat, notifier, mem, llm=None if llm_factory else chat.llm)
+    chat.review = rv
+    app.state.worklog, app.state.review = wl, rv
+    scheduler.extra_ticks.append(rv.tick)
+    from . import device_review as _dr   # v3.9.92: calendar / reminders / health through the existing device bridge
+    rv.device = _dr.DeviceReview(store, app.state.devices, notifier, chat)
+    app.state.device_review = rv.device
+    scheduler.extra_ticks.append(rv.device.tick)
+    _review.mount(app, rv, auth)
     _uploads.ensure_table(store)
     from . import search as _search   # v3.9.14: in-app search (/api/search) + session_search for the chat and tasks
     srch = _search.Search(store)

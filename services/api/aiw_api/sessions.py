@@ -92,6 +92,7 @@ class SessionManager:
         self.listeners: list = []
         self.memory = None   # memory.Memory (set by main.build_app): profile + top memories for every task
         self.lessons = None  # lessons.Lessons (set by main.build_app): what earlier tasks learned (3.8.5 self-evolution)
+        self.worklog = None  # worklog.Worklog (set by main.build_app): v3.9.92 每日回顾's record of every task end
         self.jobs: set = set()   # background jobs (lesson extraction) kept referenced until they finish
 
     # ------------------------------------------------------------------ factories
@@ -1268,6 +1269,11 @@ class SessionManager:
                     log.warning("isolated cleanup: %s", e)
             if status == "succeeded" and self.lessons is not None and not parent_id and not live.fast:
                 self._background(self._learn(task.id, getattr(getattr(live, "loop", None), "home", None)))
+            if self.worklog is not None and not parent_id and not live.fast:   # v3.9.92: every end, not only success
+                with contextlib.suppress(Exception):
+                    files = [a["path"] for a in self.store.artifacts(sid) if a["kind"] == "file"]
+                    self._background(self.worklog.record_task(self.store.task(task.id) or {"id": task.id, "prompt": task.prompt},
+                                                              status, result, files))
             if status == "succeeded":
                 await self._notify("done", "任务完成", result or "", task)
             elif status == "stopped":

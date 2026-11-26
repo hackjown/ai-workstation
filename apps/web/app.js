@@ -1326,6 +1326,12 @@ async function detectVmIp() {
   try { const r = await api("POST", "/api/settings/vm/detect"); document.querySelector("#sVmNet [name=ip]").value = r.ip; toast("检测到 " + r.ip + "，点保存生效"); }
   catch (err) { toast("检测失败：" + (err.message || err)); }
 }
+async function saveReviewPrefs(e) {   // v3.9.92 每日回顾
+  e.preventDefault(); const f = e.target;
+  try { await api("PUT", "/api/review/prefs", { enabled: f.enabled.checked, time: f.time.value || "20:00", muted_topics: f.muted.value.split(/[,，、]/).map((x) => x.trim()).filter(Boolean),
+    event_lead_min: Number(f.lead.value || 0), health_enabled: f.health.checked, health_summary_time: f.htime.value || "21:30" }); toast("已保存"); }
+  catch (err) { toast(err.message); }
+}
 async function saveNotify(e) { e.preventDefault(); const f = e.target; await api("PUT", "/api/settings/notify", { bark_url: f.bark_url.value, ntfy_url: f.ntfy_url.value, webhook_url: f.webhook_url.value,
   public_url: f.public_url ? f.public_url.value : undefined, link_mode: f.link_mode ? f.link_mode.value : undefined, bark_sound: f.bark_sound ? f.bark_sound.value : undefined, bark_critical: f.bark_critical ? f.bark_critical.value : undefined }); toast("已保存"); }
 async function addMcp(e) {

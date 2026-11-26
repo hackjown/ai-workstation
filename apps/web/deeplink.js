@@ -50,6 +50,13 @@
     } catch (e) { if (typeof toast === "function") toast("没能打开通知里的内容：" + e.message); }
   }
   window.aiwOpen = aiwOpen;
+  // v3.9.92: an aiw://… link inside a chat message (每日回顾's 原任务) opens in place on the web
+  document.addEventListener("click", (e) => {
+    const a = e.target && e.target.closest && e.target.closest('a[href^="aiw://"]');
+    if (!a) return;
+    e.preventDefault();
+    aiwOpen(a.getAttribute("href").replace(/^aiw:\/\//i, ""));
+  });
   const open = new URLSearchParams(location.search).get("open");
   if (open) {
     history.replaceState(null, "", location.pathname + location.hash);   // a reload must not route again

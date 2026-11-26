@@ -1311,9 +1311,7 @@ struct EngineGroupView: View {
     @Environment(\.colorScheme) private var cs
     @State private var group: JSON = [:]
     @State private var msgs: [JSON] = []
-    @State private var text = ""
     @State private var err = ""
-    @State private var sending = false
     @State private var confirmDelete = false
     @State private var openConv: String? = nil
     @State private var askDeliver: String? = nil     // v3.9.86: push / merge wait for a second tap
@@ -1330,10 +1328,6 @@ struct EngineGroupView: View {
     @State private var initialScrolled = false
     @State private var wantScroll = false
     @State private var showAddMembers = false
-    @State private var attach: [JSON] = []
-    @State private var uploading = false
-    @State private var photos: [PhotosPickerItem] = []
-    @State private var showPhotos = false
 
     var project: JSON { group.o("project") }
     var live: Bool { group.b("busy") || (!group.s("status").isEmpty && group.s("status") != "idle") }
@@ -1352,6 +1346,10 @@ struct EngineGroupView: View {
     }
 
     var body: some View {
+        let lastActId = msgs.last { !$0.o("data").a("actions").isEmpty }?.s("id") ?? ""
+        let phase = project.s("phase")
+        let paused = group.o("paused")
+        let pausedKey = "\(paused.s("why"))|\(paused.s("bot"))|\(paused.s("msg"))"
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
@@ -1383,7 +1381,30 @@ struct EngineGroupView: View {
                             .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
                     }
                     ForEach(msgs.indices.map { HRowKey(i: $0, id: msgs[$0].s("id")) }, id: \.id) { k in
-                        row(msgs[k.i]).id(k.id)
+                        let m = msgs[k.i]
+                        EngineGroupRow(
+                            gid: gid,
+                            m: m,
+                            sig: sigMsg(m),
+                            botTitle: title(m.s("who")),
+                            isLastAction: !lastActId.isEmpty && m.s("id") == lastActId,
+                            phase: phase,
+                            paused: paused,
+                            pausedKey: pausedKey,
+                            onReload: { Task { await load() } },
+                            onAction: { a in
+                                let id = a.s("id"), v = a.s("value")
+                                if a.b("reason") { reasonText = ""; reasonAct = a }
+                                else if id == "deliver" && v != "patch" { askDeliver = v }
+                                else { Task { await projectAct(id, v) } }
+                            },
+                            onPermitRule: { rule in permitRule = rule; showPermitRule = true },
+                            onPermit: { mode in Task { await permit(mode, "") } },
+                            onOpenConv: { cid in openConv = cid },
+                            onDiff: { mid in diff = GroupDiffSheet(msg: mid, whole: false) }
+                        )
+                        .equatable()
+                        .id(k.id)
                     }
                     if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red) }
                     Color.clear.frame(height: 24).id("end")
@@ -1391,7 +1412,11 @@ struct EngineGroupView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .safeAreaInset(edge: .top) { statusBar }
-            .safeAreaInset(edge: .bottom) { composer }
+            .safeAreaInset(edge: .bottom) {
+                EngineGroupComposer { sendText, sendAtt in
+                    await send(sendText, sendAtt)
+                }
+            }
             .onChange(of: msgs.count) { n in
                 if n > 0 && (!initialScrolled || wantScroll) {
                     let first = !initialScrolled
@@ -1430,12 +1455,6 @@ struct EngineGroupView: View {
                     Button(role: .destructive) { confirmDelete = true } label: { Label("删除群聊", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis.circle").font(.system(size: 18)) }.accessibilityLabel("更多")
             }
-        }
-        .photosPicker(isPresented: $showPhotos, selection: $photos, maxSelectionCount: 6, matching: .any(of: [.images, .videos]))
-        .onChange(of: photos) { items in
-            guard !items.isEmpty else { return }
-            let list = items; photos = []
-            Task { for it in list { await addGroupPhoto(it) } }
         }
         .sheet(isPresented: $showAddMembers) {
             EngineGroupAddMemberSheet(gid: gid, current: group.a("members"), allEngines: engines, available: addableEngines) {
@@ -1559,39 +1578,6 @@ struct EngineGroupView: View {
         .padding(.horizontal, 12).padding(.vertical, 6).background(.bar)
     }
 
-    /// the buttons on AIW 管家's newest message that asks something (开工 / 用方案 X / 交付), live only at that stage
-    /// a choice is live only at its stage: 开工 / 改方案 at confirm, 方案 / 重做 at pick, 交付 at deliver, 重试 / 跳过 while paused
-    func actLive(_ a: JSON) -> Bool {
-        if a.s("id") == "resume" { return !group.o("paused").isEmpty }
-        let at = ["go": "confirm", "revise": "confirm", "pick": "pick", "redesign": "pick", "deliver": "deliver"]
-        return project.s("phase") == at[a.s("id")]
-    }
-
-    /// v3.9.86/88: the buttons on AIW 管家's newest message that asks something, each with what it does
-    @ViewBuilder func actions(_ m: JSON) -> some View {
-        let acts = m.o("data").a("actions")
-        let last = msgs.last { !$0.o("data").a("actions").isEmpty }
-        if !acts.isEmpty, let l = last, l.s("id") == m.s("id") {
-            VStack(alignment: .trailing, spacing: 6) {
-                ForEach(acts.indices, id: \.self) { i in
-                    let a = acts[i], id = a.s("id"), v = a.s("value")
-                    let primary = ["go", "pick"].contains(id) || (id == "deliver" && ["pr", "patch"].contains(v)) || (id == "resume" && v == "retry")
-                    HStack(spacing: 8) {
-                        if !a.s("desc").isEmpty {
-                            Text(a.s("desc")).font(.caption2).foregroundColor(.secondary).multilineTextAlignment(.trailing).lineLimit(2)
-                        }
-                        Button {
-                            if a.b("reason") { reasonText = ""; reasonAct = a }
-                            else if id == "deliver" && v != "patch" { askDeliver = v }
-                            else { Task { await projectAct(id, v) } }
-                        } label: { Text(a.s("label") + (a.b("reason") ? "…" : "")).font(.caption.weight(.semibold)) }
-                            .buttonStyle(.bordered).tint(primary ? amber : Color.secondary).disabled(!actLive(a))
-                    }
-                }
-            }
-        }
-    }
-
     @ViewBuilder var workingBar: some View {
         let pending = (group["pending"] as? [String]) ?? []
         if !pending.isEmpty || group.s("status") == "merging" {
@@ -1604,108 +1590,6 @@ struct EngineGroupView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12).padding(.vertical, 8).background(amber.opacity(0.1)).background(.bar)
-        }
-    }
-
-    var composer: some View {
-        VStack(spacing: 6) {
-            if !attach.isEmpty || uploading {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        if uploading { ProgressView().controlSize(.small) }
-                        ForEach(attach.indices, id: \.self) { i in
-                            let a = attach[i]
-                            HStack(spacing: 4) {
-                                Image(systemName: a.s("kind") == "video" ? "film" : "photo").font(.caption2).foregroundColor(amber)
-                                Text(a.s("name")).font(.caption2).lineLimit(1)
-                                Button { attach.remove(at: i) } label: { Image(systemName: "xmark.circle.fill").font(.caption2).foregroundColor(.secondary) }
-                            }
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(Capsule().fill(Color(.secondarySystemBackground)))
-                        }
-                    }.padding(.horizontal, 12)
-                }
-            }
-            HStack(alignment: .bottom, spacing: 8) {
-                Button { showPhotos = true } label: {
-                    Image(systemName: "plus.circle.fill").font(.system(size: 26)).foregroundColor(.secondary)
-                }.disabled(uploading).accessibilityLabel("发图片或视频")
-                TextField("说要做什么，@muse @cue @codex @claude @grok @cbc @agy 指定谁做…", text: $text, axis: .vertical)
-                    .lineLimit(1...5).padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemBackground)))
-                Button { Task { await send() } } label: {
-                    Image(systemName: sending ? "hourglass" : "arrow.up.circle.fill").font(.system(size: 30)).foregroundColor(amber)
-                }.disabled(sending || uploading || (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attach.isEmpty))
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-        }
-        .background(.bar)
-    }
-
-    @ViewBuilder func row(_ m: JSON) -> some View {
-        let role = m.s("role")
-        if role == "system" {
-            Text(m.s("text")).font(.caption).foregroundColor(.secondary).multilineTextAlignment(.center).frame(maxWidth: .infinity)
-        } else if role == "user" || role == "aiw" {
-            VStack(alignment: .trailing, spacing: 4) {
-                if role == "aiw" { Text("AIW 管家").font(.caption2.weight(.semibold)).foregroundColor(.secondary) }
-                Group {
-                    if role == "aiw" { RichText(text: m.s("text")) } else { engineUserText(m.s("text")) }
-                }
-                .font(.callout).foregroundColor(role == "aiw" ? .primary : hInk)
-                .padding(.horizontal, 12).padding(.vertical, 8)
-                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(role == "aiw" ? amber.opacity(0.15) : hAmber))
-                if !m.o("data").a("attachments").isEmpty { AttachmentPreviews(attachments: m.o("data").a("attachments")) }
-                if !m.o("data").a("cards").isEmpty {
-                    EngineOptionCards(gid: gid, msgId: m.s("id"), cards: m.o("data").a("cards"), picked: m.o("data").s("picked")) {
-                        Task { await load() }
-                    }
-                } else if !m.o("data").a("media").isEmpty {
-                    EngineMediaList(media: m.o("data").a("media"))
-                }
-                actions(m)
-                Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
-            }.frame(maxWidth: .infinity, alignment: .trailing)
-        } else {
-            let d = m.o("data")
-            let bad = ["error", "failed", "blocked"].contains(d.s("status"))
-            let files = (d.o("changes")["files"] as? [String]) ?? []
-            HStack(alignment: .top, spacing: 8) {
-            EngineAvatar(bot: m.s("who"), size: 30)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title(m.s("who")) + (bad ? " · 没做成" : "")).font(.caption2.weight(.semibold)).foregroundColor(engineColor(m.s("who"), cs))
-                RichText(text: m.s("text").isEmpty ? "（没有文字）" : m.s("text"))
-                    .font(.callout).padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(bad ? Color.red.opacity(0.12) : Color(.secondarySystemBackground)))
-                if !d.a("media").isEmpty { EngineMediaList(media: d.a("media")) }
-                if !files.isEmpty {
-                    Text("改动：" + files.prefix(8).joined(separator: "，")).font(.caption2).foregroundColor(.secondary).lineLimit(2)
-                }
-                let pz = group.o("paused")
-                if pz.s("why") == "blocked" && pz.s("bot") == m.s("who") && pz.s("msg") == m.s("src") {   // v3.9.88: answer it here
-                    if m.s("who") == "agy" {
-                        HStack(spacing: 8) {
-                            Button { permitRule = (d.a("denied").last ?? [:]).s("rule"); showPermitRule = true } label: {
-                                Text("允许这类命令再试").font(.caption.weight(.semibold)) }.buttonStyle(.borderedProminent).tint(amber)
-                            Button { Task { await permit("once", "") } } label: { Text("这一轮放开").font(.caption) }.buttonStyle(.bordered)
-                            Button { Task { await permit("deny", "") } } label: { Text("拒绝").font(.caption) }.buttonStyle(.bordered)
-                        }
-                    } else if !d.s("conv").isEmpty {
-                        Button("\(title(m.s("who"))) 的权限要在它的对话里处理 ›") { openConv = d.s("conv") }.font(.caption2)
-                    }
-                }
-                HStack(spacing: 8) {
-                    Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
-                    if !d.o("diff").isEmpty {
-                        Button("看这一轮改动（\((d.o("diff")["files"] as? [String])?.count ?? 0) 个文件）") {
-                            diff = GroupDiffSheet(msg: m.s("id"), whole: false)
-                        }.font(.caption2)
-                    }
-                    if !d.s("conv").isEmpty { Button("看它的对话 ›") { openConv = d.s("conv") }.font(.caption2) }
-                }
-            }
-            }.frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1771,35 +1655,17 @@ struct EngineGroupView: View {
             try? await Task.sleep(nanoseconds: (live ? 2 : 8) * 1_000_000_000)
         }
     }
-    @MainActor func send() async {
-        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if body.isEmpty && attach.isEmpty { return }
-        sending = true; defer { sending = false }
-        let sendText = body.isEmpty ? "（发送了图片/视频）" : body
-        let sendAtt = attach
+    @MainActor func send(_ sendText: String, _ sendAtt: [JSON]) async -> String? {
         do {
             _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/send", ["text": sendText, "attachments": sendAtt])
-            text = ""; attach = []; err = ""; wantScroll = true
+            err = ""; wantScroll = true
             await load()
-        } catch let e { err = "没发出去：\(e.localizedDescription)" }
-    }
-    @MainActor func addGroupPhoto(_ item: PhotosPickerItem) async {
-        uploading = true; defer { uploading = false }
-        guard let d = try? await item.loadTransferable(type: Data.self) else { err = "读不了这张照片"; return }
-        let stamp = Int(Date().timeIntervalSince1970)
-        let img = UIImage(data: d)
-        let payload = img?.jpegData(compressionQuality: 0.85) ?? d
-        let name = img == nil ? "media-\(stamp).mp4" : "photo-\(stamp).jpg"
-        let ctype = img == nil ? "video/mp4" : "image/jpeg"
-        let dst = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-        do {
-            try payload.write(to: dst, options: .atomic)
-            let q = name.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? name
-            let mid = API.shared.machine.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? ""
-            var r = try await API.shared.postFile("/api/uploads/raw?name=\(q)&machine_id=\(mid)&local_only=true", file: dst, contentType: ctype) { _ in }
-            if r.s("kind").isEmpty { r["kind"] = img == nil ? "video" : "image" }
-            attach.append(r)
-        } catch { err = "上传失败：\(error.localizedDescription)" }
+            return nil
+        } catch let e {
+            let msg = "没发出去：\(e.localizedDescription)"
+            err = msg
+            return msg
+        }
     }
     @MainActor func projectAct(_ action: String, _ value: String, reason: String = "") async {
         do {
@@ -1816,6 +1682,212 @@ struct EngineGroupView: View {
     @MainActor func act(_ method: String, _ path: String) async {
         do { _ = try await API.shared.obj(method, "/api/bots/groups/\(gid)\(path)"); await load(); changed() }
         catch let e { err = e.localizedDescription }
+    }
+}
+
+/// Isolated composer so typing / picking attachments never invalidates EngineGroupView or its message list.
+private struct EngineGroupComposer: View {
+    let onSend: (String, [JSON]) async -> String?
+    @State private var text = ""
+    @State private var attach: [JSON] = []
+    @State private var uploading = false
+    @State private var sending = false
+    @State private var photos: [PhotosPickerItem] = []
+    @State private var showPhotos = false
+    @State private var localErr = ""
+
+    var body: some View {
+        VStack(spacing: 6) {
+            if !localErr.isEmpty {
+                Text(localErr).font(.caption2).foregroundColor(.red).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12)
+            }
+            if !attach.isEmpty || uploading {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        if uploading { ProgressView().controlSize(.small) }
+                        ForEach(attach.indices, id: \.self) { i in
+                            let a = attach[i]
+                            HStack(spacing: 4) {
+                                Image(systemName: a.s("kind") == "video" ? "film" : "photo").font(.caption2).foregroundColor(amber)
+                                Text(a.s("name")).font(.caption2).lineLimit(1)
+                                Button { attach.remove(at: i) } label: { Image(systemName: "xmark.circle.fill").font(.caption2).foregroundColor(.secondary) }
+                            }
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(Capsule().fill(Color(.secondarySystemBackground)))
+                        }
+                    }.padding(.horizontal, 12)
+                }
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                Button { showPhotos = true } label: {
+                    Image(systemName: "plus.circle.fill").font(.system(size: 26)).foregroundColor(.secondary)
+                }.disabled(uploading).accessibilityLabel("发图片或视频")
+                TextField("说要做什么，@muse @cue @codex @claude @grok @cbc @agy 指定谁做…", text: $text, axis: .vertical)
+                    .lineLimit(1...5).padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemBackground)))
+                Button { Task { await submit() } } label: {
+                    Image(systemName: sending ? "hourglass" : "arrow.up.circle.fill").font(.system(size: 30)).foregroundColor(amber)
+                }.disabled(sending || uploading || (text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attach.isEmpty))
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+        }
+        .background(.bar)
+        .photosPicker(isPresented: $showPhotos, selection: $photos, maxSelectionCount: 6, matching: .any(of: [.images, .videos]))
+        .onChange(of: photos) { items in
+            guard !items.isEmpty else { return }
+            let list = items; photos = []
+            Task { for it in list { await addGroupPhoto(it) } }
+        }
+    }
+
+    @MainActor func submit() async {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.isEmpty && attach.isEmpty { return }
+        sending = true; defer { sending = false }
+        let sendText = body.isEmpty ? "（发送了图片/视频）" : body
+        let sendAtt = attach
+        if let e = await onSend(sendText, sendAtt) {
+            localErr = e
+        } else {
+            text = ""; attach = []; localErr = ""
+        }
+    }
+
+    @MainActor func addGroupPhoto(_ item: PhotosPickerItem) async {
+        uploading = true; defer { uploading = false }
+        guard let d = try? await item.loadTransferable(type: Data.self) else { localErr = "读不了这张照片"; return }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let img = UIImage(data: d)
+        let payload = img?.jpegData(compressionQuality: 0.85) ?? d
+        let name = img == nil ? "media-\(stamp).mp4" : "photo-\(stamp).jpg"
+        let ctype = img == nil ? "video/mp4" : "image/jpeg"
+        let dst = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try payload.write(to: dst, options: .atomic)
+            let q = name.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? name
+            let mid = API.shared.machine.addingPercentEncoding(withAllowedCharacters: queryValueChars) ?? ""
+            var r = try await API.shared.postFile("/api/uploads/raw?name=\(q)&machine_id=\(mid)&local_only=true", file: dst, contentType: ctype) { _ in }
+            if r.s("kind").isEmpty { r["kind"] = img == nil ? "video" : "image" }
+            attach.append(r)
+            localErr = ""
+        } catch { localErr = "上传失败：\(error.localizedDescription)" }
+    }
+}
+
+/// Equatable message row so status bar updates or new arrivals never re-diff / re-parse unchanged rows.
+private struct EngineGroupRow: View, Equatable {
+    let gid: String
+    let m: JSON
+    let sig: String
+    let botTitle: String
+    let isLastAction: Bool
+    let phase: String
+    let paused: JSON
+    let pausedKey: String
+    let onReload: () -> Void
+    let onAction: (JSON) -> Void
+    let onPermitRule: (String) -> Void
+    let onPermit: (String) -> Void
+    let onOpenConv: (String) -> Void
+    let onDiff: (String) -> Void
+    @Environment(\.colorScheme) private var cs
+
+    static func == (lhs: EngineGroupRow, rhs: EngineGroupRow) -> Bool {
+        lhs.sig == rhs.sig
+            && lhs.isLastAction == rhs.isLastAction
+            && lhs.phase == rhs.phase
+            && lhs.pausedKey == rhs.pausedKey
+            && lhs.botTitle == rhs.botTitle
+    }
+
+    func actLive(_ a: JSON) -> Bool {
+        if a.s("id") == "resume" { return !paused.isEmpty }
+        let at = ["go": "confirm", "revise": "confirm", "pick": "pick", "redesign": "pick", "deliver": "deliver"]
+        return phase == at[a.s("id")]
+    }
+
+    var body: some View {
+        let role = m.s("role")
+        if role == "system" {
+            Text(m.s("text")).font(.caption).foregroundColor(.secondary).multilineTextAlignment(.center).frame(maxWidth: .infinity)
+        } else if role == "user" || role == "aiw" {
+            VStack(alignment: .trailing, spacing: 4) {
+                if role == "aiw" { Text("AIW 管家").font(.caption2.weight(.semibold)).foregroundColor(.secondary) }
+                Group {
+                    if role == "aiw" { RichText(text: m.s("text"), limit: 1500) } else { engineUserText(m.s("text")) }
+                }
+                .font(.callout).foregroundColor(role == "aiw" ? .primary : hInk)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(role == "aiw" ? amber.opacity(0.15) : hAmber))
+                if !m.o("data").a("attachments").isEmpty { AttachmentPreviews(attachments: m.o("data").a("attachments")) }
+                if !m.o("data").a("cards").isEmpty {
+                    EngineOptionCards(gid: gid, msgId: m.s("id"), cards: m.o("data").a("cards"), picked: m.o("data").s("picked"), onPicked: onReload)
+                } else if !m.o("data").a("media").isEmpty {
+                    EngineMediaList(media: m.o("data").a("media"))
+                }
+                if isLastAction {
+                    let acts = m.o("data").a("actions")
+                    if !acts.isEmpty {
+                        VStack(alignment: .trailing, spacing: 6) {
+                            ForEach(acts.indices, id: \.self) { i in
+                                let a = acts[i], id = a.s("id"), v = a.s("value")
+                                let primary = ["go", "pick"].contains(id) || (id == "deliver" && ["pr", "patch"].contains(v)) || (id == "resume" && v == "retry")
+                                HStack(spacing: 8) {
+                                    if !a.s("desc").isEmpty {
+                                        Text(a.s("desc")).font(.caption2).foregroundColor(.secondary).multilineTextAlignment(.trailing).lineLimit(2)
+                                    }
+                                    Button { onAction(a) } label: {
+                                        Text(a.s("label") + (a.b("reason") ? "…" : "")).font(.caption.weight(.semibold))
+                                    }
+                                    .buttonStyle(.bordered).tint(primary ? amber : Color.secondary).disabled(!actLive(a))
+                                }
+                            }
+                        }
+                    }
+                }
+                Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+            }.frame(maxWidth: .infinity, alignment: .trailing)
+        } else {
+            let d = m.o("data")
+            let bad = ["error", "failed", "blocked"].contains(d.s("status"))
+            let files = (d.o("changes")["files"] as? [String]) ?? []
+            HStack(alignment: .top, spacing: 8) {
+                EngineAvatar(bot: m.s("who"), size: 30)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(botTitle + (bad ? " · 没做成" : "")).font(.caption2.weight(.semibold)).foregroundColor(engineColor(m.s("who"), cs))
+                    RichText(text: m.s("text").isEmpty ? "（没有文字）" : m.s("text"), limit: 1500)
+                        .font(.callout).padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(bad ? Color.red.opacity(0.12) : Color(.secondarySystemBackground)))
+                    if !d.a("media").isEmpty { EngineMediaList(media: d.a("media")) }
+                    if !files.isEmpty {
+                        Text("改动：" + files.prefix(8).joined(separator: "，")).font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                    }
+                    if paused.s("why") == "blocked" && paused.s("bot") == m.s("who") && paused.s("msg") == m.s("src") {
+                        if m.s("who") == "agy" {
+                            HStack(spacing: 8) {
+                                Button { onPermitRule((d.a("denied").last ?? [:]).s("rule")) } label: {
+                                    Text("允许这类命令再试").font(.caption.weight(.semibold))
+                                }.buttonStyle(.borderedProminent).tint(amber)
+                                Button { onPermit("once") } label: { Text("这一轮放开").font(.caption) }.buttonStyle(.bordered)
+                                Button { onPermit("deny") } label: { Text("拒绝").font(.caption) }.buttonStyle(.bordered)
+                            }
+                        } else if !d.s("conv").isEmpty {
+                            Button("\(botTitle) 的权限要在它的对话里处理 ›") { onOpenConv(d.s("conv")) }.font(.caption2)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        Text(when(m.d("created_at"))).font(.caption2).foregroundColor(.secondary)
+                        if !d.o("diff").isEmpty {
+                            Button("看这一轮改动（\((d.o("diff")["files"] as? [String])?.count ?? 0) 个文件）") {
+                                onDiff(m.s("id"))
+                            }.font(.caption2)
+                        }
+                        if !d.s("conv").isEmpty { Button("看它的对话 ›") { onOpenConv(d.s("conv")) }.font(.caption2) }
+                    }
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 

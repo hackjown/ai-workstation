@@ -276,22 +276,67 @@ struct EngineMediaList: View {
     }
 }
 
-/// A screenshot keeps its shape (a page is wide, a phone design is tall); tap for full screen.
+/// Cached, off-main-thread downsampled thumbnail for screenshots (prevents AsyncImage reload & full-res decode stutter).
+private let shotThumbCache: NSCache<NSString, UIImage> = {
+    let c = NSCache<NSString, UIImage>()
+    c.countLimit = 80
+    c.totalCostLimit = 32 * 1024 * 1024
+    return c
+}()
+
 struct ShotThumb: View {
     let path: String
     var fallbackURL: String = ""
+    @State private var img: UIImage? = nil
+    @State private var failed = false
+
     var url: URL? {
         if !path.isEmpty { return API.shared.artifactURL(path, download: false) }
         return URL(string: fallbackURL)
     }
+    var cacheKey: String { url?.absoluteString ?? (path.isEmpty ? fallbackURL : path) }
+
     var body: some View {
-        AsyncImage(url: url) { img in
-            img.resizable().scaledToFit()
-        } placeholder: {
-            ZStack { Color(.secondarySystemBackground); ProgressView() }.frame(width: 220, height: 150)
+        Group {
+            if let ui = img ?? shotThumbCache.object(forKey: cacheKey as NSString) {
+                Image(uiImage: ui).resizable().scaledToFit()
+            } else if failed {
+                ZStack {
+                    Color(.secondarySystemBackground)
+                    Image(systemName: "photo").foregroundColor(.secondary)
+                }.frame(width: 220, height: 150)
+            } else {
+                ZStack { Color(.secondarySystemBackground); ProgressView() }.frame(width: 220, height: 150)
+            }
         }
         .frame(maxWidth: 280, maxHeight: 340, alignment: .leading)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.secondary.opacity(0.25)))
+        .task(id: cacheKey) {
+            let key = cacheKey as NSString
+            if let hit = shotThumbCache.object(forKey: key) { img = hit; return }
+            guard let u = url else { failed = true; return }
+            do {
+                let (data, _) = try await URLSession.shared.data(from: u)
+                let decoded: UIImage? = await Task.detached(priority: .utility) {
+                    guard let raw = UIImage(data: data) else { return nil }
+                    let maxDim: CGFloat = 680
+                    let sz = raw.size
+                    guard sz.width > 0, sz.height > 0 else { return raw }
+                    let scale = min(1, maxDim / max(sz.width, sz.height))
+                    let target = CGSize(width: max(1, (sz.width * scale).rounded()), height: max(1, (sz.height * scale).rounded()))
+                    return raw.preparingThumbnail(of: target) ?? raw
+                }.value
+                if let decoded {
+                    let cost = Int(decoded.size.width * decoded.size.height * decoded.scale * decoded.scale * 4)
+                    shotThumbCache.setObject(decoded, forKey: key, cost: cost)
+                    img = decoded
+                } else {
+                    failed = true
+                }
+            } catch {
+                failed = true
+            }
+        }
     }
 }

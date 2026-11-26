@@ -102,7 +102,18 @@ func escapeTildes(_ s: String) -> String {
 
 /// A whole reply, rendered block by block. 3.8: every text block is a SelectableText (partial selection + 复制 /
 /// 复制全文 in the edit menu; links still open); tables stay SwiftUI text (whole-cell copy).
-struct RichText: View {
+private final class RichBlocksBox {
+    let blocks: [RichBlock]
+    init(_ blocks: [RichBlock]) { self.blocks = blocks }
+}
+private let richBlocksCache: NSCache<NSString, RichBlocksBox> = {
+    let c = NSCache<NSString, RichBlocksBox>(); c.countLimit = 400; return c
+}()
+private let richAttrCache: NSCache<NSString, NSAttributedString> = {
+    let c = NSCache<NSString, NSAttributedString>(); c.countLimit = 2000; return c
+}()
+
+struct RichText: View, Equatable {
     let text: String
     var font: Font = .callout
     /// v2 home: 球球's bubbles show bold / highlighted text in light amber (#ffc35c)
@@ -114,6 +125,12 @@ struct RichText: View {
     var limit: Int = 4000
     @State var expanded = false
     @Environment(\.colorScheme) private var cs
+
+    static func == (lhs: RichText, rhs: RichText) -> Bool {
+        lhs.text == rhs.text && lhs.limit == rhs.limit && lhs.style == rhs.style
+            && lhs.strong == rhs.strong && lhs.color == rhs.color
+    }
+
     func md(_ s: String, leadBold: Bool = false) -> AttributedString {
         var a = inlineMD(s, leadBold: leadBold)
         guard let c = strong else { return a }
@@ -123,17 +140,34 @@ struct RichText: View {
         return a
     }
     var ink: UIColor { UIColor(color ?? hBubbleText(cs)) }
+    func cachedBlocks(_ shown: String) -> [RichBlock] {
+        let key = "\(shown.hashValue)|\(shown.count)" as NSString
+        if let hit = richBlocksCache.object(forKey: key) { return hit.blocks }
+        let b = richBlocks(shown)
+        richBlocksCache.setObject(RichBlocksBox(b), forKey: key)
+        return b
+    }
     func sel(_ s: String, leadBold: Bool = false, style st: UIFont.TextStyle? = nil, weight: UIFont.Weight = .regular,
              tint: UIColor? = nil) -> some View {
-        SelectableText(text: uiAttributed(inlineMD(s, leadBold: leadBold), style: st ?? style, weight: weight, color: tint ?? ink,
-                                          strong: strong.map { UIColor($0) }),
-                       whole: text, link: strong.map { UIColor($0) } ?? UIColor(amber))
+        let useStyle = st ?? style
+        let useColor = tint ?? ink
+        let key = "\(s.hashValue)|\(s.count)|\(leadBold ? 1 : 0)|\(useStyle.rawValue)|\(weight.rawValue)|\(cs == .dark ? 1 : 0)|\(strong == nil ? 0 : 1)|\(tint == nil ? 0 : 1)|\(color == nil ? 0 : 1)" as NSString
+        let attr: NSAttributedString
+        if let hit = richAttrCache.object(forKey: key) {
+            attr = hit
+        } else {
+            let built = uiAttributed(inlineMD(s, leadBold: leadBold), style: useStyle, weight: weight, color: useColor,
+                                     strong: strong.map { UIColor($0) })
+            richAttrCache.setObject(built, forKey: key)
+            attr = built
+        }
+        return SelectableText(text: attr, whole: text, link: strong.map { UIColor($0) } ?? UIColor(amber))
     }
     var body: some View {
         let fold = expanded ? (text, false) : foldedText(text, limit: limit)
         let shown = fold.0, folded = fold.1
         VStack(alignment: .leading, spacing: 9) {
-            ForEach(Array(richBlocks(shown).enumerated()), id: \.offset) { _, b in block(b) }
+            ForEach(Array(cachedBlocks(shown).enumerated()), id: \.offset) { _, b in block(b) }
             if folded {
                 Button { expanded = true } label: {
                     Text("展开全文（共 \(text.count) 字）").font(.caption.weight(.semibold))

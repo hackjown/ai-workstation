@@ -43,7 +43,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"   # 1.1: optional second engine AIW_CAD_ENGINE=acadmcp (autocad-mcp-pro 1.8.0)
 
 # ============================================================================================ dependencies
 
@@ -865,16 +865,25 @@ class Plan:
             holes.append((lo, s["c"] - h, hi, s["c"] + h) if s["o"] == "h" else (s["c"] - h, lo, s["c"] + h, hi))
         cells, edges = self.rect_union(rects, holes)
         self.wall_cells, self.wall_edges = cells, edges
+        # 3.9.92: AIW_CAD_ENGINE=acadmcp - walls, poche, doors and windows come from the autocad-mcp-pro DXF
+        # (imported as sheet items by acadmcp_build); the native ones are still computed (checks, label obstacles)
+        # but drawn on a scratch sheet. Room names, furniture, dimensions and the sheet stay drawkit's own.
+        acad = self.spec.get("_acad_items")
+        tgt = Sheet() if acad else sh
         for c in cells:
-            sh.fill([(c[0], c[1]), (c[2], c[1]), (c[2], c[3]), (c[0], c[3])], "墙体填充", 0.35)
+            tgt.fill([(c[0], c[1]), (c[2], c[1]), (c[2], c[3]), (c[0], c[3])], "墙体填充", 0.35)
         for a, b in edges:
-            sh.line(a, b, "墙体", 0.5)
+            tgt.line(a, b, "墙体", 0.5)
         self.obstacles = {r["id"]: [] for r in self.rooms}
         for kind, o, s, lo, hi in ops:
             if kind == "doors":
-                self._door(sh, o, s, lo, hi)
+                self._door(tgt, o, s, lo, hi)
             else:
-                self._window(sh, o, s, lo, hi)
+                self._window(tgt, o, s, lo, hi)
+        if acad:
+            sh.items.extend(json.loads(json.dumps(acad)))
+            self.wall_polys = [[tuple(p) for p in pl] for pl in self.spec.get("_acad_wall_polys") or []]
+            self.engine = "acadmcp"
         for f in self.spec.get("furniture") or []:
             self._furniture(sh, f)
         for e in self.spec.get("hollow_walls") or []:        # 3.9.2: walls the source draws hollow (two lines)
@@ -2423,6 +2432,292 @@ def repair_spec(spec):
     return out
 
 
+# ============================================================================================ optional engine: acadmcp
+# 3.9.92: AIW_CAD_ENGINE=acadmcp draws the walls / poche / doors / windows with autocad-mcp-pro 1.8.0 (MIT, ezdxf
+# headless backend) and runs its QA (critique with coverage, room detection, topology). Its modules have generic
+# names (server, config, engineering, backends): it lives in its own venv and is only ever run as a subprocess
+# (acadmcp_runner.py) that exchanges JSON. Any failure falls back to the native engine, with the reason in the
+# report. Default engine: native. Never exposed to the model as tools.
+
+ACADMCP_PIN = "1.8.0"
+ACADMCP_FOCUS_BLOCKING = ("arch_wall_gap", "arch_opening_clash")   # geometric: a hole in a wall, two openings clash
+
+
+def cad_engine():
+    v = (os.environ.get("AIW_CAD_ENGINE") or "native").strip().lower()
+    return v if v in ("native", "acadmcp") else "native"
+
+
+def acadmcp_home():
+    return Path(os.environ.get("AIW_ACADMCP_HOME") or Path.home() / ".local" / "share" / "aiw" / "acadmcp")
+
+
+def acadmcp_python():
+    home = acadmcp_home()
+    return home / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def acadmcp_version(py=None):
+    py = str(py or acadmcp_python())
+    if not os.path.exists(py):
+        return None
+    try:
+        r = subprocess.run([py, "-c", "import importlib.metadata as m; print(m.version('autocad-mcp-pro'))"],
+                           capture_output=True, text=True, timeout=60)
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def ensure_acadmcp():
+    """the venv with autocad-mcp-pro[pdf]==1.8.0 (created / upgraded when the version probe disagrees).
+    Returns (python path, None) or (None, Chinese reason)."""
+    py = acadmcp_python()
+    if acadmcp_version(py) == ACADMCP_PIN:
+        return str(py), None
+    home = acadmcp_home()
+    if os.environ.get("AIW_ACADMCP_NO_INSTALL") == "1":
+        return None, f"acadmcp 引擎未安装（{home}），且禁止自动安装"
+    try:
+        home.parent.mkdir(parents=True, exist_ok=True)
+        if not py.exists():
+            r = subprocess.run([sys.executable, "-m", "venv", str(home)], capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                _apt(["python3-venv"])
+                r = subprocess.run([sys.executable, "-m", "venv", str(home)], capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                return None, f"无法创建 acadmcp 虚拟环境：{(r.stderr or r.stdout)[-200:]}"
+        r = subprocess.run([str(py), "-m", "pip", "install", "-q", f"autocad-mcp-pro[pdf]=={ACADMCP_PIN}"],
+                           capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            return None, f"安装 autocad-mcp-pro {ACADMCP_PIN} 失败：{(r.stderr or r.stdout)[-200:]}"
+    except Exception as ex:  # noqa: BLE001
+        return None, f"安装 acadmcp 引擎出错：{type(ex).__name__}: {ex}"
+    got = acadmcp_version(py)
+    if got != ACADMCP_PIN:
+        return None, f"acadmcp 版本探测得到 {got}，需要 {ACADMCP_PIN}"
+    return str(py), None
+
+
+def acadmcp_spec(spec, scale=100, paper="A3"):
+    """our floor-plan spec -> autocad-mcp-pro's arch spec, from the SAME geometry the native engine resolves (wall
+    segments of the rooms / traced walls, openings snapped onto them), in y-up model mm. Room labels go in as
+    ASCII ids (their area / unlabelled-room checks need them) and are stripped from the import: drawkit writes the
+    Chinese names itself. Returns (their spec, notes)."""
+    eng = Plan(json.loads(json.dumps(spec)))
+    segs = eng.wall_segments()
+    notes = []
+    walls, wid = [], {}
+    for i, s in enumerate(segs):
+        if s["v"] - s["u"] < 1:
+            continue
+        a, b = ((s["u"], s["c"]), (s["v"], s["c"])) if s["o"] == "h" else ((s["c"], s["u"]), (s["c"], s["v"]))
+        w = {"id": f"W{i + 1}", "axis": [[round(a[0], 2), round(a[1], 2)], [round(b[0], 2), round(b[1], 2)]],
+             "thickness": round(float(s["t"]), 2), "material": "brick" if s["t"] >= eng.t_ext - 1 else "aac"}
+        walls.append(w); wid[id(s)] = w["id"]
+    ops = eng.openings(segs) if (not eng.traced or spec.get("draw_openings")) else []
+    openings, spans = [], {}
+    for n, (kind, o, s, lo, hi) in enumerate(ops, 1):
+        w_id = wid.get(id(s))
+        if not w_id or hi - lo < 50:
+            continue
+        if any(lo < b - 1 and a < hi - 1 for a, b in spans.get(w_id, [])):
+            notes.append(f"{'门' if kind == 'doors' else '窗'} {o.get('id') or o.get('at')} 与同一墙上的洞口重叠，acadmcp 未画")
+            continue
+        spans.setdefault(w_id, []).append((lo, hi))
+        op = {"id": f"{'D' if kind == 'doors' else 'W'}{n}", "wall": w_id, "kind": "door" if kind == "doors" else "window",
+              "offset": round(lo - s["u"], 2), "width": round(hi - lo, 2)}
+        if kind == "doors":
+            if o.get("type") in ("opening", "sliding", "double"):
+                notes.append(f"门 {o.get('id') or o.get('at')} 类型 {o.get('type')}：acadmcp 只有单扇平开门，按平开门画")
+            # which side it opens to (same rule as Plan._door), then their swing/hand: swing "in" opens to the LEFT
+            # of the axis (axis runs u -> v: +y for a horizontal wall, -x for a vertical one)
+            t, c, mid = s["t"], s["c"], (lo + hi) / 2
+            horiz = s["o"] == "h"
+            probe = lambda k: ((mid, c + k * (t / 2 + 150)) if horiz else (c + k * (t / 2 + 150), mid))
+            into = eng.by_id.get(o.get("into")) if o.get("into") else None
+            sgn = 1
+            if into is not None:
+                sgn = 1 if point_in_poly(*probe(1), into["pts"]) else -1
+            elif eng._room_at(probe(-1)) and not eng._room_at(probe(1)):
+                sgn = -1
+            side = (1 if sgn > 0 else -1) if horiz else (1 if sgn < 0 else -1)
+            hinge = o.get("hinge", "start")
+            if eng.m.y_down and not horiz:
+                hinge = "end" if hinge == "start" else "start"
+            at_lo = hinge == "start"
+            op["swing"] = "in" if side > 0 else "out"
+            # their hinge sits at the near jamb (lo) when 'toward' < 0, toward = side for hand=left
+            op["hand"] = ("right" if side > 0 else "left") if at_lo else ("left" if side > 0 else "right")
+        openings.append(op)
+    rooms = []
+    for k, r in enumerate(eng.rooms, 1):
+        pts = r["pts"]
+        if len(pts) < 3:
+            continue
+        # the point of the room farthest from every wall face (a centroid can sit in a wall of a concave room)
+        def clear_of_walls(x, y):
+            d = 1e18
+            for s in segs:
+                a, b = ((s["u"], s["c"]), (s["v"], s["c"])) if s["o"] == "h" else ((s["c"], s["u"]), (s["c"], s["v"]))
+                d = min(d, seg_dist(x, y, a, b) - s["t"] / 2)
+            return d
+        xs_ = [p[0] for p in pts]; ys_ = [p[1] for p in pts]
+        stp = max(100.0, min(max(xs_) - min(xs_), max(ys_) - min(ys_)) / 12)
+        best = None
+        y = min(ys_) + stp / 2
+        while y < max(ys_):
+            x = min(xs_) + stp / 2
+            while x < max(xs_):
+                if point_in_poly(x, y, pts):
+                    d = clear_of_walls(x, y)
+                    if best is None or d > best[0]:
+                        best = (d, x, y)
+                x += stp
+            y += stp
+        if best is None:
+            continue
+        cx, cy = best[1], best[2]
+        rooms.append({"id": f"R{k:02d}", "name": f"ROOM{k:02d}", "number": f"{k:02d}", "at": [round(cx, 1), round(cy, 1)]})
+        notes_names = spec.setdefault("_acad_room_names", {})
+        notes_names[f"R{k:02d}"] = str(r.get("name") or r.get("id"))
+    their = {"sheet": {"intent": str(spec.get("title") or "floor plan")[:60].encode("ascii", "ignore").decode() or "floor plan",
+                       "sheet_size": paper if paper in PAPER else "A3", "scale": scale},
+             "lang": "en", "poche": True, "walls": walls, "openings": openings, "rooms": rooms, "chains": None}
+    return their, notes
+
+
+ACAD_LAYERS = {"A-WALL-E-N": ("墙体", 0.5), "A-WALL-H-N": ("墙体填充", None), "A-DOOR-E-N": ("门窗", 0.18),
+               "A-WIND-E-N": ("门窗", 0.18)}
+
+
+def acadmcp_import(dxf_path):
+    """their DXF -> sheet items (walls, poche, doors, windows) + the poche polygons. Text, dimensions and their room
+    labels are left out (drawkit writes the Chinese ones)."""
+    ezdxf = need("ezdxf", "ezdxf", "python3-ezdxf")
+    doc = ezdxf.readfile(dxf_path)
+    items, polys, skipped = [], [], {}
+
+    def add(e, layer, lw):
+        t = e.dxftype()
+        if t == "LINE":
+            a, b = e.dxf.start, e.dxf.end
+            items.append({"t": "line", "pts": [(a.x, a.y), (b.x, b.y)], "layer": layer, "lw": lw or 0.25})
+        elif t == "LWPOLYLINE":
+            pts = [(p[0], p[1]) for p in e.get_points("xy")]
+            items.append({"t": "poly", "pts": pts, "closed": bool(e.closed), "layer": layer, "lw": lw or 0.25})
+        elif t == "ARC":
+            c = e.dxf.center
+            items.append({"t": "arc", "c": (c.x, c.y), "r": float(e.dxf.radius), "a1": float(e.dxf.start_angle),
+                          "a2": float(e.dxf.end_angle), "layer": layer, "lw": lw or 0.18})
+        elif t == "CIRCLE":
+            c = e.dxf.center
+            items.append({"t": "circle", "c": (c.x, c.y), "r": float(e.dxf.radius), "layer": layer, "lw": lw or 0.25})
+        elif t == "HATCH":
+            for path in e.paths:
+                pts = []
+                if hasattr(path, "vertices"):
+                    pts = [(v[0], v[1]) for v in path.vertices]
+                else:
+                    for ed in getattr(path, "edges", []):
+                        s0 = getattr(ed, "start", None)       # line edges; arc edges would need their bulge
+                        if s0 is not None:
+                            pts.append((s0[0], s0[1]))
+                if len(pts) >= 3:
+                    items.append({"t": "fill", "pts": pts, "layer": "墙体填充", "shade": 0.35})
+                    polys.append(pts)
+        elif t == "INSERT":
+            for v in e.virtual_entities():
+                add(v, layer, lw)
+        else:
+            skipped[t] = skipped.get(t, 0) + 1
+
+    for e in doc.modelspace():
+        lay = ACAD_LAYERS.get(e.dxf.layer)
+        if lay is None:
+            continue
+        add(e, lay[0], lay[1])
+    return items, polys, skipped
+
+
+def run_acadmcp(spec, out_dir, scale=100, paper="A3"):
+    """map, run the runner in its venv, import. Returns a dict with ok / reason (Chinese) / result."""
+    t0 = time.time()
+    py, why = ensure_acadmcp()
+    if not py:
+        return {"ok": False, "reason": why, "seconds": round(time.time() - t0, 2)}
+    try:
+        their, notes = acadmcp_spec(spec, scale, paper)
+    except Exception as ex:  # noqa: BLE001
+        return {"ok": False, "reason": f"规格转换失败：{type(ex).__name__}: {ex}"}
+    if not their["walls"]:
+        return {"ok": False, "reason": "规格里没有墙段，acadmcp 无法绘制"}
+    out_dxf = str((Path(out_dir) / "acadmcp.dxf").resolve())
+    runner = str(Path(__file__).resolve().parent / "acadmcp_runner.py")
+    try:
+        r = subprocess.run([py, runner], input=json.dumps({"spec": their, "out_dxf": out_dxf}), capture_output=True,
+                           text=True, timeout=float(os.environ.get("AIW_ACADMCP_TIMEOUT", "300")),
+                           env=dict(os.environ, JOURNAL_DURABLE="off"), cwd=str(out_dir))
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "acadmcp 运行超时"}
+    res = None
+    for line in reversed((r.stdout or "").splitlines()):
+        if line.startswith("ACADMCP_RESULT "):
+            res = json.loads(line[len("ACADMCP_RESULT "):]); break
+    if not res:
+        return {"ok": False, "reason": f"acadmcp 无输出（退出码 {r.returncode}）：{(r.stderr or '')[-300:]}"}
+    if not res.get("ok"):
+        return {"ok": False, "reason": f"acadmcp 绘制失败：{res.get('error')}", "result": res}
+    try:
+        items, polys, skipped = acadmcp_import(res["dxf"])
+    except Exception as ex:  # noqa: BLE001
+        return {"ok": False, "reason": f"读取 acadmcp DXF 失败：{type(ex).__name__}: {ex}", "result": res}
+    if not polys:
+        return {"ok": False, "reason": "acadmcp DXF 里没有墙体填充", "result": res}
+    names = spec.pop("_acad_room_names", {})
+    for d in res.get("rooms_dropped") or []:
+        rid = d.get("room")
+        mt = re.search(r"already labelled - (R\d+)", d.get("reason") or "")
+        if mt and rid in names:
+            notes.append(f"acadmcp 房间检测：{names.get(rid)}({rid}) 与 {names.get(mt.group(1))}({mt.group(1)}) 在同一个封闭区域里"
+                         "（两者之间没有墙，或房间框重叠）")
+        elif rid in names:
+            why = "落在墙体里" if "wall body" in (d.get("reason") or "") else "不在任何封闭区域内"
+            notes.append(f"acadmcp 房间检测：{names.get(rid)}({rid}) {why}")
+    return {"ok": True, "items": items, "polys": polys, "skipped": skipped, "notes": notes, "result": res,
+            "their_spec": their, "seconds": round(time.time() - t0, 2)}
+
+
+def acadmcp_report(res, notes):
+    """their QA -> (errors, warnings, summary) for report.json: extra issues for the repair loop; blocking only
+    when clearly geometric (a wall gap / an opening clash at error severity, an opening their wall engine had to
+    leave out)."""
+    E, W = [], []
+    for it in res.get("issues") or []:
+        msg = f"acadmcp {it.get('focus')}: {it.get('message')}"
+        if it.get("focus") == "arch_room_unlabelled":
+            continue      # our room labels are stripped from their DXF on purpose (drawkit writes the Chinese ones)
+        if it.get("focus") in ACADMCP_FOCUS_BLOCKING and it.get("severity") == "error":
+            E.append(msg)
+        elif it.get("severity") in ("error", "warning"):
+            W.append(msg)
+    for o in res.get("omitted") or []:
+        W.append(f"acadmcp 未能在墙上开出洞口 {o.get('element')}：{o.get('reason')}")
+    topo = res.get("topology_findings") or {}
+    for it in topo.get("issues") or []:
+        if it.get("severity") in ("error",):
+            W.append(f"acadmcp topology {it.get('focus')}: {it.get('message')}")
+    W += notes
+    summ = {"version": res.get("version"), "critique_total": res.get("critique_total"), "by_focus": res.get("by_focus"),
+            "by_severity": res.get("by_severity"), "not_checked": res.get("not_checked"),
+            "domain_absent": res.get("domain_absent"), "coverage_complete": res.get("coverage_complete"),
+            "rooms_detected": [{k: r.get(k) for k in ("area_m2", "centroid", "label", "confidence")}
+                               for r in res.get("rooms_detected") or []],
+            "topology_findings": {k: v for k, v in topo.items() if k != "issues"}, "omitted": res.get("omitted"),
+            "rooms_dropped": res.get("rooms_dropped"), "seconds": res.get("seconds")}
+    return E, W[:40], summ
+
+
 def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=None, repair=True):
     spec = load_spec(spec_path)
     if source:
@@ -2452,7 +2747,42 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
         E += fr["errors"]; W += fr["warnings"]
         if fr.get("transform"):
             I.append("pixel->mm fit: " + ", ".join(f"{k}={v:.5f}" for k, v in fr["transform"].items()))
-    eng, sh, scale = make(spec)
+    engine = {"requested": cad_engine(), "used": "native"}
+    acad = None
+    if engine["requested"] == "acadmcp":
+        if spec.get("kind", "floor_plan") != "floor_plan":
+            engine["fallback_reason"] = "acadmcp 引擎只画平面图（floor_plan），本图用原生引擎"
+        else:
+            try:
+                acad = run_acadmcp(spec, out_dir, paper=spec.get("paper", "A3"))
+            except Exception as ex:  # noqa: BLE001
+                acad = {"ok": False, "reason": f"acadmcp 引擎异常：{type(ex).__name__}: {ex}"}
+            if acad.get("ok"):
+                spec["_acad_items"] = acad["items"]
+                spec["_acad_wall_polys"] = acad["polys"]
+            else:
+                engine["fallback_reason"] = "acadmcp 引擎失败，已回退原生引擎：" + str(acad.get("reason"))
+    try:
+        eng, sh, scale = make(spec)
+        if acad and acad.get("ok"):
+            engine["used"] = "acadmcp"
+    except Exception as ex:  # noqa: BLE001
+        if not spec.pop("_acad_items", None):
+            raise
+        spec.pop("_acad_wall_polys", None)
+        engine["fallback_reason"] = f"acadmcp 几何导入后出图失败，已回退原生引擎：{type(ex).__name__}: {ex}"
+        acad = None
+        eng, sh, scale = make(spec)
+    spec.pop("_acad_items", None); spec.pop("_acad_wall_polys", None); spec.pop("_acad_room_names", None)
+    if engine["used"] == "acadmcp":
+        e, w, summ = acadmcp_report(acad["result"], acad.get("notes") or [])
+        E += e; W += w
+        engine["acadmcp"] = summ
+        engine["seconds"] = acad.get("seconds")
+        if acad.get("skipped"):
+            engine["acadmcp"]["import_skipped"] = acad["skipped"]
+    elif engine.get("fallback_reason"):
+        W.append(engine["fallback_reason"])
     e, w, i = eng.checks(sh); E += e; W += w; I += i
     e, w = text_checks(sh, eng); E += e; W += w
     W += sh.warnings
@@ -2469,7 +2799,8 @@ def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=
     if not cjk_font():
         W.append("no Chinese font on this computer (apt install fonts-wqy-microhei): the PNG preview shows boxes for hanzi")
     rep = {"version": VERSION, "kind": spec.get("kind"), "scale": f"1:{scale}", "errors": _uniq(E), "warnings": _uniq(W),
-           "info": _uniq(I), "repairs": repairs}
+           "info": _uniq(I), "repairs": repairs, "engine": engine,
+           "sheet_offset_mm": [round(v, 3) for v in (getattr(eng, "offset", None) or (0.0, 0.0))]}
     if verify_m is not None:
         rep["verify"] = verify_m
     if spec.get("kind", "floor_plan") == "floor_plan":

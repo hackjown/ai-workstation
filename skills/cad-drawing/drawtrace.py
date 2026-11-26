@@ -1316,6 +1316,14 @@ def verify(spec, eng, image=None, out_png=None, tol_px=None):
             xs.append((T["ax"] * X + T["bx"]) * f); ys.append((T["ay"] * yd + T["by"]) * f)
         x0, x1 = sorted(xs); y0, y1 = sorted(ys)
         cv2.rectangle(drawn, (int(round(x0)), int(round(y0))), (int(round(x1)) - 1, int(round(y1)) - 1), 1, -1)
+    if getattr(eng, "wall_polys", None):     # 3.9.92 acadmcp engine: the walls as that engine drew them (poche)
+        drawn[:] = 0
+        for pl in eng.wall_polys:
+            pts = []
+            for X, Y in pl:
+                yd = (m.H - Y) if m.y_down else Y
+                pts.append([(T["ax"] * X + T["bx"]) * f, (T["ay"] * yd + T["by"]) * f])
+            cv2.fillPoly(drawn, [np.array(pts, np.int32).reshape(-1, 1, 2)], 1)
     srcw = tr.wall
     tol = tol_px or max(2, int(round(30 / (tr.sx))))           # ~30 mm, at least 2 px
     ker = np.ones((2 * tol + 1, 2 * tol + 1), np.uint8)

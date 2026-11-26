@@ -191,3 +191,13 @@ python3 $D/drawkit.py schema                         # spec 字段说明
   `"free_labels": [{"text": "客厅", "at_px": [420, 950]}]`（或 `at` 用毫米），再 `drawing_build`。
 - 确定性流水线（drawing_auto --from-spec）现在会保留旧 spec 的所有房间名和 free_labels，一个名字都不会丢；
   找不到房间的名字会自动变成 free_labels 并列入「待确认」。
+
+## 3.9.92 可选第二绘图引擎（AIW_CAD_ENGINE）
+- 默认 `native`（drawkit 自己画）。服务器设 `AIW_CAD_ENGINE=acadmcp` 时，`drawing_build` 的墙体、墙体填充、门窗改由
+  autocad-mcp-pro 1.8.0（ezdxf 无头后端）画；房间名、家具、尺寸、图框标题栏、PNG/PDF、DWG 导出和核对仍是 drawkit 的。
+- 它装在独立虚拟环境 `~/.local/share/aiw/acadmcp`（首次自动 `pip install "autocad-mcp-pro[pdf]==1.8.0"`），只通过
+  `acadmcp_runner.py` 子进程调用，**不是**给模型用的工具；spec 写法完全不变。
+- 失败（装不上、超时、画不出）自动回退原生引擎，原因写在 report.json 的 `engine.fallback_reason`。
+- report.json 的 `engine.acadmcp` 里有它的检查结果（critique 数量、not_checked、检测到的封闭房间、拓扑）；
+  “房间检测：A 与 B 在同一个封闭区域里”说明两房间之间没有墙或房间框重叠，按 warnings 修 spec 即可。
+  墙上开不出的洞口（撞到墙交接处）会列在 warnings 里，不会画成跨角的窗。

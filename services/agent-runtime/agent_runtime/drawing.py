@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 
 KIT_DIR = Path(os.environ.get("AIW_DRAWKIT_DIR") or Path(__file__).resolve().parents[3] / "skills" / "cad-drawing")
-KIT_FILES = ("drawkit.py", "drawauto.py", "drawtrace.py", "SKILL.md", "examples/xinda-g-108.spec.json")
+KIT_FILES = ("drawkit.py", "drawauto.py", "drawtrace.py", "acadmcp_runner.py", "SKILL.md", "examples/xinda-g-108.spec.json")
 REMOTE = ".aiw/cad-drawing"          # under the computer's ~/workspace (files_write root)
 ROOT = '"${VM_AGENT_FILES_ROOT:-$HOME/workspace}"'
 MAX_ROUNDS = int(os.environ.get("AIW_DRAW_MAX_ROUNDS", "3"))
@@ -49,7 +49,7 @@ def version_probe() -> str:
 def install_command(version: str) -> str:
     """after the files are written: mirror them as a skill folder and make sure the dependencies are there."""
     return (f"cd {ROOT}/{REMOTE} && echo {version} > VERSION && mkdir -p \"$HOME/.claude/skills/cad-drawing/examples\" && "
-            f"cp -f drawkit.py drawauto.py drawtrace.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
+            f"cp -f drawkit.py drawauto.py drawtrace.py acadmcp_runner.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
             f"cp -f examples/*.json \"$HOME/.claude/skills/cad-drawing/examples/\" 2>/dev/null; "
             f"M=\"$HOME/.config/aiw/drawkit-ready-v3\"; if [ ! -f \"$M\" ]; then "
             f"python3 drawkit.py ensure && mkdir -p \"$(dirname $M)\" && touch \"$M\"; else echo deps-ok; fi; "
@@ -58,7 +58,10 @@ def install_command(version: str) -> str:
 
 def build_command(spec: str, out: str = "cad", name: str = "plan", source: str | None = None, task: str | None = None) -> str:
     q = lambda s: "'" + str(s).replace("'", "'\\''") + "'"
-    cmd = (f"cd {ROOT} && python3 {REMOTE}/drawkit.py build {q(spec)} --out {q(out)} --name {q(name)}")
+    # 3.9.92: the optional second engine (autocad-mcp-pro) is chosen on the server: AIW_CAD_ENGINE=acadmcp|native
+    eng = (os.environ.get("AIW_CAD_ENGINE") or "").strip().lower()
+    pre = f"AIW_CAD_ENGINE={eng} " if eng in ("acadmcp", "native") else ""
+    cmd = (f"cd {ROOT} && {pre}python3 {REMOTE}/drawkit.py build {q(spec)} --out {q(out)} --name {q(name)}")
     if source:
         cmd += f" --source {q(source)}"
     if task:

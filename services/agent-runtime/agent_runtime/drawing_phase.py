@@ -90,8 +90,27 @@ def similarity(a: str, b: str) -> float:
     return len(ga & gb) / min(len(ga), len(gb))
 
 
+_OUT_RE = re.compile(r"(^|/)(cad|out)/[^\s'\"]*\.(png|jpe?g|pdf)$", re.I)
+# 3.9.93 (task-241): these are progress, never "the same analysis again" - the guard skipped the drawing_note that
+# would have saved the step-1 findings, then cut the reading off
+WRITE_TOOLS = ("drawing_note", "drawing_brief", "files_write", "drawing_build", "drawing_auto", "send_file", "done",
+               "update_plan", "ask_user")
+
+
+def reads_output(tool: str, args: dict) -> bool:
+    """reading the task's OWN result (a sheet PNG, the diff, the overlay): that is VERIFY."""
+    a = args or {}
+    if tool != "read_image":
+        return False
+    paths = [a.get("path")] + list(a.get("paths") or [])
+    return any(p and _OUT_RE.search(str(p).lstrip("~/").replace("workspace/", "", 1)) for p in paths)
+
+
 class DrawPhase:
-    def __init__(self, read_budget: int = READ_BUDGET):
+    def __init__(self, read_budget: int = READ_BUDGET, site: bool = False):
+        self.site = site             # 3.9.93: 施工图 set (景观/场地/装修/构筑物): brief -> 图纸目录 -> sheets -> verify
+        self.brief_done = False
+        self.output_reads = 0
         self.phase = READ
         self.reads = 0
         self.read_budget = read_budget
@@ -155,6 +174,8 @@ class DrawPhase:
         return ()
 
     def gate(self, tool: str, args: dict) -> Optional[str]:
+        if self.site:
+            return self._site_gate(tool, args)
         if self.phase == READ and is_read(tool, args):
             if self.reads >= self.read_budget:
                 self.forced = True
@@ -175,7 +196,39 @@ class DrawPhase:
                     "still uncertain." % self.verify)
         return None
 
+    def _site_gate(self, tool: str, args: dict) -> Optional[str]:
+        """a 施工图 set: reading the inputs is the job until the brief exists (no budget cut), reading the task's own
+        sheets is VERIFY (its own budget), and the floor-plan tracer is never used."""
+        if tool == "drawing_auto":
+            self.refusals += 1
+            return ("REFUSED: drawing_auto is the floor-plan TRACER (walls/rooms from a plan image). This is a 施工图 set "
+                    "(景观/场地/装修/构筑物): drawing_brief (reads every input, writes cad/brief.json, the 图纸目录 and a "
+                    "drafted cad/spec.json), then drawing_build spec=cad/spec.json.")
+        if reads_output(tool, args):
+            if self.output_reads >= 14:
+                return ("REFUSED: 14 sheet reads done. drawing_build already shows every sheet to the vision checklist; "
+                        "fix what it reported in cad/spec.json and build again, or deliver.")
+            return None
+        if not self.brief_done and tool in ("drawing_build",) and not (args or {}).get("content"):
+            return None   # the build itself runs drawing_brief first when it is missing
+        if self.brief_done and self.phase == READ and is_read(tool, args) and self.reads >= self.read_budget:
+            self.refusals += 1
+            return ("REFUSED: the inputs are read and summarised in cad/brief.json (drawing_brief). Build the set now: "
+                    "drawing_build spec=cad/spec.json. To re-read one input with a new question use read_image on that "
+                    "one file once; drawing_brief again=true re-reads them all.")
+        return None
+
     def after(self, tool: str, args: dict, ok: bool, text: str = "") -> None:
+        if reads_output(tool, args):
+            self.output_reads += 1
+            self.progress += 1
+            return
+        if tool == "drawing_brief" and ok:
+            self.brief_done = True
+            self.progress += 1
+            if self.phase == READ:
+                self.phase = SPEC
+            return
         if is_read(tool, args) and self.phase == READ:
             self.reads += 1
         elif is_read(tool, args):
@@ -191,12 +244,12 @@ class DrawPhase:
             self.progress += 1
             self.spec_written = True
             self.round_reads = 0
-            self.last_ok = "ALL CHECKS PASS" in (text or "")
+            self.last_ok = "ALL CHECKS PASS" in (text or "") or "SET VERIFIED" in (text or "")
             m = re.search(r"ERRORS: (.*)", text or "")
             self.last_errors = [e.strip() for e in m.group(1).split(" | ")][:12] if m else []
             if not self.last_ok and self.builds >= VERIFY_ROUNDS:
                 self.must_deliver = True
-            if "ALL CHECKS PASS" in (text or "") or "STOP ITERATING" in (text or ""):
+            if "ALL CHECKS PASS" in (text or "") or "STOP ITERATING" in (text or "") or "SET VERIFIED" in (text or ""):
                 self.phase = VERIFY if self.phase != DELIVER else DELIVER
             elif self.phase in (READ, SPEC):
                 self.phase = BUILD
@@ -233,6 +286,10 @@ class DrawPhase:
         alike) while nothing new was written or built; also a model that keeps sending refused reads."""
         th = (thought or "")[:400]
         ar = tool + " " + json.dumps(args or {}, ensure_ascii=False)[:300]
+        if tool in WRITE_TOOLS or reads_output(tool, args) or (self.site and not self.brief_done):
+            self.intents.append((th, ar, self.progress + 1000 + len(self.intents)))   # a writing step is progress
+            self.intents = self.intents[-12:]
+            return None
         self.intents.append((th, ar, self.progress))
         self.intents = self.intents[-12:]
         if self.quiet > 0:                       # just resumed by the user: a fresh start, no re-pause
@@ -284,7 +341,12 @@ class DrawPhase:
         self.must_deliver = False
 
     # ---- context ----------------------------------------------------------------------------------------------
+    def _site_block(self) -> str:
+        return _site_block_text(self)
+
     def block(self) -> str:
+        if self.site:
+            return self._site_block()
         left = max(0, self.read_budget - self.reads)
         head = f"DRAWING PHASE: {self.phase}"
         if self.phase == READ:
@@ -310,6 +372,21 @@ class DrawPhase:
             lk = (" LOCKED (do not re-read): " + ", ".join(sorted(self.locked))) if self.locked else ""
             head += f"\nFACTS so far (cad/facts.json):{lk}\n{body}"
         return head
+
+
+def _site_block_text(dp) -> str:
+    if not dp.brief_done:
+        return ("DRAWING PHASE: READ (施工图 set). First drawing_brief: it reads EACH image on its own (role, elements and "
+                "where they are, materials, counts, texts, dimensions), the text brief and any 报价/清单, and writes "
+                "cad/brief.json (facts with sources, conflicts, unknowns + the assumption used), the 图纸目录 and a drafted "
+                "cad/spec.json. Reading is not cut short before that. Never drawing_auto (floor-plan tracer).")
+    st = {SPEC: "build the set: drawing_build spec=cad/spec.json", BUILD: "fix the listed errors in cad/spec.json (MODEL mm "
+          "coordinates, PAPER mm text h / offsets) and drawing_build again", VERIFY: "every sheet was shown to the vision "
+          "checklist inside drawing_build; fix what it reported or deliver", DELIVER: "send_file the PDF + DXF, then done"}
+    head = f"DRAWING PHASE: {dp.phase} (施工图 set) - " + st.get(dp.phase, "")
+    if dp.last_errors:
+        head += "\nLAST BUILD ERRORS: " + " | ".join(dp.last_errors[:8])
+    return head
 
 
 def _short_err(e: str) -> str:

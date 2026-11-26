@@ -25,6 +25,7 @@ from tool_router.registry import BOS_TOOLS, SUBAGENT_TOOLS
 from . import cad as _cad
 from . import drawing as _draw
 from . import drawing_hooks as _dh
+from . import drawing_site as _ds
 from . import video as _video
 from . import image_edit as _ie
 from . import image_brief as _ib
@@ -951,6 +952,19 @@ class AgentLoop:
                         "(cad/spec.json -> drawing_build) and its PNG + DXF sent with send_file before done. Continue with "
                         "the next unfinished sheet now. If you have no spec yet, read the source and write it first.")
                 continue
+            if (decision.tool == "done" and getattr(self, "_sheet_job", False) and self._done_rejects < 4
+                    and self.step < self._cap() - 3 and self._draw_rounds < _draw.MAX_ROUNDS
+                    and not (getattr(self, "_site", None) or {}).get("verified")):
+                self._done_rejects += 1
+                errs = ((getattr(self, "_site", None) or {}).get("last_errors") or [])[:6]
+                await self.emit(EventType.DECISION, thought=decision.thought, tool=decision.tool, args=decision.args)
+                await self.emit(EventType.VALIDATION, success=False, change=0.0, message="拒绝 done：施工图还没通过核对")
+                self.history.append(f"{self.step}. done REJECTED: the sheet set has not passed its checks")
+                note = ("REJECTED: the drawing set has not passed the mechanical checks and the per-sheet vision checklist"
+                        + (": " + " | ".join(errs) if errs else " (it was never built)") + ". Fix cad/spec.json and "
+                        "drawing_build again. After " + str(_draw.MAX_ROUNDS) + " rounds the set is delivered with its "
+                        "failures stated plainly.")
+                continue
             if (decision.tool == "done" and self._cad_task and self._sent_file and self._done_rejects < 6
                     and self.step < self._cap() - 3 and (not self._cad_pdf_ok or self._sheet_audit.get("thin"))):
                 self._done_rejects += 1
@@ -1325,6 +1339,12 @@ class AgentLoop:
 
             if outcome.control == "done":
                 summ = str(decision.args.get("summary", "done"))
+                if getattr(self, "_sheet_job", False):   # 3.9.93: the set's real verdict, 目录, assumptions, quantities
+                    st = _ds.site_state(self)
+                    ok, text = _ds.final_message(st.get("report"), st.get("brief"), st.get("vision"),
+                                                 [self._sent_file] if self._sent_file else [])
+                    self._finish(TaskStatus.SUCCEEDED if ok else TaskStatus.FAILED, text + ("\n\n" + summ if summ and summ != "done" else ""))
+                    return
                 if self._intent == _in.DEV_FIX:
                     summ = await self._dev_finish(summ)
                 if self.guard.mode == "deliver" and self.guard.reason in ("budget", "soft_cap") and "深挖" not in summ:
@@ -1514,7 +1534,7 @@ class AgentLoop:
             return await self._drawing_read(a)
         if t == "drawing_build":
             return await self._drawing_build(a, decision.thought)
-        if t in ("drawing_note", "drawing_auto"):
+        if t in ("drawing_note", "drawing_auto", "drawing_brief"):
             return await _dh.tool(self, decision)
         if t == "cad_command":
             return await self._cad_command(a, decision.thought)
@@ -3477,6 +3497,11 @@ class AgentLoop:
         if err:
             await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=False, error=err[:200], result={})
             return f"FAILED: {err}"
+        pre = ""
+        if getattr(self, "_sheet_job", False) and not _ds.site_state(self).get("brief"):
+            # 3.9.93: READ is mandatory for a 施工图 set: the brief (and the drafted set) come first
+            pre = await _ds.brief_tool(self, {"regen": content is None and not await self._exists(spec)})
+            pre = "(drawing_brief ran first)\n" + pre.split("\nNEXT:")[0] + "\n"
         r = await self.tools.run("shell", {"command": _draw.build_command(spec, out, name, a.get("source"), task=self._root_id), "timeout": 600},
                                  intent=intent or "generate the drawing from the spec")
         res = r.result if isinstance(r.result, dict) else {}
@@ -3492,6 +3517,8 @@ class AgentLoop:
         self._draw_rounds += 1
         self._drawkit_built = True
         self._acted = True
+        if rep.get("kind") == "sheet_set":
+            return pre + await self._sheet_build_done(rep, out, name)
         files = rep.get("files") or {}
         rel = lambda f: f if (f.startswith(out + "/") or f.startswith("/")) else f"{out}/{f}"   # noqa: E731
         self._cad_file = rel(files.get("dxf") or name + ".dxf")
@@ -3531,6 +3558,61 @@ class AgentLoop:
             nxt = ("\nNEXT: fix these in cad/spec.json (a misread chain number: re-read that chain with drawing_read; a text "
                    "overlap: move or shorten that item, or give the room label_at), then drawing_build again.")
         self.history.append(f"{self.step}. drawing_build {spec}: {'ok' if rep.get('ok') else str(len(rep.get('errors') or [])) + ' errors'}")
+        return text + nxt
+
+    async def _exists(self, path: str) -> bool:
+        try:
+            r = await self.tools.run("shell", {"command": f'cd "${{VM_AGENT_FILES_ROOT:-$HOME/workspace}}" && [ -e \'{path}\' ] && echo yes; true',
+                                               "timeout": 20}, intent="is the file there")
+            return "yes" in (((r.result or {}).get("stdout") or "") if isinstance(r.result, dict) else "")
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _sheet_build_done(self, rep: dict, out: str, name: str) -> str:
+        """3.9.93: a 施工图 set was built. Mechanical checks first; when they pass every sheet PNG goes to the vision
+        checklist (never blocked by the anti-loop guard). The verdict decides delivery; the anti-loop policy can only
+        deliver it with its failures said plainly."""
+        st = _ds.site_state(self)
+        st["out"] = out
+        files = rep.get("files") or {}
+        rel = lambda f: f if (not f or f.startswith(out + "/") or f.startswith("/")) else f"{out}/{Path(f).name}"   # noqa: E731
+        self._cad_file = rel(files.get("dxf") or name + ".dxf")
+        vis = {"errors": [], "warnings": []}
+        if rep.get("ok") and os.environ.get("AIW_SHEET_VISION", "1") != "0":
+            vis = await _ds.verify_sheets(self, rep, out)
+        st["report"], st["vision"] = rep, vis
+        errs = list(rep.get("errors") or []) + list(vis.get("errors") or [])
+        st["last_errors"] = errs
+        st["verified"] = not errs
+        if not errs or self._draw_rounds >= _draw.MAX_ROUNDS:
+            self._cad_pdf_ok = True
+            self._sheet_audit = {}
+        if files.get("view_dxf"):
+            try:
+                await self._type_cad([], rel(files["view_dxf"]), "open the generated drawing set in LibreCAD")
+            except Exception:  # noqa: BLE001
+                pass
+        await self.emit(EventType.ACTION_RESULT, tool="drawing_build", success=not errs, error=None,
+                        result={"ok": not errs, "kind": "sheet_set", "errors": errs[:20], "warnings": (rep.get("warnings") or [])[:10],
+                                "sheets": [f"{s['no']} {s['title']}" for s in rep.get("sheets") or []],
+                                "vision": {k: v for k, v in vis.items() if k != "sheets"}, "files": files})
+        text = _draw.summary(rep, self._draw_rounds, out)
+        if vis.get("errors"):
+            text += "\nVISION CHECKLIST ERRORS: " + " | ".join(vis["errors"][:10])
+        if vis.get("warnings"):
+            text += "\nvision notes: " + " | ".join(vis["warnings"][:6])
+        deliver = " and ".join(rel(files[k]) for k in ("pdf", "dxf", "dwg") if files.get(k))
+        if not errs:
+            text = "SET VERIFIED (mechanical checks + vision checklist on every sheet).\n" + text
+            nxt = f"\nNEXT: send_file {deliver}, then done (the final message is composed from the report: 目录, assumptions, quantities)."
+        elif self._draw_rounds >= _draw.MAX_ROUNDS:
+            nxt = (f"\nSTOP ITERATING ({self._draw_rounds} rounds): send_file {deliver} and done; the message will say the set "
+                   "FAILED its checks and list them - do not call it a draft that is fine.")
+        else:
+            nxt = ("\nNEXT: fix exactly these in cad/spec.json (each error names its sheet and position; coordinates are MODEL "
+                   "mm, text h and dim offsets PAPER mm; a view that does not fit -> smaller scale or its own sheet), then "
+                   "drawing_build again. You may read_image a sheet PNG to see a problem.")
+        self.history.append(f"{self.step}. drawing_build {out}: sheet set {'verified' if not errs else str(len(errs)) + ' errors'}")
         return text + nxt
 
     def _hidden_tools(self) -> tuple:
@@ -3928,7 +4010,7 @@ def _ws_rel(p: str) -> str:
 _GUESSED_HOME = re.compile(r"(/home/(?:user|aiw|ubuntu|debian)/)workspace(?=/|\b)")
 _NO_SCREEN_TOOLS = {"antigravity", "read_file", "grep", "glob", "todo_write", "files_patch", "verify_html", "read_image", "image_edit", "generate_image", "shell", "files_read", "files_write", "files_list", "files_download", "send_file", "delegate", "dispatch",
                     # 3.8.9 (task-3fc): file-only drawing steps; a desktop look + vision description cost 12-15 s each
-                    "drawing_auto", "drawing_build", "drawing_note", "drawing_read",
+                    "drawing_auto", "drawing_build", "drawing_note", "drawing_read", "drawing_brief",
                     # v3.9.17: facts, remote commands and the request log never change the screen
                     "note_finding", "ssh_exec", "remote_exec", "browser_network", "session_search",
                     # v3.9.49: DeepSeek web tools run on the API host

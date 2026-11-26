@@ -20,7 +20,8 @@ import re
 from pathlib import Path
 
 KIT_DIR = Path(os.environ.get("AIW_DRAWKIT_DIR") or Path(__file__).resolve().parents[3] / "skills" / "cad-drawing")
-KIT_FILES = ("drawkit.py", "drawauto.py", "drawtrace.py", "SKILL.md", "examples/xinda-g-108.spec.json")
+KIT_FILES = ("drawkit.py", "drawauto.py", "drawtrace.py", "sitework.py", "sheetset.py", "SKILL.md",
+             "examples/xinda-g-108.spec.json")
 REMOTE = ".aiw/cad-drawing"          # under the computer's ~/workspace (files_write root)
 ROOT = '"${VM_AGENT_FILES_ROOT:-$HOME/workspace}"'
 MAX_ROUNDS = int(os.environ.get("AIW_DRAW_MAX_ROUNDS", "3"))
@@ -49,7 +50,7 @@ def version_probe() -> str:
 def install_command(version: str) -> str:
     """after the files are written: mirror them as a skill folder and make sure the dependencies are there."""
     return (f"cd {ROOT}/{REMOTE} && echo {version} > VERSION && mkdir -p \"$HOME/.claude/skills/cad-drawing/examples\" && "
-            f"cp -f drawkit.py drawauto.py drawtrace.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
+            f"cp -f drawkit.py drawauto.py drawtrace.py sitework.py sheetset.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
             f"cp -f examples/*.json \"$HOME/.claude/skills/cad-drawing/examples/\" 2>/dev/null; "
             f"M=\"$HOME/.config/aiw/drawkit-ready-v3\"; if [ ! -f \"$M\" ]; then "
             f"python3 drawkit.py ensure && mkdir -p \"$(dirname $M)\" && touch \"$M\"; else echo deps-ok; fi; "
@@ -77,6 +78,8 @@ def parse_result(stdout: str) -> dict | None:
 
 
 def summary(rep: dict, rounds: int, out_dir: str = "cad") -> str:
+    if rep.get("kind") == "sheet_set":
+        return sheet_summary(rep, rounds, out_dir)
     files = rep.get("files") or {}
     rel = lambda f: f if not f or f.startswith(out_dir + "/") or f.startswith("/") else f"{out_dir}/{f}"
     lines = [f"drawing_build round {rounds}/{MAX_ROUNDS}: {'ALL CHECKS PASS' if rep.get('ok') else 'CHECKS FAILED'} "
@@ -95,6 +98,29 @@ def summary(rep: dict, rounds: int, out_dir: str = "cad") -> str:
         lines.append(f"overlay: {rep['overlay_score']}")
     names = [rel(files[k]) for k in ("png", "pdf", "dxf", "dwg", "diff", "overlay", "librecad_pdf") if files.get(k)]
     lines.append("files: " + ", ".join(names) + f", {out_dir}/report.json")
+    return "\n".join(lines)
+
+
+def sheet_summary(rep: dict, rounds: int, out_dir: str = "cad") -> str:
+    """3.9.93: a 施工图 set: one line per sheet (no, title, paper, scales, its errors), the requirement checks, files."""
+    files = rep.get("files") or {}
+    rel = lambda f: f if not f or f.startswith(out_dir + "/") or f.startswith("/") else f"{out_dir}/{f}"   # noqa: E731
+    lines = [f"drawing_build round {rounds}/{MAX_ROUNDS}: {len(rep.get('sheets') or [])}-sheet set, "
+             f"{'MECHANICAL CHECKS PASS' if rep.get('ok') else 'CHECKS FAILED'}."]
+    lines.append("图纸目录: " + "; ".join(f"{s['no']} {s['title']} ({s.get('paper')}, {'、'.join(s.get('scales') or []) or '—'}"
+                                         + (f", {s['errors']} errors" if s.get("errors") else "") + ")" for s in rep.get("sheets") or []))
+    if rep.get("errors"):
+        lines.append("ERRORS: " + " | ".join(rep["errors"][:14]))
+    miss = [r.get("what") for r in rep.get("requirements") or [] if not r.get("ok")]
+    if miss:
+        lines.append("required but not found: " + "; ".join(str(m) for m in miss))
+    if rep.get("warnings"):
+        lines.append("warnings: " + " | ".join(rep["warnings"][:6]))
+    if rep.get("info"):
+        lines.append("info: " + " | ".join(rep["info"][:6]))
+    names = [rel(files[k]) for k in ("pdf", "dxf", "dwg") if files.get(k)]
+    lines.append("files: " + ", ".join(names) + f" (pages {files.get('pdf_pages', '?')}); sheet PNGs: "
+                 + ", ".join(rel(p) for p in (files.get("pngs") or [])[:12]) + f"; {out_dir}/report.json")
     return "\n".join(lines)
 
 

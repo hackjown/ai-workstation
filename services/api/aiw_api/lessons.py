@@ -112,8 +112,19 @@ SEED_DRAW2 = [   # 3.8.9 (task-3fc)
     ("general", "", "用户点了「继续」，任务马上又因同一个原因暂停，什么都没变",
      "继续 = 重置计数、给新的预算，并换方法（画图任务直接跑确定性流水线）；同一原因短时间内不再暂停；最多 3 轮核对后交付最好的草稿并列出待确认项"),
 ]
+SEED_DRAW3_MARK = "lessons_seeded_sitework_v1"
+SEED_DRAW3 = [   # 3.9.93 (task-241, 升旗台广场)
+    ("skill", "cad-drawing", "景观/场地施工图：两张图一次 read_image 读得很浅，就断定“都是实景照片、没尺寸”，第 4 步就被防循环截断，没列出布局和缺失项",
+     "施工图先 drawing_brief：每张图单独结构化读（角色、构件及相对位置、材质、数量、文字/尺寸），文字和报价逐条解析，写 cad/brief.json（事实带来源、矛盾、缺失项+假定），阻塞项问一次用户"),
+    ("skill", "cad-drawing", "一个广场改造的全部内容塞进一张通用图，手写坐标，文字高度写成模型毫米（h_mm 800 = 1:100 下 80 米高），647 个文字重叠",
+     "先按工种模板规划图纸目录（目录说明/总平面拆除/铺装/竖向排水/大样/剖面/节点/工程量），sheet_set 一张一张出；坐标是模型毫米，文字高和标注偏移是图纸毫米（2.5–7），不要自己乘比例"),
+    ("skill", "cad-drawing", "场地照片被当成户型图跑 drawing_auto 描图，交付说明里写“墙、房间、门窗、尺寸链刻度”，还把有硬错误的图当“最好的草稿”交付",
+     "景观/场地/装修施工图永远不走描图器；出图后逐张看 PNG 核对清单；还有硬错误就明确说“未通过核对（失败）”并列出问题，同时列图纸目录、假定和工程量"),
+]
+
+
 def _SEEDED_PROBLEMS():   # noqa: N802
-    out = [p for _s, _k, p, _f in SEED_DRAW + SEED_DRAW2]
+    out = [p for _s, _k, p, _f in SEED_DRAW + SEED_DRAW2 + SEED_DRAW3]
     for name in ("SEED", "SEED_V2", "SEEDS"):
         for row in globals().get(name) or []:
             if isinstance(row, (list, tuple)) and len(row) >= 3:
@@ -206,6 +217,7 @@ class Lessons:
             self.seed()
             self.seed_draw()
             self.seed_draw2()
+            self.seed_draw3()
         except Exception as e:  # noqa: BLE001
             log.warning("seeding lessons failed: %s", e)
 
@@ -260,6 +272,20 @@ class Lessons:
             if self.add(scope, key, problem, fix, "auto"):
                 n += 1
         self.store.kv_set(SEED_DRAW2_MARK, {"at": time.time(), "n": n})
+        return n
+
+    def seed_draw3(self) -> int:
+        """3.9.93 lessons (kv lessons_seeded_sitework_v1): read every input, plan the 图纸目录, units, verify honestly."""
+        try:
+            if self.store.kv_get(SEED_DRAW3_MARK):
+                return 0
+        except Exception:  # noqa: BLE001
+            return 0
+        n = 0
+        for scope, key, problem, fix in SEED_DRAW3:
+            if self.add(scope, key, problem, fix, "auto"):
+                n += 1
+        self.store.kv_set(SEED_DRAW3_MARK, {"at": time.time(), "n": n})
         return n
 
     # ------------------------------------------------------------------ rows

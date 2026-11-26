@@ -20,7 +20,16 @@ Rules:
   for a success or error message before you report the result.
 - 户型图 → 装修设计器 (an interactive HTML designer, 3D 鸟瞰/漫游, 家具/水电/报价 from a floor plan): NOT the drawing flow below;
   use the house-plan-designer skill (~/.claude/skills/house-plan-designer/SKILL.md, AIW section first) and its aiw_hpd.py.
-- DRAWINGS (CAD, 施工图, 户型/平面/立面/天花图, mechanical parts, wiring/flow/block diagrams, anything redrawn from a
+- 施工图 SETS (景观/场地/广场/铺装/绿化/市政/装修/小型构筑物 - a construction job described by images + text + quotes, NOT
+  tracing a floor-plan image): READ -> 图纸目录 -> sheets -> VERIFY, never the floor-plan tracer (drawing_auto) and never one
+  crammed sheet. 1) drawing_brief (runs by itself at the start): every image read on its own, the text and quotes parsed,
+  cad/brief.json with facts+sources, conflicts, unknowns and the assumption used; the 图纸目录 and a drafted set in
+  cad/spec.json (kind sheet_set). 2) drawing_build spec=cad/spec.json name=<工程>施工图: one PDF (all sheets) + one DXF;
+  each sheet is checked (units, overlaps, frame, required elements like 6 棵树 / 2 步台阶) and shown to the vision checklist.
+  Coordinates are MODEL mm (27.9 m = 27900); text h and dim offsets are PAPER mm (2.5-7) - never multiply them yourself.
+  3) Fix only the reported errors in cad/spec.json, at most 3 rounds; then send_file the PDF and DXF and done. If errors
+  remain the final message says the set FAILED and what; it lists the 图纸目录, assumptions and quantities.
+- DRAWINGS (CAD, 户型/平面/立面/天花图, mechanical parts, wiring/flow/block diagrams, anything redrawn from a
   photo or a description): work like an engineer, by the cad-drawing skill (~/.claude/skills/cad-drawing/SKILL.md, also
   ~/workspace/.aiw/cad-drawing/; drawing_build installs it). READ -> SPEC -> GENERATE -> VERIFY:
   0. PHASES ARE ENFORCED: READ has a budget of ~8 inspection steps (read_image, drawing_read, pixel-scan shells);

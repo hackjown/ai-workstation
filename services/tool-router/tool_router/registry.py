@@ -204,8 +204,22 @@ TOOLS: list[ToolSpec] = [
               "key": {"type": "string"}, "value": {"description": "the finding (number list, object or text)"},
               "confirmed": {"type": "boolean"},
               "items": {"type": "array", "items": {"type": "object"}, "description": "several {kind,key,value,confirmed}"}}, []),
+    ToolSpec("drawing_brief", None,
+             "施工图 sets (景观/场地/市政/装修/小型构筑物 - anything that is not tracing a floor-plan image): READ every input "
+             "before drawing. Each image is read ON ITS OWN by the vision model with a structured question (role: 设计效果图/"
+             "方案平面/现场照片/手绘草图; elements and where they are; layout; materials; counts; legible texts and "
+             "dimensions), the user's text is parsed into facts, every 报价/清单 file is read row by row. Writes cad/brief.json "
+             "(facts with their source, derived quantities, conflicts, unknowns with the assumption used; blocking unknowns "
+             "are asked once), plans the 图纸目录 from the job-type template and drafts the whole numbered set in "
+             "cad/spec.json (kind sheet_set). Then drawing_build spec=cad/spec.json. It runs by itself at the start of such "
+             "a task; call it again with again=true after the user adds material.",
+             {"images": {"type": "array", "items": {"type": "string"}, "description": "optional: images to read (default: every uploaded image)"},
+              "quotes": {"type": "array", "items": {"type": "string"}, "description": "optional: quote / BOQ files (xlsx, xls, csv, pdf)"},
+              "again": {"type": "boolean", "description": "re-read the inputs (new material)"},
+              "regen": {"type": "boolean", "description": "rewrite cad/spec.json from the brief (default true)"}}, []),
     ToolSpec("drawing_auto", None,
-             "Floor plan from a photo: the DETERMINISTIC draft (drawkit auto). It FINDS the four dimension chains itself "
+             "Floor plan from a photo ONLY (房屋平面描图; never a site / landscape / interior 施工图 job - those use "
+             "drawing_brief): the DETERMINISTIC draft (drawkit auto). It FINDS the four dimension chains itself "
              "(long thin lines outside the outer walls and their ticks; numbers by OCR, or one vision read per chain "
              "crop), fits the px->mm scale per axis, builds the wall grid from the thick wall pixels and makes "
              "rectilinear, non-overlapping rooms from it; doors and windows go where the walls have gaps. Your job is "
@@ -219,7 +233,10 @@ TOOLS: list[ToolSpec] = [
                                         "the lines themselves are located automatically"}}, []),
     ToolSpec("drawing_build", None,
              "Generate the WHOLE drawing deterministically from a structured spec (JSON, schema in the cad-drawing skill: "
-             "floor_plan rooms/doors/windows/furniture/dimension chains, diagram nodes/edges, or generic entities/dims). "
+             "floor_plan rooms/doors/windows/furniture/dimension chains, diagram nodes/edges, generic entities/dims, or a "
+             "sheet_set = a numbered 施工图 set: one multi-page PDF + one DXF, every sheet checked for units/overlaps/frame/"
+             "required elements and then shown to the vision checklist). UNITS: coordinates in model mm, text heights and "
+             "dimension offsets in PAPER mm (2.5-7). "
              "Writes <out>/<name>.dxf (+ a LibreCAD viewing copy, opened on the desktop), <name>.png, overlay.png (the "
              "result drawn on the source photo with the pixel->mm fit of the dimension ticks) and report.json, and returns "
              "the automatic checks: opposite chains add up, each written number fits its measured tick spacing, no text "
@@ -433,7 +450,7 @@ BY_NAME = {t.name: t for t in TOOLS}
 BOS_TOOLS = tuple(t.name for t in TOOLS if t.action == "browseros.call")
 
 
-LOOP_TOOLS = {"read_file", "grep", "glob", "todo_write", "verify_html", "done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "read_image", "photopea", "image_edit", "generate_image", "antigravity"}
+LOOP_TOOLS = {"read_file", "grep", "glob", "todo_write", "verify_html", "done", "fail", "note_finding", "update_plan", "ask_user", "request_takeover", "remember", "delegate", "dispatch", "click_element", "cad_draw", "cad_command", "drawing_read", "drawing_build", "drawing_note", "drawing_auto", "drawing_brief", "read_image", "photopea", "image_edit", "generate_image", "antigravity"}
 SUBAGENT_TOOLS = ("shell", "files_list", "files_read", "files_write", "files_patch", "files_download", "done", "fail")
 
 

@@ -6,11 +6,13 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
 
 from . import drawing_phase as _dp
+from . import drawing_site as _ds
 from . import taskdir as _td
 
 _UPLOAD_RE = re.compile(r"(?:~/workspace/|/workspace/)?(uploads/[^\s'\"，。；;]+?\.(?:jpe?g|png|webp|bmp|gif))", re.I)
@@ -23,7 +25,10 @@ async def _emit(L, tool: str, ok: bool, result: dict, error: Optional[str] = Non
 
 def init(L) -> None:
     L._root_id = _td.root_id(L.task)
-    L._dphase = _dp.DrawPhase() if getattr(L, "_cad_task", False) else None
+    from . import cad as _cad
+    L._sheet_job = (bool(getattr(L, "_cad_task", False)) and _ds.is_sheet_job(L.task.prompt or "")   # 3.9.93 routing
+                    and not _cad.script_drawing_allowed(L.task.prompt or ""))   # a script the user asked for stays a script
+    L._dphase = _dp.DrawPhase(site=L._sheet_job) if getattr(L, "_cad_task", False) else None
     L._delivered = _td.index_for(getattr(L.cfg, "artifacts_dir", None))
     L._draw_escalations = 0
 
@@ -50,6 +55,13 @@ async def start(L) -> None:
     cont = L._root_id != L.task.id
     L.history.append(f"0. work folder {d}/ ({'continuing task ' + L._root_id + ': its files are kept' if cont else 'NEW task: it starts empty'})"
                      + (f"; cad/ is {d}/cad" if cad else "") + (f" [{out.splitlines()[0]}]" if "moved" in out or "adopted" in out else ""))
+    if cad and getattr(L, "_sheet_job", False) and not cont and os.environ.get("AIW_SITE_AUTOBRIEF", "1") != "0":
+        # 3.9.93 (task-241): READ is not optional for a 施工图 set - every input is read before the first decision
+        try:
+            r = await _ds.brief_tool(L, {})
+            L.history.append("0. drawing_brief (automatic, before the first step) ->\n" + r)
+        except Exception as e:  # noqa: BLE001  the model can still call drawing_brief itself
+            L.history.append(f"0. drawing_brief could not run automatically ({type(e).__name__}: {str(e)[:120]}); call drawing_brief.")
 
 
 def task_block(L) -> str:
@@ -72,6 +84,22 @@ async def pre_tool(L, decision):
     instead of a pause; only a task with no spec at all and no way to make one asks the user."""
     dp = getattr(L, "_dphase", None)
     if not dp:
+        return None, None
+    if dp.site:   # 3.9.93: a 施工图 set - READ and VERIFY are never cut off; no tracer
+        refusal = dp.gate(decision.tool, decision.args or {})
+        if refusal:
+            L.history.append(f"{L.step}. {decision.tool} REFUSED: {refusal[:90]}")
+            return "skip", refusal
+        if dp.must_deliver and decision.tool not in ("send_file", "done", "drawing_build", "files_write", "read_image",
+                                                     "files_read", "drawing_brief"):
+            return "converge", f"{_dp.VERIFY_ROUNDS} 轮核对已用完"
+        st = dp.intent(decision.thought or "", decision.tool, decision.args or {})
+        if st == "escalate" and (dp.builds or dp.brief_done):
+            return "converge", dp.stuck()[1]
+        if st:
+            L.history.append(f"{L.step}. {decision.tool} SKIPPED: the last steps repeat the same analysis")
+            return "skip", ("Your last steps repeat the same analysis. " + ("Build the set now: drawing_build spec=cad/spec.json."
+                            if dp.brief_done else "Run drawing_brief now (it reads every input for you)."))
         return None, None
     if dp.must_deliver and decision.tool not in ("send_file", "done", "drawing_build"):
         return "converge", f"{_dp.VERIFY_ROUNDS} 轮核对已用完"
@@ -170,6 +198,8 @@ async def converge(L, why: str) -> bool:
     the drawing still does not pass, deliver the best draft with what is unconfirmed. True when the task ended."""
     dp = getattr(L, "_dphase", None) or _dp.DrawPhase()
     L._dphase = dp
+    if dp.site or getattr(L, "_sheet_job", False):
+        return await converge_site(L, why)
     if dp.auto_runs <= dp.resumes and not dp.must_deliver:
         res = await auto_pipeline(L, why)
         dp.quiet = _dp.QUIET_STEPS
@@ -190,9 +220,30 @@ async def converge(L, why: str) -> bool:
     return await deliver_best(L, why)
 
 
+async def converge_site(L, why: str) -> bool:
+    """a 施工图 set stuck in a loop: never the tracer. Brief if missing, build if never built, then deliver with the
+    honest verdict (a failed set is reported as FAILED with its errors)."""
+    from types import SimpleNamespace
+    dp = L._dphase
+    st = _ds.site_state(L)
+    if not dp.brief_done or not st.get("brief"):
+        r = await _ds.brief_tool(L, {"regen": not dp.builds})
+        post_tool(L, SimpleNamespace(tool="drawing_brief", args={}), not r.startswith("FAILED"), r)
+    if not dp.builds:
+        b = await L._drawing_build({"spec": "cad/spec.json", "name": _ds._name(st.get("brief") or {})}, "build the drawing set")
+        post_tool(L, SimpleNamespace(tool="drawing_build", args={"spec": "cad/spec.json"}), not b.startswith("FAILED"), b)
+        if dp.last_ok is False and not dp.must_deliver:
+            L._converge_note = ("You were looping, so the set was built for you:\n" + b + "\nFix only the listed errors in "
+                                "cad/spec.json and drawing_build again.")
+            return False
+    return await _ds.deliver(L, why)
+
+
 async def deliver_best(L, why: str) -> bool:
     """send the best draft (PNG, DXF, PDF) with a list of what is unconfirmed, and finish the task."""
     from aiw_protocols import TaskStatus
+    if getattr(L, "_sheet_job", False):   # 3.9.93: no floor-plan boilerplate on a site / interior set
+        return await _ds.deliver(L, why)
     dp = getattr(L, "_dphase", None) or _dp.DrawPhase()
     dxf = getattr(L, "_cad_file", None)
     sent = []
@@ -347,7 +398,13 @@ async def tool(L, decision) -> Optional[str]:
         await _emit(L, "drawing_note", True, {"n": len(out)})
         return "; ".join(out) or "nothing noted (give kind, key, value)"
     if t == "drawing_auto":
+        if getattr(L, "_sheet_job", False):   # 3.9.93 (task-241): the tracer ran on a site photo
+            await _emit(L, "drawing_auto", False, {}, "not a floor plan")
+            return L._dphase.gate("drawing_auto", a) if L._dphase else "REFUSED: not a floor plan"
         return await _auto(L, a)
+    if t == "drawing_brief":
+        L._dphase = L._dphase or _dp.DrawPhase(site=True)
+        return await _ds.brief_tool(L, a)
     return None
 
 

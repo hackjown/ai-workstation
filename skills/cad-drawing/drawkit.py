@@ -26,6 +26,8 @@ AIW "cad-drawing" skill helper. One file, Python 3.8+, needs numpy + Pillow (+ e
         holding a label (OCR if rapidocr is installed, else the labels file). Then only CORRECT the draft.
   ensure              install numpy / Pillow / ezdxf and a Chinese font when missing.
 
+  sheet_set (3.9.93): `build` makes a numbered 施工图 set: <name>-<no>.png per sheet, <name>.pdf (all pages), one DXF.
+
 Spec kinds: floor_plan (rooms -> walls, doors, windows, furniture, dimension chains), diagram (boxes + connectors,
 for wiring / flow / block diagrams), generic (explicit lines, arcs, circles, rects, texts, dims; mechanical parts).
 All kinds share the text placement (collision-free, font shrink), the frame / title / notes, the checks and render.
@@ -1451,6 +1453,9 @@ def _arrow(sh, p, q, L):
         sh.line(q, (q[0] + L * math.cos(a), q[1] + L * math.sin(a)), "连线", 0.25)
 
 
+TEXT_PAPER_MIN, TEXT_PAPER_MAX = 1.8, 14.0     # printed text height, paper mm
+
+
 class Generic:
     """explicit entities (mechanical parts, details): line, poly, rect, circle, arc, centerline, text, label, dim."""
 
@@ -1478,12 +1483,23 @@ class Generic:
                 sh.arc(P(e["c"]), e["r"], e["a1"], e["a2"], L, lw)
             elif t == "text":
                 x, y = P(e["at"])
-                sh.text(x, y, e["text"], float(e.get("h_mm", 3.5)) * scale, e.get("layer", "文字"), e.get("anchor", "mc"))
+                h = float(e.get("h_mm", 3.5))
+                if not (TEXT_PAPER_MIN <= h <= TEXT_PAPER_MAX):
+                    # task-241: h_mm 800 was meant as model mm; at 1:100 it drew an 80 m title over the whole sheet
+                    self.errors.append(f"text '{str(e['text'])[:20]}' h_mm={h:g}: h_mm is the PRINTED height in PAPER mm "
+                                       f"({TEXT_PAPER_MIN:g}–{TEXT_PAPER_MAX:g}, normally 2.5/3.5/5/7); at 1:{scale} it would be "
+                                       f"{h * scale / 1000:g} m tall. Write h_mm 3.5–7 (the scale is applied for you).")
+                    h = 7.0 if h > TEXT_PAPER_MAX else TEXT_PAPER_MIN
+                sh.text(x, y, e["text"], h * scale, e.get("layer", "文字"), e.get("anchor", "mc"))
         g = sh.extents(geom_only=True)
         for d in self.spec.get("dims") or []:
             a, b = P(d["a"]), P(d["b"])
             horiz = abs(a[1] - b[1]) < abs(a[0] - b[0]) if "axis" not in d else d["axis"] == "x"
-            off = float(d.get("offset_mm", 8)) * scale
+            off = float(d.get("offset_mm", 8))
+            if abs(off) > 80:
+                self.errors.append(f"dimension offset_mm={off:g}: offset_mm is PAPER mm (5–30), not model mm")
+                off = math.copysign(10, off)
+            off *= scale
             val = d.get("value", round(abs(b[0] - a[0]) if horiz else abs(b[1] - a[1])))
             ext = (min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1]))
             if d.get("outside", True):     # dimension rows sit outside the part outline, as on a real drawing
@@ -1546,6 +1562,8 @@ def choose_scale(w, h, paper, notes_w_mm, want=None):
 
 def make(spec):
     kind = spec.get("kind", "floor_plan")
+    if kind == "sheet_set":
+        raise SystemExit("kind sheet_set is built by `drawkit.py build` (sheetset.py), not make()")
     Eng = {"floor_plan": Plan, "diagram": Diagram, "generic": Generic}.get(kind)
     if Eng is None:
         raise SystemExit(f"unknown kind {kind}; use floor_plan, diagram or generic")
@@ -1671,7 +1689,7 @@ def _legend(sh, x, y, scale, eng):
 def _wrap(s, h, width):
     """wrap a note: never split a number or a latin word, never start a line with punctuation."""
     import re as _re
-    toks = _re.findall(r"[0-9A-Za-z.~²+\-/×]+|.", s)
+    toks = _re.findall(r"[0-9A-Za-z.~²³+\-/×%‰:]+|.", s)
     out, cur = [], ""
     for tk in toks:
         if cur and text_width(cur + tk, h) > width and tk not in "，。；：、）)!！?？,.;:":
@@ -2425,6 +2443,10 @@ def repair_spec(spec):
 
 def run_build(spec_path, out_dir=None, name="plan", source=None, dxf=True, task=None, repair=True):
     spec = load_spec(spec_path)
+    if spec.get("kind") == "sheet_set":   # 3.9.93: a numbered 施工图 set (景观/场地/装修/构筑物), see sheetset.py
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import sheetset as _ss
+        return _ss.build_set(spec, out_dir or Path(spec_path).resolve().parent, name, dxf=dxf)
     if source:
         spec.setdefault("source", {})["image"] = source
     src = spec.get("source") or {}
@@ -2830,6 +2852,13 @@ diagram: "nodes": [{"id","text","box":[x0,y0,x1,y1] | "at":[x,y],"w","h","shape"
 generic: "entities": [{"type":"line","a","b"} | {"type":"poly","points","closed"} | {"type":"rect","box"} |
          {"type":"circle","c","r"} | {"type":"arc","c","r","a1","a2"} | {"type":"centerline","a","b"} |
          {"type":"text","at","text","h_mm"}], "dims": [{"a","b","offset_mm","value"}], "labels": [{"at","text"}]
+         UNITS: coordinates are MODEL mm; h_mm and offset_mm are PAPER mm (text 2.5-7), the scale is applied for you.
+sheet_set (施工图 SET: 景观/场地/装修/构筑物 - one spec, many numbered sheets; see sheetset.py for every entity type):
+ {"kind": "sheet_set", "project", "source_note", "requirements": [{"sheet": key, "tag"|"dim"|"text", "count"|"min", "what"}],
+  "sheets": [{"no": "JS-01", "key": "site_plan", "title": "总平面图", "paper": "A3" (grows to A2/A1 when the views do not fit),
+              "views": [{"title", "scale": 100, "entities": [...model mm, "h" of texts in PAPER mm...], "dims": [...]}],
+              "notes": [...], "legend": [{"sym","text"}], "table": {"title","cols","widths","rows"}}]}
+ Do not write it by hand from nothing: `python3 sitework.py spec cad/brief.json --out cad/spec.json` drafts it from the brief.
 """
 
 

@@ -120,8 +120,9 @@ CATALOG: list[dict] = [
      "desc": "按设计图和报价单画施工图，导出 DXF / PDF",
      "path": "", "setup": "bash ~/ai-workstation/deploy/vm/librecad-setup.sh",
      "note": ("New drawings follow the cad-drawing method: read each dimension chain with drawing_read, write "
-              "cad/spec.json, generate with drawing_build. LibreCAD (cad_command) is the viewer and the editor for "
-              "small manual tweaks only.")},
+              "cad/spec.json, generate with drawing_build. A 施工图 set (景观/场地/装修/构筑物 from images + text + quotes): "
+              "drawing_brief -> 图纸目录 -> drawing_build of the sheet_set (see SKILL.md 3.9.93), never drawing_auto. "
+              "LibreCAD (cad_command) is the viewer and the editor for small manual tweaks only.")},
     {"id": "house-plan-designer", "title": "户型图 → 装修设计器", "icon": "ruler",
      "desc": "户型图（酷家乐/贝壳/售楼处图、手绘尺寸图、CAD 矢量 PDF/DXF、原始结构图）还原成单文件 HTML 装修设计器：2D + 3D 漫游 + 家具 + 水电/吊顶/铺装/拆改 + 管线自动排布 + 报价 + PDF/DXF 施工图",
      "path": "~/.claude/skills/house-plan-designer",

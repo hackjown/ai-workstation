@@ -987,7 +987,7 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     # v3.9.15: image2_* = the second image endpoint (its key is the secret image2_api_key); image_default picks which
     # of the two is tried first (gateway | custom), the other is the fallback
     MODEL_KEYS = ("model", "vision_model", "vision_fallback", "fallback", "subagent_model", "image_model", "video_model",
-                  "base_url", "thinking", "chat_model", "small_model", "embed_model",
+                  "base_url", "thinking", "chat_model", "chat_engine", "small_model", "embed_model",
                   "image2_base_url", "image2_model", "image_default",
                   # v3.9.31 视频通话: the omni model (empty = calls off), its voice, the realtime endpoint / model, the
                   # model that reads a text-only omni model's answers aloud, auto|realtime|turn, max minutes a call

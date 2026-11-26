@@ -818,3 +818,68 @@ async def test_group_messages_pagination(tmp_path):
     inc, has_inc = groups.messages_page(gid, after=p2[-1]["seq"], limit=10)
     assert [m["text"] for m in inc] == ["msg-4", "msg-5"]
     assert has_inc is False
+
+
+@pytest.mark.asyncio
+async def test_main_chat_local_tools_and_engine_takeover(tmp_path):
+    from aiw_api.chat import Chat
+    from aiw_api.config import Settings
+
+    store = Store(str(tmp_path / "aiw.db"))
+    store.upsert_machine({"id": "ai-linux-001", "provider": "local", "provider_vm_id": "v1",
+                          "name": "Local PC", "agent_endpoint": "ws://localhost:8001"})
+    secrets = SecretBox(store, str(tmp_path))
+    ran_cmds = []
+
+    async def fake_shell(mid: str, cmd: str, timeout: int) -> str:
+        ran_cmds.append(cmd)
+        return "ok: shell output"
+
+    class _DummySess:
+        listeners = []
+        def model_settings(self):
+            return store.kv_get("models", {}) or {}
+
+    bots = B.Bots(store, shell=fake_shell, secrets=secrets)
+    groups = G.Groups(bots)
+    chat = Chat(store, _DummySess(), None, Settings(), secrets)
+    chat.engines = G.Dispatch(bots, groups, chat)
+
+    # 1. Main chat exposes local_shell, read_local_file, write_local_file, and blocks dangerous commands
+    ctools = await chat.tools()
+    assert {"local_shell", "read_local_file", "write_local_file", "ssh_exec"}.issubset(ctools)
+    blocked = await chat.run_tool(ctools, "local_shell", {"command": "rm -rf /"})
+    assert "已拦截高危命令" in blocked
+    ok_res = await chat.run_tool(ctools, "local_shell", {"command": "ls -la", "workdir": "~/workspace"})
+    assert "ok: shell output" in ok_res
+    assert any("ls -la" in c for c in ran_cmds)
+
+    # 2. Engine takeover (chat_engine = "codebuddy") routes Chat.reply() through bots._turn()
+    store.kv_set("models", {"chat_engine": "codebuddy"})
+    turn_calls = []
+
+    async def fake_turn(cid: str, prompt: str, skip: bool = False, fresh: bool = False) -> dict:
+        turn_calls.append((cid, prompt))
+        return {"status": "done", "text": "已用本机工具查完。\n[[交给电脑:打开 PS 修图]]"}
+
+    bots._turn = fake_turn
+    msg = await chat.reply("帮我查一下日志，顺便用 PS 修一下图")
+    assert len(turn_calls) == 1
+    assert msg["data"].get("engine") == "codebuddy"
+    assert msg["data"].get("offer_task") == "打开 PS 修图"
+    assert "已用本机工具查完" in msg["text"]
+    # main_chat conv stays hidden from normal engine convs list
+    assert all(c.get("kind") != "main_chat" for c in bots.convs())
+
+    # 3. Engine failure falls back cleanly to API model
+    async def fail_turn(cid: str, prompt: str, skip: bool = False, fresh: bool = False) -> dict:
+        return {"status": "error", "text": "电脑离线"}
+
+    class _FallbackLLM:
+        async def chat(self, messages, schemas=None, max_tokens=1500, cb=None):
+            return {"content": "API 模型已接手回复", "tool_calls": []}
+
+    bots._turn = fail_turn
+    chat.llm_factory = lambda role: _FallbackLLM()
+    fb = await chat.reply("在吗")
+    assert "API 模型已接手回复" in fb["text"]

@@ -583,7 +583,7 @@ class Bots:
     # ------------------------------------------------------------------ storage
     def convs(self, members: bool = False) -> list[dict]:
         """v3.9.61: a group's members live in its group view, not in the list (members=True lists them too)."""
-        rows = self.store._x("SELECT * FROM bot_convs " + ("" if members else "WHERE grp IS NULL OR grp='' ")
+        rows = self.store._x("SELECT * FROM bot_convs " + ("" if members else "WHERE (grp IS NULL OR grp='') AND COALESCE(kind,'')!='main_chat' ")
                              + "ORDER BY updated_at DESC")
         out = []
         for r in rows:
@@ -1396,6 +1396,8 @@ class Bots:
         if not self.notifier:
             return
         c = self.conv(cid) or {}
+        if c.get("kind") == "main_chat":
+            return
         try:
             await self.notifier.notify("reply", f"{ENGINES.get(c.get('bot'), {}).get('title', 'Agent')} 回复了",
                                        clip(re.sub(r"\s+", " ", text), 200), deep=f"bots?c={cid}")

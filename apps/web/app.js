@@ -980,6 +980,17 @@ async function loadSettings() {
         <button type="button" class="btn sm" onclick="probeModel(this)">探测</button><div class="probe small"></div></div>`).join("")}
       <span class="muted">深度思考<div class="small">关掉可快很多</div></span>
       <select name="thinking"><option value="off" ${(models.thinking || "off") === "off" ? "selected" : ""}>关闭（推荐，更快）</option><option value="on" ${models.thinking === "on" ? "selected" : ""}>模型默认</option></select>
+      <span class="muted">主聊天引擎<div class="small">可用已登录引擎接管小秘；离线自动回退 API</div></span>
+      <select name="chat_engine">
+        <option value="" ${!(models.chat_engine) ? "selected" : ""}>API 模型（默认小秘）</option>
+        <option value="codebuddy" ${models.chat_engine === "codebuddy" ? "selected" : ""}>CodeBuddy (cbc)</option>
+        <option value="agy" ${models.chat_engine === "agy" ? "selected" : ""}>Antigravity (agy)</option>
+        <option value="claude" ${models.chat_engine === "claude" ? "selected" : ""}>Claude Code</option>
+        <option value="codex" ${models.chat_engine === "codex" ? "selected" : ""}>Codex</option>
+        <option value="grok" ${models.chat_engine === "grok" ? "selected" : ""}>Grok Build</option>
+        <option value="muse" ${models.chat_engine === "muse" ? "selected" : ""}>Meta Muse（云端）</option>
+        <option value="cue" ${models.chat_engine === "cue" ? "selected" : ""}>Cue（云端）</option>
+      </select>
     </div>
     <div class="row gap wrap"><button class="btn primary">保存</button><button type="button" class="btn" onclick="fetchModels(true)">刷新模型列表</button><span id="modelListNote" class="small"></span></div></form>
 
@@ -1271,7 +1282,7 @@ async function saveModels(e) {
   if (f.key.value) await api("PUT", "/api/secrets/openai_api_key", { value: f.key.value });
   if (f.image2_key && f.image2_key.value) await api("PUT", "/api/secrets/image2_api_key", { value: f.image2_key.value });
   const v = (n) => (f[n].value === "__custom" ? "" : f[n].value);
-  const body = { model: v("model"), vision_model: v("vision_model"), vision_fallback: v("vision_fallback"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value };
+  const body = { model: v("model"), vision_model: v("vision_model"), vision_fallback: v("vision_fallback"), fallback: v("fallback"), subagent_model: v("subagent_model"), video_model: v("video_model"), image_model: v("image_model"), base_url: f.base_url.value, thinking: f.thinking.value, chat_engine: f.chat_engine ? f.chat_engine.value : "" };
   if (f.image2_base_url) { body.image2_base_url = f.image2_base_url.value.trim(); body.image2_model = f.image2_model.value.trim(); body.image_default = (f.image_default && f.image_default.value) || ""; }
   if (f.omni_model) body.omni_model = v("omni_model");
   f.querySelectorAll("select.psel").forEach((s) => { body[s.name] = s.value; });   // v3.9.33 *_provider

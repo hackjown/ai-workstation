@@ -122,7 +122,9 @@ SYSTEM = """你是「{name}」，用户的私人助理，形象是一只叫球�
 现在的北京时间写在用户最新那条消息开头的［背景］里（用户看不到这段）。
 说话方式：简体中文，口语、简洁、直接给答案；不要客套，不要长篇大论；需要列点时用短列表。
 你在聊天里能用的工具：{tools}。不知道的事先查，查不到就直说，绝不编造。
-你自己不能操作电脑。用户要的事需要在电脑上动手（打开网站办事、登录、填表、下单、下载、做或改文件、画图、剪视频、长时间执行）时，
+分工原则：
+- 能用聊天自带工具直接完成的（读写电脑文件、跑本机命令、查 git/docker/日志、SSH 运维、查网页、搜记录、AI 生图/改图）就直接动手做完并回报结果，这样最快，不要推给电脑任务；
+- 需要图形界面或桌面软件操作的（如 Photoshop/PS 修图、专业画图/CAD、浏览器登录/填表/下单、下载大文件、剪视频、多步长时间自动化）时，
 先用一两句话说明你会怎么做，然后在回复的最后单独一行写：[[交给电脑:一句话说清要电脑做什么]]。用户点按钮就会交给电脑去做。
 不要输出你的思考过程。永远不要索要或复述密码、验证码。"""
 
@@ -706,7 +708,9 @@ class Chat:
         upto = int(summ.get("upto") or 0)
         gap = self.store._x("SELECT * FROM chat_messages WHERE conv=? AND seq>? AND seq<? ORDER BY seq DESC LIMIT 40",
                             (CONV, upto, start))
-        tools = ["读网页（read_url）", "读文件（read_file）", "查任务和例程的状态（task_status）"]
+        tools = ["读网页（read_url）", "读附件/产物文件（read_file）", "查任务和例程的状态（task_status）", "SSH 远程执行（ssh_exec）"]
+        if getattr(self, "engines", None) is not None and getattr(self.engines.bots, "sh", None) is not None:
+            tools.append("本机电脑命令（local_shell）、读写本机文件（read_local_file / write_local_file）")
         if getattr(self, "search", None) is not None:
             tools.append("搜以前的聊天、任务和文件（session_search，用户说「上次/之前/那个…」时先搜）")
         if getattr(self, "_search_names", None):
@@ -976,8 +980,109 @@ class Chat:
             except Exception as e:  # noqa: BLE001
                 log.warning("memory learn: %s", e)
 
+    def _chat_engine(self) -> str:
+        """Optional engine (e.g. codebuddy / agy / claude / codex / grok / muse / cue) taking over main chat."""
+        try:
+            m = self.sessions.model_settings() if hasattr(self.sessions, "model_settings") else (self.store.kv_get("models", {}) or {})
+        except Exception:  # noqa: BLE001
+            m = self.store.kv_get("models", {}) or {}
+        eng = str((m or {}).get("chat_engine") or "").strip().lower()
+        disp = getattr(self, "engines", None)
+        if eng and disp is not None and eng in getattr(disp.bots, "engines", {}):
+            return eng
+        return ""
+
+    async def _reply_via_engine(self, bot: str, text: str, on_delta=None, on_status=None,
+                                attachments: Optional[list] = None) -> Optional[dict]:
+        """Run main chat reply through the selected engine's persistent session; return None to fall back to API model."""
+        from . import bots as _B
+        bots = self.engines.bots
+        title = (_B.ENGINES.get(bot) or {}).get("title") or bot
+        if on_status:
+            try:
+                await on_status(f"{title} 正在处理…")
+            except Exception:  # noqa: BLE001
+                pass
+        rows = self.store._x("SELECT id FROM bot_convs WHERE bot=? AND kind='main_chat' ORDER BY created_at LIMIT 1", (bot,))
+        if rows:
+            cid = rows[0]["id"]
+            c = bots.conv(cid)
+            first_turn = not bool((c or {}).get("session"))
+        else:
+            cfg = bots.engine_cfg(bot)
+            c = bots.create(bot, f"主聊天（{title}）", cfg["workdir"] or f"~/workspace/{bot}-chat/main", cfg["machine_id"])
+            cid = c["id"]
+            self.store._x("UPDATE bot_convs SET kind='main_chat' WHERE id=?", (cid,))
+            first_turn = True
+
+        parts: list[str] = []
+        now = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+        if first_turn:
+            head = (
+                f"你是「{self.agent_name()}」，用户的私人助理（现在由 {title} 接管主聊天）。\n"
+                "说话简洁口语，简体中文，直接给结果。能用本机读写文件和命令直接完成的就直接做完并汇报；"
+                "需要图形界面操作（如 Photoshop/PS、专业画图、浏览器登录下单、剪视频）或长任务时，"
+                "先简短说明做法，并在回复最后单独一行写：[[交给电脑:一句话说清要电脑做什么]]。"
+            )
+            if self.memory:
+                try:
+                    pb = self.memory.profile_block() if hasattr(self.memory, "profile_block") else ""
+                    if pb:
+                        head += "\n\n" + pb
+                except Exception:  # noqa: BLE001
+                    pass
+            summ = (self.summary() or {}).get("text") or ""
+            if summ:
+                head += "\n\n更早的聊天摘要：\n" + summ
+            parts.append(head)
+        bg_lines = [f"现在是 {now}（北京时间）。"]
+        if self.memory:
+            try:
+                fb = self.memory.facts_block(text) if hasattr(self.memory, "facts_block") else self.memory.prompt_block(text)
+                if fb:
+                    bg_lines.append(fb)
+            except Exception:  # noqa: BLE001
+                pass
+        parts.append("［背景：" + "\n".join(bg_lines) + "］")
+        if attachments:
+            fb = _B.files_block([a for a in attachments if isinstance(a, dict)])
+            if fb:
+                parts.append(fb)
+        parts.append(text)
+        prompt = "\n\n".join(p for p in parts if p)
+        try:
+            res = await bots._turn(cid, prompt)
+        except Exception as e:  # noqa: BLE001
+            log.warning("chat_engine %s failed, falling back to API model: %s", bot, e)
+            return None
+        st = (res or {}).get("status")
+        raw = str((res or {}).get("text") or "").strip()
+        if st in ("error", "failed") or not raw:
+            log.warning("chat_engine %s status=%s, falling back to API model", bot, st)
+            return None
+        flt = OfferFilter()
+        flt.feed(raw)
+        vis, off = flt.finish()
+        body = (vis or raw).strip()
+        if on_delta and body:
+            try:
+                await on_delta(body)
+            except Exception:  # noqa: BLE001
+                pass
+        data: dict = {"engine": bot}
+        if off:
+            data["offer_task"] = off
+            if attachments:
+                data["offer_attachments"] = attachments[:10]
+        return self.add("assistant", "text", body, data)
+
     async def reply(self, text: str, on_delta=None, on_status=None, attachments: Optional[list] = None) -> dict:
         self._made_files = []   # v3.9.15: pictures generate_image / edit_image made in this reply
+        chat_eng = self._chat_engine()
+        if chat_eng:
+            eng_reply = await self._reply_via_engine(chat_eng, text, on_delta=on_delta, on_status=on_status, attachments=attachments)
+            if eng_reply is not None:
+                return eng_reply
         tools = await self.tools()
         if self.memory and hasattr(self.memory, "prepare"):   # embeds the question when an embedding model is set
             try:
@@ -1081,6 +1186,94 @@ class Chat:
                                       "prompt": {"type": "string", "description": "只写要改什么，其余保持不变"}},
                                       "required": ["path", "prompt"]}}, self._edit_image)
         disp = getattr(self, "engines", None)
+        if disp is not None and getattr(disp.bots, "sh", None) is not None:
+            import base64 as _b64
+            import shlex as _shlex
+            _DANGEROUS_SHELL_RE = re.compile(
+                r"(?:\brm\s+-[a-z]*r[a-z]*f[a-z]*\s+(?:/|~|\$HOME|\*)(?:\s|$)|\bmkfs\b|\bdd\s+if=|"
+                r"\bshutdown\b|\breboot\b|\bpoweroff\b|\bgit\s+push\b[^\n]*--force|\bgit\s+reset\s+--hard\b)",
+                re.I,
+            )
+
+            async def _local_shell(a, _d=disp):
+                cmd = str(a.get("command") or "").strip()
+                wd = str(a.get("workdir") or "").strip()
+                if not cmd:
+                    return "需要 command 参数"
+                if _DANGEROUS_SHELL_RE.search(cmd):
+                    return f"已拦截高危命令（禁止强制删除根目录、强推或关机）：{cmd}"
+                mid = _d.bots.default_machine()
+                if not mid:
+                    return "当前没有可用的电脑"
+                full = f"cd {_shlex.quote(os.path.expanduser(wd) if wd.startswith('~') else wd)} && {cmd}" if wd else cmd
+                if wd.startswith("~/"):
+                    full = f'cd "$HOME/"{_shlex.quote(wd[2:])} && {cmd}'
+                elif wd == "~":
+                    full = f'cd "$HOME" && {cmd}'
+                out = await _d.bots.sh(mid, full, 45)
+                return (out or "(无输出)")[:8000]
+
+            async def _read_local_file(a, _d=disp):
+                path = str(a.get("path") or "").strip()
+                if not path:
+                    return "需要 path 参数"
+                start = max(1, int(a.get("start_line") or 1))
+                max_lines = max(1, min(int(a.get("max_lines") or 200), 400))
+                mid = _d.bots.default_machine()
+                if not mid:
+                    return "当前没有可用的电脑"
+                py = (
+                    "import os, sys; p = os.path.expanduser(sys.argv[1]); s = int(sys.argv[2]); n = int(sys.argv[3])\n"
+                    "if not os.path.isfile(p): print('文件不存在：' + p); sys.exit(0)\n"
+                    "with open(p, 'r', encoding='utf-8', errors='replace') as f:\n"
+                    "    lines = f.readlines()\n"
+                    "tot = len(lines); chunk = lines[s-1:s-1+n]\n"
+                    "print(f'[{p} 共 {tot} 行，显示 {s}-{s+len(chunk)-1}]')\n"
+                    "for i, ln in enumerate(chunk, s): print(f'{i}: {ln}', end='')\n"
+                )
+                cmd = f"python3 -c {_shlex.quote(py)} {_shlex.quote(path)} {start} {max_lines}"
+                out = await _d.bots.sh(mid, cmd, 25)
+                return (out or "(空文件)")[:12000]
+
+            async def _write_local_file(a, _d=disp):
+                path = str(a.get("path") or "").strip()
+                content = a.get("content")
+                append = bool(a.get("append"))
+                if not path or content is None:
+                    return "需要 path 和 content 参数"
+                mid = _d.bots.default_machine()
+                if not mid:
+                    return "当前没有可用的电脑"
+                b64 = _b64.b64encode(str(content).encode("utf-8")).decode("ascii")
+                py = (
+                    "import base64, os, sys; p = os.path.expanduser(sys.argv[1]); mode = sys.argv[2]\n"
+                    "data = base64.b64decode(sys.stdin.read().strip())\n"
+                    "d = os.path.dirname(os.path.abspath(p))\n"
+                    "if d: os.makedirs(d, exist_ok=True)\n"
+                    "with open(p, mode) as f: f.write(data)\n"
+                    "print(f'已写入 {p}（{len(data)} 字节）')\n"
+                )
+                cmd = f"printf '%s' {_shlex.quote(b64)} | python3 -c {_shlex.quote(py)} {_shlex.quote(path)} {'ab' if append else 'wb'}"
+                out = await _d.bots.sh(mid, cmd, 25)
+                return (out or f"已写入 {path}")[:2000]
+
+            out["local_shell"] = ({"name": "local_shell", "description": "在用户本机电脑上执行 shell 命令（查目录、git、docker、日志、跑脚本等，45 秒超时；禁止高危删除/强推）",
+                                   "parameters": {"type": "object", "properties": {
+                                       "command": {"type": "string", "description": "要执行的 shell 命令"},
+                                       "workdir": {"type": "string", "description": "可选工作目录，如 ~/workspace/demo"}},
+                                       "required": ["command"]}}, _local_shell)
+            out["read_local_file"] = ({"name": "read_local_file", "description": "直接读取用户本机电脑上的文本文件内容（支持 ~/ 路径和行号分页）",
+                                       "parameters": {"type": "object", "properties": {
+                                           "path": {"type": "string", "description": "本机文件路径，如 ~/workspace/notes.md"},
+                                           "start_line": {"type": "integer", "description": "起始行号，默认 1"},
+                                           "max_lines": {"type": "integer", "description": "最多读取行数，默认 200"}},
+                                           "required": ["path"]}}, _read_local_file)
+            out["write_local_file"] = ({"name": "write_local_file", "description": "直接在本机电脑上创建、覆盖或追加写入文本文件（写笔记、改配置、写脚本等）",
+                                        "parameters": {"type": "object", "properties": {
+                                            "path": {"type": "string", "description": "本机文件路径，如 ~/workspace/todo.md"},
+                                            "content": {"type": "string", "description": "要写入的文本内容"},
+                                            "append": {"type": "boolean", "description": "true 为追加，默认 false 覆盖"}},
+                                            "required": ["path", "content"]}}, _write_local_file)
         if disp is not None:   # v3.9.61: hand coding work to an engine on the computer (agy, Codex, Claude Code, …)
             async def _engine_task(a, _d=disp):
                 bots = [str(x).lower() for x in (a.get("engines") or []) if str(x).lower() in
@@ -1287,6 +1480,7 @@ class Chat:
                 "session_search": "正在翻以前的记录…", "generate_image": "正在画图…",
                 "edit_image": "正在改图…", "doc_ask": "正在读文档…", "engine_task": "正在交给引擎…",
                 "engine_convs": "正在翻引擎的对话…", "engine_status": "正在看引擎进度…", "engine_config": "正在改引擎设置…",
+                "local_shell": "正在电脑上执行命令…", "read_local_file": "正在读电脑文件…", "write_local_file": "正在写电脑文件…",
                 "ssh_exec": "正在 SSH 连服务器…", "remote_exec": "正在连运维主机…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
@@ -1296,7 +1490,7 @@ class Chat:
             res = await asyncio.wait_for(tools[name][1](args),
                                          float(os.environ.get("AIW_IMAGE_EDIT_TIMEOUT", "300")) * 2 + 30
                                          if name in ("generate_image", "edit_image") else 300 if name == "doc_ask" else 60
-                                         if name in ("read_url", "web_search") else 40)
+                                         if name in ("read_url", "web_search", "local_shell", "ssh_exec", "remote_exec") else 40)
         except Exception as e:  # noqa: BLE001
             return f"工具出错：{type(e).__name__}: {str(e)[:200]}"
         return res if isinstance(res, str) else json.dumps(res, ensure_ascii=False, default=str)

@@ -8,6 +8,7 @@ struct SettingsView: View {
     @AppStorage("mate") private var mate = true
     // 3.8.9: 主模型思考 = the server's models.thinking ("on" | "off"), the same setting as the web 深度思考 select
     @State private var thinking = false
+    @State private var chatEngine = ""
     @State private var thinkingLoaded = false
     @State private var thinkingSaving = false
     @State private var thinkingError = ""
@@ -33,8 +34,19 @@ struct SettingsView: View {
                     }
                 }
                 Section(header: Text("模型"), footer: Text(thinkingError.isEmpty
-                        ? "打开后主模型每一步先深度思考再操作，更稳但慢很多；关闭更快（推荐）。和网页设置里的「深度思考」是同一个开关，下一个任务开始生效。"
+                        ? "「主聊天引擎」可让 CodeBuddy 等引擎接管小秘，电脑离线会自动回退到 API 模型；「主模型思考」关闭更快（推荐）。"
                         : thinkingError).foregroundColor(thinkingError.isEmpty ? .secondary : .red)) {
+                    Picker("主聊天引擎", selection: Binding(get: { chatEngine }, set: { v in Task { await setChatEngine(v) } })) {
+                        Text("API 模型（默认小秘）").tag("")
+                        Text("CodeBuddy (cbc)").tag("codebuddy")
+                        Text("Antigravity (agy)").tag("agy")
+                        Text("Claude Code").tag("claude")
+                        Text("Codex").tag("codex")
+                        Text("Grok Build").tag("grok")
+                        Text("Meta Muse（云端）").tag("muse")
+                        Text("Cue（云端）").tag("cue")
+                    }
+                    .disabled(!thinkingLoaded || thinkingSaving)
                     Toggle(isOn: Binding(get: { thinking }, set: { v in Task { await setThinking(v) } })) {
                         HStack(spacing: 6) {
                             Text("主模型思考")
@@ -88,9 +100,25 @@ struct SettingsView: View {
         do {
             let m = try await api.obj("GET", "/api/settings/models")
             thinking = m.s("thinking") == "on"
+            chatEngine = m.s("chat_engine")
             thinkingLoaded = true
             thinkingError = ""
         } catch { thinkingError = "读不到模型设置：" + error.localizedDescription }
+    }
+
+    func setChatEngine(_ eng: String) async {
+        let before = chatEngine
+        chatEngine = eng
+        thinkingSaving = true
+        defer { thinkingSaving = false }
+        do {
+            let m = try await api.obj("PATCH", "/api/settings/models", ["chat_engine": eng])
+            chatEngine = m.s("chat_engine")
+            thinkingError = ""
+        } catch {
+            chatEngine = before
+            thinkingError = "没能保存：" + error.localizedDescription
+        }
     }
 
     func setThinking(_ on: Bool) async {

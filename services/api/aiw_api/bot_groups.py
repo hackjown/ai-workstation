@@ -483,10 +483,35 @@ class Groups:
         self._emit("group_message", m)
         return m
 
+    def messages_page(self, gid: str, after: int = 0, before: int = 0, limit: int = 300) -> tuple[list[dict], bool]:
+        lim = max(1, min(int(limit or 300), 300))
+        b = int(before or 0)
+        a = int(after or 0)
+        if b > 0:
+            rows = self.store._x(
+                "SELECT * FROM bot_group_messages WHERE grp=? AND seq<? ORDER BY seq DESC LIMIT ?",
+                (gid, b, lim + 1),
+            )
+            has_more = len(rows) > lim
+            rows = rows[:lim]
+        elif a > 0:
+            rows = self.store._x(
+                "SELECT * FROM bot_group_messages WHERE grp=? AND seq>? ORDER BY seq DESC LIMIT ?",
+                (gid, a, lim),
+            )
+            has_more = False
+        else:
+            rows = self.store._x(
+                "SELECT * FROM bot_group_messages WHERE grp=? ORDER BY seq DESC LIMIT ?",
+                (gid, lim + 1),
+            )
+            has_more = len(rows) > lim
+            rows = rows[:lim]
+        return [B.msg_row(r) for r in reversed(rows)], has_more
+
     def messages(self, gid: str, after: int = 0, limit: int = 300) -> list[dict]:
-        rows = self.store._x("SELECT * FROM bot_group_messages WHERE grp=? AND seq>? ORDER BY seq DESC LIMIT ?",
-                             (gid, int(after or 0), int(limit)))
-        return [B.msg_row(r) for r in reversed(rows)]
+        msgs, _ = self.messages_page(gid, after=after, limit=limit)
+        return msgs
 
     def add(self, gid: str, role: str, who: str, text: str, data: Optional[dict] = None, src: str = "") -> dict:
         if role in ("bot", "aiw"):
@@ -2091,19 +2116,21 @@ def mount(app, groups: Groups, auth) -> None:
         return groups.group(g["id"])
 
     @app.get("/api/bots/groups/{gid}", dependencies=dep)
-    async def groups_get(gid: str, after: int = 0):
+    async def groups_get(gid: str, after: int = 0, before: int = 0, limit: int = 300):
         g = need(gid)
-        for m in g["members"]:
-            if m.get("conv") and B.is_cloud_engine(m.get("bot") or ""):
-                await groups.bots.sync_cloud(m["conv"])
-        groups.mark_read(gid)
-        g["unread"] = 0
-        convs = {m["conv"]: groups.bots.conv(m["conv"]) for m in g["members"] if m.get("conv")}
-        for m in g["members"]:
-            c = convs.get(m.get("conv")) or {}
-            m["busy"] = groups.bots.busy(m.get("conv") or "")
-            m["status"] = c.get("status")
-        return {"group": g, "messages": groups.messages(gid, after)}
+        if before <= 0:
+            for m in g["members"]:
+                if m.get("conv") and B.is_cloud_engine(m.get("bot") or ""):
+                    await groups.bots.sync_cloud(m["conv"])
+            groups.mark_read(gid)
+            g["unread"] = 0
+            convs = {m["conv"]: groups.bots.conv(m["conv"]) for m in g["members"] if m.get("conv")}
+            for m in g["members"]:
+                c = convs.get(m.get("conv")) or {}
+                m["busy"] = groups.bots.busy(m.get("conv") or "")
+                m["status"] = c.get("status")
+        msgs, has_more = groups.messages_page(gid, after=after, before=before, limit=limit)
+        return {"group": g, "messages": msgs, "has_more": has_more}
 
     @app.post("/api/bots/groups/{gid}/members", dependencies=dep)
     async def groups_add_members(gid: str, body: GroupMembersIn):

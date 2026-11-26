@@ -787,3 +787,34 @@ async def test_no_space_mentions_manager_tools_and_chat_ssh(tmp_path):
     chat = Chat(store, _DummySess(), None, Settings(), secrets)
     ctools = await chat.tools()
     assert "ssh_exec" in ctools
+
+
+@pytest.mark.asyncio
+async def test_group_messages_pagination(tmp_path):
+    store = Store(str(tmp_path / "aiw.db"))
+    bots = B.Bots(store, secrets=SecretBox(store, str(tmp_path)))
+    groups = G.Groups(bots)
+    g = await groups.create("page-grp", "", ["muse"])
+    gid = g["id"]
+    for i in range(1, 6):
+        groups.add(gid, "user", "user", f"msg-{i}")
+
+    # Latest 2 messages (page 1)
+    p1, has1 = groups.messages_page(gid, limit=2)
+    assert [m["text"] for m in p1] == ["msg-4", "msg-5"]
+    assert has1 is True
+
+    # Older 2 messages before p1[0] (page 2)
+    p2, has2 = groups.messages_page(gid, before=p1[0]["seq"], limit=2)
+    assert [m["text"] for m in p2] == ["msg-2", "msg-3"]
+    assert has2 is True
+
+    # Remaining older messages before p2[0] (page 3, includes system creation msg + msg-1)
+    p3, has3 = groups.messages_page(gid, before=p2[0]["seq"], limit=5)
+    assert p3[-1]["text"] == "msg-1"
+    assert has3 is False
+
+    # Incremental after query
+    inc, has_inc = groups.messages_page(gid, after=p2[-1]["seq"], limit=10)
+    assert [m["text"] for m in inc] == ["msg-4", "msg-5"]
+    assert has_inc is False

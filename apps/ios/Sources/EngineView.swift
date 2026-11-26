@@ -1322,8 +1322,11 @@ struct EngineGroupView: View {
     @State private var permitRule = ""
     @State private var showPermitRule = false
     @State private var diff: GroupDiffSheet? = nil
-    @State private var msgsSig = ""
     @State private var groupSig = ""
+    @State private var loaded = false
+    @State private var hasMore = false
+    @State private var loadingOlder = false
+    @State private var olderOK = false
     @State private var initialScrolled = false
     @State private var wantScroll = false
     @State private var showAddMembers = false
@@ -1351,12 +1354,37 @@ struct EngineGroupView: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    if msgs.isEmpty && !group.isEmpty {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    if hasMore {
+                        HStack {
+                            Spacer()
+                            if loadingOlder {
+                                ProgressView()
+                            } else {
+                                Button("加载更早的消息") {
+                                    Task { if let keep = await loadOlder() { proxy.scrollTo(keep, anchor: .top) } }
+                                }
+                                .font(.caption).foregroundColor(.secondary)
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 6).id("older")
+                        .onAppear {
+                            Task {
+                                guard olderOK else { return }
+                                if let keep = await loadOlder() { proxy.scrollTo(keep, anchor: .top) }
+                            }
+                        }
+                    } else if !msgs.isEmpty {
+                        Text("· 聊天从这里开始 ·").font(.caption2).foregroundColor(.secondary).frame(maxWidth: .infinity)
+                    }
+                    if loaded && msgs.isEmpty && !group.isEmpty {
                         Text("说要做什么：不 @ 就由 AIW 管家分工；@codex 只发给它。每个引擎在自己的分支上改，做完管家合并。\n以「项目规划：」开头发一份规划，就按 讨论 → 设计 → 开发 → 评审 → 验收 → 实测截图 → 交付 走完。")
                             .font(.footnote).foregroundColor(.secondary).frame(maxWidth: .infinity).padding(.top, 40)
                     }
-                    ForEach(msgs.indices.map { HRowKey(i: $0, id: msgs[$0].s("id")) }, id: \.id) { k in row(msgs[k.i]) }
+                    ForEach(msgs.indices.map { HRowKey(i: $0, id: msgs[$0].s("id")) }, id: \.id) { k in
+                        row(msgs[k.i]).id(k.id)
+                    }
                     if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red) }
                     Color.clear.frame(height: 24).id("end")
                 }.padding(.horizontal, 14).padding(.vertical, 10)
@@ -1366,8 +1394,14 @@ struct EngineGroupView: View {
             .safeAreaInset(edge: .bottom) { composer }
             .onChange(of: msgs.count) { n in
                 if n > 0 && (!initialScrolled || wantScroll) {
+                    let first = !initialScrolled
                     initialScrolled = true; wantScroll = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { proxy.scrollTo("end", anchor: .bottom) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                        proxy.scrollTo("end", anchor: .bottom)
+                        if first {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { olderOK = true }
+                        }
+                    }
                 }
             }
         }
@@ -1624,7 +1658,7 @@ struct EngineGroupView: View {
                 if !m.o("data").a("attachments").isEmpty { AttachmentPreviews(attachments: m.o("data").a("attachments")) }
                 if !m.o("data").a("cards").isEmpty {
                     EngineOptionCards(gid: gid, msgId: m.s("id"), cards: m.o("data").a("cards"), picked: m.o("data").s("picked")) {
-                        msgsSig = ""; Task { await load() }
+                        Task { await load() }
                     }
                 } else if !m.o("data").a("media").isEmpty {
                     EngineMediaList(media: m.o("data").a("media"))
@@ -1680,20 +1714,56 @@ struct EngineGroupView: View {
         let pend = ((g["pending"] as? [String]) ?? []).joined(separator: ",")
         return "\(g.s("status"))|\(g.b("busy"))|\(pend)|\(g.o("project").s("phase"))|\(g.o("paused").s("msg"))|\(ms)"
     }
-    func sigMsgs(_ arr: [JSON]) -> String {
-        guard let last = arr.last else { return "0" }
-        let d = last.o("data")
-        return "\(arr.count)|\(last.s("id"))|\(last.s("text").count)|\(d.a("media").count)|\(d.a("actions").count)|\(d.o("diff").s("to"))"
+    func sigMsg(_ m: JSON) -> String {
+        let d = m.o("data")
+        return "\(m.s("id"))|\(m.s("text").count)|\(d.a("media").count)|\(d.a("actions").count)|\(d.a("cards").count)|\(d.s("picked"))|\(d.o("diff").s("to"))"
     }
     @MainActor func load() async {
         do {
-            let r = try await API.shared.obj("GET", "/api/bots/groups/\(gid)?after=0")
+            let lim = loaded ? 15 : 20
+            let r = try await API.shared.obj("GET", "/api/bots/groups/\(gid)?limit=\(lim)")
             let ng = r.o("group"), nm = r.a("messages")
-            let gs = sigGroup(ng), ms = sigMsgs(nm)
+            let gs = sigGroup(ng)
             if gs != groupSig { groupSig = gs; group = ng }
-            if ms != msgsSig { msgsSig = ms; msgs = nm }
+            if !loaded {
+                msgs = nm
+                hasMore = r.b("has_more")
+                loaded = true
+            } else {
+                var next = msgs
+                var changedAny = false
+                for m in nm {
+                    let id = m.s("id")
+                    if let idx = next.firstIndex(where: { $0.s("id") == id }) {
+                        if sigMsg(next[idx]) != sigMsg(m) {
+                            next[idx] = m
+                            changedAny = true
+                        }
+                    } else {
+                        next.append(m)
+                        changedAny = true
+                    }
+                }
+                if changedAny {
+                    next.sort { $0.d("seq") < $1.d("seq") }
+                    msgs = next
+                }
+            }
             if err.hasPrefix("读不到") { err = "" }
         } catch let e { err = "读不到这个群聊：\(e.localizedDescription)" }
+    }
+    @MainActor func loadOlder() async -> String? {
+        guard hasMore, !loadingOlder, let first = msgs.first(where: { $0.d("seq") > 0 }) else { return nil }
+        loadingOlder = true
+        defer { loadingOlder = false }
+        guard let r = try? await API.shared.obj("GET", "/api/bots/groups/\(gid)?limit=20&before=\(Int(first.d("seq")))") else { return nil }
+        let have = Set(msgs.map { $0.s("id") })
+        let older = r.a("messages").filter { !have.contains($0.s("id")) }
+        if !older.isEmpty {
+            msgs = older + msgs
+        }
+        hasMore = r.b("has_more")
+        return first.s("id")
     }
     @MainActor func poll() async {
         while !Task.isCancelled {
@@ -1709,7 +1779,7 @@ struct EngineGroupView: View {
         let sendAtt = attach
         do {
             _ = try await API.shared.obj("POST", "/api/bots/groups/\(gid)/send", ["text": sendText, "attachments": sendAtt])
-            text = ""; attach = []; err = ""; wantScroll = true; msgsSig = ""
+            text = ""; attach = []; err = ""; wantScroll = true
             await load()
         } catch let e { err = "没发出去：\(e.localizedDescription)" }
     }

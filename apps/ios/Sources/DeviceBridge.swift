@@ -22,7 +22,7 @@ final class DeviceBridge: NSObject, ObservableObject {
         ("calendar.read", "读取日历"), ("calendar.write", "新建日程"),
         ("reminders.read", "读取提醒事项"), ("reminders.write", "新建/完成/删除提醒事项"),
         ("contacts.read", "搜索通讯录"), ("phone.call", "打电话（拨号前确认）"), ("sms.send", "发短信（系统短信界面，你点发送）"),
-        ("health.read", "读取健康（步数、睡眠、心率、体能训练）"), ("health.write", "写入健康（饮水、体重、正念）"),
+        ("health.read", "读取健康（步数、睡眠、心率、体能训练、活动能量、静息心率、HRV）"), ("health.write", "写入健康（饮水、体重、正念）"),
         ("location.read", "当前位置"), ("alarm.write", "设闹钟（iOS 26+）"), ("shortcuts.run", "运行快捷指令"),
     ]
     @Published var online = false
@@ -80,7 +80,8 @@ final class DeviceBridge: NSObject, ObservableObject {
         let caps = Self.allCaps.map { $0.0 }.filter { enabled($0) && ($0 != "alarm.write" || alarmKitAvailable) }
         send(["type": "hello", "device_id": deviceId, "platform": "ios", "name": UIDevice.current.name,
               "capabilities": caps, "features": ["alarmkit": alarmKitAvailable,
-                                                 "ios": UIDevice.current.systemVersion] as [String: Any]])
+                                                 "ios": UIDevice.current.systemVersion,
+                                                 "health_kinds": Self.healthKinds] as [String: Any]])
     }
     private func send(_ obj: [String: Any]) {
         guard let d = try? JSONSerialization.data(withJSONObject: obj), let s = String(data: d, encoding: .utf8) else { return }
@@ -350,8 +351,13 @@ final class DeviceBridge: NSObject, ObservableObject {
         if let t = HKObjectType.quantityType(forIdentifier: .stepCount) { s.insert(t) }
         if let t = HKObjectType.quantityType(forIdentifier: .heartRate) { s.insert(t) }
         if let t = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { s.insert(t) }
+        if let t = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned) { s.insert(t) }
+        if let t = HKObjectType.quantityType(forIdentifier: .restingHeartRate) { s.insert(t) }
+        if let t = HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN) { s.insert(t) }
         return s
     }
+    /// health_read kinds this build answers; sent in hello so the server asks only for these.
+    static let healthKinds = ["steps", "heart_rate", "sleep", "workouts", "active_energy", "resting_heart_rate", "hrv"]
     private var writeTypes: Set<HKSampleType> {
         var s: Set<HKSampleType> = []
         if let t = HKObjectType.quantityType(forIdentifier: .dietaryWater) { s.insert(t) }
@@ -372,22 +378,38 @@ final class DeviceBridge: NSObject, ObservableObject {
             health.execute(q)
         }
     }
+    /// One HKStatisticsQuery over start–end; nil when HealthKit has no samples (errorNoData), not an error.
+    private func statistics(_ id: HKQuantityTypeIdentifier, _ start: Date, _ end: Date,
+                            _ options: HKStatisticsOptions) async throws -> HKStatistics? {
+        guard let t = HKQuantityType.quantityType(forIdentifier: id) else { return nil }
+        return try await withCheckedThrowingContinuation { c in
+            let q = HKStatisticsQuery(quantityType: t, quantitySamplePredicate: HKQuery.predicateForSamples(withStart: start, end: end),
+                                      options: options) { _, s, e in
+                if let e = e as? HKError, e.code == .errorNoData { c.resume(returning: nil) }
+                else if let e = e { c.resume(throwing: e) }
+                else { c.resume(returning: s) }
+            }
+            health.execute(q)
+        }
+    }
     private func healthRead(_ a: [String: Any]) async throws -> [String: Any] {
         try await healthAccess()
         let start = date(a["start"]) ?? Calendar.current.startOfDay(for: Date()), end = date(a["end"]) ?? Date()
         switch a["kind"] as? String ?? "steps" {
         case "steps":
-            guard let t = HKQuantityType.quantityType(forIdentifier: .stepCount) else { break }
-            let total: Double = try await withCheckedThrowingContinuation { c in
-                let q = HKStatisticsQuery(quantityType: t, quantitySamplePredicate: HKQuery.predicateForSamples(withStart: start, end: end),
-                                          options: .cumulativeSum) { _, s, e in
-                    if let e = e as? HKError, e.code == .errorNoData { c.resume(returning: 0) }
-                    else if let e = e { c.resume(throwing: e) }
-                    else { c.resume(returning: s?.sumQuantity()?.doubleValue(for: .count()) ?? 0) }
-                }
-                health.execute(q)
-            }
+            let total = try await statistics(.stepCount, start, end, .cumulativeSum)?.sumQuantity()?.doubleValue(for: .count()) ?? 0
             return ["kind": "steps", "start": iso(start), "end": iso(end), "steps": Int(total)]
+        case "active_energy":   // a sum, so no samples = 0 kcal (same as steps)
+            let kcal = try await statistics(.activeEnergyBurned, start, end, .cumulativeSum)?.sumQuantity()?.doubleValue(for: .kilocalorie()) ?? 0
+            return ["kind": "active_energy", "start": iso(start), "end": iso(end), "kcal": Int(kcal.rounded())]
+        case "resting_heart_rate":   // an average: no samples = null, not 0
+            let bpm = try await statistics(.restingHeartRate, start, end, .discreteAverage)?.averageQuantity()?
+                .doubleValue(for: HKUnit.count().unitDivided(by: .minute()))
+            return ["kind": "resting_heart_rate", "start": iso(start), "end": iso(end), "bpm": bpm.map { (($0 * 10).rounded() / 10) as Any } ?? NSNull()]
+        case "hrv":   // SDNN average in ms: no samples = null
+            let ms = try await statistics(.heartRateVariabilitySDNN, start, end, .discreteAverage)?.averageQuantity()?
+                .doubleValue(for: HKUnit.secondUnit(with: .milli))
+            return ["kind": "hrv", "start": iso(start), "end": iso(end), "ms": ms.map { (($0 * 10).rounded() / 10) as Any } ?? NSNull()]
         case "heart_rate":
             guard let t = HKQuantityType.quantityType(forIdentifier: .heartRate) else { break }
             let unit = HKUnit.count().unitDivided(by: .minute())

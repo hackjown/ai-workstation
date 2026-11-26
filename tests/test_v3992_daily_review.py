@@ -59,11 +59,15 @@ class FakeChat:
 
 
 class FakeHub:
-    def __init__(self, caps=(), online=True, answer=None):
+    def __init__(self, caps=(), online=True, answer=None, features=None):
         self.caps, self.is_online, self.answer, self.calls = list(caps), online, answer or (lambda t, a: {}), []
+        self.features = features
 
     def known(self):
-        return [{"id": "iphone", "caps": self.caps}] if self.caps is not None else []
+        rec = {"id": "iphone", "caps": self.caps}
+        if self.features is not None:
+            rec["features"] = self.features
+        return [rec] if self.caps is not None else []
 
     def _pick(self, cap, device_id=""):
         return "iphone" if self.is_online and cap in self.caps else None
@@ -388,6 +392,89 @@ async def test_health_summary_off_or_not_granted_sends_nothing(tmp_path):
     assert hub.calls == [] and notes.sent == []
     hub2 = FakeHub(caps=["calendar.read"], answer=_health_hub())
     assert await DR.DeviceReview(store, hub2, notes).health_summary(NOW) is None and hub2.calls == []
+
+
+def _full_health_hub(today=None):
+    """A newer app: answers every kind it lists in hello features.health_kinds."""
+    d0 = DR.day_start(NOW)
+    today = today or {"steps": 9000, "kcal": 520, "bpm": 66.0, "ms": 32.0}
+
+    def ans(tool, a):
+        t = DR.parse_iso(a["start"]) >= d0
+        k = a["kind"]
+        if k == "steps":
+            return {"steps": today["steps"] if t else 8000}
+        if k == "sleep":
+            return {"asleep_minutes": 420, "segments": []}
+        if k == "workouts":
+            return {"workouts": []}
+        if k == "heart_rate":
+            return {"count": 0, "min": 0, "max": 0, "avg": 0, "recent": []}
+        if k == "active_energy":
+            return {"kind": k, "kcal": today["kcal"] if t else 400}
+        if k == "resting_heart_rate":
+            return {"kind": k, "bpm": today["bpm"] if t else 60.0}
+        if k == "hrv":
+            return {"kind": k, "ms": today["ms"] if t else 40.0}
+        return None
+    return ans
+
+
+async def test_hello_health_kinds_means_only_those_kinds_are_requested(tmp_path):
+    kinds = ["steps", "sleep", "workouts", "heart_rate", "resting_heart_rate"]   # no active_energy / hrv on this phone
+    hub = FakeHub(caps=["health.read"], answer=_full_health_hub(), features={"ios": "18.1", "health_kinds": kinds})
+    store, wl, rv, chat, notes, _ = setup(tmp_path, answers=None, hub=hub)
+    res = await rv.device.health_summary(NOW)
+    asked = {a["kind"] for t, a in hub.calls}
+    assert asked == set(kinds)
+    # declared kinds are asked for every day (no try-once memo), the undeclared never
+    assert sum(1 for t, a in hub.calls if a["kind"] == "resting_heart_rate") == 8
+    assert res["row"]["active_kcal"] is None and res["row"]["hrv"] is None and res["row"]["resting_hr"] == 66.0
+
+
+async def test_hello_health_kinds_from_the_live_hello_wins(tmp_path):
+    hub = FakeHub(caps=["health.read"], answer=_full_health_hub(), features={})   # stored record: older hello
+    hub.online = {"iphone": {"caps": ["health.read"], "features": {"health_kinds": ["steps", "hrv"]}}}
+    store, wl, rv, chat, notes, _ = setup(tmp_path, answers=None, hub=hub)
+    assert rv.device.health_kinds() == {"steps", "hrv"}
+    await rv.device.read_day(DR.day_start(NOW), NOW)
+    assert [a["kind"] for t, a in hub.calls] == ["steps", "hrv"]
+
+
+async def test_without_health_kinds_the_old_fallback_tries_newer_kinds_once(tmp_path):
+    hub = FakeHub(caps=["health.read"], answer=_health_hub(), features={"alarmkit": False, "ios": "17.5"})
+    store, wl, rv, chat, notes, _ = setup(tmp_path, answers=None, hub=hub)
+    assert rv.device.health_kinds() is None
+    await rv.device.health_summary(NOW)
+    for k in DR.DeviceReview.NEWER:
+        assert sum(1 for t, a in hub.calls if a["kind"] == k) == 1
+    assert sum(1 for t, a in hub.calls if a["kind"] == "steps") == 8
+
+
+async def test_summary_compares_active_energy_resting_hr_and_hrv_with_the_7_day_baseline(tmp_path):
+    hub = FakeHub(caps=["health.read"], answer=_full_health_hub(),
+                  features={"health_kinds": ["steps", "sleep", "workouts", "heart_rate", "active_energy",
+                                             "resting_heart_rate", "hrv"]})
+    store, wl, rv, chat, notes, _ = setup(tmp_path, answers=None, hub=hub)
+    res = await rv.device.health_summary(NOW)
+    b = res["baseline"]
+    assert b["active_kcal"] == 400 and b["resting_hr"] == 60 and b["hrv"] == 40
+    assert res["row"]["active_kcal"] == 520 and res["row"]["resting_hr"] == 66.0 and res["row"]["hrv"] == 32.0
+    assert "活动能量 520 千卡（7 天平均 400，+30%）" in res["text"]
+    assert "静息心率 66（7 天平均 60，+10%）" in res["text"]
+    assert "HRV 32 ms（7 天平均 40，-20%）" in res["text"]
+    assert "静息心率比你最近 7 天平均高了一些（60 → 66）" in res["tip"]   # still one suggestion, worth watching only
+    row = store._x("SELECT * FROM health_daily ORDER BY day DESC LIMIT 1")[0]
+    assert row["active_kcal"] == 520 and row["resting_hr"] == 66.0 and row["hrv"] == 32.0
+
+
+async def test_newer_kinds_with_no_samples_are_left_out_not_zero(tmp_path):
+    hub = FakeHub(caps=["health.read"], answer=_full_health_hub({"steps": 9000, "kcal": 0, "bpm": None, "ms": None}),
+                  features={"health_kinds": ["steps", "active_energy", "resting_heart_rate", "hrv"]})
+    store, wl, rv, chat, notes, _ = setup(tmp_path, answers=None, hub=hub)
+    res = await rv.device.health_summary(NOW)
+    assert res["row"]["resting_hr"] is None and res["row"]["hrv"] is None
+    assert "静息心率" not in res["text"] and "HRV" not in res["text"] and "活动能量" not in res["text"]
 
 
 def test_abnormal_looking_values_are_only_worth_watching():

@@ -13,7 +13,8 @@ calendar_list / reminders_list / health_read。没有新协议。
   按 事件 id + 开始时间 去重；日程改了时间就改提醒时间（只重排一次，不会重复推）；日程被删就丢掉。到点
   （prefs.event_lead_min，默认 15 分钟，0 = 关）用已有的 notify（Bark，timeSensitive，点开回到聊天）推一条。
 * 健康小结：独立定时（prefs.health_summary_time，默认 21:30 AIW_TZ；"off" 或 health_enabled=false 关掉）。读当天
-  步数、昨晚睡眠、体能训练（分钟、千卡）、心率均值，以及手机支持时的活动能量 / 静息心率 / HRV；和用户自己最近
+  步数、昨晚睡眠、体能训练（分钟、千卡）、心率均值，以及手机支持时的活动能量 / 静息心率 / HRV（App 在 hello 的
+  features.health_kinds 里报了支持哪些就只问哪些；老版本 App 不报时，新类型每个进程只试一次）；和用户自己最近
   7 天的平均比，发一条简短小结 + 最多一条建议。表 health_daily 只存每天的汇总数字，不存原始样本；小结由规则
   生成，不调用任何模型、不发给第三方。只说趋势，不给医疗建议；看着不寻常的只说「值得留意」。
 """
@@ -232,12 +233,29 @@ class DeviceReview:
     # ---------------------------------------------------------------- health
     NEWER = ("active_energy", "resting_heart_rate", "hrv")
 
+    def health_kinds(self) -> Optional[set]:
+        """The health_read kinds the phone that would answer said it supports (hello features.health_kinds);
+        None for an older app that does not say, which keeps the try-once fallback."""
+        if not self.hub:
+            return None
+        did = self.hub._pick("health.read")
+        live = getattr(self.hub, "online", None)   # DeviceHub.online: device_id -> {..., features} from this hello
+        feats = live[did].get("features") if isinstance(live, dict) and did in live else None
+        if feats is None:
+            rec = next((d for d in self.hub.known() if d.get("id") == did), None) if did else None
+            feats = (rec or {}).get("features")
+        kinds = (feats or {}).get("health_kinds") if isinstance(feats, dict) else None
+        return {str(k) for k in kinds} if isinstance(kinds, list) else None
+
     async def _health(self, kind: str, start: float, end: float) -> Optional[dict]:
+        declared = self.health_kinds()
+        if declared is not None and kind not in declared:   # the app said which kinds it answers: no guessing
+            return None
         unsupported = self.__dict__.setdefault("_unsupported", set())
-        if kind in unsupported:
+        if declared is None and kind in unsupported:
             return None
         r = await self.call("health_read", {"kind": kind, "start": iso(start), "end": iso(end)})
-        if r is None and kind in self.NEWER:   # an app without this kind: do not ask again in this process
+        if r is None and declared is None and kind in self.NEWER:   # an older app without this kind: do not ask again in this process
             unsupported.add(kind)
         return r
 
@@ -260,9 +278,9 @@ class DeviceReview:
         ae = await self._health("active_energy", day0, end)
         row["active_kcal"] = int(ae.get("kcal") or 0) if ae and ae.get("kcal") is not None else None
         rh = await self._health("resting_heart_rate", day0, end)
-        row["resting_hr"] = float(rh["bpm"]) if rh and rh.get("bpm") else None
+        row["resting_hr"] = round(float(rh["bpm"]), 1) if rh and rh.get("bpm") else None   # null / 0 = no samples
         hv = await self._health("hrv", day0, end)
-        row["hrv"] = float(hv["ms"]) if hv and hv.get("ms") else None
+        row["hrv"] = round(float(hv["ms"]), 1) if hv and hv.get("ms") else None
         return row
 
     def save_day(self, day: str, row: dict) -> None:
@@ -372,9 +390,9 @@ def compose(row: dict, base: dict) -> tuple[str, str]:
     if row.get("active_kcal"):
         parts.append(f"活动能量 {row['active_kcal']} 千卡{cmp(row['active_kcal'], base.get('active_kcal'))}")
     if row.get("resting_hr"):
-        parts.append(f"静息心率 {row['resting_hr']:.0f}")
+        parts.append(f"静息心率 {row['resting_hr']:.0f}{cmp(row['resting_hr'], base.get('resting_hr'))}")
     if row.get("hrv"):
-        parts.append(f"HRV {row['hrv']:.0f} ms")
+        parts.append(f"HRV {row['hrv']:.0f} ms{cmp(row['hrv'], base.get('hrv'))}")
     text = "🫀 **今日健康小结**\n" + " · ".join(parts)
     if base.get("days", 0) < 3:
         text += "\n（还在积累你自己的 7 天基线，过几天对比会更准）"

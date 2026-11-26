@@ -3,7 +3,7 @@ contacts, health, location, alarms, Shortcuts), the server never touches the pho
 
   WS /ws/device?token=<API token>   (same token the app already uses for /ws/events and every API call)
     app -> {"type":"hello","device_id","platform":"ios|android","name","capabilities":["calendar.read",...],
-            "features":{"alarmkit":false,...}}
+            "features":{"alarmkit":false,"health_kinds":["steps",...],...}}
     srv -> {"type":"welcome","queued":n}
     srv -> {"type":"call","id","tool":"calendar_list","args":{...},"expires_at":<unix>}
     app -> {"type":"result","id","ok":true,"result":{...}} | {"type":"result","id","ok":false,"error":"..."}
@@ -61,8 +61,10 @@ TOOLS: dict[str, tuple] = {
                  ["to", "body"]),
     "contacts_search": ("contacts.read", False, "在手机通讯录里按姓名/电话/邮箱搜索联系人",
                         {"query": S, "limit": {"type": "integer"}}, ["query"]),
-    "health_read": ("health.read", False, "读取手机健康数据：steps（步数）、sleep（睡眠）、heart_rate（心率）、workouts（体能训练）",
-                    {"kind": {"type": "string", "enum": ["steps", "sleep", "heart_rate", "workouts"]},
+    "health_read": ("health.read", False, "读取手机健康数据：steps（步数）、sleep（睡眠）、heart_rate（心率）、workouts（体能训练）、"
+                    "active_energy（活动能量千卡）、resting_heart_rate（静息心率）、hrv（心率变异性 ms；较新版本 App 才支持）",
+                    {"kind": {"type": "string", "enum": ["steps", "sleep", "heart_rate", "workouts",
+                                                         "active_energy", "resting_heart_rate", "hrv"]},
                      "start": {"type": "string", "description": "开始 ISO 时间"}, "end": {"type": "string", "description": "结束 ISO 时间"}},
                     ["kind", "start", "end"]),
     "health_write": ("health.write", True, "写入有限的健康数据：water（饮水 ml）、weight（体重 kg）、mindful（正念分钟）。会先请用户确认",

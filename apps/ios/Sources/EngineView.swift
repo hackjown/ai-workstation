@@ -583,7 +583,7 @@ struct EngineConvView: View {
     @State private var showRename = false
     @State private var newTitle = ""
     @State private var confirmDelete = false
-    @State private var lastCount = 0
+    @StateObject private var pin = BottomPin()   // v3.9.96: same bottom pinning as the chat (blank list after send)
     @State private var showAllow = false        // v3.9.67: 允许这类命令再试 (the rule, editable)
     @State private var allowRule = ""
     @State private var confirmOnce = false      // v3.9.67: 这一轮放开权限重跑
@@ -626,14 +626,33 @@ struct EngineConvView: View {
                     if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red) }
                     Color.clear.frame(height: 1).id("end")
                 }.padding(.horizontal, 14).padding(.vertical, 10)
+                .reportsScrollMetrics()
             }
             .scrollDismissesKeyboard(.interactively)
-            .safeAreaInset(edge: .top) { if !takeover.isEmpty { takeBar } }
-            .safeAreaInset(edge: .bottom) { composer }
-            .onChange(of: msgs.count) { n in
-                if n != lastCount { lastCount = n; withAnimation { proxy.scrollTo("end", anchor: .bottom) } }
+            // v3.9.96 blank list after sending: the scroll to "end" ran (animated) in the same update as the new
+            // messages, before the LazyVStack had measured its rows, and the keyboard / composer shrinking moved the
+            // visible bottom too, so the offset landed past the real end and the screen stayed empty until a drag.
+            // Now the chat's BottomPin: scroll after layout (and again once rows are measured), fix a position that
+            // is in empty space, follow growth while it is running, stay at the end when the keyboard / composer moves.
+            .onPreferenceChange(ScrollMetricsKey.self) { mm in pin.metrics(mm, live: live || sending) }
+            .onChange(of: msgs.last?.s("id") ?? "") { _ in pin.newContent() }
+            .onChange(of: msgs.last?.s("text") ?? "") { _ in pin.newContent() }
+            .onAppear {
+                pin.jumpAction = { animated in
+                    if animated { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("end", anchor: .bottom) } }
+                    else { proxy.scrollTo("end", anchor: .bottom) }
+                }
+                if !pin.opened || pin.pinned { pin.toEnd(follow: 2.5) }
             }
-            .onChange(of: msgs.last?.s("text") ?? "") { _ in proxy.scrollTo("end", anchor: .bottom) }
+            .overlay(alignment: .bottomTrailing) {
+                if pin.showJump {
+                    JumpToLatest { pin.toEnd(animated: true) }.padding(.trailing, 16).padding(.bottom, 12)
+                }
+            }
+            .animation(.easeOut(duration: 0.18), value: pin.showJump)
+            .safeAreaInset(edge: .top) { if !takeover.isEmpty { takeBar } }
+            .safeAreaInset(edge: .bottom) { composer.reportsComposerTop() }
+            .onPreferenceChange(ComposerTopKey.self) { pin.composer($0) }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -997,7 +1016,11 @@ struct EngineConvView: View {
     @MainActor func load() async {
         do {
             let r = try await API.shared.obj("GET", "/api/bots/convs/\(cid)?after=0")
-            conv = r.o("conv"); msgs = r.a("messages")
+            let nc = r.o("conv"), nm = r.a("messages")
+            // v3.9.96: the poll (every 2 s while it runs) only replaces what changed, so the lazy list is not
+            // rebuilt and re-measured under the scroll position each time
+            if !(conv as NSDictionary).isEqual(nc as NSDictionary) { conv = nc }
+            if !(msgs as NSArray).isEqual(nm as NSArray) { msgs = nm }
             if err.hasPrefix("读不到") { err = "" }
         } catch { err = "读不到这个对话：\(error.localizedDescription)" }
     }
@@ -1023,7 +1046,10 @@ struct EngineConvView: View {
         if let q = quote { req["quote"] = q.id }
         let keep = (text, attach, picked, quote)
         text = ""; attach = []; picked = []; quote = nil; err = ""
-        do { _ = try await API.shared.call("POST", "/api/bots/convs/\(cid)/send", req, timeout: 180); await load() }
+        do {
+            _ = try await API.shared.call("POST", "/api/bots/convs/\(cid)/send", req, timeout: 180); await load()
+            pin.toEnd(follow: 2)   // your own message: always to the end
+        }
         catch {
             (text, attach, picked, quote) = keep
             err = "没发出去：\(error.localizedDescription)"
@@ -1328,6 +1354,7 @@ struct EngineGroupView: View {
     @State private var initialScrolled = false
     @State private var wantScroll = false
     @State private var showAddMembers = false
+    @StateObject private var pin = BottomPin()   // v3.9.96: same bottom pinning as the chat
 
     var project: JSON { group.o("project") }
     var live: Bool { group.b("busy") || (!group.s("status").isEmpty && group.s("status") != "idle") }
@@ -1409,26 +1436,43 @@ struct EngineGroupView: View {
                     if !err.isEmpty { Text(err).font(.footnote).foregroundColor(.red) }
                     Color.clear.frame(height: 24).id("end")
                 }.padding(.horizontal, 14).padding(.vertical, 10)
+                .reportsScrollMetrics()
             }
             .scrollDismissesKeyboard(.interactively)
+            // v3.9.96: the newest message decides (older pages prepend and keep it), scrolled by BottomPin after layout
+            .onPreferenceChange(ScrollMetricsKey.self) { mm in pin.metrics(mm, live: live) }
+            .onChange(of: msgs.last?.s("id") ?? "") { _ in
+                guard !msgs.isEmpty else { return }
+                if !initialScrolled {
+                    initialScrolled = true; wantScroll = false
+                    pin.toEnd(follow: 2.5)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { olderOK = true }
+                } else {
+                    let own = wantScroll
+                    wantScroll = false
+                    pin.newContent(own: own)
+                }
+            }
+            .onAppear {
+                pin.jumpAction = { animated in
+                    if animated { withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("end", anchor: .bottom) } }
+                    else { proxy.scrollTo("end", anchor: .bottom) }
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if pin.showJump {
+                    JumpToLatest { pin.toEnd(animated: true) }.padding(.trailing, 16).padding(.bottom, 12)
+                }
+            }
+            .animation(.easeOut(duration: 0.18), value: pin.showJump)
             .safeAreaInset(edge: .top) { statusBar }
             .safeAreaInset(edge: .bottom) {
                 EngineGroupComposer { sendText, sendAtt in
                     await send(sendText, sendAtt)
                 }
+                .reportsComposerTop()
             }
-            .onChange(of: msgs.count) { n in
-                if n > 0 && (!initialScrolled || wantScroll) {
-                    let first = !initialScrolled
-                    initialScrolled = true; wantScroll = false
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                        proxy.scrollTo("end", anchor: .bottom)
-                        if first {
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { olderOK = true }
-                        }
-                    }
-                }
-            }
+            .onPreferenceChange(ComposerTopKey.self) { pin.composer($0) }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

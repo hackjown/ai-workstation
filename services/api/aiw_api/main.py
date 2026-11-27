@@ -396,6 +396,8 @@ def build_app(settings: Optional[Settings] = None, llm_factory=None, computer_fa
     _pv.mount(app, store, secrets, auth)   # v3.9.33: 设置 › 模型 › 供应商 (/api/providers)
     from . import dsweb as _dsweb   # v3.9.49: DeepSeek 联网工具 (/api/web-tools): web_search / web_fetch / doc_ask
     _dsweb.mount(app, store, secrets, auth)
+    from . import home_assistant as _ha   # v3.9.94: 智能家居 (/api/home-assistant): chat + call control of HA devices
+    _ha.mount(app, store, secrets, auth)
 
     # ------------------------------------------------------------- tasks
 

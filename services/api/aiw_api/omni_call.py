@@ -686,6 +686,39 @@ class ToolBridge:
     def __init__(self, chat):
         self.chat = chat
         self.tasks: list[str] = []
+        self.ha = None            # v3.9.94: Home Assistant, when 设置 › 智能家居 is connected
+        self.home = ""            # device names by room, for the instructions
+
+    async def prepare(self) -> str:
+        """v3.9.94: switch the Home Assistant tools on for this call and read the device list (≤4 s, never fatal).
+        Returns the line to add to the call's instructions."""
+        try:
+            from . import home_assistant as _ha
+            st, sec = getattr(self.chat, "store", None), getattr(self.chat, "secrets", None)
+            if not _ha.enabled(st, sec):
+                return ""
+            self.ha = _ha.HomeAssistant(st, sec)
+            try:
+                self.home = await asyncio.wait_for(self.ha.summary(), 4)
+            except Exception as e:  # noqa: BLE001  the tools still work; the model just looks devices up
+                log.info("omni ha summary: %s", e)
+            s = ("\n家里的 Home Assistant 已接入：用户让开关或调节家里的设备（灯、空调、窗帘、风扇、电视、扫地机、场景）时，"
+                 "直接调用 ha_control，做完用一句话告诉用户结果；问家里状态（温度、湿度、哪些灯开着、门窗）用 ha_devices。"
+                 "名字对应多个设备时问用户要哪个。开锁、撤防、开车库门必须先口头问用户，用户明确同意后才加 confirm=true。"
+                 "这些不要交给 aiw 任务。")
+            if self.home:
+                s += "\n家里的设备（房间：设备名）：" + self.home[:1500]
+            return s
+        except Exception as e:  # noqa: BLE001
+            log.warning("omni ha prepare: %s", e)
+            self.ha = None
+            return ""
+
+    def specs(self) -> list:
+        if self.ha is None:
+            return TOOL_SPECS
+        from . import home_assistant as _ha
+        return TOOL_SPECS + _ha.SPECS
 
     async def run(self, name: str, args: Any) -> str:
         if isinstance(args, str):
@@ -699,6 +732,9 @@ class ToolBridge:
                 return await self._create(str(args.get("goal") or "").strip())
             if name == "task_status":
                 return await self._status(str(args.get("task_id") or "").strip())
+            if name.startswith("ha_") and self.ha is not None:
+                from . import home_assistant as _ha
+                return await _ha.run_tool(self.ha, name, args)
         except Exception as e:  # noqa: BLE001  a tool failure is spoken, never kills the call
             log.warning("omni tool %s: %s", name, e)
             return f"没办成：{type(e).__name__}"
@@ -803,7 +839,7 @@ class RealtimeBackend:
         if asr:   # the user's words for captions / the transcript (DashScope's realtime ASR model)
             s["input_audio_transcription"] = {"model": os.environ.get("AIW_OMNI_ASR_MODEL", "qwen3-asr-flash-realtime")}
         if tools and self.bridge is not None:
-            s["tools"] = TOOL_SPECS
+            s["tools"] = self.bridge.specs()
         return s
 
     async def _send(self, ev: dict):
@@ -1026,8 +1062,8 @@ async def ws_open(url: str, headers: dict, timeout: float, proxy: str = ""):
     return await asyncio.wait_for(connect(url, **kw), timeout + 2)
 
 
-def gemini_tools() -> list:
-    """TOOL_SPECS as Gemini functionDeclarations (OpenAPI schema with upper-case types)."""
+def gemini_tools(specs: Optional[list] = None) -> list:
+    """TOOL_SPECS (or the call's own list) as Gemini functionDeclarations (OpenAPI schema with upper-case types)."""
     def conv(sch):
         if not isinstance(sch, dict):
             return sch
@@ -1043,7 +1079,7 @@ def gemini_tools() -> list:
                 out[k] = conv(v) if isinstance(v, dict) else v
         return out
     return [{"functionDeclarations": [{"name": t["function"]["name"], "description": t["function"]["description"],
-                                       "parameters": conv(t["function"]["parameters"])} for t in TOOL_SPECS]}]
+                                       "parameters": conv(t["function"]["parameters"])} for t in (specs or TOOL_SPECS)]}]
 
 
 def _close_reason(e: BaseException) -> str:
@@ -1207,7 +1243,7 @@ class GeminiBackend:
             "sessionResumption": {"handle": handle} if handle else {},
         }
         if self.bridge is not None:
-            s["tools"] = gemini_tools()
+            s["tools"] = gemini_tools(self.bridge.specs())
         return {"setup": s}
 
     async def _open(self, handle: str = ""):
@@ -1757,7 +1793,7 @@ class TurnBackend:
         else:
             b["modalities"] = ["text"]
         if v["tools"] and tools and self.bridge is not None:
-            b["tools"] = TOOL_SPECS
+            b["tools"] = self.bridge.specs()
         if v["extras"]:
             b["enable_thinking"] = False
         return b
@@ -2126,6 +2162,10 @@ class OmniCall:
     async def start(self) -> dict:
         cfg = self.cfg
         notes: list[str] = []
+        home = await self.bridge.prepare()   # v3.9.94: Home Assistant tools + device list, before any backend opens
+        if home and home not in self.instructions:
+            self.instructions += home
+            self.diag.ev(f"home assistant on ({len(self.bridge.home)} chars of devices)")
         for kind in self.plan():
             if kind == "turn":
                 self.diag.ev(f"backend turn: model {cfg['model']} base {cfg['base_url']}")

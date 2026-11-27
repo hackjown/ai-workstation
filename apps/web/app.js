@@ -1506,3 +1506,57 @@ function deskFull(id) {
   if (typeof S !== "undefined" && !S.take && typeof toggleTakeover === "function") { try { toggleTakeover(); } catch (e) { /* stays watching */ } }
   Promise.resolve(req.call(box)).then(() => { try { fr.focus(); } catch (e) { /* ok */ } }, () => toast("没能全屏"));
 }
+
+/* v3.9.94 设置 › 智能家居: Home Assistant (GET/PUT /api/home-assistant, POST /api/home-assistant/test).
+   接入后小秘聊天和语音/视频通话都能直接控制 HA 里的设备；开锁、撤防、开车库门会先问你。 */
+async function loadHomeAssistant() {
+  const box = document.getElementById("g-home");
+  if (!box) return;
+  const no = typeof secNo === "function" ? secNo("g-home") : "";
+  const head = (chip, act) => `<div class="grp-h"><h2>${no}智能家居</h2>${chip}${act ? `<div class="act">${act}</div>` : ""}</div>`;
+  let h;
+  try { h = await api("GET", "/api/home-assistant"); } catch (e) {
+    box.innerHTML = head('<span class="chip bad">读取失败</span>') + `<div class="grp-d">读取失败：${esc(String(e.message || e).slice(0, 120))}（API 还是旧版本？）</div>`; return; }
+  const chip = typeof pill === "function" ? pill(!!h.active, "已接入", h.url ? "未接入" : "未配置") : `<span class="chip">${h.active ? "已接入" : "未接入"}</span>`;
+  const desc = "接入 Home Assistant 后，在小秘聊天、语音通话、视频通话里说「关掉客厅的灯」「空调调到 26 度」「家里多少度」就能直接控制和查看，不开电脑。开锁、撤防、开车库门一定先问你。";
+  const tokPh = h.token_set ? "已保存（留空不改）" : "HA › 个人资料 › 安全 › 长期访问令牌 › 创建令牌";
+  box.innerHTML = head(chip, `<button class="btn sm primary">保存</button>`)
+    + `<div class="grp-d">${desc}</div><div class="rows">`
+    + row("开启", "关掉后聊天和通话都不再用 HA", "", `<input type="checkbox" name="enabled" ${h.enabled ? "checked" : ""} aria-label="开启" />`, "sw")
+    + row("地址", "服务器能访问到的 HA 地址，例如 http://192.168.1.10:8123", `<input name="url" value="${esc(h.url || "")}" placeholder="http://homeassistant.local:8123" />`)
+    + row("长期访问令牌", "只存在服务器上，加密保存", `<input name="token" type="password" autocomplete="off" value="" placeholder="${esc(tokPh)}" />`,
+          h.token_set ? `<button type="button" class="btn sm ghost" onclick="haClearToken()">清除</button>` : "")
+    + row("只控制这些房间", "HA 里的区域名，逗号分隔；留空 = 全部", `<input name="areas" value="${esc((h.areas || []).join("，"))}" placeholder="客厅，主卧，书房" />`)
+    + row("只控制这些设备", "entity_id，逗号分隔；和房间二选一或都填", `<input name="entities" value="${esc((h.entities || []).join("，"))}" placeholder="light.living_room，climate.bedroom" />`)
+    + row("额外需要确认", "这些设备或类型（entity_id 或 domain）每次操作前都先问你", `<input name="confirm" value="${esc((h.confirm || []).join("，"))}" placeholder="switch.water_heater，cover" />`)
+    + row("校验 HTTPS 证书", "自签名证书时关掉", "", `<input type="checkbox" name="verify_ssl" ${h.verify_ssl ? "checked" : ""} aria-label="校验证书" />`, "sw")
+    + row("测试", "连一次 HA，读设备列表（不控制任何设备）", `<span id="haTestOut" class="small"></span>`, `<button type="button" class="btn sm" onclick="testHomeAssistant(this)">测试</button>`)
+    + `</div>`;
+  if (typeof paintIcons === "function") paintIcons(box);
+}
+async function saveHomeAssistant(e) {
+  e.preventDefault();
+  const f = e.target;
+  const body = { enabled: f.enabled.checked, url: f.url.value.trim(), areas: f.areas.value, entities: f.entities.value,
+    confirm: f.confirm.value, verify_ssl: f.verify_ssl.checked };
+  if (f.token.value.trim()) body.token = f.token.value.trim();
+  try { await api("PUT", "/api/home-assistant", body); toast("智能家居已保存"); loadHomeAssistant(); }
+  catch (err) { toast("保存失败：" + (err.message || err)); }
+}
+async function haClearToken() {
+  if (!confirm("清除 Home Assistant 令牌？清除后聊天和通话不能再控制设备。")) return;
+  try { await api("PUT", "/api/home-assistant", { clear_token: true }); toast("已清除"); loadHomeAssistant(); }
+  catch (err) { toast("清除失败：" + (err.message || err)); }
+}
+async function testHomeAssistant(btn) {
+  const out = document.getElementById("haTestOut");
+  btn.disabled = true; if (out) out.textContent = "连接中…";
+  try {
+    const r = await api("POST", "/api/home-assistant/test", {});
+    if (!out) return;
+    if (!r.ok) { out.textContent = "✕ " + (r.error || "失败"); return; }
+    const kinds = Object.entries(r.by_kind || {}).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k} ${v}`).join("、");
+    out.textContent = `✓ ${(r.ms / 1000).toFixed(1)}s · ${r.count} 个设备（可控制 ${r.controllable}）：${kinds}` + (r.areas && r.areas.length ? ` · 房间：${r.areas.slice(0, 10).join("、")}` : " · HA 里还没分房间");
+  } catch (err) { if (out) out.textContent = "✕ " + (err.message || err); }
+  finally { btn.disabled = false; }
+}

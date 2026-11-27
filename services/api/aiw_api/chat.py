@@ -722,9 +722,14 @@ class Chat:
         if getattr(self, "_image_on", False):
             tools.append("AI 生成图片（generate_image）、AI 改用户发来的图片（edit_image）——用户只是要一张图或改图时直接用它们，"
                          "不要交给电脑；生成后用一句话说明，图片会自动显示")
+        if getattr(self, "_ha_on", False):   # v3.9.94
+            tools.append("控制家里 Home Assistant 的设备（ha_control）、查设备和温湿度状态（ha_devices）、看摄像头画面（ha_camera）")
         from agent_runtime import prompts as _prompts   # v3.9.24: the user's edited chat prompt, if any
         system = _prompts.fmt("chat", SYSTEM, name=self.agent_name(), now=time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600)),
                                tools="、".join(tools))
+        if getattr(self, "_ha_on", False):
+            from . import home_assistant as _ha
+            system += "\n" + _ha.PROMPT
         prof = self.store.kv_get("profile", {}) or {}
         if prof.get("tone"):
             system += f"\n回复语气：{prof['tone']}。"
@@ -907,6 +912,8 @@ class Chat:
                 route = {"route": "task", "title": ""}
             elif not attachments and wants_travel(text):   # v3.9.40: 机票比价 / 订餐厅 need the computer's browser
                 route = {"route": "task", "title": ""}
+            elif mode == "auto" and not attachments and self._home_request(text):   # v3.9.94 智能家居: right here, no computer
+                route = {"route": "chat", "title": "", "home": True}
             elif mode == "auto" and self.phone_fast(text, attachments):   # v3.9.28 手机快通道: no LLM router
                 route = {"route": "task", "title": "", "fast": "device"}
             else:
@@ -1098,6 +1105,8 @@ class Chat:
     async def reply(self, text: str, on_delta=None, on_status=None, attachments: Optional[list] = None) -> dict:
         self._made_files = []   # v3.9.15: pictures generate_image / edit_image made in this reply
         chat_eng = self._chat_engine()
+        if chat_eng and self._home_request(text):   # v3.9.94: an engine has no Home Assistant tools
+            chat_eng = None
         if chat_eng:
             eng_reply = await self._reply_via_engine(chat_eng, text, on_delta=on_delta, on_status=on_status, attachments=attachments)
             if eng_reply is not None:
@@ -1458,6 +1467,35 @@ class Chat:
             # v3.9.82: only a message that starts with @引擎 talks to an engine (Chat.send -> Dispatch); without it
             # the main chat just answers and reads progress, so engine_task is no longer offered to the model.
             self._engine_task = _engine_task
+        self._ha_on = False
+        try:   # v3.9.94: Home Assistant devices right in the chat (设置 › 智能家居)
+            from . import home_assistant as _ha
+            if _ha.enabled(self.store, self.secrets):
+                ha = _ha.HomeAssistant(self.store, self.secrets)
+                for spec in _ha.SPECS:
+                    n = spec["function"]["name"]
+
+                    async def _run(a, _n=n, _h=ha):
+                        return await _ha.run_tool(_h, _n, a)
+                    out[n] = (_ha.flat(spec), _run)
+
+                async def _cam(a, _h=ha):
+                    try:
+                        img, e = await _h.camera(str(a.get("target") or ""))
+                    except _ha.HAError as x:
+                        return x.message
+                    root = (self.settings.artifacts_dir if self.settings else None) or "workspace/artifacts"
+                    d = os.path.join(root, "chat-images")
+                    os.makedirs(d, exist_ok=True)
+                    path = os.path.join(d, f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-camera.jpg")
+                    with open(path, "wb") as f:
+                        f.write(img)
+                    self._made_files.append(path)
+                    return f"已截取「{e['name']}」的画面（{len(img) // 1024} KB），会自动显示给用户"
+                out["ha_camera"] = (_ha.flat(_ha.CAMERA_SPEC), _cam)
+                self._ha_on = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("chat home assistant tools: %s", e)
         srch = getattr(self, "search", None)
         if srch is not None:   # v3.9.14: earlier chats, tasks and files
             out["session_search"] = srch.tool()
@@ -1500,7 +1538,8 @@ class Chat:
                 "edit_image": "正在改图…", "doc_ask": "正在读文档…", "engine_task": "正在交给引擎…",
                 "engine_convs": "正在翻引擎的对话…", "engine_status": "正在看引擎进度…", "engine_config": "正在改引擎设置…",
                 "local_shell": "正在电脑上执行命令…", "read_local_file": "正在读电脑文件…", "write_local_file": "正在写电脑文件…",
-                "ssh_exec": "正在 SSH 连服务器…", "remote_exec": "正在连运维主机…"}.get(name, "正在查…")
+                "ssh_exec": "正在 SSH 连服务器…", "remote_exec": "正在连运维主机…",
+                "ha_control": "正在控制家里的设备…", "ha_devices": "正在看家里的设备…", "ha_camera": "正在看摄像头…"}.get(name, "正在查…")
 
     async def run_tool(self, tools: dict, name: str, args: dict) -> str:
         if name not in tools:
@@ -1860,6 +1899,14 @@ class Chat:
             "prompt": one_line(SKILL_RE.sub("", prompt), 120), "started_at": time.time() if st != "queued" else None,
             "actions": [], **({"backup_vm": notice} if notice else {})}, task_id=t["id"])
         return self._catch_up_sync(card)
+
+    def _home_request(self, text: str) -> bool:
+        """v3.9.94: 「关掉客厅的灯」 with Home Assistant connected stays in the chat (ha_control), never a task."""
+        try:
+            from . import home_assistant as _ha
+            return _ha.wants_home(text) and _ha.enabled(self.store, self.secrets)
+        except Exception:  # noqa: BLE001
+            return False
 
     def phone_fast(self, text: str, attachments: Optional[list] = None) -> Optional[dict]:
         """v3.9.28: {"path": "device", "kind"} for a phone-only request with a phone online or registered."""

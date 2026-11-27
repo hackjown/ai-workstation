@@ -389,7 +389,7 @@ body{font-family:var(--sans)}
 
 .a .bubble.result,.bubble.result{border:1px solid var(--line);color:var(--text)}
 .set-index{top:-20px;padding-top:22px}
-.grp-d .mono{font:500 12px var(--mono);color:var(--text);background:var(--panel2);padding:1px 6px;border-radius:3px;word-break:break-all}
+.grp-d .mono{font:500 12px var(--mono);color:var(--text);background:var(--panel2);padding:1px 6px;border-radius:3px;overflow-wrap:anywhere}
 .composer textarea,.composer textarea:focus{border:0;box-shadow:none;background:transparent;min-height:0;padding-left:4px;padding-right:4px}
 .mcp .ds{white-space:normal}
 .set-index a{white-space:nowrap;flex:none}
@@ -631,3 +631,23 @@ input:not([type=checkbox]):not([type=radio]):focus,select:focus,textarea:focus{b
 .rw.rhost .v{align-items:flex-start}
 .rw.rhost .t{display:flex;gap:6px}
 @media (max-width:720px){.rw.rhost{grid-template-columns:1fr}.rw.rhost .t{justify-content:flex-start}}
+
+/* v3.9.95 设置页样式核对（手机为主） */
+.rw.out:has(.v > span:empty){display:none}                     /* 「测试」结果行：没结果时不留一块空白 */
+.rw .v > .chip{align-self:flex-start}                          /* 状态 chip 不被拉成整行宽 */
+.rows label:has(> input[type=checkbox]),.rows label:has(> input[type=radio]):not(.segsw label){display:inline-flex;align-items:center;gap:8px}
+.skupd-h label.small{display:inline-flex;align-items:center;gap:8px}
+@media (max-width:760px){
+  .rw.head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}   /* 长说明 + 长状态：说明占整行，状态换到下一行 */
+  .rw.head > .k{flex:1 1 220px;min-width:0}
+  .rw.head > div:last-child{flex:0 1 auto;max-width:100%}
+  .rw.head .chip{white-space:normal;text-align:left}
+  .rw .t .chip{white-space:nowrap}
+  .rw .k small{overflow-wrap:anywhere}
+  .segsw{max-width:100%;flex-wrap:wrap;width:auto;align-self:flex-start}
+  .skupd-h{flex-direction:column;align-items:stretch}
+  .skupd-h .sp{display:none}
+  .skupd-h .btn{align-self:flex-start}
+  .grp-h .act{flex-wrap:wrap;justify-content:flex-end}
+}
+details.more > summary .cnt,.savebar .note{font-family:var(--sans);letter-spacing:0}   /* 中文说明不用等宽字体（字距被拉开） */

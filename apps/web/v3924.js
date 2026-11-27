@@ -82,7 +82,7 @@ function v24Group() {
   const host = page.querySelector(".set") || page;
   const sec = document.createElement("section");
   sec.className = "grp"; sec.id = "g-v24";
-  sec.innerHTML = `<div class="v24-grp-h"><h2>进阶功能</h2><span class="v24-sub">v3.9.24 · 每项默认关闭或为空，不配置不影响现有行为</span></div>
+  sec.innerHTML = `<div class="grp-h"><h2>进阶功能</h2></div><div class="grp-d">每项默认关闭或为空，不配置不影响现有行为</div>
     <div class="rows"><div class="v24-grid">${V24_PAGES.map(([k, t, d]) => `<button type="button" class="btn sm" title="${q24(d)}" onclick="v24Open('${k}')">${q24(t)}</button>`).join("")}</div></div>`;
   const before = host.querySelector("#g-notify") || host.querySelector("#g-me");
   if (before) host.insertBefore(sec, before); else host.appendChild(sec);

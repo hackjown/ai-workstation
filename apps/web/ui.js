@@ -112,7 +112,10 @@ loadThreads();
 
 /* ---------- settings: grouped page (模型 / 电脑 / 集成 / 通知 / 你 / 关于), same handlers */
 const SECTIONS = [["g-model", "模型"], ["g-web", "联网"], ["g-home", "智能家居"], ["g-pc", "电脑"], ["g-conn", "连接器"], ["g-int", "集成"], ["g-skill", "技能"], ["g-travel", "出行"], ["g-notify", "通知"], ["g-me", "你和记忆"], ["g-upd", "更新"], ["g-about", "关于"]];
-const secNo = (id) => { const i = SECTIONS.findIndex((x) => x[0] === id); return `<span class="no">// ${String(i + 1).padStart(2, "0")}</span>`; };
+// v3.9.95: 不常用的分组不放导航条（页面里照样在，往下滑能找到；编号只数导航条上的）
+const NAV_HIDE = new Set(["g-travel", "g-me"]);
+const NAV_SECTIONS = SECTIONS.filter(([id]) => !NAV_HIDE.has(id));
+const secNo = (id) => { const i = NAV_SECTIONS.findIndex((x) => x[0] === id); return i < 0 ? "" : `<span class="no">// ${String(i + 1).padStart(2, "0")}</span>`; };
 const pill = (ok, on, off) => `<span class="chip ${ok === true ? "ok" : ok === false ? "" : "bad"}">${ok ? on : off}</span>`;
 function row(k, hint, v, t = "", cls = "") { return `<div class="rw ${cls}"><div class="k">${k}${hint ? `<small>${hint}</small>` : ""}</div><div class="v">${v}</div><div class="t">${t}</div></div>`; }
 /* ---------- computers: display names (云电脑 1, 2, 3… by the order added, or the user's own), shared with iOS */
@@ -190,7 +193,7 @@ loadSettings = async function () {
       <div class="t"><span class="chip ok">已连接</span><button class="btn sm" onclick="testMcp(${i})">测试</button><button class="btn sm ghost" style="color:var(--bad)" onclick="delMcp(${i})">删除</button></div></div>`; }).join("");
   const keyOk = !!models.has_key;
   $("settingsPage").innerHTML = `<div class="set">
-  <nav class="set-index">${SECTIONS.map(([id, t], i) =>
+  <nav class="set-index">${NAV_SECTIONS.map(([id, t], i) =>
     `<a href="#${id}" class="${i ? "" : "on"}" onclick="event.preventDefault();document.getElementById('${id}').scrollIntoView({behavior:'smooth'});this.parentNode.querySelectorAll('a').forEach(a=>a.classList.toggle('on',a===this))">${t}</a>`).join("")}</nav>
 
   <form class="grp" id="g-model" onsubmit="saveModels(event)"><span id="sModel" hidden></span>
@@ -214,7 +217,7 @@ loadSettings = async function () {
       ${row("模型", "生图和改图都用它", `<input name="image2_model" value="${esc(models.image2_model || "")}" placeholder="gpt-image-2.5" />`)}
       ${row("默认用", "默认的出错或不可用时自动换另一个", `<div class="segsw"><label><input type="radio" name="image_default" value="custom" ${(models.image_default || (models.image2_model ? "custom" : "gateway")) === "custom" ? "checked" : ""}>生图接口</label><label><input type="radio" name="image_default" value="gateway" ${(models.image_default || (models.image2_model ? "custom" : "gateway")) === "gateway" ? "checked" : ""}>主网关（生图/改图模型）</label></div>`,
         `<button type="button" class="btn sm" onclick="testImage(this)">测试</button>`)}
-      <div class="rw"><div class="k"></div><div class="v"><span class="small" id="imageTestOut"></span></div><div class="t"></div></div>
+      <div class="rw out"><div class="k"></div><div class="v"><span class="small" id="imageTestOut"></span></div><div class="t"></div></div>
     </div>
     <div class="rows" id="g-call">
       <div class="rw head"><div class="k">视频通话<small>聊天顶部的电话按钮：和球球语音/视频通话，能看摄像头画面，能把事交给 aiw</small></div><div>${omniSt.enabled || models.omni_model ? '<span class="chip ok">已开启</span>' : '<span class="chip">未开启（先选通话模型或填 Gemini Key）</span>'}</div></div>
@@ -561,7 +564,7 @@ function renderSkillUpdates() {
       <span class="sp"></span>
       <label class="small"><input type="checkbox" ${auto.sync_self ? "checked" : ""} onchange="setSkillAuto({sync_self:this.checked})" /> 自建技能每 ${auto.hours || 2} 小时自动同步</label>
       <label class="small"><input type="checkbox" ${auto.update_all ? "checked" : ""} onchange="setSkillAuto({update_all:this.checked})" /> 全部自动更新</label>
-      <button class="btn sm ghost" ${job ? "disabled" : ""} onclick="loadSkillUpdates(true)">检查更新</button>
+      <button class="btn sm" ${job ? "disabled" : ""} onclick="loadSkillUpdates(true)">检查更新</button>
       <button class="btn sm primary" ${job || !act.length ? "disabled" : ""} onclick="runSkillUpdate()">${job ? "更新中…" : act.length ? `一键更新（${act.length}）` : "一键更新"}</button></div>
     ${rows || `<div class="small">${when ? "所有技能都是最新的。" : ""}</div>`}`;
 }

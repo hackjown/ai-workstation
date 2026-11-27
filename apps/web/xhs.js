@@ -56,7 +56,7 @@ function xhsSettingsGroup(o) {
   const before = host.querySelector("#g-notify") || host.querySelector("#g-me");
   if (before) host.insertBefore(sec, before); else host.appendChild(sec);
   const nav = page.querySelector(".set-index");
-  if (nav && !nav.querySelector('[href="#g-xhs"]')) {
+  if (false && nav && !nav.querySelector('[href="#g-xhs"]')) {   // v3.9.95: 小红书不放导航条（不常用）
     const a = document.createElement("a"); a.href = "#g-xhs"; a.textContent = "小红书";
     a.onclick = (e) => { e.preventDefault(); xhsOpen(); };
     const ref = nav.querySelector('[href="#g-v24"]') || nav.querySelector('[href="#g-upd"]') || nav.querySelector('[href="#g-about"]');

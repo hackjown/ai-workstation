@@ -7,29 +7,44 @@ const XHS_WARN = { captcha: "验证码/滑块", verify: "安全验证", rate_lim
 const xhsQ = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 let XHS = null;
 
-(function xhsStyle() {
+(function xhsStyle() {   // v3.9.95: 页面用设置页同一套样式（.set/.grp/.rows/.rw），这里只补少量布局
   const st = document.createElement("style");
   st.textContent = `
-  .xhs-ov{position:fixed;inset:0;z-index:60;background:var(--bg,#0a0a0a);overflow:auto;-webkit-overflow-scrolling:touch}
-  .xhs-ov .wrap{max-width:860px;margin:0 auto;padding:18px 16px 80px}
-  .xhs-ov .top{display:flex;align-items:center;gap:10px;margin-bottom:12px}
-  .xhs-ov .top h2{flex:1;margin:0;font-size:20px}
-  .xhs-ov .box{border:1px solid var(--line,rgba(127,127,127,.25));border-radius:12px;padding:14px;margin:12px 0}
-  .xhs-ov .box h3{margin:0 0 8px;font-size:15px}
-  .xhs-ov .g2{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
-  .xhs-ov label.f{display:flex;flex-direction:column;gap:4px;font-size:12px;opacity:.95}
-  .xhs-ov label.sw{display:flex;align-items:center;gap:8px;font-size:13px}
-  .xhs-ov label.sw input{width:auto}
-  .xhs-ov .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
-  .xhs-ov .meter{display:flex;gap:10px;flex-wrap:wrap}
-  .xhs-ov .meter div{flex:1;min-width:120px;padding:8px 10px;border-radius:10px;background:rgba(200,118,24,.10)}
-  .xhs-ov .meter b{font-size:18px}
-  .xhs-d{border:1px solid var(--line,rgba(127,127,127,.25));border-radius:10px;padding:10px;margin:8px 0}
-  .xhs-d .tg{font-size:12px;opacity:.8;margin-bottom:4px}
-  .xhs-d .ex{font-size:12px;opacity:.75;border-left:3px solid rgba(200,118,24,.6);padding-left:8px;margin:6px 0}
-  .xhs-d textarea{width:100%;min-height:58px}
-  .xhs-warn{padding:10px 12px;border-radius:10px;background:rgba(220,60,60,.12);margin:10px 0;font-size:13px}
-  .xhs-note{font-size:12px;opacity:.8}
+  .xhs-ov{position:fixed;inset:0;z-index:60;background:var(--bg);overflow:auto;-webkit-overflow-scrolling:touch}
+  .xhs-ov .set{padding:18px 16px 80px}
+  .xhs-ov .xhs-top{display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:2;background:var(--bg);padding:6px 0 12px;border-bottom:1px solid var(--line)}
+  .xhs-ov .xhs-top h2{flex:1;margin:0;font-size:18px;font-weight:700}
+  .xhs-ov .meter{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--line)}
+  .xhs-ov .meter > div{background:var(--panel);padding:12px 16px;display:flex;flex-direction:column;gap:2px}
+  .xhs-ov .meter small{font-size:12px;color:var(--mute)}
+  .xhs-ov .meter b{font:600 18px var(--mono);color:var(--text)}
+  .xhs-ov .meter b span{font-size:13px;color:var(--dim);font-weight:500}
+  .xhs-ov .rw .v textarea{min-height:64px}
+  .xhs-ov .caps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;max-width:520px}
+  .xhs-ov .caps label,.xhs-ov .win label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mute)}
+  .xhs-ov .win{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-width:520px}
+  .xhs-ov .acts{display:flex;flex-wrap:wrap;gap:10px 18px}
+  .xhs-ov .acts label{display:inline-flex;align-items:center;gap:8px;font-size:14px;color:var(--text)}
+  .xhs-ov .rw.full{grid-template-columns:minmax(0,1fr)}
+  .xhs-ov .rw.full .v{grid-column:1/-1}
+  .xhs-d{border-top:1px solid var(--line);padding:12px 16px;display:flex;flex-direction:column;gap:6px}
+  .xhs-d:first-child{border-top:0}
+  .xhs-d .tg{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:13px;color:var(--mute)}
+  .xhs-d .tg a{color:var(--text)}
+  .xhs-d .tg input[type=checkbox]{margin-right:2px}
+  .xhs-d .ex{font-size:12px;color:var(--mute);border-left:2px solid var(--acc);padding-left:8px}
+  .xhs-d textarea{width:100%;min-height:64px}
+  .xhs-d .bar,.xhs-ov .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .ask.c .xhs-d{padding:10px 0}
+  .xhs-warn{padding:12px 16px;border:1px solid var(--bad);border-radius:var(--r-lg);color:var(--text);font-size:13px;line-height:20px;display:flex;flex-direction:column;gap:8px;align-items:flex-start}
+  .xhs-note{font-size:12px;line-height:18px;color:var(--mute)}
+  .xhs-ov .rows > .xhs-note{padding:12px 16px}
+  @media (max-width:760px){
+    .xhs-ov .set{padding:12px 14px 80px}
+    .xhs-ov .meter{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .xhs-ov .caps{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .xhs-d{padding:12px 14px}
+  }
   `;
   document.head.appendChild(st);
 })();
@@ -68,7 +83,7 @@ function xhsSettingsGroup(o) {
 async function xhsOpen() {
   let ov = $("xhsOv");
   if (!ov) { ov = document.createElement("div"); ov.id = "xhsOv"; ov.className = "xhs-ov"; document.body.appendChild(ov); }
-  ov.innerHTML = `<div class="wrap"><div class="top"><button class="btn sm" onclick="xhsClose()">‹ 返回</button><h2>小红书运营</h2></div><div class="muted">加载中…</div></div>`;
+  ov.innerHTML = `<div class="set"><div class="xhs-top"><button class="btn sm" onclick="xhsClose()">‹ 返回</button><h2>小红书运营</h2></div><div class="xhs-note">加载中…</div></div>`;
   await xhsLoad();
 }
 function xhsClose() { const ov = $("xhsOv"); if (ov) ov.remove(); if (S.view === "settings") loadSettings(); }
@@ -79,58 +94,56 @@ async function xhsLoad() {
   const o = XHS, s = o.settings, c = o.counts, p = o.pause;
   const mopt = o.machines.map((m) => `<option value="${xhsQ(m.id)}" ${m.id === o.machine_id ? "selected" : ""}>${xhsQ(m.name)}${m.cloud ? "（云电脑 · 机房 IP）" : "（本地 · 家庭网络）"}</option>`).join("");
   const cloudPicked = (o.machines.find((m) => m.id === o.machine_id) || {}).cloud;
-  const tog = (k) => `<label class="sw"><input type="checkbox" name="act_${k}" ${s.actions[k] ? "checked" : ""}/>${XHS_KIND[k]}</label>`;
-  const cap = (k, max) => `<label class="f">${XHS_KIND[k]} / 天<input type="number" min="0" max="${max}" name="cap_${k}" value="${s.caps[k]}"/></label>`;
+  const tog = (k) => `<label><input type="checkbox" name="act_${k}" ${s.actions[k] ? "checked" : ""} aria-label="${XHS_KIND[k]}"/>${XHS_KIND[k]}</label>`;
+  const cap = (k, max) => `<label>${XHS_KIND[k]} / 天<input type="number" min="0" max="${max}" name="cap_${k}" value="${s.caps[k]}"/></label>`;
   const next = (o.next_runs || []).map((t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })).join("、");
-  ov.innerHTML = `<div class="wrap">
-    <div class="top"><button class="btn sm" onclick="xhsClose()">‹ 返回</button><h2>小红书运营</h2>
+  const chip = p ? '<span class="chip bad">已暂停</span>' : s.enabled ? '<span class="chip ok">运行中</span>' : '<span class="chip">未开启</span>';
+  ov.innerHTML = `<div class="set">
+    <div class="xhs-top"><button class="btn sm" onclick="xhsClose()">‹ 返回</button><h2>小红书运营</h2>${chip}
       <button class="btn sm" onclick="xhsRun()">现在跑一次</button></div>
-    ${p ? `<div class="xhs-warn"><b>已暂停到 ${when(p.until)}</b>：${xhsQ(XHS_WARN[p.kind] || p.reason || "")}${p.detail ? " · " + xhsQ(p.detail) : ""}。
-      页面出现验证码、验证、频繁提示或账号警告时会自动停下并暂停 24 小时；验证码不会自动处理，需要的话请在「电脑」页接管后自己处理。
+    ${p ? `<div class="xhs-warn"><div><b>已暂停到 ${when(p.until)}</b>：${xhsQ(XHS_WARN[p.kind] || p.reason || "")}${p.detail ? " · " + xhsQ(p.detail) : ""}。
+      页面出现验证码、验证、频繁提示或账号警告时会自动停下并暂停 24 小时；验证码不会自动处理，需要的话请在「电脑」页接管后自己处理。</div>
       <button class="btn sm" onclick="xhsResume()">解除暂停</button></div>` : ""}
-    <div class="box"><h3>今天</h3><div class="meter">
-      ${["like", "comment", "reply", "post"].map((k) => `<div><div class="xhs-note">${XHS_KIND[k]}</div><b>${c[k]}</b> / ${s.caps[k]}</div>`).join("")}</div>
-      <div class="xhs-note" style="margin-top:8px">${s.enabled ? (next ? `今天还会在 ${next} 左右各跑一次（时间随机，每次长短不同）` : "今天的时段已过或额度已满") : "未开启：打开下面的「自动运营」后，在活跃时段内随机安排几次"}</div></div>
 
-    <div class="box"><h3>待审核 ${o.pending.length ? `<span class="chip warn">${o.pending.length}</span>` : ""}</h3>
-      ${o.pending.length ? `<div class="bar" style="margin:0 0 6px"><label class="sw"><input type="checkbox" id="xhsAll" onchange="document.querySelectorAll('.xhs-pick').forEach(x=>x.checked=this.checked)"/>全选</label>
-        <button class="btn sm primary" onclick="xhsBatch('approve')">通过所选</button><button class="btn sm" onclick="xhsBatch('skip')">跳过所选</button></div>` : ""}
-      ${o.pending.map((d) => xhsDraftHTML(d, true)).join("") || '<div class="xhs-note">没有待审核的草稿。新草稿会推送通知给你。</div>'}
-      ${o.approved.length ? `<div class="xhs-note" style="margin-top:8px">已批准、等下次会话发出：${o.approved.length} 条</div>${o.approved.map((d) => xhsDraftHTML(d, false)).join("")}` : ""}</div>
+    <section class="grp"><div class="grp-h"><h2>今天</h2></div>
+      <div class="grp-d">${s.enabled ? (next ? `今天还会在 ${next} 左右各跑一次（时间随机，每次长短不同）` : "今天的时段已过或额度已满") : "未开启：打开下面的「自动运营」后，在活跃时段内随机安排几次"}</div>
+      <div class="rows"><div class="meter">${["like", "comment", "reply", "post"].map((k) => `<div><small>${XHS_KIND[k]}</small><b>${c[k]}<span> / ${s.caps[k]}</span></b></div>`).join("")}</div></div></section>
 
-    <div class="box"><h3>发一篇笔记</h3>
-      <div class="xhs-note">自己写好内容（图片/视频会上传到所选电脑），审核即视为批准，下次会话通过 creator.xiaohongshu.com 发布；或者只写要求，让 Agent 起草，再推给你审核。</div>
-      <form id="xhsPost" onsubmit="xhsPost(event)" class="g2" style="margin-top:8px">
-        <label class="f" style="grid-column:1/-1">标题（≤20 字）<input name="title" maxlength="20"/></label>
-        <label class="f" style="grid-column:1/-1">正文<textarea name="text" rows="4" placeholder="留空 + 写在下面的要求里 = 让 Agent 起草"></textarea></label>
-        <label class="f" style="grid-column:1/-1">或：让 Agent 起草的要求<input name="brief" placeholder="例如：写一篇周末湖边露营的装备分享，语气轻松"/></label>
-        <label class="f" style="grid-column:1/-1">图片 / 视频<input type="file" name="files" multiple accept="image/*,video/*"/></label>
-        <div class="bar" style="grid-column:1/-1"><button class="btn primary">提交</button><span class="xhs-note" id="xhsPostNote"></span></div>
-      </form></div>
-
-    <form class="box" onsubmit="xhsSave(event)"><h3>设置</h3>
-      <label class="sw"><input type="checkbox" name="enabled" ${s.enabled ? "checked" : ""}/>自动运营（在活跃时段内随机时间运行）</label>
-      <div class="g2" style="margin-top:10px">
-        <label class="f" style="grid-column:1/-1">电脑<select name="machine_id">${mopt}</select></label>
+    <section class="grp"><div class="grp-h"><h2>待审核</h2>${o.pending.length ? `<span class="chip warn">${o.pending.length} 条</span>` : ""}
+      ${o.pending.length ? `<div class="act"><button class="btn sm" onclick="xhsBatch('skip')">跳过所选</button><button class="btn sm primary" onclick="xhsBatch('approve')">通过所选</button></div>` : ""}</div>
+      <div class="rows">
+        ${o.pending.length ? `<div class="rw head"><div class="k"><label style="display:inline-flex;align-items:center;gap:8px"><input type="checkbox" id="xhsAll" aria-label="全选" onchange="document.querySelectorAll('.xhs-pick').forEach(x=>x.checked=this.checked)"/>全选</label></div><div></div></div>` : ""}
+        ${o.pending.map((d) => xhsDraftHTML(d, true)).join("") || '<div class="xhs-note">没有待审核的草稿。新草稿会推送通知给你。</div>'}
       </div>
-      <div class="xhs-note" style="margin-top:4px">${cloudPicked ? "⚠️ 云电脑是机房 IP，更容易被风控，建议用本地虚拟机（家庭网络 IP）。" : "推荐本地虚拟机（如 104）：家庭网络 IP，比云电脑的机房 IP 更不容易被风控。"}
-        这台电脑的 Chrome 需要登录一次小红书：没登录时会通知你，到「电脑」页点接管，用小红书 App 扫码即可。</div>
-      <div class="g2" style="margin-top:10px">
-        <label class="f" style="grid-column:1/-1">人设<textarea name="persona" rows="2" placeholder="例如：杭州上班族，周末露营、手冲咖啡，喜欢分享实用经验">${xhsQ(s.persona)}</textarea></label>
-        <label class="f" style="grid-column:1/-1">兴趣关键词（逗号分隔，用来找兴趣相近的笔记）<input name="keywords" value="${xhsQ((s.keywords || []).join("，"))}" placeholder="露营，手冲咖啡，徒步"/></label>
-        <label class="f" style="grid-column:1/-1">语气<input name="tone" value="${xhsQ(s.tone)}"/></label>
-        ${cap("like", 100)}${cap("comment", 30)}${cap("reply", 60)}${cap("post", 3)}
-        <label class="f">活跃开始<input type="time" name="w_start" value="${xhsQ(s.window.start)}"/></label>
-        <label class="f">活跃结束<input type="time" name="w_end" value="${xhsQ(s.window.end)}"/></label>
-      </div>
-      <div class="bar">${tog("like")}${tog("comment")}${tog("reply")}${tog("post")}</div>
-      <label class="sw" style="margin-top:8px"><input type="checkbox" name="auto_reply" ${s.auto_reply ? "checked" : ""}/>回复我笔记下的评论时不用审核，直接发（评论别人和发布笔记始终要审核）</label>
-      <div class="bar"><button class="btn primary">保存</button><span class="xhs-note">点赞不审核，但受每日上限限制。所有上限在服务器端计数。</span></div>
-    </form>
+      ${o.approved.length ? `<div class="grp-d">已批准、等下次会话发出：${o.approved.length} 条</div><div class="rows">${o.approved.map((d) => xhsDraftHTML(d, false)).join("")}</div>` : ""}</section>
 
-    ${o.recent.length ? `<div class="box"><h3>最近</h3>${o.recent.map((d) => `<div class="xhs-note">${when(d.sent_at || d.decided_at || d.created_at)} · ${XHS_KIND[d.kind]} · ${{ sent: "已发出", skipped: "已跳过", failed: "未发出" }[d.status] || d.status} · ${xhsQ((d.text || "").slice(0, 40))}</div>`).join("")}</div>` : ""}
-    <div class="box xhs-note">风险提示：自动化操作违反小红书社区规范时可能被限流或封号。Aiw 会模仿真人节奏（随机间隔、先浏览再互动、每天次数有限、不固定时间），
-      但不能保证不被识别。遇到任何验证或警告会立刻停下并暂停 24 小时。</div>
+    <form class="grp" id="xhsPost" onsubmit="xhsPost(event)"><div class="grp-h"><h2>发一篇笔记</h2></div>
+      <div class="grp-d">自己写好内容（图片/视频会上传到所选电脑），提交即视为批准，下次会话通过 creator.xiaohongshu.com 发布；或者只写要求，让 Agent 起草，再推给你审核。</div>
+      <div class="rows">
+        ${row("标题", "≤20 字", `<input name="title" maxlength="20"/>`)}
+        ${row("正文", "留空并写下面的要求 = 让 Agent 起草", `<textarea name="text" rows="4"></textarea>`, "", "top")}
+        ${row("起草要求", "只写要求时由 Agent 起草", `<input name="brief" placeholder="例如：写一篇周末湖边露营的装备分享，语气轻松"/>`)}
+        ${row("图片 / 视频", "", `<input type="file" name="files" multiple accept="image/*,video/*"/>`)}
+        <div class="savebar"><span class="note" id="xhsPostNote"></span><button class="btn primary">提交</button></div>
+      </div></form>
+
+    <form class="grp" onsubmit="xhsSave(event)"><div class="grp-h"><h2>设置</h2></div>
+      <div class="rows">
+        ${row("自动运营", "在活跃时段内随机时间运行", "", `<input type="checkbox" name="enabled" ${s.enabled ? "checked" : ""} aria-label="自动运营"/>`, "sw")}
+        ${row("电脑", cloudPicked ? "⚠️ 云电脑是机房 IP，更容易被风控，建议用本地虚拟机" : "推荐本地虚拟机：家庭网络 IP 更不容易被风控", `<select name="machine_id">${mopt}</select>`)}
+        <div class="rw full"><div class="v"><span class="xhs-note">这台电脑的 Chrome 需要登录一次小红书：没登录时会通知你，到「电脑」页点接管，用小红书 App 扫码即可。</span></div></div>
+        ${row("人设", "", `<textarea name="persona" rows="2" placeholder="例如：杭州上班族，周末露营、手冲咖啡，喜欢分享实用经验">${xhsQ(s.persona)}</textarea>`, "", "top")}
+        ${row("兴趣关键词", "逗号分隔，用来找兴趣相近的笔记", `<input name="keywords" value="${xhsQ((s.keywords || []).join("，"))}" placeholder="露营，手冲咖啡，徒步"/>`)}
+        ${row("语气", "", `<input name="tone" value="${xhsQ(s.tone)}"/>`)}
+        ${row("每日上限", "所有上限在服务器端计数", `<div class="caps">${cap("like", 100)}${cap("comment", 30)}${cap("reply", 60)}${cap("post", 3)}</div>`, "", "top")}
+        ${row("活跃时段", "", `<div class="win"><label>开始<input type="time" name="w_start" value="${xhsQ(s.window.start)}"/></label><label>结束<input type="time" name="w_end" value="${xhsQ(s.window.end)}"/></label></div>`)}
+        ${row("做哪些事", "点赞不审核，但受每日上限限制", `<div class="acts">${tog("like")}${tog("comment")}${tog("reply")}${tog("post")}</div>`, "", "top")}
+        ${row("回复评论免审核", "回复我笔记下的评论直接发；评论别人和发布笔记始终要审核", "", `<input type="checkbox" name="auto_reply" ${s.auto_reply ? "checked" : ""} aria-label="回复评论免审核"/>`, "sw")}
+        <div class="savebar"><span class="note">保存立即生效</span><button class="btn primary">保存</button></div>
+      </div></form>
+
+    ${o.recent.length ? `<section class="grp"><div class="grp-h"><h2>最近</h2></div><div class="rows">${o.recent.map((d) => `<div class="rw full"><div class="v"><span class="xhs-note">${when(d.sent_at || d.decided_at || d.created_at)} · ${XHS_KIND[d.kind]} · ${{ sent: "已发出", skipped: "已跳过", failed: "未发出" }[d.status] || d.status} · ${xhsQ((d.text || "").slice(0, 40))}</span></div></div>`).join("")}</div></section>` : ""}
+    <div class="grp-d">风险提示：自动化操作违反小红书社区规范时可能被限流或封号。Aiw 会模仿真人节奏（随机间隔、先浏览再互动、每天次数有限、不固定时间），但不能保证不被识别。遇到任何验证或警告会立刻停下并暂停 24 小时。</div>
   </div>`;
 }
 
@@ -138,9 +151,9 @@ function xhsDraftHTML(d, editable) {
   const tgt = d.kind === "post" ? `<b>${xhsQ(d.title || "（无标题）")}</b>${(d.media || []).length ? ` · ${d.media.length} 个图片/视频` : ""}`
     : `${d.target_url ? `<a href="${xhsQ(d.target_url)}" target="_blank" rel="noopener">${xhsQ(d.target_title || d.target_url.slice(0, 50))}</a>` : xhsQ(d.target_title)}${d.target_author ? " · @" + xhsQ(d.target_author) : ""}`;
   return `<div class="xhs-d" id="xd-${xhsQ(d.id)}">
-    <div class="tg">${editable ? `<input type="checkbox" class="xhs-pick" value="${xhsQ(d.id)}" style="width:auto;margin-right:6px"/>` : ""}<span class="chip">${XHS_KIND[d.kind]}</span>${d.auto ? ' <span class="chip">自动回复</span>' : ""} ${tgt}</div>
+    <div class="tg">${editable ? `<input type="checkbox" class="xhs-pick" value="${xhsQ(d.id)}" aria-label="选中"/>` : ""}<span class="chip">${XHS_KIND[d.kind]}</span>${d.auto ? ' <span class="chip">自动回复</span>' : ""} ${tgt}</div>
     ${d.target_excerpt ? `<div class="ex">${xhsQ(d.target_excerpt)}</div>` : ""}
-    ${editable ? `${d.kind === "post" ? `<input class="xt" value="${xhsQ(d.title)}" maxlength="20" style="margin-bottom:6px"/>` : ""}<textarea class="xx">${xhsQ(d.text)}</textarea>
+    ${editable ? `${d.kind === "post" ? `<input class="xt" value="${xhsQ(d.title)}" maxlength="20"/>` : ""}<textarea class="xx">${xhsQ(d.text)}</textarea>
       <div class="bar"><button class="btn sm primary" onclick="xhsDecide('${xhsQ(d.id)}','approve')">通过</button>
       <button class="btn sm" onclick="xhsDecide('${xhsQ(d.id)}','edit')">保存修改</button>
       <button class="btn sm" onclick="xhsDecide('${xhsQ(d.id)}','skip')">跳过</button></div>`

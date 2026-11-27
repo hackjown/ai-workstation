@@ -62,6 +62,32 @@ COLORS = {"尺寸": (0, 110, 0), "现状": (120, 120, 120), "现状填充": (165
 _GID = 0
 
 
+def _meta(sh):
+    """side channel for the 精排 renderer (sheetstyle.py): hatch regions, labels, view titles, tables, title block.
+    Nothing here is drawn by render_png / write_dxf, so the plain PNG and DXF do not change."""
+    m = getattr(sh, "meta", None)
+    if m is None:
+        m = sh.meta = []
+    return m
+
+
+def _shift_meta(sh, dx, dy):
+    for r in getattr(sh, "meta", None) or []:
+        for k in ("poly",):
+            if r.get(k):
+                r[k] = [(p[0] + dx, p[1] + dy) for p in r[k]]
+        if r.get("holes"):
+            r["holes"] = [(b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy) for b in r["holes"]]
+        for k in ("at",):
+            if r.get(k):
+                r[k] = (r[k][0] + dx, r[k][1] + dy)
+        for k in ("box", "bbox"):
+            if r.get(k):
+                b = r[k]; r[k] = (b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy)
+        if r.get("shelf"):
+            a, y, b = r["shelf"]; r["shelf"] = (a + dx, y + dy, b + dx)
+
+
 class SetError(Exception):
     pass
 
@@ -318,6 +344,18 @@ class View:
         holes = [[v / self.s for v in hb] for hb in e.get("holes") or []]
         pat = e.get("pattern", "ansi")
         layer = e.get("layer", "填充")
+        n0 = len(sh.items)
+        rec = {"k": "hatch", "pattern": pat, "poly": list(poly), "holes": [tuple(h) for h in holes], "layer": layer,
+               "material": e.get("material") or e.get("name") or "", "scale": self.s}
+        _meta(sh).append(rec)
+        try:
+            self._hatch_items(e, poly, holes, pat, layer)
+        finally:
+            for it in sh.items[n0:]:
+                it["_hz"] = rec
+
+    def _hatch_items(self, e, poly, holes, pat, layer):
+        sh = self.sh
         xs = [p[0] for p in poly]; ys = [p[1] for p in poly]
         bx = (min(xs), min(ys), max(xs), max(ys))
         diag = math.hypot(bx[2] - bx[0], bx[3] - bx[1])
@@ -517,7 +555,12 @@ class View:
         near = bx0 if abs(bx0 - x) < abs(bx0 + w - x) else bx0 + w
         sh.line((x, y), (near, ey), "标注", 0.18)
         sh.line((bx0, ey), (bx0 + w, ey), "标注", 0.18)
+        rec = {"k": "label", "at": (x, y), "text": s, "h": h, "spec": e.get("spec"), "shelf": (bx0, ey, bx0 + w), "n0": None}
+        _meta(sh).append(rec)
+        for it in sh.items[-4:]:
+            it["_lab"] = rec
         sh.text(bx0, ey + 0.6, s, h, "文字", "bl", role="label")
+        sh.items[-1]["_lab"] = rec
 
     def _clear_strong(self, box):
         """a label must not sit on the outline of a main element (thick construction / existing lines); hatch, dims
@@ -560,10 +603,13 @@ class View:
         sh.line((x, y), (ax, yb), "标注", 0.18)
         sh.line((ax, yb), (ax, yt), "标注", 0.18)
         yy = yt
+        rec = {"k": "layers", "at": (x, y), "title": bool(title), "n": len(lines), "box": (x0, yb, x0 + w, yt)}
+        _meta(sh).append(rec)
         for k, s in enumerate(lines):
             yy -= step
             sh.line((x0, yy), (x0 + w, yy), "标注", 0.13)
             sh.text(x0 + 0.5, yy + 0.5, s, h, "文字", "bl", role="label")
+            sh.items[-1]["_lay"] = (rec, k)
 
 
 # ============================================================================================ sheet composition
@@ -647,9 +693,16 @@ class SheetBuild:
                 dx = x + (w - (ex[2] - ex[0])) / 2 - ex[0]
                 dy = (y - (hrow - h) / 2) - ex[3]
                 dk._shift(vb.sh, dx, dy)
+                _shift_meta(vb.sh, dx, dy)
                 cx = x + w / 2
                 ty = y - (hrow - h) / 2 - (ex[3] - ex[1]) - 6.5
+                vrec = {"k": "view", "title": vb.title, "scale": vb.s, "bbox": (ex[0] + dx, ex[1] + dy, ex[2] + dx, ex[3] + dy),
+                        "slot": (x, x + w), "ty": ty}
+                for it in vb.sh.items:
+                    it["_v"] = vrec
+                _meta(self.sh).append(vrec)
                 self._absorb(vb.sh)
+                n_t = len(self.sh.items)
                 tw = dk.text_width(vb.title, 5)
                 sw = dk.text_width(f"1:{vb.s:g}", 3.5)
                 tx = cx - (tw + 3 + sw) / 2
@@ -657,6 +710,8 @@ class SheetBuild:
                 self.sh.text(tx + tw + 3, ty, f"1:{vb.s:g}", 3.5, "文字", "bl", role="title")
                 self.sh.line((tx, ty - 1.0), (tx + tw, ty - 1.0), "文字", 0.7)
                 self.sh.line((tx, ty - 2.0), (tx + tw, ty - 2.0), "文字", 0.18)
+                for it in self.sh.items[n_t:]:
+                    it["_vt"] = vrec
                 x += w + gx
             y -= hrow + gap
         self.scales = [v.s for v in views]
@@ -664,6 +719,7 @@ class SheetBuild:
     def _absorb(self, other):
         self.sh.items += other.items
         self.sh.texts += other.texts
+        _meta(self.sh).extend(getattr(other, "meta", None) or [])
 
     # ---------------------------------------------------------------- side column: notes + legend
     def _side(self, x, y, ymin):
@@ -672,7 +728,7 @@ class SheetBuild:
         notes = [n for n in self.s.get("notes") or [] if n]
         h = 3.0
         if notes:
-            sh.text(x, y - 3, "说明", 5, "说明", "ml", role="notes"); y -= 9
+            sh.text(x, y - 3, "说明", 5, "说明", "ml", role="notes"); sh.items[-1]["_hdr"] = True; y -= 9
             for i, n in enumerate(notes, 1):
                 for k, part in enumerate(dk._wrap(f"{i}. {n}", h, NOTES_W - 11)):
                     sh.text(x + (0 if k == 0 else 3.5), y, part, h, "说明", "ml", role="notes"); y -= h * 1.6
@@ -680,10 +736,14 @@ class SheetBuild:
         leg = self.s.get("legend") or []
         if leg:
             y -= 3
-            sh.text(x, y, "图例", 5, "说明", "ml", role="notes"); y -= 8
+            sh.text(x, y, "图例", 5, "说明", "ml", role="notes"); sh.items[-1]["_hdr"] = True
+            lrec = {"k": "legend", "x": x, "top": y + 4}
+            _meta(sh).append(lrec)
+            y -= 8
             for it in leg:
                 self._legend_item(x, y, it)
                 y -= 7.5
+            lrec["bottom"] = y + 3.5
         if y < ymin:
             self.errors.append(f"[{self.no} {self.title}] the notes/legend column runs {ymin - y:.0f} mm into the title block: "
                                "shorten the notes or move some to the 设计说明 sheet")
@@ -712,8 +772,12 @@ class SheetBuild:
             tmp.sh.rect(b, "构造", 0.25)
         self._absorb_items(tmp.sh)
         sh.text(x + 16, y, it.get("text", ""), 3.0, "说明", "ml", role="notes")
+        sh.items[-1]["_legtext"] = True
 
     def _absorb_items(self, other):
+        for r in getattr(other, "meta", None) or []:
+            r["legend"] = True
+        _meta(self.sh).extend(getattr(other, "meta", None) or [])
         self.sh.items += [i for i in other.items if i["t"] != "text"]
         for t in other.texts:   # legend sample texts (the level value) stay in the legend
             self.sh.items.append(t); self.sh.texts.append(t)
@@ -731,8 +795,10 @@ class SheetBuild:
         h = 3.0
         y = ytop
         if tb.get("title"):
-            sh.text(x, y - 3, tb["title"], 5, "文字", "ml", role="title"); y -= 9
+            sh.text(x, y - 3, tb["title"], 5, "文字", "ml", role="title"); sh.items[-1]["_hdr"] = True; y -= 9
         top = y
+        trec = {"k": "table", "x": x, "top": top, "widths": list(widths), "rows": []}
+        _meta(sh).append(trec)
 
         def row(cells, head=False):
             nonlocal y
@@ -745,6 +811,7 @@ class SheetBuild:
                     sh.text(xx + 1.5, y - 1.3 - h * 0.62 - k * h * 1.45, s, h, "文字", "ml", role="table")
                 xx += w
             y -= rh
+            trec["rows"].append(y)
             sh.line((x, y), (x + tw, y), "图框", 0.5 if head else 0.18)
         sh.line((x, top), (x + tw, top), "图框", 0.5)
         row(cols, True)
@@ -771,7 +838,7 @@ class SheetBuild:
         yy = y1
 
         def block(title, items, x, y, w):
-            self.sh.text(x, y - 3, title, 5, "文字", "ml", role="title"); y -= 9
+            self.sh.text(x, y - 3, title, 5, "文字", "ml", role="title"); self.sh.items[-1]["_hdr"] = True; y -= 9
             for i, n in enumerate([n for n in items if n], 1):
                 for k, part in enumerate(dk._wrap(f"{i}. {n}", h, w - 9)):
                     self.sh.text(x + (0 if k == 0 else 3.5), y, part, h, "说明", "ml", role="notes"); y -= h * 1.55
@@ -790,6 +857,7 @@ class SheetBuild:
         sh = self.sh
         x1, y0 = self.inner[2], self.inner[1]
         x0, y1 = x1 - TB_W, y0 + TB_H
+        _meta(sh).append({"k": "tb", "box": (x0, y0, x1, y1)})
         sh.rect((x0, y0, x1, y1), "图框", 0.5)
         views = self.s.get("views") or []
         scales = sorted({float(v.get("scale") or 100) for v in views})
@@ -1107,15 +1175,47 @@ def measured_width(s, h):
 _EST = dk.text_width
 
 
-def build_set(spec, out_dir, name="drawings", dxf=True):
+STYLES = ("presentation", "plain")
+
+
+def sheet_style(spec=None, style=None):
+    """3.9.96: which PDF the set delivers. presentation (精排, default) = sheetstyle.py vector PDF; plain = the PNG pages.
+    The per-sheet PNGs (VERIFY/核对) and the DXF are the plain ones either way."""
+    st = (style or (spec or {}).get("style") or os.environ.get("DRAWKIT_SHEET_STYLE") or "presentation").strip().lower()
+    alias = {"精排": "presentation", "jingpai": "presentation", "plain": "plain", "普通": "plain", "none": "plain"}
+    st = alias.get(st, st)
+    return st if st in STYLES else "presentation"
+
+
+def build_set(spec, out_dir, name="drawings", dxf=True, style=None):
     dk.text_width = measured_width
     try:
-        return _build_set(spec, out_dir, name, dxf)
+        return _build_set(spec, out_dir, name, dxf, style=sheet_style(spec, style))
     finally:
         dk.text_width = _EST
 
 
-def _build_set(spec, out_dir, name="drawings", dxf=True):
+def _presentation(built, out_dir, name, files, W):
+    """the 精排 PDF replaces <name>.pdf; the plain page PDF is kept as <name>-plain.pdf. Any failure: plain stays."""
+    try:
+        import sheetstyle as _st
+        r = _st.write_presentation(built, out_dir, name, pdf_name=f"{name}.jingpai.pdf")
+    except Exception as ex:  # noqa: BLE001
+        W.append(f"精排 PDF not written ({type(ex).__name__}: {ex}); the plain PDF is delivered")
+        return
+    plain = out_dir / f"{name}-plain.pdf"
+    if files.get("pdf"):
+        os.replace(files["pdf"], plain)
+        files["pdf_plain"] = str(plain)
+    os.replace(r["pdf"], out_dir / f"{name}.pdf")
+    files["pdf"] = str(out_dir / f"{name}.pdf")
+    files["pdf_pages"] = r["pages"]
+    files["svgs"] = r["svgs"]
+    files["style"] = "presentation"
+    W += r.get("warnings") or []
+
+
+def _build_set(spec, out_dir, name="drawings", dxf=True, style="plain"):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     sheets = spec.get("sheets") or []
@@ -1185,6 +1285,8 @@ def _build_set(spec, out_dir, name="drawings", dxf=True):
             files["pdf_pages"] = len(ims)
     except Exception as ex:  # noqa: BLE001
         E.append(f"PDF not written: {type(ex).__name__}: {ex}")
+    if style == "presentation":
+        _presentation(built, out_dir, name, files, W)
     if dxf:
         try:
             files.update(write_dxf(built, str(out_dir / f"{name}.dxf")))

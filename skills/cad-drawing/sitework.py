@@ -1110,24 +1110,43 @@ class _SiteGeom:
         D = fp["W"]
         n = fp["stair_n"]
         y0 = 0
-        e = [{"type": "line", "a": [-n * 300 - 1500, 0], "b": [D + 1500, 0], "layer": "构造", "lw": 0.7}]
-        # plaza build-up below 0
-        e.append({"type": "hatch", "pattern": "earth", "box": [-n * 300 - 1500, -900, D + 1500, -400], "layer": "填充"})
-        e.append({"type": "rect", "box": [0, -400, D, h], "layer": "构造", "lw": 0.5})
-        e.append({"type": "hatch", "pattern": "concrete", "box": [0, -400, D, h - 50], "layer": "填充"})
+        # 3.9.96 (2-2 fix): the plaza finish line stops at the stair and the platform (it ran through both), the plaza
+        # build-up under the finish is drawn (it was blank, so the stair foundation hung in white space below the
+        # ground and the steps read as lower than the plaza), and the stair is a closed concrete body ON the plaza slab.
+        xl, xr = -n * 300 - 1500, D + 1500
+        e = [{"type": "line", "a": [xl, 0], "b": [-n * 300, 0], "layer": "构造", "lw": 0.7},
+             {"type": "line", "a": [D, 0], "b": [xr, 0], "layer": "构造", "lw": 0.7}]
+        hole = [[0, -550, D, h]]
+        e.append({"type": "hatch", "pattern": "mortar", "box": [xl, -50, xr, 0], "holes": hole, "layer": "填充", "material": "面层及结合层"})
+        e.append({"type": "hatch", "pattern": "concrete", "box": [xl, -150, xr, -50], "holes": hole, "layer": "填充", "material": "C20混凝土垫层"})
+        e.append({"type": "hatch", "pattern": "gravel", "box": [xl, -300, xr, -150], "holes": hole, "layer": "填充", "material": "级配碎石"})
+        e.append({"type": "hatch", "pattern": "earth", "box": [xl, -900, xr, -300], "holes": hole, "layer": "填充", "material": "素土夯实"})
+        for yy in (-50, -150, -300):
+            e.append({"type": "line", "a": [xl, yy], "b": [0, yy], "layer": "构造", "lw": 0.18})
+            e.append({"type": "line", "a": [D, yy], "b": [xr, yy], "layer": "构造", "lw": 0.18})
+        # platform: stone top, C25 body, 100 C15 垫层, 150 gravel
+        e.append({"type": "rect", "box": [0, -550, D, h], "layer": "构造", "lw": 0.5})
+        e.append({"type": "hatch", "pattern": "concrete", "box": [0, -300, D, h - 50], "layer": "填充", "material": "C25钢筋混凝土"})
         e.append({"type": "rect", "box": [0, h - 50, D, h], "layer": "构造", "lw": 0.25})
         e.append({"type": "hatch", "pattern": "stone", "box": [0, h - 50, D, h], "layer": "填充"})
-        for i in range(n):   # stair profile in front (negative y)
-            e.append({"type": "poly", "points": [[-(n - i) * 300, i * 150], [-(n - i) * 300, (i + 1) * 150], [-(n - i - 1) * 300, (i + 1) * 150]],
-                      "layer": "构造", "lw": 0.5})
-        e.append({"type": "poly", "points": [[-n * 300, 0], [-n * 300, -250], [0, -400]], "layer": "构造", "lw": 0.35})
+        e.append({"type": "line", "a": [0, -300], "b": [D, -300], "layer": "构造", "lw": 0.25})
+        e.append({"type": "hatch", "pattern": "concrete", "box": [0, -400, D, -300], "layer": "填充", "material": "C15混凝土垫层"})
+        e.append({"type": "line", "a": [0, -400], "b": [D, -400], "layer": "构造", "lw": 0.25})
+        e.append({"type": "hatch", "pattern": "gravel", "box": [0, -550, D, -400], "layer": "填充", "material": "级配碎石"})
+        # stair in front (negative y): closed concrete body standing on the plaza finish
+        st = [[-n * 300, 0]]
+        for i in range(n):
+            st += [[-(n - i) * 300, (i + 1) * 150], [-(n - i - 1) * 300, (i + 1) * 150]]
+        st += [[0, 0]]
+        e.append({"type": "hatch", "pattern": "concrete", "points": st, "layer": "填充", "material": "C20混凝土台阶"})
+        e.append({"type": "poly", "points": st, "closed": True, "layer": "构造", "lw": 0.5})
         for yy in (D - p / 2 - 50,):
             e.append({"type": "rect", "box": [yy - p / 2, h, yy + p / 2, h + rh], "layer": "构造", "lw": 0.35, "tag": "post"})
         e.append({"type": "label", "at": [D * 0.5, h * 0.4], "text": "C25 钢筋混凝土台身", "h": 3.0, "dir": "down"})
         e.append({"type": "layers", "at": [D * 0.75, h - 25], "items": GENERIC_LAYERS["platform"][:4], "h": 2.5, "title": "台面做法（通用做法，待确认）"})
         e += [{"type": "level", "at": [D + 300, 0], "value": f"+{self.raise_h / 1000:.3f}", "kind": "elev"},
               {"type": "level", "at": [D + 300, h], "value": f"+{(self.raise_h + h) / 1000:.3f}", "kind": "elev"}]
-        dims = [{"chain": [-n * 300, 0, D], "axis": "x", "base": -400, "offset": -12},
+        dims = [{"chain": [-n * 300, 0, D], "axis": "x", "base": -900, "offset": -8},
                 {"chain": [0, h, h + rh], "axis": "y", "base": D, "offset": 22}]
         return {"e": e, "dims": dims}
 
@@ -1152,8 +1171,15 @@ class _SiteGeom:
             e.append({"type": "hatch", "pattern": "concrete", "points": [[-n * tr, -100], [-n * tr, ri - 40]] +
                       [[p[0], p[1] - 40] for p in prof[1:-1]] + [[1500, n * ri - 40], [1500, n * ri - 160], [0, n * ri - 160], [0, -100]], "layer": "填充"})
             e.append({"type": "poly", "points": [[-n * tr, -100], [0, -100], [0, n * ri - 160], [1500, n * ri - 160]], "layer": "构造", "lw": 0.25})
-            e.append({"type": "hatch", "pattern": "gravel", "box": [-n * tr, -250, 1500, -100], "layer": "填充"})
-            e.append({"type": "hatch", "pattern": "earth", "box": [x_road, -450, 1500, -250], "layer": "填充"})
+            # 3.9.96: under the plaza the build-up continues (150 gravel under the C20 slab, earth below); it was blank
+            pg = n * ri - 160 - 150
+            e.append({"type": "hatch", "pattern": "gravel", "box": [-n * tr, -250, 0, -100], "layer": "填充"})
+            e.append({"type": "hatch", "pattern": "gravel", "box": [0, pg, 1500, n * ri - 160], "layer": "填充"})
+            e.append({"type": "line", "a": [0, pg], "b": [1500, pg], "layer": "构造", "lw": 0.18})
+            e.append({"type": "line", "a": [-n * tr, -250], "b": [0, -250], "layer": "构造", "lw": 0.18})
+            e.append({"type": "line", "a": [0, -250], "b": [0, pg], "layer": "构造", "lw": 0.18})
+            e.append({"type": "hatch", "pattern": "earth", "points": [[x_road, -450], [1500, -450], [1500, pg], [0, pg], [0, -250], [x_road, -250]],
+                      "layer": "填充"})
             e.append({"type": "layers", "at": [-tr * 0.5, n * ri - 20], "items": GENERIC_LAYERS["step"], "h": 2.5, "title": "台阶做法（通用做法，待确认）"})
             e += [{"type": "level", "at": [x_road + 200, 0], "value": "±0.000", "kind": "elev"},
                   {"type": "level", "at": [900, n * ri], "value": f"+{n * ri / 1000:.3f}", "kind": "elev"}]

@@ -20,8 +20,11 @@ import re
 from pathlib import Path
 
 KIT_DIR = Path(os.environ.get("AIW_DRAWKIT_DIR") or Path(__file__).resolve().parents[3] / "skills" / "cad-drawing")
-KIT_FILES = ("drawkit.py", "drawauto.py", "drawtrace.py", "sitework.py", "sheetset.py", "SKILL.md",
-             "examples/xinda-g-108.spec.json")
+KIT_FILES = ("drawkit.py", "drawauto.py", "drawtrace.py", "sitework.py", "sheetset.py", "sheetstyle.py", "SKILL.md",
+             "examples/xinda-g-108.spec.json",
+             # 3.9.96 精排: Render a House hatch patterns (CC0 1.0) used by sheetstyle.py
+             "hatches/RAH_CONCRETE.pat", "hatches/RAH_GRAVEL.pat", "hatches/RAH_EARTH.pat", "hatches/architectural-metric.pat",
+             "hatches/LICENSE.txt", "hatches/README-RenderAHouse.md")
 REMOTE = ".aiw/cad-drawing"          # under the computer's ~/workspace (files_write root)
 ROOT = '"${VM_AGENT_FILES_ROOT:-$HOME/workspace}"'
 MAX_ROUNDS = int(os.environ.get("AIW_DRAW_MAX_ROUNDS", "3"))
@@ -49,9 +52,10 @@ def version_probe() -> str:
 
 def install_command(version: str) -> str:
     """after the files are written: mirror them as a skill folder and make sure the dependencies are there."""
-    return (f"cd {ROOT}/{REMOTE} && echo {version} > VERSION && mkdir -p \"$HOME/.claude/skills/cad-drawing/examples\" && "
-            f"cp -f drawkit.py drawauto.py drawtrace.py sitework.py sheetset.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
+    return (f"cd {ROOT}/{REMOTE} && echo {version} > VERSION && mkdir -p \"$HOME/.claude/skills/cad-drawing/examples\" \"$HOME/.claude/skills/cad-drawing/hatches\" && "
+            f"cp -f drawkit.py drawauto.py drawtrace.py sitework.py sheetset.py sheetstyle.py SKILL.md \"$HOME/.claude/skills/cad-drawing/\" && "
             f"cp -f examples/*.json \"$HOME/.claude/skills/cad-drawing/examples/\" 2>/dev/null; "
+            f"cp -f hatches/* \"$HOME/.claude/skills/cad-drawing/hatches/\" 2>/dev/null; "
             f"M=\"$HOME/.config/aiw/drawkit-ready-v3\"; if [ ! -f \"$M\" ]; then "
             f"python3 drawkit.py ensure && mkdir -p \"$(dirname $M)\" && touch \"$M\"; else echo deps-ok; fi; "
             f"python3 -c 'import ezdxf, PIL, numpy' ")
